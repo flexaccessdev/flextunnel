@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 
 /// Deadline for receiving the client's auth handshake once a connection opens.
 /// The QUIC keep-alive keeps the connection from idling out, so without this a
@@ -20,6 +21,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Deadline for dialing an outbound target (DNS resolution + TCP connect), so a
 /// slow or black-holed target can't tie up a task and its sockets indefinitely.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Cap on concurrent connection handlers. A flood of inbound connections would
+/// otherwise spawn unbounded handler tasks; once this many are live the accept
+/// loop waits for a slot (backpressure) instead of spawning more. Per-connection
+/// SOCKS5 streams are separately bounded by the QUIC transport's bidi-stream
+/// limit, so this single cap is enough to bound overall task growth.
+const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 pub struct ProxyServer {
     valid_tokens: HashSet<String>,
@@ -38,11 +45,23 @@ impl ProxyServer {
 
     /// Accept connections until the endpoint closes.
     pub async fn run(self: Arc<Self>, endpoint: &Endpoint) -> ProxyResult<()> {
+        let conn_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
         loop {
             match endpoint.accept().await {
                 Some(incoming) => {
+                    // Acquire a slot before spawning so a flood of connections
+                    // applies backpressure here rather than spawning unbounded
+                    // handlers. The permit is released when the handler ends.
+                    // `acquire_owned` only errors if the semaphore is closed,
+                    // which never happens (it lives for this loop).
+                    let permit = conn_limit
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .expect("connection semaphore is never closed");
                     let server = self.clone();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = server.handle_connection(incoming).await {
                             log::debug!("Connection ended: {e}");
                         }

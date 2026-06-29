@@ -54,7 +54,7 @@ pub async fn read_connect_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 ) -> io::Result<Target> {
     let mut head = [0u8; 4];
     stream.read_exact(&mut head).await?;
-    let [ver, cmd, _rsv, atyp] = head;
+    let [ver, cmd, rsv, atyp] = head;
 
     if ver != SOCKS_VERSION {
         return Err(io::Error::other(format!(
@@ -65,6 +65,14 @@ pub async fn read_connect_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         write_reply(stream, signaling::REP_CMD_NOT_SUPPORTED).await?;
         return Err(io::Error::other(format!(
             "unsupported SOCKS5 command: 0x{cmd:02x} (only CONNECT)"
+        )));
+    }
+    // RSV is reserved and MUST be 0x00 (RFC 1928); reject a malformed request
+    // before parsing the address.
+    if rsv != 0x00 {
+        write_reply(stream, signaling::REP_GENERAL_FAILURE).await?;
+        return Err(io::Error::other(format!(
+            "invalid SOCKS5 reserved byte: 0x{rsv:02x} (must be 0x00)"
         )));
     }
 
@@ -111,12 +119,17 @@ pub async fn read_connect_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     // address (ATYP IPv4/IPv6) decides *where* DNS happens: a domain is resolved
     // on the server (flextunnel's whole point), an IP means the client already
     // resolved it locally. Logged so the iOS POC can confirm server-side DNS.
+    // Keep the DNS-mode diagnostic at info (the POC's server-side-DNS check),
+    // but log the specific destination only at debug so default logs don't leak
+    // user destinations.
     match &target {
         Target::Domain(host, port) => {
-            log::info!("SOCKS5 CONNECT {host}:{port} — ATYP_DOMAIN (remote DNS, resolved on server)")
+            log::info!("SOCKS5 CONNECT — ATYP_DOMAIN (remote DNS, resolved on server)");
+            log::debug!("SOCKS5 CONNECT target {host}:{port}");
         }
         Target::Ip(addr) => {
-            log::info!("SOCKS5 CONNECT {addr} — ATYP_IP (local DNS, client pre-resolved)")
+            log::info!("SOCKS5 CONNECT — ATYP_IP (local DNS, client pre-resolved)");
+            log::debug!("SOCKS5 CONNECT target {addr}");
         }
     }
     Ok(target)
