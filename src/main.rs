@@ -7,6 +7,7 @@
 //! encryption. Neither side needs admin/root (no TUN device).
 
 mod auth;
+mod config;
 mod error;
 mod proxy;
 mod secret;
@@ -20,7 +21,9 @@ use std::path::{Path, PathBuf};
 
 use crate::proxy::signaling::build_alpn;
 use crate::proxy::{ClientConfig, ProxyClient, ProxyServer};
-use crate::transport::endpoint::{create_client_endpoint, create_server_endpoint, load_secret};
+use crate::transport::endpoint::{
+    create_client_endpoint, create_server_endpoint, load_secret, load_secret_from_string,
+};
 
 #[derive(Parser)]
 #[command(name = "flextunnel")]
@@ -76,9 +79,15 @@ enum Command {
 enum ServerAction {
     /// Start the proxy server.
     Start {
+        /// Config file path (TOML). CLI flags override file values.
+        #[arg(short = 'c', long)]
+        config: Option<PathBuf>,
+        /// Load config from ~/.config/flextunnel/server.toml.
+        #[arg(long)]
+        default_config: bool,
         /// Secret key file for the server's persistent identity.
         #[arg(long)]
-        secret_file: PathBuf,
+        secret_file: Option<PathBuf>,
         /// Accepted client auth token (repeatable).
         #[arg(long = "auth-token")]
         auth_tokens: Vec<String>,
@@ -104,12 +113,18 @@ enum ServerAction {
 enum ClientAction {
     /// Start the proxy client (local SOCKS5 listener).
     Start {
-        /// Local address for the SOCKS5 listener.
-        #[arg(long, default_value = "127.0.0.1:1080")]
-        socks_listen: SocketAddr,
+        /// Config file path (TOML). CLI flags override file values.
+        #[arg(short = 'c', long)]
+        config: Option<PathBuf>,
+        /// Load config from ~/.config/flextunnel/client.toml.
+        #[arg(long)]
+        default_config: bool,
+        /// Local address for the SOCKS5 listener (default 127.0.0.1:1080).
+        #[arg(long)]
+        socks_listen: Option<SocketAddr>,
         /// EndpointId of the server to connect to.
         #[arg(short = 'n', long)]
-        server_node_id: String,
+        server_node_id: Option<String>,
         /// Authentication token to send to the server.
         #[arg(long)]
         auth_token: Option<String>,
@@ -202,6 +217,8 @@ async fn run_async(command: Command) -> Result<()> {
         Command::Server {
             action:
                 ServerAction::Start {
+                    config: config_path,
+                    default_config,
                     secret_file,
                     auth_tokens,
                     auth_tokens_file,
@@ -212,20 +229,24 @@ async fn run_async(command: Command) -> Result<()> {
                 },
         } => {
             log_version();
-            run_server(
+            let cli = config::ServerConfig {
                 secret_file,
-                auth_tokens,
+                secret: None, // no inline-secret CLI flag; config file only
+                auth_tokens: (!auth_tokens.is_empty()).then_some(auth_tokens),
                 auth_tokens_file,
                 alpn_token,
                 alpn_token_file,
-                relay_urls,
+                relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
                 dns_server,
-            )
-            .await
+            };
+            let file = config::load_server_config(config_path.as_deref(), default_config)?;
+            run_server(config::resolve_server(cli, file)).await
         }
         Command::Client {
             action:
                 ClientAction::Start {
+                    config: config_path,
+                    default_config,
                     socks_listen,
                     server_node_id,
                     auth_token,
@@ -239,51 +260,53 @@ async fn run_async(command: Command) -> Result<()> {
                 },
         } => {
             log_version();
-            run_client(
-                socks_listen,
+            let cli = config::ClientConfig {
                 server_node_id,
+                socks_listen,
                 auth_token,
                 auth_token_file,
                 alpn_token,
                 alpn_token_file,
-                relay_urls,
+                relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
                 dns_server,
-                !no_auto_reconnect,
+                auto_reconnect: no_auto_reconnect.then_some(false),
                 max_reconnect_attempts,
-            )
-            .await
+            };
+            let file = config::load_client_config(config_path.as_deref(), default_config)?;
+            run_client(config::resolve_client(cli, file)).await
         }
         _ => unreachable!("synchronous commands handled in main()"),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_server(
-    secret_file: PathBuf,
-    auth_tokens: Vec<String>,
-    auth_tokens_file: Option<PathBuf>,
-    alpn_token: Option<String>,
-    alpn_token_file: Option<PathBuf>,
-    relay_urls: Vec<String>,
-    dns_server: Option<String>,
-) -> Result<()> {
-    let valid_tokens = auth::load_auth_tokens(&auth_tokens, auth_tokens_file.as_deref())
+async fn run_server(r: config::ResolvedServer) -> Result<()> {
+    let valid_tokens = auth::load_auth_tokens(&r.auth_tokens, r.auth_tokens_file.as_deref())
         .context("Failed to load authentication tokens")?;
     if valid_tokens.is_empty() {
         anyhow::bail!(
             "The server requires at least one authentication token.\n\
              Generate one with: flextunnel generate-auth-token\n\
-             Then pass --auth-token <TOKEN> or --auth-tokens-file <FILE>."
+             Then pass --auth-token <TOKEN>, --auth-tokens-file <FILE>, or set \
+             auth_tokens/auth_tokens_file in the config."
         );
     }
     log::info!("Loaded {} authentication token(s)", valid_tokens.len());
 
-    let alpn_token = resolve_alpn_token(alpn_token.as_deref(), alpn_token_file.as_deref())?;
+    let alpn_token = resolve_alpn_token(r.alpn_token.as_deref(), r.alpn_token_file.as_deref())?;
     let alpn = build_alpn(&alpn_token);
 
-    let secret_key = load_secret(&secret_file).context("Failed to load secret key")?;
+    let secret_key = match (r.secret.as_deref(), r.secret_file.as_deref()) {
+        (Some(_), Some(_)) => anyhow::bail!("Provide only one of secret or secret_file, not both"),
+        (Some(s), None) => load_secret_from_string(s).context("Invalid inline secret key")?,
+        (None, Some(path)) => load_secret(path).context("Failed to load secret key")?,
+        (None, None) => anyhow::bail!(
+            "The server requires a secret key.\n\
+             Generate one with: flextunnel generate-server-key -o <FILE>\n\
+             Then pass --secret-file <FILE> or set secret_file/secret in the config."
+        ),
+    };
 
-    let endpoint = create_server_endpoint(&relay_urls, secret_key, dns_server.as_deref(), &alpn)
+    let endpoint = create_server_endpoint(&r.relay_urls, secret_key, r.dns_server.as_deref(), &alpn)
         .await
         .context("Failed to create iroh endpoint")?;
 
@@ -316,39 +339,32 @@ async fn run_server(
     res
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_client(
-    socks_listen: SocketAddr,
-    server_node_id: String,
-    auth_token: Option<String>,
-    auth_token_file: Option<PathBuf>,
-    alpn_token: Option<String>,
-    alpn_token_file: Option<PathBuf>,
-    relay_urls: Vec<String>,
-    dns_server: Option<String>,
-    auto_reconnect: bool,
-    max_reconnect_attempts: Option<NonZeroU32>,
-) -> Result<()> {
-    if auth_token.is_some() && auth_token_file.is_some() {
-        anyhow::bail!("Provide only one of --auth-token or --auth-token-file, not both");
+async fn run_client(r: config::ResolvedClient) -> Result<()> {
+    let server_node_id = r.server_node_id.context(
+        "The client requires a server node id (--server-node-id or server_node_id in the config).",
+    )?;
+
+    if r.auth_token.is_some() && r.auth_token_file.is_some() {
+        anyhow::bail!("Provide only one of auth_token or auth_token_file, not both");
     }
-    let token = if let Some(token) = auth_token {
+    let token = if let Some(token) = r.auth_token {
         auth::validate_token(&token).context("Invalid authentication token")?;
         token
-    } else if let Some(path) = auth_token_file {
+    } else if let Some(path) = r.auth_token_file {
         auth::load_auth_token_from_file(&path)
             .context("Failed to load authentication token from file")?
     } else {
         anyhow::bail!(
             "The client requires an authentication token.\n\
-             Use --auth-token <TOKEN> or --auth-token-file <FILE>."
+             Use --auth-token <TOKEN>, --auth-token-file <FILE>, or set \
+             auth_token/auth_token_file in the config."
         );
     };
 
-    let alpn_token = resolve_alpn_token(alpn_token.as_deref(), alpn_token_file.as_deref())?;
+    let alpn_token = resolve_alpn_token(r.alpn_token.as_deref(), r.alpn_token_file.as_deref())?;
     let alpn = build_alpn(&alpn_token);
 
-    let endpoint = create_client_endpoint(&relay_urls, dns_server.as_deref())
+    let endpoint = create_client_endpoint(&r.relay_urls, r.dns_server.as_deref())
         .await
         .context("Failed to create iroh endpoint")?;
     log::info!("flextunnel client Node ID: {}", endpoint.id());
@@ -357,10 +373,10 @@ async fn run_client(
         server_node_id,
         auth_token: token,
         alpn,
-        socks_listen,
-        relay_urls,
-        auto_reconnect,
-        max_reconnect_attempts,
+        socks_listen: r.socks_listen,
+        relay_urls: r.relay_urls,
+        auto_reconnect: r.auto_reconnect,
+        max_reconnect_attempts: r.max_reconnect_attempts,
     });
 
     let run = async {

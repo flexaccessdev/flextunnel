@@ -1,0 +1,26 @@
+# flextunnel client config (TOML).
+#
+# Load with:  flextunnel client start -c client.toml
+#         or: flextunnel client start --default-config   (~/.config/flextunnel/client.toml)
+#
+# CLI flags override these values. Unknown keys are rejected.
+
+# EndpointId of the server to connect to (from `flextunnel show-server-id`).
+server_node_id = "<server endpoint id>"
+
+# Local SOCKS5 listen address (default 127.0.0.1:1080).
+socks_listen = "127.0.0.1:1080"
+
+# Auth token for this client. Provide exactly one of `auth_token` or `auth_token_file`.
+auth_token = "vXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+# auth_token_file = "~/.config/flextunnel/token.txt"
+
+# Shared ALPN "knock" token (must match the server). Provide one of the two.
+alpn_token = "XXXXXXXXXXXXXX"
+# alpn_token_file = "~/.config/flextunnel/alpn_token.txt"
+
+# Optional iroh tuning and reconnect behavior.
+# relay_urls = ["https://relay.example"]
+# dns_server = "https://dns.example"        # or "none"
+# auto_reconnect = true                      # false = exit on first disconnect
+# max_reconnect_attempts = 10                # omit for unlimited

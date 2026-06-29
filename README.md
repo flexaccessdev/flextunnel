@@ -146,7 +146,9 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 
 | Flag | Description |
 |---|---|
-| `--secret-file <FILE>` | Server identity key (required). |
+| `-c, --config <FILE>` | Load options from a TOML file (CLI flags override it). |
+| `--default-config` | Load `~/.config/flextunnel/server.toml`. |
+| `--secret-file <FILE>` | Server identity key. |
 | `--auth-token <TOKEN>` | Accepted client token (repeatable). |
 | `--auth-tokens-file <FILE>` | File of accepted tokens, one per line. |
 | `--alpn-token <TOKEN>` / `--alpn-token-file <FILE>` | Shared ALPN knock secret (one required). |
@@ -157,7 +159,9 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 
 | Flag | Description |
 |---|---|
-| `-n, --server-node-id <ID>` | Server EndpointId (required). |
+| `-c, --config <FILE>` | Load options from a TOML file (CLI flags override it). |
+| `--default-config` | Load `~/.config/flextunnel/client.toml`. |
+| `-n, --server-node-id <ID>` | Server EndpointId. |
 | `--socks-listen <ADDR>` | Local SOCKS5 bind address (default `127.0.0.1:1080`). |
 | `--auth-token <TOKEN>` / `--auth-token-file <FILE>` | Client auth token (one required). |
 | `--alpn-token <TOKEN>` / `--alpn-token-file <FILE>` | Shared ALPN knock secret (one required). |
@@ -165,6 +169,35 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 | `--dns-server <URL>` | Custom discovery DNS server, or `none` to disable. |
 | `--no-auto-reconnect` | Exit on the first disconnection instead of reconnecting. |
 | `--max-reconnect-attempts <N>` | Cap reconnect attempts between successful connections (unlimited if unset). |
+
+## Configuration files
+
+Instead of passing everything on the command line, `server start` and
+`client start` can read a TOML file:
+
+```sh
+flextunnel server start -c server.toml
+flextunnel client start --default-config   # ~/.config/flextunnel/client.toml
+```
+
+Precedence is **CLI flag > config file > built-in default**, so you can keep a
+file and override individual settings on the command line. Unknown/misspelled
+keys are rejected (`deny_unknown_fields`) rather than silently ignored. Paths
+support `~` expansion.
+
+See [`server.toml.example`](server.toml.example) and
+[`client.toml.example`](client.toml.example) for the full set of keys. A minimal
+client file:
+
+```toml
+server_node_id = "<server endpoint id>"
+socks_listen   = "127.0.0.1:1080"
+auth_token     = "v…"          # or: auth_token_file = "~/.config/flextunnel/token.txt"
+alpn_token     = "…"           # or: alpn_token_file = "…"
+```
+
+Secrets may be inline (as above) or kept in separate files via the `*_file`
+keys. CLI flags still work and override any of these.
 
 ## Reconnect behavior
 

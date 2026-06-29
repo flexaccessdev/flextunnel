@@ -34,6 +34,7 @@ TCP connection.
 | Module | Responsibility |
 |---|---|
 | `main.rs` | clap CLI, command dispatch, logger/runtime, graceful `endpoint.close()`, shutdown signal |
+| `config.rs` | TOML config files (`-c`/`--default-config`), `deny_unknown_fields`, CLI>file>default merge, `~` expansion |
 | `auth.rs` | auth-token + ALPN-token generation/validation/file-loading (CRC16-checksummed Base64URL tokens) |
 | `secret.rs` | server secret-key (iroh identity) generation and loading; prints the `EndpointId` |
 | `error.rs` | `ProxyError` (`Network`/`Config`/`Signaling`/`AuthenticationFailed`/`ConnectionLost`) + `is_recoverable()` |
