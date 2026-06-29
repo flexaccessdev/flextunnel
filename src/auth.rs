@@ -177,32 +177,37 @@ pub fn load_auth_tokens_from_file(path: &Path) -> Result<HashSet<String>> {
 
     let mut tokens = HashSet::new();
 
-    for (line_num, line) in content.lines().enumerate() {
-        let line_num = line_num + 1; // 1-based line numbers
-        let line = line.trim();
-
-        // Skip empty lines and comment lines
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        // Handle inline comments: take only the part before #
-        let token = line.split('#').next().unwrap_or(line).trim();
-
-        if !token.is_empty() {
-            validate_token(token).with_context(|| {
-                format!(
-                    "Invalid token at {}:{}: '{}'",
-                    path.display(),
-                    line_num,
-                    token
-                )
-            })?;
-            tokens.insert(token.to_string());
-        }
+    for (line_num, token) in meaningful_token_lines(&content) {
+        validate_token(token).with_context(|| {
+            format!("Invalid token at {}:{}: '{}'", path.display(), line_num, token)
+        })?;
+        tokens.insert(token.to_string());
     }
 
     Ok(tokens)
+}
+
+/// Yield the meaningful `(line_num, token)` pairs from a token file's contents.
+///
+/// Line numbers are 1-based. Empty lines and `#` comment lines are skipped,
+/// inline `#` comments are stripped, and surrounding whitespace is trimmed;
+/// lines that are empty after stripping are skipped. Shared by all token-file
+/// loaders so their parsing stays identical.
+fn meaningful_token_lines(content: &str) -> impl Iterator<Item = (usize, &str)> {
+    content.lines().enumerate().filter_map(|(i, line)| {
+        let line = line.trim();
+        // Skip empty lines and comment lines.
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        // Handle inline comments: take only the part before #.
+        let token = line.split('#').next().unwrap_or(line).trim();
+        if token.is_empty() {
+            None
+        } else {
+            Some((i + 1, token))
+        }
+    })
 }
 
 /// Load a single auth token from a file.
@@ -216,29 +221,11 @@ pub fn load_auth_token_from_file(path: &Path) -> Result<String> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read auth token file: {}", path.display()))?;
 
-    for (line_num, line) in content.lines().enumerate() {
-        let line_num = line_num + 1; // 1-based line numbers
-        let line = line.trim();
-
-        // Skip empty lines and comment lines
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        // Handle inline comments: take only the part before #
-        let token = line.split('#').next().unwrap_or(line).trim();
-
-        if !token.is_empty() {
-            validate_token(token).with_context(|| {
-                format!(
-                    "Invalid token at {}:{}: '{}'",
-                    path.display(),
-                    line_num,
-                    token
-                )
-            })?;
-            return Ok(token.to_string());
-        }
+    if let Some((line_num, token)) = meaningful_token_lines(&content).next() {
+        validate_token(token).with_context(|| {
+            format!("Invalid token at {}:{}: '{}'", path.display(), line_num, token)
+        })?;
+        return Ok(token.to_string());
     }
 
     anyhow::bail!("No valid token found in file: {}", path.display())
@@ -334,29 +321,11 @@ pub fn load_alpn_token_from_file(path: &Path) -> Result<String> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read ALPN token file: {}", path.display()))?;
 
-    for (line_num, line) in content.lines().enumerate() {
-        let line_num = line_num + 1; // 1-based line numbers
-        let line = line.trim();
-
-        // Skip empty lines and comment lines
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        // Handle inline comments: take only the part before #
-        let token = line.split('#').next().unwrap_or(line).trim();
-
-        if !token.is_empty() {
-            validate_alpn_token(token).with_context(|| {
-                format!(
-                    "Invalid ALPN token at {}:{}: '{}'",
-                    path.display(),
-                    line_num,
-                    token
-                )
-            })?;
-            return Ok(token.to_string());
-        }
+    if let Some((line_num, token)) = meaningful_token_lines(&content).next() {
+        validate_alpn_token(token).with_context(|| {
+            format!("Invalid ALPN token at {}:{}: '{}'", path.display(), line_num, token)
+        })?;
+        return Ok(token.to_string());
     }
 
     anyhow::bail!("No valid ALPN token found in file: {}", path.display())
