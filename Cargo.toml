@@ -1,6 +1,6 @@
 [package]
 name = "flextunnel"
-version = "0.0.4"
+version = "0.0.5-alpha1"
 edition = "2024"
 description = "SOCKS5-over-QUIC proxy via iroh P2P"
 
