@@ -16,7 +16,7 @@ Transport, NAT traversal, relay fallback, and TLS 1.3 encryption are provided by
 
 ```
 local app ──SOCKS5──► flextunnel client (127.0.0.1:1080)
-                          │  one iroh QUIC connection (ALPN knock + auth handshake)
+                          │  one iroh QUIC connection (fixed ALPN + auth handshake)
                           │  ├─ control stream:  Hello / HelloResponse
                           │  └─ N data streams:  [target header][reply][raw bytes]
                           ▼
@@ -30,18 +30,18 @@ local app ──SOCKS5──► flextunnel client (127.0.0.1:1080)
 
 - **TCP `CONNECT` only.** No UDP `ASSOCIATE`, no `BIND`.
 - The local SOCKS5 listener is **no-auth** and binds to loopback by default;
-  access control is enforced by the QUIC layer (ALPN knock + auth token), not by
-  SOCKS5.
+  access control is enforced by the QUIC layer (auth token), not by SOCKS5.
 
 ## Security model
 
-Two shared secrets gate every connection:
+A per-client auth token gates every connection:
 
-- **ALPN "knock" token** — embedded in the QUIC ALPN. A peer that doesn't know
-  it fails at the TLS/QUIC handshake, before any stream is opened. The same ALPN
-  token must be configured on the server and all clients.
 - **Auth token** — sent in the connection handshake and checked against the
   server's accepted set. Per-client, like an API key.
+
+The QUIC ALPN is a fixed protocol identifier (`flextunnel/1`), not a secret: it
+ensures both peers speak the flextunnel protocol but provides no access control
+on its own.
 
 All payload is end-to-end encrypted by QUIC/TLS 1.3.
 
@@ -88,19 +88,17 @@ binaries for amd64 + arm64 via Docker, use `./build-linux.sh`.
 flextunnel generate-server-key -o server.key   # prints the server's EndpointId
 flextunnel show-server-id --secret-file server.key   # re-print the EndpointId
 flextunnel generate-auth-token                  # a client auth token
-flextunnel generate-alpn-token                  # the shared ALPN "knock" token
 ```
 
-Keep `server.key` private (written `0600` on Unix). Share the **EndpointId**,
-the **auth token**, and the **ALPN token** with clients.
+Keep `server.key` private (written `0600` on Unix). Share the **EndpointId**
+and the **auth token** with clients.
 
 ### 2. Run the server (no root needed)
 
 ```sh
 flextunnel server start \
     --secret-file server.key \
-    --auth-token  <AUTH_TOKEN> \
-    --alpn-token  <ALPN_TOKEN>
+    --auth-token  <AUTH_TOKEN>
 ```
 
 It prints `flextunnel server Node ID: <ENDPOINT_ID>` — give that to clients.
@@ -111,7 +109,6 @@ It prints `flextunnel server Node ID: <ENDPOINT_ID>` — give that to clients.
 flextunnel client start \
     --server-node-id <ENDPOINT_ID> \
     --auth-token     <AUTH_TOKEN> \
-    --alpn-token     <ALPN_TOKEN> \
     --socks-listen   127.0.0.1:1080
 ```
 
@@ -140,7 +137,6 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 | `generate-server-key -o <FILE> [--force]` | Generate the server identity key. |
 | `show-server-id --secret-file <FILE>` | Print the EndpointId for a key. |
 | `generate-auth-token [-c N]` | Generate N auth tokens. |
-| `generate-alpn-token [-c N]` | Generate N ALPN tokens. |
 
 ### `server start`
 
@@ -151,7 +147,6 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 | `--secret-file <FILE>` | Server identity key. |
 | `--auth-token <TOKEN>` | Accepted client token (repeatable). |
 | `--auth-tokens-file <FILE>` | File of accepted tokens, one per line. |
-| `--alpn-token <TOKEN>` / `--alpn-token-file <FILE>` | Shared ALPN knock secret (one required). |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). |
 | `--dns-server <URL>` | Custom discovery DNS server, or `none` to disable. |
 
@@ -164,7 +159,6 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 | `-n, --server-node-id <ID>` | Server EndpointId. |
 | `--socks-listen <ADDR>` | Local SOCKS5 bind address (default `127.0.0.1:1080`). |
 | `--auth-token <TOKEN>` / `--auth-token-file <FILE>` | Client auth token (one required). |
-| `--alpn-token <TOKEN>` / `--alpn-token-file <FILE>` | Shared ALPN knock secret (one required). |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). |
 | `--dns-server <URL>` | Custom discovery DNS server, or `none` to disable. |
 | `--auto-reconnect` | Force auto-reconnect on (overrides `auto_reconnect = false` in the config). |
@@ -194,7 +188,6 @@ client file:
 server_node_id = "<server endpoint id>"
 socks_listen   = "127.0.0.1:1080"
 auth_token     = "v…"          # or: auth_token_file = "~/.config/flextunnel/token.txt"
-alpn_token     = "…"           # or: alpn_token_file = "…"
 ```
 
 Secrets may be inline (as above) or kept in separate files via the `*_file`
@@ -224,7 +217,7 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
 ## Documentation
 
 - [`docs/architecture.md`](docs/architecture.md) — how it works: connection
-  lifecycle (ALPN knock, auth handshake, per-stream protocol), module map,
+  lifecycle (fixed ALPN, auth handshake, per-stream protocol), module map,
   concurrency model, reconnect policy, security boundaries, and reference
   constants.
 - [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) — planned HTTP
@@ -233,7 +226,7 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
 ## How it relates to ezvpn
 
 flextunnel is modeled on the sibling project **ezvpn** (an IP-over-QUIC VPN),
-reusing its iroh transport, ALPN-knock + auth-token scheme, and secret-key
+reusing its iroh transport, auth-token scheme, and secret-key
 identity. The difference: ezvpn creates a TUN device and ships IP packets over
 unreliable QUIC datagrams (and needs root); flextunnel exposes a SOCKS5 listener
 and tunnels TCP over reliable QUIC streams (and needs no root).

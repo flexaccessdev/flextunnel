@@ -13,10 +13,6 @@ secret_file = "./server.key"
 auth_tokens = ["vXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"]
 # auth_tokens_file = "/etc/flextunnel/auth_tokens.txt"
 
-# Shared ALPN "knock" token (must match every client). Provide one of the two.
-alpn_token = "XXXXXXXXXXXXXX"
-# alpn_token_file = "/etc/flextunnel/alpn_token.txt"
-
 # Optional iroh tuning.
 # relay_urls = ["https://relay.example"]   # custom relay(s) for failover
 # dns_server = "https://dns.example"        # custom discovery DNS, or "none"
