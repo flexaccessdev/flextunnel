@@ -1,7 +1,7 @@
 # flextunnel client config (TOML).
 #
-# Load with:  flextunnel client start -c client.toml
-#         or: flextunnel client start --default-config   (~/.config/flextunnel/client.toml)
+# Load with:  flextunnel client -c client.toml
+#         or: flextunnel client --default-config   (~/.config/flextunnel/client.toml)
 #
 # CLI flags override these values. Unknown keys are rejected.
 

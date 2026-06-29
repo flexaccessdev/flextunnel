@@ -35,43 +35,8 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Proxy server commands.
-    Server {
-        #[command(subcommand)]
-        action: ServerAction,
-    },
-    /// Proxy client commands.
-    Client {
-        #[command(subcommand)]
-        action: ClientAction,
-    },
-    /// Generate a new private key for persistent server identity.
-    GenerateServerKey {
-        /// Path where to save the private key file ("-" for stdout).
-        #[arg(short, long)]
-        output: PathBuf,
-        /// Overwrite existing file if it exists.
-        #[arg(long)]
-        force: bool,
-    },
-    /// Show the server's public EndpointId derived from a private key.
-    ShowServerId {
-        /// Path to the private key file.
-        #[arg(short, long)]
-        secret_file: PathBuf,
-    },
-    /// Generate client authentication token(s).
-    GenerateAuthToken {
-        /// Number of tokens to generate.
-        #[arg(short, long, default_value = "1")]
-        count: usize,
-    },
-}
-
-#[derive(Subcommand)]
-enum ServerAction {
     /// Start the proxy server.
-    Start {
+    Server {
         /// Config file path (TOML). CLI flags override file values.
         #[arg(short = 'c', long)]
         config: Option<PathBuf>,
@@ -94,12 +59,8 @@ enum ServerAction {
         #[arg(long)]
         dns_server: Option<String>,
     },
-}
-
-#[derive(Subcommand)]
-enum ClientAction {
     /// Start the proxy client (local SOCKS5 listener).
-    Start {
+    Client {
         /// Config file path (TOML). CLI flags override file values.
         #[arg(short = 'c', long)]
         config: Option<PathBuf>,
@@ -133,6 +94,27 @@ enum ClientAction {
         /// Cap on reconnect attempts between successful connections (unlimited if unset).
         #[arg(long)]
         max_reconnect_attempts: Option<NonZeroU32>,
+    },
+    /// Generate a new private key for persistent server identity.
+    GenerateServerKey {
+        /// Path where to save the private key file ("-" for stdout).
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Overwrite existing file if it exists.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show the server's public EndpointId derived from a private key.
+    ShowServerId {
+        /// Path to the private key file.
+        #[arg(short, long)]
+        secret_file: PathBuf,
+    },
+    /// Generate client authentication token(s).
+    GenerateAuthToken {
+        /// Number of tokens to generate.
+        #[arg(short, long, default_value = "1")]
+        count: usize,
     },
 }
 
@@ -174,16 +156,13 @@ fn main() -> Result<()> {
 async fn run_async(command: Command) -> Result<()> {
     match command {
         Command::Server {
-            action:
-                ServerAction::Start {
-                    config: config_path,
-                    default_config,
-                    secret_file,
-                    auth_tokens,
-                    auth_tokens_file,
-                    relay_urls,
-                    dns_server,
-                },
+            config: config_path,
+            default_config,
+            secret_file,
+            auth_tokens,
+            auth_tokens_file,
+            relay_urls,
+            dns_server,
         } => {
             log_version();
             let cli = config::ServerConfig {
@@ -198,20 +177,17 @@ async fn run_async(command: Command) -> Result<()> {
             run_server(config::resolve_server(cli, file)).await
         }
         Command::Client {
-            action:
-                ClientAction::Start {
-                    config: config_path,
-                    default_config,
-                    socks_listen,
-                    server_node_id,
-                    auth_token,
-                    auth_token_file,
-                    relay_urls,
-                    dns_server,
-                    auto_reconnect,
-                    no_auto_reconnect,
-                    max_reconnect_attempts,
-                },
+            config: config_path,
+            default_config,
+            socks_listen,
+            server_node_id,
+            auth_token,
+            auth_token_file,
+            relay_urls,
+            dns_server,
+            auto_reconnect,
+            no_auto_reconnect,
+            max_reconnect_attempts,
         } => {
             log_version();
             // CLI precedence: --auto-reconnect → Some(true), --no-auto-reconnect →
@@ -271,7 +247,7 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
 
     log::info!("flextunnel server Node ID: {}", endpoint.id());
     log::info!(
-        "Clients connect with: flextunnel client start --server-node-id {} --auth-token <TOKEN>",
+        "Clients connect with: flextunnel client --server-node-id {} --auth-token <TOKEN>",
         endpoint.id()
     );
 

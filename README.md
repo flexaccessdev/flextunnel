@@ -99,7 +99,7 @@ and the **auth token** with clients.
 ### 2. Run the server (no root needed)
 
 ```sh
-flextunnel server start \
+flextunnel server \
     --secret-file server.key \
     --auth-token  <AUTH_TOKEN>
 ```
@@ -109,7 +109,7 @@ It prints `flextunnel server Node ID: <ENDPOINT_ID>` — give that to clients.
 ### 3. Run the client (no root needed)
 
 ```sh
-flextunnel client start \
+flextunnel client \
     --server-node-id <ENDPOINT_ID> \
     --auth-token     <AUTH_TOKEN> \
     --socks-listen   127.0.0.1:1080
@@ -135,13 +135,13 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 
 | Command | Description |
 |---|---|
-| `server start` | Run the proxy server. |
-| `client start` | Run the proxy client (local SOCKS5 listener). |
+| `server` | Run the proxy server. |
+| `client` | Run the proxy client (local SOCKS5 listener). |
 | `generate-server-key -o <FILE> [--force]` | Generate the server identity key. |
 | `show-server-id --secret-file <FILE>` | Print the EndpointId for a key. |
 | `generate-auth-token [-c N]` | Generate N auth tokens. |
 
-### `server start`
+### `server`
 
 | Flag | Description |
 |---|---|
@@ -153,7 +153,7 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). |
 | `--dns-server <URL>` | Custom discovery DNS server, or `none` to disable. |
 
-### `client start`
+### `client`
 
 | Flag | Description |
 |---|---|
@@ -170,12 +170,12 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 
 ## Configuration files
 
-Instead of passing everything on the command line, `server start` and
-`client start` can read a TOML file:
+Instead of passing everything on the command line, `server` and
+`client` can read a TOML file:
 
 ```sh
-flextunnel server start -c server.toml
-flextunnel client start --default-config   # ~/.config/flextunnel/client.toml
+flextunnel server -c server.toml
+flextunnel client --default-config   # ~/.config/flextunnel/client.toml
 ```
 
 Precedence is **CLI flag > config file > built-in default**, so you can keep a
