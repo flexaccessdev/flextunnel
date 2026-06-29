@@ -143,8 +143,11 @@ enum ClientAction {
         /// Custom DNS server URL for peer discovery ("none" to disable).
         #[arg(long)]
         dns_server: Option<String>,
+        /// Force auto-reconnect on (overrides `auto_reconnect = false` in the config).
+        #[arg(long, conflicts_with = "no_auto_reconnect")]
+        auto_reconnect: bool,
         /// Disable auto-reconnect (exit on the first disconnection).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "auto_reconnect")]
         no_auto_reconnect: bool,
         /// Cap on reconnect attempts between successful connections (unlimited if unset).
         #[arg(long)]
@@ -255,11 +258,22 @@ async fn run_async(command: Command) -> Result<()> {
                     alpn_token_file,
                     relay_urls,
                     dns_server,
+                    auto_reconnect,
                     no_auto_reconnect,
                     max_reconnect_attempts,
                 },
         } => {
             log_version();
+            // CLI precedence: --auto-reconnect → Some(true), --no-auto-reconnect →
+            // Some(false), neither → None (defer to config file, then default).
+            // The two flags are mutually exclusive (clap `conflicts_with`).
+            let auto_reconnect = if auto_reconnect {
+                Some(true)
+            } else if no_auto_reconnect {
+                Some(false)
+            } else {
+                None
+            };
             let cli = config::ClientConfig {
                 server_node_id,
                 socks_listen,
@@ -269,7 +283,7 @@ async fn run_async(command: Command) -> Result<()> {
                 alpn_token_file,
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
                 dns_server,
-                auto_reconnect: no_auto_reconnect.then_some(false),
+                auto_reconnect,
                 max_reconnect_attempts,
             };
             let file = config::load_client_config(config_path.as_deref(), default_config)?;

@@ -167,6 +167,7 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 | `--alpn-token <TOKEN>` / `--alpn-token-file <FILE>` | Shared ALPN knock secret (one required). |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). |
 | `--dns-server <URL>` | Custom discovery DNS server, or `none` to disable. |
+| `--auto-reconnect` | Force auto-reconnect on (overrides `auto_reconnect = false` in the config). |
 | `--no-auto-reconnect` | Exit on the first disconnection instead of reconnecting. |
 | `--max-reconnect-attempts <N>` | Cap reconnect attempts between successful connections (unlimited if unset). |
 
@@ -201,12 +202,16 @@ keys. CLI flags still work and override any of these.
 
 ## Reconnect behavior
 
+Auto-reconnect is **enabled by default** (`auto_reconnect = true`); pass
+`--no-auto-reconnect` (or set `auto_reconnect = false`) to disable it, and
+`--auto-reconnect` to force it on over a config that disabled it.
+
 - The **first** connection must succeed. If it fails — bad node id, wrong
   relay, server down, or a rejected token — the client **exits immediately**
   rather than retrying blindly.
 - Once connected at least once, a transient drop triggers reconnection with
   **exponential backoff + jitter** (1s → 60s), indefinitely, unless
-  `--max-reconnect-attempts` caps it or `--no-auto-reconnect` is set.
+  `--max-reconnect-attempts` caps it or auto-reconnect is disabled.
 - A permanent error (auth/config) never retries.
 - The local SOCKS5 listener stays bound across reconnects, so local apps queue
   briefly instead of seeing connection-refused during the gap.

@@ -22,5 +22,5 @@ alpn_token = "XXXXXXXXXXXXXX"
 # Optional iroh tuning and reconnect behavior.
 # relay_urls = ["https://relay.example"]
 # dns_server = "https://dns.example"        # or "none"
-# auto_reconnect = true                      # false = exit on first disconnect
-# max_reconnect_attempts = 10                # omit for unlimited
+# auto_reconnect = true                      # default: true. set false to exit on first disconnect
+# max_reconnect_attempts = 10                # default: unlimited (omit for no cap)
