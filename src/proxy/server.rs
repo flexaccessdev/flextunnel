@@ -9,8 +9,17 @@ use iroh::endpoint::{Incoming, RecvStream, SendStream};
 use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+
+/// Deadline for receiving the client's auth handshake once a connection opens.
+/// The QUIC keep-alive keeps the connection from idling out, so without this a
+/// peer that never opens the handshake stream would hang the task forever.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for dialing an outbound target (DNS resolution + TCP connect), so a
+/// slow or black-holed target can't tie up a task and its sockets indefinitely.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct ProxyServer {
     valid_tokens: HashSet<String>,
@@ -49,12 +58,17 @@ impl ProxyServer {
         let remote_id = connection.remote_id();
         log::info!("New connection from {remote_id}");
 
-        // Control stream: read Hello, validate token, reply.
-        let (mut send, mut recv) = connection
-            .accept_bi()
-            .await
-            .map_err(|e| ProxyError::Signaling(format!("Failed to accept handshake stream: {e}")))?;
-        let data = signaling::read_message(&mut recv, signaling::MAX_HANDSHAKE_SIZE).await?;
+        // Control stream: read Hello, validate token, reply. Bounded so a peer
+        // that opens the connection but never sends the handshake can't hang us.
+        let (mut send, data) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+            let (send, mut recv) = connection.accept_bi().await.map_err(|e| {
+                ProxyError::Signaling(format!("Failed to accept handshake stream: {e}"))
+            })?;
+            let data = signaling::read_message(&mut recv, signaling::MAX_HANDSHAKE_SIZE).await?;
+            Ok::<(SendStream, Vec<u8>), ProxyError>((send, data))
+        })
+        .await
+        .map_err(|_| ProxyError::Signaling("timed out waiting for client handshake".into()))??;
         let hello = signaling::decode_hello(&data)?;
 
         let accepted = self.valid_tokens.contains(&hello.auth_token);
@@ -105,9 +119,18 @@ async fn handle_socks_stream(mut send: SendStream, mut recv: RecvStream) -> io::
     let target = signaling::read_request(&mut recv).await?;
     log::debug!("Stream target: {target:?}");
 
-    let connected = match &target {
-        Target::Ip(sa) => TcpStream::connect(*sa).await,
-        Target::Domain(host, port) => connect_resolved(host, *port).await,
+    // Bound the dial (DNS + TCP connect) so a slow/black-holed target can't tie
+    // up this task and its sockets indefinitely.
+    let connected = match tokio::time::timeout(CONNECT_TIMEOUT, async {
+        match &target {
+            Target::Ip(sa) => TcpStream::connect(*sa).await,
+            Target::Domain(host, port) => connect_resolved(host, *port).await,
+        }
+    })
+    .await
+    {
+        Ok(res) => res,
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")),
     };
 
     let mut tcp = match connected {

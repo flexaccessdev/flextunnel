@@ -139,6 +139,9 @@ enum ClientAction {
 
 /// Resolve and validate the required ALPN token from an inline value or a file.
 fn resolve_alpn_token(inline: Option<&str>, file: Option<&Path>) -> Result<String> {
+    if inline.is_some() && file.is_some() {
+        anyhow::bail!("Provide only one of --alpn-token or --alpn-token-file, not both");
+    }
     if let Some(token) = inline {
         auth::validate_alpn_token(token).context("Invalid ALPN token")?;
         Ok(token.to_string())
@@ -326,6 +329,9 @@ async fn run_client(
     auto_reconnect: bool,
     max_reconnect_attempts: Option<NonZeroU32>,
 ) -> Result<()> {
+    if auth_token.is_some() && auth_token_file.is_some() {
+        anyhow::bail!("Provide only one of --auth-token or --auth-token-file, not both");
+    }
     let token = if let Some(token) = auth_token {
         auth::validate_token(&token).context("Invalid authentication token")?;
         token

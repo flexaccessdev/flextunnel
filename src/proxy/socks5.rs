@@ -91,9 +91,13 @@ pub async fn read_connect_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             let mut host = vec![0u8; len];
             stream.read_exact(&mut host).await?;
             let port = stream.read_u16().await?;
-            let host = String::from_utf8(host)
-                .map_err(|_| io::Error::other("SOCKS5 domain is not valid UTF-8"))?;
-            Target::Domain(host, port)
+            match String::from_utf8(host) {
+                Ok(host) => Target::Domain(host, port),
+                Err(_) => {
+                    write_reply(stream, signaling::REP_GENERAL_FAILURE).await?;
+                    return Err(io::Error::other("SOCKS5 domain is not valid UTF-8"));
+                }
+            }
         }
         other => {
             write_reply(stream, signaling::REP_ATYP_NOT_SUPPORTED).await?;

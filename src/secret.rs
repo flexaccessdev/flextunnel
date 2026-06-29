@@ -65,7 +65,23 @@ fn write_secret_to_output(
 
     #[cfg(not(unix))]
     {
-        std::fs::write(output, secret_content).context("Failed to write secret key file")?;
+        use std::io::Write;
+
+        // Mirror the Unix path: when not forcing, refuse to overwrite atomically
+        // via `create_new` (closing the TOCTOU window after the `exists()` check)
+        // instead of `std::fs::write`, which would truncate an existing file.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true);
+        if force {
+            options.create(true).truncate(true);
+        } else {
+            options.create_new(true);
+        }
+        let mut file = options
+            .open(output)
+            .context("Failed to open secret key file")?;
+        file.write_all(secret_content.as_bytes())
+            .context("Failed to write secret key file")?;
     }
 
     info!("{} saved to: {}", secret_label, output.display());
