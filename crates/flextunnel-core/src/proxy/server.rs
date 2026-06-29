@@ -166,7 +166,10 @@ async fn handle_socks_stream(
             s
         }
         Err(e) => {
-            log::warn!("Connect to {target:?} failed: {e}");
+            // Keep the failure visible at warn, but don't expose the requested
+            // target there; log the target-specific detail at debug instead.
+            log::warn!("Connect to target failed: {e}");
+            log::debug!("Connect to {target:?} failed: {e}");
             signaling::write_reply(&mut send, signaling::map_io_err(&e)).await?;
             send.flush().await?;
             return Ok(());
