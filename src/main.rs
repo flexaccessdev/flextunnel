@@ -15,6 +15,7 @@ mod transport;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use crate::proxy::signaling::build_alpn;
@@ -127,6 +128,12 @@ enum ClientAction {
         /// Custom DNS server URL for peer discovery ("none" to disable).
         #[arg(long)]
         dns_server: Option<String>,
+        /// Disable auto-reconnect (exit on the first disconnection).
+        #[arg(long)]
+        no_auto_reconnect: bool,
+        /// Cap on reconnect attempts between successful connections (unlimited if unset).
+        #[arg(long)]
+        max_reconnect_attempts: Option<NonZeroU32>,
     },
 }
 
@@ -224,6 +231,8 @@ async fn run_async(command: Command) -> Result<()> {
                     alpn_token_file,
                     relay_urls,
                     dns_server,
+                    no_auto_reconnect,
+                    max_reconnect_attempts,
                 },
         } => {
             log_version();
@@ -236,6 +245,8 @@ async fn run_async(command: Command) -> Result<()> {
                 alpn_token_file,
                 relay_urls,
                 dns_server,
+                !no_auto_reconnect,
+                max_reconnect_attempts,
             )
             .await
         }
@@ -282,18 +293,24 @@ async fn run_server(
     let server = ProxyServer::new(valid_tokens);
     let run = async {
         server
-            .run(endpoint)
+            .run(&endpoint)
             .await
             .map_err(|e| anyhow::anyhow!("Server error: {e}"))
     };
 
-    tokio::select! {
+    let res = tokio::select! {
         res = run => res,
         _ = shutdown_signal() => {
             log::info!("Received shutdown signal, stopping server");
             Ok(())
         }
-    }
+    };
+
+    // Close the endpoint gracefully before it is dropped. Skipping this makes
+    // iroh tear down its relay tasks via an ungraceful abort, which panics
+    // (`JoinSet::join_all` on a cancelled task) — fatal under panic=abort.
+    endpoint.close().await;
+    res
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -306,6 +323,8 @@ async fn run_client(
     alpn_token_file: Option<PathBuf>,
     relay_urls: Vec<String>,
     dns_server: Option<String>,
+    auto_reconnect: bool,
+    max_reconnect_attempts: Option<NonZeroU32>,
 ) -> Result<()> {
     let token = if let Some(token) = auth_token {
         auth::validate_token(&token).context("Invalid authentication token")?;
@@ -334,6 +353,8 @@ async fn run_client(
         alpn,
         socks_listen,
         relay_urls,
+        auto_reconnect,
+        max_reconnect_attempts,
     });
 
     let run = async {
@@ -343,13 +364,17 @@ async fn run_client(
             .map_err(|e| anyhow::anyhow!("Client error: {e}"))
     };
 
-    tokio::select! {
+    let res = tokio::select! {
         res = run => res,
         _ = shutdown_signal() => {
             log::info!("Received shutdown signal, stopping client");
             Ok(())
         }
-    }
+    };
+
+    // Close the endpoint gracefully before it is dropped (see run_server).
+    endpoint.close().await;
+    res
 }
 
 #[cfg(unix)]

@@ -7,9 +7,17 @@ use crate::proxy::socks5;
 use anyhow::Result;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
+use rand::Rng;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+
+/// Reconnect backoff: base 1s, doubling per attempt, capped at 60s.
+const RECONNECT_BACKOFF_MAX: u64 = 60;
+/// Max jitter (ms) added to each backoff to avoid thundering reconnects.
+const RECONNECT_JITTER_MAX_MS: u64 = 500;
 
 /// Configuration for the proxy client.
 pub struct ClientConfig {
@@ -23,6 +31,18 @@ pub struct ClientConfig {
     pub socks_listen: SocketAddr,
     /// Relay URL hints (optional).
     pub relay_urls: Vec<String>,
+    /// Reconnect with backoff on a transient failure instead of exiting.
+    pub auto_reconnect: bool,
+    /// Cap on reconnect attempts between successful connections (unlimited if None).
+    pub max_reconnect_attempts: Option<NonZeroU32>,
+}
+
+/// Exponential backoff with jitter for the Nth (1-based) reconnect attempt.
+fn calculate_backoff(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(6); // cap the doubling at 2^6 = 64
+    let secs = (1u64 << shift).min(RECONNECT_BACKOFF_MAX);
+    let jitter = rand::rng().random_range(0..=RECONNECT_JITTER_MAX_MS);
+    Duration::from_secs(secs) + Duration::from_millis(jitter)
 }
 
 pub struct ProxyClient {
@@ -34,26 +54,102 @@ impl ProxyClient {
         Self { config }
     }
 
-    /// Connect to the server, authenticate, then serve the local SOCKS5
-    /// listener until the QUIC connection drops or the listener fails.
+    /// Bind the local SOCKS5 listener once, then connect to the server and serve
+    /// it. Reconnect policy (matching ezvpn): the **first** connection must
+    /// succeed — if it fails, exit immediately (a bad node id, wrong relay, or
+    /// down server is not worth retrying blindly). Once connected at least once,
+    /// transient drops are retried with exponential backoff, indefinitely
+    /// (unless `--max-reconnect-attempts` caps it or `--no-auto-reconnect` is
+    /// set). The listener stays bound across reconnects so local apps queue
+    /// rather than see connection-refused during the gap.
     pub async fn run(&self, endpoint: &Endpoint) -> ProxyResult<()> {
-        let endpoint_addr = self.resolve_server_addr()?;
-
-        let connection = endpoint
-            .connect(endpoint_addr, self.config.alpn.as_slice())
-            .await
-            .map_err(|e| ProxyError::Signaling(format!("Failed to connect to server: {e}")))?;
-        log::info!("Connected to server, authenticating...");
-
-        self.handshake(&connection).await?;
-        log::info!("Authenticated.");
-
         let listener = TcpListener::bind(self.config.socks_listen).await?;
         log::info!(
             "SOCKS5 proxy listening on {} (TCP CONNECT only)",
             self.config.socks_listen
         );
 
+        let mut ever_connected = false;
+        let mut attempt: u32 = 0;
+        loop {
+            // Establish (connect + auth).
+            let connection = match self.establish(endpoint).await {
+                Ok(conn) => {
+                    ever_connected = true;
+                    attempt = 0; // reset backoff on a successful connection
+                    conn
+                }
+                Err(e) => match self.handle_failure(e, ever_connected, &mut attempt) {
+                    Ok(backoff) => {
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    Err(fatal) => return Err(fatal),
+                },
+            };
+
+            // Serve until the connection drops, then reconnect (or exit).
+            if let Err(e) = self.serve(&connection, &listener).await {
+                match self.handle_failure(e, ever_connected, &mut attempt) {
+                    Ok(backoff) => {
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    Err(fatal) => return Err(fatal),
+                }
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Decide what to do with a connection error: `Ok(backoff)` to retry after
+    /// the given delay, or `Err(e)` to give up.
+    ///
+    /// Gives up when: the first connection never succeeded (`!ever_connected` —
+    /// fail fast), auto-reconnect is disabled, the error is permanent
+    /// (auth/config), or an explicit attempt cap was reached. Otherwise retries.
+    fn handle_failure(
+        &self,
+        e: ProxyError,
+        ever_connected: bool,
+        attempt: &mut u32,
+    ) -> Result<Duration, ProxyError> {
+        if !ever_connected || !self.config.auto_reconnect || !e.is_recoverable() {
+            return Err(e);
+        }
+        *attempt += 1;
+        if let Some(max) = self.config.max_reconnect_attempts
+            && *attempt > max.get()
+        {
+            log::error!("Giving up after {} reconnect attempt(s): {e}", max.get());
+            return Err(e);
+        }
+        let backoff = calculate_backoff(*attempt);
+        log::warn!(
+            "Connection lost ({e}); reconnecting in {:.1}s (attempt {})",
+            backoff.as_secs_f64(),
+            *attempt
+        );
+        Ok(backoff)
+    }
+
+    /// Connect to the server and complete the auth handshake.
+    async fn establish(&self, endpoint: &Endpoint) -> ProxyResult<Connection> {
+        let endpoint_addr = self.resolve_server_addr()?;
+        let connection = endpoint
+            .connect(endpoint_addr, self.config.alpn.as_slice())
+            .await
+            .map_err(|e| ProxyError::Signaling(format!("Failed to connect to server: {e}")))?;
+        log::info!("Connected to server, authenticating...");
+        self.handshake(&connection).await?;
+        log::info!("Authenticated.");
+        Ok(connection)
+    }
+
+    /// Accept local SOCKS5 connections and tunnel each over its own bi-stream,
+    /// until the QUIC connection drops.
+    async fn serve(&self, connection: &Connection, listener: &TcpListener) -> ProxyResult<()> {
         loop {
             let accept = tokio::select! {
                 r = listener.accept() => r,

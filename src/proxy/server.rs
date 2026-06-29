@@ -22,7 +22,7 @@ impl ProxyServer {
     }
 
     /// Accept connections until the endpoint closes.
-    pub async fn run(self: Arc<Self>, endpoint: Endpoint) -> ProxyResult<()> {
+    pub async fn run(self: Arc<Self>, endpoint: &Endpoint) -> ProxyResult<()> {
         loop {
             match endpoint.accept().await {
                 Some(incoming) => {

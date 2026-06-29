@@ -61,6 +61,19 @@ impl ProxyError {
     {
         Self::Config(ErrorContext::with_source(message, source))
     }
+
+    /// Whether this error is potentially recoverable by reconnecting.
+    ///
+    /// Transient (recoverable): `ConnectionLost`, `Network`, `Signaling` — a
+    /// dropped/failed connection that a retry might fix. Permanent: `Config`
+    /// (bad input) and `AuthenticationFailed` (the server rejected the token —
+    /// retrying with the same token is pointless).
+    pub fn is_recoverable(&self) -> bool {
+        matches!(
+            self,
+            ProxyError::ConnectionLost(_) | ProxyError::Network(_) | ProxyError::Signaling(_)
+        )
+    }
 }
 
 /// Result type alias for proxy operations.
