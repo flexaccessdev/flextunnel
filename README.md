@@ -45,14 +45,40 @@ Two shared secrets gate every connection:
 
 All payload is end-to-end encrypted by QUIC/TLS 1.3.
 
-## Build
+## Install
+
+Prebuilt binaries (Linux amd64/arm64, macOS arm64, Windows amd64) are published
+on the [GitHub Releases](https://github.com/andrewtheguy/flextunnel/releases)
+page. The install scripts download the latest release, verify its SHA-256
+checksum, and install to a per-user location (`~/.local/bin` on Linux/macOS,
+`%LOCALAPPDATA%\Programs\flextunnel` on Windows) — **no admin required**.
+
+**Linux / macOS:**
+
+```sh
+curl -sSL https://andrewtheguy.github.io/flextunnel/install.sh | bash
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://andrewtheguy.github.io/flextunnel/install.ps1 | iex
+```
+
+Options: append `-s -- --prerelease` (bash) / `-PreRelease` (pwsh) for the
+latest prerelease, a release tag to pin a version, or `--download-only` /
+`-DownloadOnly` to fetch the binary without installing. A container image is
+also published to `ghcr.io/andrewtheguy/flextunnel`.
+
+## Build from source
 
 ```sh
 cargo build --release
 # binary: target/release/flextunnel
 ```
 
-Requires a recent Rust toolchain (edition 2024).
+Requires a recent Rust toolchain (edition 2024). To cross-build static Linux
+binaries for amd64 + arm64 via Docker, use `./build-linux.sh`.
 
 ## Quick start
 

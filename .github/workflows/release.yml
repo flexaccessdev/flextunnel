@@ -1,0 +1,271 @@
+name: Release (Manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  GHCR_IMAGE: ghcr.io/andrewtheguy/flextunnel
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.tag.outputs.release_tag }}
+      release_title: ${{ steps.tag.outputs.release_title }}
+      is_prerelease: ${{ steps.tag.outputs.is_prerelease }}
+      minor_version: ${{ steps.version.outputs.minor_version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "::error::Could not parse version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "minor_version=$(echo "$VERSION" | cut -d. -f1-2)" >> "$GITHUB_OUTPUT"
+      - name: Generate Tag
+        id: tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Tag and name are always derived from the Cargo.toml version so the flow is
+          # uniform across releases and prereleases. Whether it's a prerelease is decided
+          # purely by the branch this workflow runs against (anything other than main).
+          echo "release_tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "release_title=Prerelease v$VERSION" >> "$GITHUB_OUTPUT"
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_title=Release v$VERSION" >> "$GITHUB_OUTPUT"
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Abort if tag already exists
+        run: |
+          if git ls-remote --tags origin "refs/tags/${{ steps.tag.outputs.release_tag }}" | grep -q .; then
+            echo "::error::Tag ${{ steps.tag.outputs.release_tag }} already exists on remote"
+            exit 1
+          fi
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Clean up any leftover draft from a previous failed run with the same tag.
+          # A draft release doesn't create the git tag on the remote, so a stale draft is the
+          # only thing that can collide here (real published tags are caught by the step above).
+          if gh release view "${{ steps.tag.outputs.release_tag }}" --json isDraft --jq '.isDraft' 2>/dev/null | grep -qx true; then
+            echo "Deleting stale draft release ${{ steps.tag.outputs.release_tag }}"
+            gh release delete "${{ steps.tag.outputs.release_tag }}" --yes
+          fi
+          args=()
+          if [ "${{ steps.tag.outputs.is_prerelease }}" = "true" ]; then
+            args+=(--prerelease)
+          else
+            # Generate notes against the previous *stable* release, not the latest prerelease.
+            prev_stable=$(gh release list --exclude-pre-releases --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName // empty')
+            if [ -n "$prev_stable" ]; then
+              args+=(--notes-start-tag "$prev_stable")
+            fi
+          fi
+          gh release create "${{ steps.tag.outputs.release_tag }}" \
+            --draft \
+            --target "${{ github.sha }}" \
+            --title "${{ steps.tag.outputs.release_title }}" \
+            --generate-notes \
+            "${args[@]}"
+
+  build-linux:
+    needs: setup
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-amd64
+            docker_arch: amd64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            suffix: linux-arm64
+            docker_arch: arm64
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Release
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename Binaries
+        run: |
+          mv target/${{ matrix.target }}/release/flextunnel target/release/flextunnel-${{ matrix.suffix }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flextunnel-${{ matrix.docker_arch }}
+          path: target/release/flextunnel-${{ matrix.suffix }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.suffix }}
+          path: target/release/flextunnel-${{ matrix.suffix }}
+
+  build-macos:
+    needs: setup
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Release
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+
+      - name: Rename Binaries
+        run: |
+          mv target/aarch64-apple-darwin/release/flextunnel target/release/flextunnel-macos-arm64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-arm64
+          path: target/release/flextunnel-macos-arm64
+
+  build-windows:
+    needs: setup
+    if: needs.setup.outputs.is_prerelease == 'false'
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Release
+        run: |
+          cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Rename Binaries
+        run: |
+          move target\x86_64-pc-windows-msvc\release\flextunnel.exe target\release\flextunnel-windows-amd64.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-amd64
+          path: target/release/flextunnel-windows-amd64.exe
+
+  publish-release:
+    needs: [setup, build-linux, build-macos, build-windows]
+    if: always() && needs.setup.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Upload artifacts to draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "${{ needs.setup.outputs.release_tag }}" artifacts/* --clobber
+
+      - name: Publish release (remove draft, creates the tag)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "${{ needs.setup.outputs.release_tag }}" --draft=false
+
+  docker-build:
+    needs: [setup, build-linux]
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+            suffix: linux-amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            suffix: linux-arm64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: flextunnel-${{ matrix.arch }}
+          path: .
+      - name: Prepare binary
+        run: |
+          mv flextunnel-${{ matrix.suffix }} flextunnel
+          chmod +x flextunnel
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.build
+          target: runtime-prebuilt
+          push: true
+          tags: ${{ env.GHCR_IMAGE }}:${{ needs.setup.outputs.release_tag }}-${{ matrix.arch }}
+          provenance: false
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.arch }}
+
+  docker-manifest:
+    needs: [setup, docker-build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest
+        run: |
+          TAG=${{ needs.setup.outputs.release_tag }}
+
+          docker manifest create ${{ env.GHCR_IMAGE }}:${TAG} \
+            ${{ env.GHCR_IMAGE }}:${TAG}-amd64 \
+            ${{ env.GHCR_IMAGE }}:${TAG}-arm64
+          docker manifest push ${{ env.GHCR_IMAGE }}:${TAG}
+
+      - name: Create and push minor version multi-arch manifest
+        if: needs.setup.outputs.is_prerelease == 'false'
+        run: |
+          TAG=${{ needs.setup.outputs.release_tag }}
+          MINOR=${{ needs.setup.outputs.minor_version }}
+
+          docker manifest create ${{ env.GHCR_IMAGE }}:${MINOR} \
+            ${{ env.GHCR_IMAGE }}:${TAG}-amd64 \
+            ${{ env.GHCR_IMAGE }}:${TAG}-arm64
+          docker manifest push ${{ env.GHCR_IMAGE }}:${MINOR}
+
+      - name: Create and push latest multi-arch manifest
+        if: needs.setup.outputs.is_prerelease == 'false'
+        run: |
+          TAG=${{ needs.setup.outputs.release_tag }}
+
+          docker manifest create ${{ env.GHCR_IMAGE }}:latest \
+            ${{ env.GHCR_IMAGE }}:${TAG}-amd64 \
+            ${{ env.GHCR_IMAGE }}:${TAG}-arm64
+          docker manifest push ${{ env.GHCR_IMAGE }}:latest
