@@ -22,6 +22,12 @@ const RECONNECT_JITTER_MAX_MS: u64 = 500;
 /// connection from idling out, so without this a server that accepts the
 /// connection but never replies on the stream would hang the client forever.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for opening a tunnel stream and receiving the server's CONNECT
+/// reply. Must exceed the server's own connect timeout (it replies only after
+/// dialing the target, up to ~10s), so a legitimately slow target isn't cut
+/// off; without it a server that stalls after accepting the stream would hang
+/// the local SOCKS5 connection forever.
+const TUNNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Configuration for the proxy client.
 pub struct ClientConfig {
@@ -246,7 +252,11 @@ async fn handle_local_conn(mut tcp: TcpStream, conn: Connection) -> Result<()> {
     // Open the tunnel stream and read the server's reply. If any step fails the
     // local app hasn't been answered yet, so send a SOCKS5 general-failure reply
     // (best effort) instead of dropping the connection with no response.
-    let (send, recv, rep) = match open_tunnel(&conn, &target).await {
+    let opened = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, open_tunnel(&conn, &target))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out opening tunnel / awaiting server reply"))
+        .and_then(|r| r);
+    let (send, recv, rep) = match opened {
         Ok(v) => v,
         Err(e) => {
             let _ = socks5::write_reply(&mut tcp, signaling::REP_GENERAL_FAILURE).await;
