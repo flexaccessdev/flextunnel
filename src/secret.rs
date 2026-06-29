@@ -1,0 +1,97 @@
+//! Secret key generation and management commands (iroh).
+
+use anyhow::{Context, Result};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use iroh::SecretKey;
+use log::info;
+use std::path::PathBuf;
+
+use crate::transport::endpoint::{load_secret, secret_to_endpoint_id};
+
+fn write_secret_to_output(
+    output: &PathBuf,
+    secret_content: &str,
+    public_info: &str,
+    force: bool,
+    secret_label: &str,
+) -> Result<()> {
+    if output.as_os_str() == std::ffi::OsStr::new("-") {
+        println!("{}", secret_content);
+        eprintln!("{}", public_info);
+        return Ok(());
+    }
+
+    if output.exists() && !force {
+        anyhow::bail!(
+            "File already exists: {}. Use --force to overwrite.",
+            output.display()
+        );
+    }
+
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent).context("Failed to create parent directory")?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).mode(0o600);
+        if force {
+            // Overwrite an existing file in place.
+            options.create(true).truncate(true);
+        } else {
+            // Atomically refuse to overwrite, closing the TOCTOU window between
+            // the `output.exists()` check above and this open.
+            options.create_new(true);
+        }
+        let mut file = options
+            .open(output)
+            .context("Failed to open secret key file")?;
+
+        // `.mode(0o600)` only takes effect when the file is created; on a
+        // force-overwrite of a pre-existing file its old permissions persist,
+        // so tighten the open descriptor explicitly before writing the secret.
+        if force {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .context("Failed to set secret key file permissions")?;
+        }
+
+        file.write_all(secret_content.as_bytes())
+            .context("Failed to write secret key file")?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(output, secret_content).context("Failed to write secret key file")?;
+    }
+
+    info!("{} saved to: {}", secret_label, output.display());
+    println!("{}", public_info);
+
+    Ok(())
+}
+
+/// Generate a new secret key file (base64 encoded) and output the EndpointId to stdout
+pub fn generate_secret(output: PathBuf, force: bool) -> Result<()> {
+    let secret = SecretKey::generate();
+    let secret_base64 = BASE64.encode(secret.to_bytes());
+    let endpoint_id = secret_to_endpoint_id(&secret);
+    write_secret_to_output(
+        &output,
+        &secret_base64,
+        &format!("EndpointId: {}", endpoint_id),
+        force,
+        "Secret key",
+    )
+}
+
+/// Show the EndpointId for an existing secret key file
+pub fn show_id(secret_file: PathBuf) -> Result<()> {
+    let secret = load_secret(&secret_file)?;
+    let endpoint_id = secret_to_endpoint_id(&secret);
+    println!("{}", endpoint_id);
+    Ok(())
+}
