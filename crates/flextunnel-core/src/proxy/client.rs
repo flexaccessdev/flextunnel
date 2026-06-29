@@ -28,6 +28,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// off; without it a server that stalls after accepting the stream would hang
 /// the local SOCKS5 connection forever.
 const TUNNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Deadline for the local app to complete its SOCKS5 handshake (method
+/// negotiation + CONNECT request). A peer that connects to the loopback
+/// listener but sends nothing would otherwise pin the spawned task and socket
+/// forever; generous since this is loopback.
+const LOCAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Configuration for the proxy client.
 pub struct ClientConfig {
@@ -246,8 +251,14 @@ impl ProxyClient {
 /// Handle one local SOCKS5 connection: negotiate, parse CONNECT, open a stream
 /// to the server, relay the reply, then pipe bytes.
 async fn handle_local_conn(mut tcp: TcpStream, conn: Connection) -> Result<()> {
-    socks5::negotiate_method(&mut tcp).await?;
-    let target = socks5::read_connect_request(&mut tcp).await?;
+    // Bound the local SOCKS5 handshake so a peer that connects and sends nothing
+    // can't pin this task and its socket indefinitely.
+    let target = tokio::time::timeout(LOCAL_HANDSHAKE_TIMEOUT, async {
+        socks5::negotiate_method(&mut tcp).await?;
+        socks5::read_connect_request(&mut tcp).await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out during local SOCKS5 handshake"))??;
 
     // Open the tunnel stream and read the server's reply. If any step fails the
     // local app hasn't been answered yet, so send a SOCKS5 general-failure reply
