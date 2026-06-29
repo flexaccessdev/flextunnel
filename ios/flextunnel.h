@@ -44,7 +44,8 @@ void flextunnel_init_logging(void);
 
 /*
  * Start the in-process SOCKS5 proxy: create the iroh endpoint, bind a loopback
- * listener on an OS-assigned port, and spawn the connect/auth/serve loop.
+ * listener on a FIXED port (default 18080, or "socks_port" in the config), and
+ * spawn the connect/auth/serve loop.
  *
  * config_json : NUL-terminated UTF-8 JSON, e.g.
  *   {"server_node_id":"<id>","auth_token":"<token>",
