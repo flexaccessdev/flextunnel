@@ -1,0 +1,309 @@
+//! TOML configuration files for the server and client.
+//!
+//! Both roles can be configured from a TOML file (`-c <FILE>` or
+//! `--default-config` → `~/.config/flextunnel/{server,client}.toml`). CLI flags
+//! always override file values; the file overrides built-in defaults. Unknown
+//! keys are rejected (`deny_unknown_fields`) so typos fail loudly.
+//!
+//! The schema is flat: flextunnel has a single transport and the `server`/
+//! `client` subcommands already determine the role, so there is no `[iroh]`
+//! table or `role`/`mode` key.
+
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::net::SocketAddr;
+use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
+
+/// Server config file schema. Every field is optional; CLI flags override these.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerConfig {
+    /// Path to the server's secret-key file (persistent identity).
+    pub secret_file: Option<PathBuf>,
+    /// Inline base64 secret key (alternative to `secret_file`).
+    pub secret: Option<String>,
+    /// Accepted client auth tokens (inline list).
+    pub auth_tokens: Option<Vec<String>>,
+    /// File of accepted client auth tokens (one per line).
+    pub auth_tokens_file: Option<PathBuf>,
+    /// Shared ALPN "knock" token.
+    pub alpn_token: Option<String>,
+    /// File containing the ALPN token.
+    pub alpn_token_file: Option<PathBuf>,
+    /// Custom relay URL(s) for failover.
+    pub relay_urls: Option<Vec<String>>,
+    /// Custom discovery DNS server URL ("none" to disable).
+    pub dns_server: Option<String>,
+}
+
+/// Client config file schema. Every field is optional; CLI flags override these.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientConfig {
+    /// EndpointId of the server to connect to.
+    pub server_node_id: Option<String>,
+    /// Local address for the SOCKS5 listener.
+    pub socks_listen: Option<SocketAddr>,
+    /// Auth token to send to the server.
+    pub auth_token: Option<String>,
+    /// File containing the auth token.
+    pub auth_token_file: Option<PathBuf>,
+    /// Shared ALPN "knock" token.
+    pub alpn_token: Option<String>,
+    /// File containing the ALPN token.
+    pub alpn_token_file: Option<PathBuf>,
+    /// Custom relay URL(s) for failover.
+    pub relay_urls: Option<Vec<String>>,
+    /// Custom discovery DNS server URL ("none" to disable).
+    pub dns_server: Option<String>,
+    /// Reconnect with backoff on a transient drop (default true).
+    pub auto_reconnect: Option<bool>,
+    /// Cap on reconnect attempts between successful connections.
+    pub max_reconnect_attempts: Option<NonZeroU32>,
+}
+
+/// Fully-resolved server settings (CLI > file > default), paths tilde-expanded.
+pub struct ResolvedServer {
+    pub secret_file: Option<PathBuf>,
+    pub secret: Option<String>,
+    pub auth_tokens: Vec<String>,
+    pub auth_tokens_file: Option<PathBuf>,
+    pub alpn_token: Option<String>,
+    pub alpn_token_file: Option<PathBuf>,
+    pub relay_urls: Vec<String>,
+    pub dns_server: Option<String>,
+}
+
+/// Fully-resolved client settings (CLI > file > default), paths tilde-expanded.
+pub struct ResolvedClient {
+    pub server_node_id: Option<String>,
+    pub socks_listen: SocketAddr,
+    pub auth_token: Option<String>,
+    pub auth_token_file: Option<PathBuf>,
+    pub alpn_token: Option<String>,
+    pub alpn_token_file: Option<PathBuf>,
+    pub relay_urls: Vec<String>,
+    pub dns_server: Option<String>,
+    pub auto_reconnect: bool,
+    pub max_reconnect_attempts: Option<NonZeroU32>,
+}
+
+/// Default SOCKS5 listen address when neither CLI nor config sets one.
+const DEFAULT_SOCKS_LISTEN: &str = "127.0.0.1:1080";
+
+/// Expand a leading `~` / `~/…` to the user's home directory.
+pub fn expand_tilde(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    } else if s == "~"
+        && let Some(home) = dirs::home_dir()
+    {
+        return home;
+    }
+    path.to_path_buf()
+}
+
+/// Default config path for a role file (e.g. `~/.config/flextunnel/server.toml`).
+fn default_config_path(file_name: &str) -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("flextunnel").join(file_name))
+}
+
+/// Read and parse a TOML config file, with the path in any error.
+fn load_config<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+    toml::from_str(&content)
+        .with_context(|| format!("Failed to parse config file: {}", path.display()))
+}
+
+/// Resolve the config file to load, if any: an explicit `path`, else the default
+/// location when `default_config` is set, else `None`.
+fn resolve_config_path(
+    path: Option<&Path>,
+    default_config: bool,
+    default_name: &str,
+) -> Result<Option<PathBuf>> {
+    if let Some(p) = path {
+        Ok(Some(expand_tilde(p)))
+    } else if default_config {
+        Ok(Some(default_config_path(default_name).context(
+            "Could not determine the default config directory; pass -c <FILE> instead",
+        )?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Load the server config file (explicit path or `--default-config`), or `None`.
+pub fn load_server_config(path: Option<&Path>, default_config: bool) -> Result<Option<ServerConfig>> {
+    match resolve_config_path(path, default_config, "server.toml")? {
+        Some(p) => Ok(Some(load_config(&p)?)),
+        None => Ok(None),
+    }
+}
+
+/// Load the client config file (explicit path or `--default-config`), or `None`.
+pub fn load_client_config(path: Option<&Path>, default_config: bool) -> Result<Option<ClientConfig>> {
+    match resolve_config_path(path, default_config, "client.toml")? {
+        Some(p) => Ok(Some(load_config(&p)?)),
+        None => Ok(None),
+    }
+}
+
+/// Merge CLI-provided values over file values over defaults for the server.
+///
+/// `cli` carries the CLI flags as a `ServerConfig` (a field is `Some`/non-empty
+/// only when the user passed it). For each field CLI wins, then the file; list
+/// fields are replaced wholesale (not appended), matching tunnel-rs.
+pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> ResolvedServer {
+    let file = file.unwrap_or_default();
+
+    // Credential groups are merged as a *unit* per source: if the CLI set any
+    // part of a group, the CLI's group wins wholesale; otherwise the file's does.
+    // This avoids a false "both set" conflict when e.g. the CLI gives a token and
+    // the file gives a token-file.
+    let (secret, secret_file) = if cli.secret.is_some() || cli.secret_file.is_some() {
+        (cli.secret, cli.secret_file)
+    } else {
+        (file.secret, file.secret_file)
+    };
+    let (auth_tokens, auth_tokens_file) = if cli.auth_tokens.is_some() || cli.auth_tokens_file.is_some()
+    {
+        (cli.auth_tokens, cli.auth_tokens_file)
+    } else {
+        (file.auth_tokens, file.auth_tokens_file)
+    };
+    let (alpn_token, alpn_token_file) = if cli.alpn_token.is_some() || cli.alpn_token_file.is_some() {
+        (cli.alpn_token, cli.alpn_token_file)
+    } else {
+        (file.alpn_token, file.alpn_token_file)
+    };
+
+    ResolvedServer {
+        secret_file: secret_file.map(|p| expand_tilde(&p)),
+        secret,
+        auth_tokens: auth_tokens.unwrap_or_default(),
+        auth_tokens_file: auth_tokens_file.map(|p| expand_tilde(&p)),
+        alpn_token,
+        alpn_token_file: alpn_token_file.map(|p| expand_tilde(&p)),
+        relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
+        dns_server: cli.dns_server.or(file.dns_server),
+    }
+}
+
+/// Merge CLI-provided values over file values over defaults for the client.
+pub fn resolve_client(cli: ClientConfig, file: Option<ClientConfig>) -> ResolvedClient {
+    let file = file.unwrap_or_default();
+
+    // Token group merged as a unit per source (see `resolve_server`).
+    let (auth_token, auth_token_file) = if cli.auth_token.is_some() || cli.auth_token_file.is_some() {
+        (cli.auth_token, cli.auth_token_file)
+    } else {
+        (file.auth_token, file.auth_token_file)
+    };
+    let (alpn_token, alpn_token_file) = if cli.alpn_token.is_some() || cli.alpn_token_file.is_some() {
+        (cli.alpn_token, cli.alpn_token_file)
+    } else {
+        (file.alpn_token, file.alpn_token_file)
+    };
+
+    ResolvedClient {
+        server_node_id: cli.server_node_id.or(file.server_node_id),
+        socks_listen: cli
+            .socks_listen
+            .or(file.socks_listen)
+            .unwrap_or_else(|| DEFAULT_SOCKS_LISTEN.parse().expect("valid default addr")),
+        auth_token,
+        auth_token_file: auth_token_file.map(|p| expand_tilde(&p)),
+        alpn_token,
+        alpn_token_file: alpn_token_file.map(|p| expand_tilde(&p)),
+        relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
+        dns_server: cli.dns_server.or(file.dns_server),
+        auto_reconnect: cli.auto_reconnect.or(file.auto_reconnect).unwrap_or(true),
+        max_reconnect_attempts: cli.max_reconnect_attempts.or(file.max_reconnect_attempts),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_server_config() {
+        let toml = r#"
+            secret_file = "./server.key"
+            auth_tokens = ["vAAA", "vBBB"]
+            alpn_token = "knock"
+            relay_urls = ["https://relay.example"]
+            dns_server = "none"
+        "#;
+        let cfg: ServerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.secret_file, Some(PathBuf::from("./server.key")));
+        assert_eq!(cfg.auth_tokens.as_deref().map(<[_]>::len), Some(2));
+        assert_eq!(cfg.alpn_token.as_deref(), Some("knock"));
+        assert_eq!(cfg.dns_server.as_deref(), Some("none"));
+        assert!(cfg.secret.is_none());
+    }
+
+    #[test]
+    fn parse_client_config() {
+        let toml = r#"
+            server_node_id = "abc123"
+            socks_listen = "127.0.0.1:1085"
+            auth_token = "vTOKEN"
+            alpn_token = "knock"
+            auto_reconnect = false
+            max_reconnect_attempts = 5
+        "#;
+        let cfg: ClientConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.server_node_id.as_deref(), Some("abc123"));
+        assert_eq!(cfg.socks_listen, Some("127.0.0.1:1085".parse().unwrap()));
+        assert_eq!(cfg.auto_reconnect, Some(false));
+        assert_eq!(cfg.max_reconnect_attempts, NonZeroU32::new(5));
+    }
+
+    #[test]
+    fn unknown_key_is_rejected() {
+        // A misspelled key must be a hard error, not silently ignored.
+        let err = toml::from_str::<ServerConfig>("auth_tokenz = []").unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn cli_overrides_file() {
+        let file = ServerConfig {
+            dns_server: Some("https://file.example".into()),
+            relay_urls: Some(vec!["https://file-relay".into()]),
+            ..Default::default()
+        };
+        let cli = ServerConfig {
+            dns_server: Some("https://cli.example".into()),
+            ..Default::default()
+        };
+        let r = resolve_server(cli, Some(file));
+        // CLI wins where set; file fills the rest.
+        assert_eq!(r.dns_server.as_deref(), Some("https://cli.example"));
+        assert_eq!(r.relay_urls, vec!["https://file-relay".to_string()]);
+    }
+
+    #[test]
+    fn client_defaults_applied() {
+        let r = resolve_client(ClientConfig::default(), None);
+        assert_eq!(r.socks_listen, "127.0.0.1:1080".parse().unwrap());
+        assert!(r.auto_reconnect);
+    }
+
+    #[test]
+    fn expand_tilde_handles_home() {
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(expand_tilde(Path::new("~/x")), home.join("x"));
+            assert_eq!(expand_tilde(Path::new("~")), home);
+        }
+        // Non-tilde paths are unchanged.
+        assert_eq!(expand_tilde(Path::new("/etc/x")), PathBuf::from("/etc/x"));
+    }
+}

@@ -1,0 +1,22 @@
+# flextunnel server config (TOML).
+#
+# Load with:  flextunnel server start -c server.toml
+#         or: flextunnel server start --default-config   (~/.config/flextunnel/server.toml)
+#
+# CLI flags override these values. Unknown keys are rejected.
+
+# Server identity key. Provide exactly one of `secret_file` or `secret`.
+secret_file = "./server.key"
+# secret = "<base64-encoded 32-byte key>"   # inline alternative to secret_file
+
+# Accepted client auth tokens. Provide inline list and/or a file (they combine).
+auth_tokens = ["vXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"]
+# auth_tokens_file = "/etc/flextunnel/auth_tokens.txt"
+
+# Shared ALPN "knock" token (must match every client). Provide one of the two.
+alpn_token = "XXXXXXXXXXXXXX"
+# alpn_token_file = "/etc/flextunnel/alpn_token.txt"
+
+# Optional iroh tuning.
+# relay_urls = ["https://relay.example"]   # custom relay(s) for failover
+# dns_server = "https://dns.example"        # custom discovery DNS, or "none"
