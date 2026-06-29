@@ -68,7 +68,7 @@ explicitly rejected with `501 Not Implemented` until Phase 2.
   sending a reply on `open_tunnel` failure.
 
 ### CLI / config (`src/main.rs`)
-- Add `--http-listen <ADDR>` to `client start` (e.g. `127.0.0.1:8081`), optional.
+- Add `--http-listen <ADDR>` to `client` (e.g. `127.0.0.1:8081`), optional.
 - At least one of `--socks-listen` / `--http-listen` must be enabled; allow both
   simultaneously. Thread an `http_listen: Option<SocketAddr>` into `ClientConfig`.
 

@@ -96,8 +96,11 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
 }
 
 /// Default config path for a role file (e.g. `~/.config/flextunnel/server.toml`).
+///
+/// Always uses `~/.config` (not the platform config dir) to match tunnel-rs,
+/// so the same location works across Linux and macOS.
 fn default_config_path(file_name: &str) -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("flextunnel").join(file_name))
+    dirs::home_dir().map(|home| home.join(".config").join("flextunnel").join(file_name))
 }
 
 /// Read and parse a TOML config file, with the path in any error.
