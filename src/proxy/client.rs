@@ -29,8 +29,6 @@ pub struct ClientConfig {
     pub server_node_id: String,
     /// Authentication token sent in the connection handshake.
     pub auth_token: String,
-    /// ALPN value (embeds the shared "knock" token).
-    pub alpn: Vec<u8>,
     /// Local address the SOCKS5 listener binds to.
     pub socks_listen: SocketAddr,
     /// Relay URL hints (optional).
@@ -142,7 +140,7 @@ impl ProxyClient {
     async fn establish(&self, endpoint: &Endpoint) -> ProxyResult<Connection> {
         let endpoint_addr = self.resolve_server_addr()?;
         let connection = endpoint
-            .connect(endpoint_addr, self.config.alpn.as_slice())
+            .connect(endpoint_addr, crate::transport::ALPN)
             .await
             .map_err(|e| ProxyError::Signaling(format!("Failed to connect to server: {e}")))?;
         log::info!("Connected to server, authenticating...");

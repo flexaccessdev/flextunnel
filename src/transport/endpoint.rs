@@ -1,6 +1,6 @@
 //! Common endpoint helpers for iroh proxy connections.
 
-use crate::transport::build_quic_transport_config;
+use crate::transport::{ALPN, build_quic_transport_config};
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use iroh::{
@@ -135,19 +135,18 @@ async fn wait_online(endpoint: &Endpoint) -> Result<()> {
     }
 }
 
-/// Create a server endpoint with a persistent identity and an ALPN.
+/// Create a server endpoint with a persistent identity and the fixed ALPN.
 pub async fn create_server_endpoint(
     relay_urls: &[String],
     secret: SecretKey,
     dns_server: Option<&str>,
-    alpn: &[u8],
 ) -> Result<Endpoint> {
     let relay_mode = parse_relay_mode(relay_urls)?;
     let using_custom_relay = !matches!(relay_mode, RelayMode::Default);
     print_relay_status(relay_urls, using_custom_relay);
 
     let builder = create_endpoint_builder(relay_mode, dns_server, Some(&secret))?
-        .alpns(vec![alpn.to_vec()])
+        .alpns(vec![ALPN.to_vec()])
         .secret_key(secret);
 
     let endpoint = builder

@@ -38,14 +38,6 @@ pub const REP_CONN_REFUSED: u8 = 0x05;
 pub const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 pub const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 
-/// Build the ALPN protocol identifier with an embedded pre-shared ALPN token.
-///
-/// The ALPN acts as a lightweight pre-handshake "port knock": a peer that
-/// doesn't know the token fails at the QUIC handshake, before any stream opens.
-pub fn build_alpn(alpn_token: &str) -> Vec<u8> {
-    format!("flextunnel/1/{alpn_token}").into_bytes()
-}
-
 /// Client → server auth handshake (first bi-stream of the connection).
 ///
 /// `Debug` is implemented manually to redact `auth_token` (a bearer credential)

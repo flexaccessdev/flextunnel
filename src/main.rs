@@ -3,7 +3,7 @@
 //! A SOCKS5-over-QUIC proxy via iroh P2P connections. The client runs a local
 //! SOCKS5 listener; each CONNECT is tunneled as a reliable QUIC bi-stream to the
 //! server, which resolves DNS and connects to the target from its own network.
-//! Uses an ALPN "knock" + auth tokens for access control and TLS 1.3/QUIC for
+//! Uses a fixed ALPN for protocol selection, auth tokens for access control, and TLS 1.3/QUIC for
 //! encryption. Neither side needs admin/root (no TUN device).
 
 mod auth;
@@ -17,9 +17,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use crate::proxy::signaling::build_alpn;
 use crate::proxy::{ClientConfig, ProxyClient, ProxyServer};
 use crate::transport::endpoint::{
     create_client_endpoint, create_server_endpoint, load_secret, load_secret_from_string,
@@ -67,12 +66,6 @@ enum Command {
         #[arg(short, long, default_value = "1")]
         count: usize,
     },
-    /// Generate an ALPN token (shared pre-handshake "knock" secret).
-    GenerateAlpnToken {
-        /// Number of tokens to generate.
-        #[arg(short, long, default_value = "1")]
-        count: usize,
-    },
 }
 
 #[derive(Subcommand)]
@@ -94,12 +87,6 @@ enum ServerAction {
         /// File of accepted client auth tokens (one per line).
         #[arg(long)]
         auth_tokens_file: Option<PathBuf>,
-        /// ALPN token (shared "knock" secret; must match clients).
-        #[arg(long)]
-        alpn_token: Option<String>,
-        /// File containing the ALPN token.
-        #[arg(long)]
-        alpn_token_file: Option<PathBuf>,
         /// Custom relay server URL(s) for failover (repeatable).
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
@@ -131,12 +118,6 @@ enum ClientAction {
         /// File containing the authentication token.
         #[arg(long)]
         auth_token_file: Option<PathBuf>,
-        /// ALPN token (shared "knock" secret; must match the server).
-        #[arg(long)]
-        alpn_token: Option<String>,
-        /// File containing the ALPN token.
-        #[arg(long)]
-        alpn_token_file: Option<PathBuf>,
         /// Custom relay server URL(s) for failover (repeatable).
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
@@ -153,25 +134,6 @@ enum ClientAction {
         #[arg(long)]
         max_reconnect_attempts: Option<NonZeroU32>,
     },
-}
-
-/// Resolve and validate the required ALPN token from an inline value or a file.
-fn resolve_alpn_token(inline: Option<&str>, file: Option<&Path>) -> Result<String> {
-    if inline.is_some() && file.is_some() {
-        anyhow::bail!("Provide only one of --alpn-token or --alpn-token-file, not both");
-    }
-    if let Some(token) = inline {
-        auth::validate_alpn_token(token).context("Invalid ALPN token")?;
-        Ok(token.to_string())
-    } else if let Some(path) = file {
-        auth::load_alpn_token_from_file(path).context("Failed to load ALPN token from file")
-    } else {
-        anyhow::bail!(
-            "An ALPN token is required.\n\
-             Generate one with: flextunnel generate-alpn-token\n\
-             Then pass --alpn-token <TOKEN> or --alpn-token-file <FILE>."
-        );
-    }
 }
 
 fn init_logger() {
@@ -205,12 +167,6 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::GenerateAlpnToken { count } => {
-            for _ in 0..count {
-                println!("{}", auth::generate_alpn_token());
-            }
-            Ok(())
-        }
         command => build_runtime()?.block_on(run_async(command)),
     }
 }
@@ -225,8 +181,6 @@ async fn run_async(command: Command) -> Result<()> {
                     secret_file,
                     auth_tokens,
                     auth_tokens_file,
-                    alpn_token,
-                    alpn_token_file,
                     relay_urls,
                     dns_server,
                 },
@@ -237,8 +191,6 @@ async fn run_async(command: Command) -> Result<()> {
                 secret: None, // no inline-secret CLI flag; config file only
                 auth_tokens: (!auth_tokens.is_empty()).then_some(auth_tokens),
                 auth_tokens_file,
-                alpn_token,
-                alpn_token_file,
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
                 dns_server,
             };
@@ -254,8 +206,6 @@ async fn run_async(command: Command) -> Result<()> {
                     server_node_id,
                     auth_token,
                     auth_token_file,
-                    alpn_token,
-                    alpn_token_file,
                     relay_urls,
                     dns_server,
                     auto_reconnect,
@@ -279,8 +229,6 @@ async fn run_async(command: Command) -> Result<()> {
                 socks_listen,
                 auth_token,
                 auth_token_file,
-                alpn_token,
-                alpn_token_file,
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
                 dns_server,
                 auto_reconnect,
@@ -306,9 +254,6 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
     }
     log::info!("Loaded {} authentication token(s)", valid_tokens.len());
 
-    let alpn_token = resolve_alpn_token(r.alpn_token.as_deref(), r.alpn_token_file.as_deref())?;
-    let alpn = build_alpn(&alpn_token);
-
     let secret_key = match (r.secret.as_deref(), r.secret_file.as_deref()) {
         (Some(_), Some(_)) => anyhow::bail!("Provide only one of secret or secret_file, not both"),
         (Some(s), None) => load_secret_from_string(s).context("Invalid inline secret key")?,
@@ -320,13 +265,13 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
         ),
     };
 
-    let endpoint = create_server_endpoint(&r.relay_urls, secret_key, r.dns_server.as_deref(), &alpn)
+    let endpoint = create_server_endpoint(&r.relay_urls, secret_key, r.dns_server.as_deref())
         .await
         .context("Failed to create iroh endpoint")?;
 
     log::info!("flextunnel server Node ID: {}", endpoint.id());
     log::info!(
-        "Clients connect with: flextunnel client start --server-node-id {} --auth-token <TOKEN> --alpn-token <ALPN_TOKEN>",
+        "Clients connect with: flextunnel client start --server-node-id {} --auth-token <TOKEN>",
         endpoint.id()
     );
 
@@ -375,9 +320,6 @@ async fn run_client(r: config::ResolvedClient) -> Result<()> {
         );
     };
 
-    let alpn_token = resolve_alpn_token(r.alpn_token.as_deref(), r.alpn_token_file.as_deref())?;
-    let alpn = build_alpn(&alpn_token);
-
     let endpoint = create_client_endpoint(&r.relay_urls, r.dns_server.as_deref())
         .await
         .context("Failed to create iroh endpoint")?;
@@ -386,7 +328,6 @@ async fn run_client(r: config::ResolvedClient) -> Result<()> {
     let client = ProxyClient::new(ClientConfig {
         server_node_id,
         auth_token: token,
-        alpn,
         socks_listen: r.socks_listen,
         relay_urls: r.relay_urls,
         auto_reconnect: r.auto_reconnect,

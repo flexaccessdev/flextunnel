@@ -27,10 +27,6 @@ pub struct ServerConfig {
     pub auth_tokens: Option<Vec<String>>,
     /// File of accepted client auth tokens (one per line).
     pub auth_tokens_file: Option<PathBuf>,
-    /// Shared ALPN "knock" token.
-    pub alpn_token: Option<String>,
-    /// File containing the ALPN token.
-    pub alpn_token_file: Option<PathBuf>,
     /// Custom relay URL(s) for failover.
     pub relay_urls: Option<Vec<String>>,
     /// Custom discovery DNS server URL ("none" to disable).
@@ -49,10 +45,6 @@ pub struct ClientConfig {
     pub auth_token: Option<String>,
     /// File containing the auth token.
     pub auth_token_file: Option<PathBuf>,
-    /// Shared ALPN "knock" token.
-    pub alpn_token: Option<String>,
-    /// File containing the ALPN token.
-    pub alpn_token_file: Option<PathBuf>,
     /// Custom relay URL(s) for failover.
     pub relay_urls: Option<Vec<String>>,
     /// Custom discovery DNS server URL ("none" to disable).
@@ -69,8 +61,6 @@ pub struct ResolvedServer {
     pub secret: Option<String>,
     pub auth_tokens: Vec<String>,
     pub auth_tokens_file: Option<PathBuf>,
-    pub alpn_token: Option<String>,
-    pub alpn_token_file: Option<PathBuf>,
     pub relay_urls: Vec<String>,
     pub dns_server: Option<String>,
 }
@@ -81,8 +71,6 @@ pub struct ResolvedClient {
     pub socks_listen: SocketAddr,
     pub auth_token: Option<String>,
     pub auth_token_file: Option<PathBuf>,
-    pub alpn_token: Option<String>,
-    pub alpn_token_file: Option<PathBuf>,
     pub relay_urls: Vec<String>,
     pub dns_server: Option<String>,
     pub auto_reconnect: bool,
@@ -177,19 +165,12 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Resolved
     } else {
         (file.auth_tokens, file.auth_tokens_file)
     };
-    let (alpn_token, alpn_token_file) = if cli.alpn_token.is_some() || cli.alpn_token_file.is_some() {
-        (cli.alpn_token, cli.alpn_token_file)
-    } else {
-        (file.alpn_token, file.alpn_token_file)
-    };
 
     ResolvedServer {
         secret_file: secret_file.map(|p| expand_tilde(&p)),
         secret,
         auth_tokens: auth_tokens.unwrap_or_default(),
         auth_tokens_file: auth_tokens_file.map(|p| expand_tilde(&p)),
-        alpn_token,
-        alpn_token_file: alpn_token_file.map(|p| expand_tilde(&p)),
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
         dns_server: cli.dns_server.or(file.dns_server),
     }
@@ -205,11 +186,6 @@ pub fn resolve_client(cli: ClientConfig, file: Option<ClientConfig>) -> Resolved
     } else {
         (file.auth_token, file.auth_token_file)
     };
-    let (alpn_token, alpn_token_file) = if cli.alpn_token.is_some() || cli.alpn_token_file.is_some() {
-        (cli.alpn_token, cli.alpn_token_file)
-    } else {
-        (file.alpn_token, file.alpn_token_file)
-    };
 
     ResolvedClient {
         server_node_id: cli.server_node_id.or(file.server_node_id),
@@ -219,8 +195,6 @@ pub fn resolve_client(cli: ClientConfig, file: Option<ClientConfig>) -> Resolved
             .unwrap_or_else(|| DEFAULT_SOCKS_LISTEN.parse().expect("valid default addr")),
         auth_token,
         auth_token_file: auth_token_file.map(|p| expand_tilde(&p)),
-        alpn_token,
-        alpn_token_file: alpn_token_file.map(|p| expand_tilde(&p)),
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
         dns_server: cli.dns_server.or(file.dns_server),
         auto_reconnect: cli.auto_reconnect.or(file.auto_reconnect).unwrap_or(true),
@@ -237,14 +211,12 @@ mod tests {
         let toml = r#"
             secret_file = "./server.key"
             auth_tokens = ["vAAA", "vBBB"]
-            alpn_token = "knock"
             relay_urls = ["https://relay.example"]
             dns_server = "none"
         "#;
         let cfg: ServerConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.secret_file, Some(PathBuf::from("./server.key")));
         assert_eq!(cfg.auth_tokens.as_deref().map(<[_]>::len), Some(2));
-        assert_eq!(cfg.alpn_token.as_deref(), Some("knock"));
         assert_eq!(cfg.dns_server.as_deref(), Some("none"));
         assert!(cfg.secret.is_none());
     }
@@ -255,7 +227,6 @@ mod tests {
             server_node_id = "abc123"
             socks_listen = "127.0.0.1:1085"
             auth_token = "vTOKEN"
-            alpn_token = "knock"
             auto_reconnect = false
             max_reconnect_attempts = 5
         "#;
