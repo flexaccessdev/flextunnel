@@ -47,10 +47,22 @@ pub fn build_alpn(alpn_token: &str) -> Vec<u8> {
 }
 
 /// Client → server auth handshake (first bi-stream of the connection).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is implemented manually to redact `auth_token` (a bearer credential)
+/// so it can never leak into logs or error context.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Hello {
     pub version: u16,
     pub auth_token: String,
+}
+
+impl std::fmt::Debug for Hello {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hello")
+            .field("version", &self.version)
+            .field("auth_token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Server → client auth handshake response.

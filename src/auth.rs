@@ -250,7 +250,7 @@ pub fn load_auth_token_from_file(path: &Path) -> Result<String> {
 //
 // The ALPN token is a separate, shorter credential from the per-client auth
 // token above. It is embedded into the iroh ALPN protocol value (see
-// `crate::tunnel::signaling::build_vpn_alpn`) and acts as a lightweight
+// `crate::proxy::signaling::build_alpn`) and acts as a lightweight
 // pre-handshake "port knock": a peer that doesn't know the token fails at the
 // QUIC/TLS handshake before any application stream is opened.
 

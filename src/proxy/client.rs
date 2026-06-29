@@ -5,7 +5,7 @@ use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::signaling::{self, Hello};
 use crate::proxy::socks5;
 use anyhow::Result;
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
 use rand::Rng;
 use std::net::SocketAddr;
@@ -18,6 +18,10 @@ use tokio::net::{TcpListener, TcpStream};
 const RECONNECT_BACKOFF_MAX: u64 = 60;
 /// Max jitter (ms) added to each backoff to avoid thundering reconnects.
 const RECONNECT_JITTER_MAX_MS: u64 = 500;
+/// Deadline for the server's handshake response. The QUIC keep-alive keeps the
+/// connection from idling out, so without this a server that accepts the
+/// connection but never replies on the stream would hang the client forever.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Configuration for the proxy client.
 pub struct ClientConfig {
@@ -203,7 +207,14 @@ impl ProxyClient {
         signaling::write_message(&mut send, &signaling::encode_hello(&hello)?).await?;
         send.flush().await?;
 
-        let data = signaling::read_message(&mut recv, signaling::MAX_HANDSHAKE_SIZE).await?;
+        let data = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            signaling::read_message(&mut recv, signaling::MAX_HANDSHAKE_SIZE),
+        )
+        .await
+        .map_err(|_| {
+            ProxyError::Signaling("timed out waiting for server handshake response".into())
+        })??;
         let response = signaling::decode_hello_response(&data)?;
         let _ = send.finish();
 
@@ -221,11 +232,17 @@ async fn handle_local_conn(mut tcp: TcpStream, conn: Connection) -> Result<()> {
     socks5::negotiate_method(&mut tcp).await?;
     let target = socks5::read_connect_request(&mut tcp).await?;
 
-    let (mut send, mut recv) = conn.open_bi().await?;
-    signaling::write_request(&mut send, &target).await?;
-    send.flush().await?;
+    // Open the tunnel stream and read the server's reply. If any step fails the
+    // local app hasn't been answered yet, so send a SOCKS5 general-failure reply
+    // (best effort) instead of dropping the connection with no response.
+    let (send, recv, rep) = match open_tunnel(&conn, &target).await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = socks5::write_reply(&mut tcp, signaling::REP_GENERAL_FAILURE).await;
+            return Err(e);
+        }
+    };
 
-    let rep = signaling::read_reply(&mut recv).await?;
     socks5::write_reply(&mut tcp, rep).await?;
     if rep != signaling::REP_SUCCESS {
         return Ok(());
@@ -234,4 +251,18 @@ async fn handle_local_conn(mut tcp: TcpStream, conn: Connection) -> Result<()> {
     let mut iroh = tokio::io::join(recv, send);
     let _ = tokio::io::copy_bidirectional(&mut tcp, &mut iroh).await;
     Ok(())
+}
+
+/// Open a bi-stream to the server, send the CONNECT request, and read back the
+/// reply code. Returns the stream halves and the reply so the caller can relay
+/// the reply to the local app and then pipe bytes.
+async fn open_tunnel(
+    conn: &Connection,
+    target: &signaling::Target,
+) -> Result<(SendStream, RecvStream, u8)> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    signaling::write_request(&mut send, target).await?;
+    send.flush().await?;
+    let rep = signaling::read_reply(&mut recv).await?;
+    Ok((send, recv, rep))
 }

@@ -190,7 +190,10 @@ jobs:
         run: gh release edit "${{ needs.setup.outputs.release_tag }}" --draft=false
 
   docker-build:
-    needs: [setup, build-linux]
+    # Only push images once the release is actually published, so GHCR never
+    # gets images for a release that failed to publish. docker-manifest depends
+    # on docker-build, so it inherits this gate transitively.
+    needs: [setup, build-linux, publish-release]
     strategy:
       matrix:
         include:
