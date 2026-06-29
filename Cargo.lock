@@ -936,14 +936,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
-name = "flextunnel"
-version = "0.0.5"
+name = "flextunnel-cli"
+version = "0.0.6"
+dependencies = [
+ "anyhow",
+ "clap",
+ "env_logger",
+ "flextunnel-core",
+ "log",
+ "tokio",
+]
+
+[[package]]
+name = "flextunnel-core"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "base64",
- "clap",
  "dirs",
- "env_logger",
  "iroh",
  "iroh-mdns-address-lookup",
  "log",
@@ -956,6 +966,19 @@ dependencies = [
  "tokio",
  "toml",
  "url",
+]
+
+[[package]]
+name = "flextunnel-ffi"
+version = "0.0.6"
+dependencies = [
+ "env_logger",
+ "flextunnel-core",
+ "iroh",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

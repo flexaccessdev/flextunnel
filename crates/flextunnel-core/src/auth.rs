@@ -138,12 +138,13 @@ pub fn validate_token(token: &str) -> Result<()> {
 pub fn load_auth_tokens(cli_tokens: &[String], file: Option<&Path>) -> Result<HashSet<String>> {
     let mut tokens = HashSet::new();
 
-    // Load from CLI arguments
-    for token in cli_tokens {
+    // Load from CLI arguments. Identify a bad token by its position, never by
+    // value — the token is a credential and must not leak into logs/output.
+    for (idx, token) in cli_tokens.iter().enumerate() {
         let trimmed = token.trim();
         if !trimmed.is_empty() && !trimmed.starts_with('#') {
             validate_token(trimmed)
-                .with_context(|| format!("Invalid token from CLI: '{}'", trimmed))?;
+                .with_context(|| format!("Invalid token at CLI argument #{}", idx + 1))?;
             tokens.insert(trimmed.to_string());
         }
     }
@@ -178,9 +179,9 @@ pub fn load_auth_tokens_from_file(path: &Path) -> Result<HashSet<String>> {
     let mut tokens = HashSet::new();
 
     for (line_num, token) in meaningful_token_lines(&content) {
-        validate_token(token).with_context(|| {
-            format!("Invalid token at {}:{}: '{}'", path.display(), line_num, token)
-        })?;
+        // Locate by file:line only; never echo the token value (a credential).
+        validate_token(token)
+            .with_context(|| format!("Invalid token at {}:{}", path.display(), line_num))?;
         tokens.insert(token.to_string());
     }
 
@@ -222,9 +223,9 @@ pub fn load_auth_token_from_file(path: &Path) -> Result<String> {
         .with_context(|| format!("Failed to read auth token file: {}", path.display()))?;
 
     if let Some((line_num, token)) = meaningful_token_lines(&content).next() {
-        validate_token(token).with_context(|| {
-            format!("Invalid token at {}:{}: '{}'", path.display(), line_num, token)
-        })?;
+        // Locate by file:line only; never echo the token value (a credential).
+        validate_token(token)
+            .with_context(|| format!("Invalid token at {}:{}", path.display(), line_num))?;
         return Ok(token.to_string());
     }
 

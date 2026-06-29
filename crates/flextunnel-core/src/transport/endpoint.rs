@@ -108,10 +108,13 @@ fn create_endpoint_builder(
             }
         }
         None => {
-            // Default n0 DNS
-            builder = builder
-                .address_lookup(PkarrPublisher::n0_dns())
-                .address_lookup(DnsAddressLookup::n0_dns());
+            // Default n0 DNS: always resolve, but only publish when we have a
+            // persistent identity. An ephemeral client (no secret) shouldn't
+            // advertise its endpoint — mirrors the custom-DNS branch above.
+            if secret_key.is_some() {
+                builder = builder.address_lookup(PkarrPublisher::n0_dns());
+            }
+            builder = builder.address_lookup(DnsAddressLookup::n0_dns());
         }
     }
     // mDNS always enabled for local network discovery

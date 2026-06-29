@@ -22,6 +22,17 @@ const RECONNECT_JITTER_MAX_MS: u64 = 500;
 /// connection from idling out, so without this a server that accepts the
 /// connection but never replies on the stream would hang the client forever.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for opening a tunnel stream and receiving the server's CONNECT
+/// reply. Must exceed the server's own connect timeout (it replies only after
+/// dialing the target, up to ~10s), so a legitimately slow target isn't cut
+/// off; without it a server that stalls after accepting the stream would hang
+/// the local SOCKS5 connection forever.
+const TUNNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Deadline for the local app to complete its SOCKS5 handshake (method
+/// negotiation + CONNECT request). A peer that connects to the loopback
+/// listener but sends nothing would otherwise pin the spawned task and socket
+/// forever; generous since this is loopback.
+const LOCAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Configuration for the proxy client.
 pub struct ClientConfig {
@@ -66,9 +77,22 @@ impl ProxyClient {
     /// rather than see connection-refused during the gap.
     pub async fn run(&self, endpoint: &Endpoint) -> ProxyResult<()> {
         let listener = TcpListener::bind(self.config.socks_listen).await?;
+        self.run_with_listener(endpoint, listener).await
+    }
+
+    /// Serve on an already-bound listener (see [`run`](Self::run) for the
+    /// reconnect policy). Callers that need the actual bound address — e.g. the
+    /// FFI binding to an ephemeral `127.0.0.1:0` and reporting the chosen port —
+    /// bind the [`TcpListener`] themselves, read `local_addr()`, then hand it
+    /// here. `run` is the thin convenience wrapper that binds `socks_listen`.
+    pub async fn run_with_listener(
+        &self,
+        endpoint: &Endpoint,
+        listener: TcpListener,
+    ) -> ProxyResult<()> {
         log::info!(
             "SOCKS5 proxy listening on {} (TCP CONNECT only)",
-            self.config.socks_listen
+            listener.local_addr()?
         );
 
         let mut ever_connected = false;
@@ -227,13 +251,23 @@ impl ProxyClient {
 /// Handle one local SOCKS5 connection: negotiate, parse CONNECT, open a stream
 /// to the server, relay the reply, then pipe bytes.
 async fn handle_local_conn(mut tcp: TcpStream, conn: Connection) -> Result<()> {
-    socks5::negotiate_method(&mut tcp).await?;
-    let target = socks5::read_connect_request(&mut tcp).await?;
+    // Bound the local SOCKS5 handshake so a peer that connects and sends nothing
+    // can't pin this task and its socket indefinitely.
+    let target = tokio::time::timeout(LOCAL_HANDSHAKE_TIMEOUT, async {
+        socks5::negotiate_method(&mut tcp).await?;
+        socks5::read_connect_request(&mut tcp).await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out during local SOCKS5 handshake"))??;
 
     // Open the tunnel stream and read the server's reply. If any step fails the
     // local app hasn't been answered yet, so send a SOCKS5 general-failure reply
     // (best effort) instead of dropping the connection with no response.
-    let (send, recv, rep) = match open_tunnel(&conn, &target).await {
+    let opened = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, open_tunnel(&conn, &target))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out opening tunnel / awaiting server reply"))
+        .and_then(|r| r);
+    let (send, recv, rep) = match opened {
         Ok(v) => v,
         Err(e) => {
             let _ = socks5::write_reply(&mut tcp, signaling::REP_GENERAL_FAILURE).await;

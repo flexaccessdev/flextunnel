@@ -1,1 +1,4 @@
 /target
+tmp/
+# build-ios.sh staging output (libflextunnel.a + the copied flextunnel.h)
+dist/ios/

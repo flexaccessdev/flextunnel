@@ -23,7 +23,7 @@ jobs:
       - name: Extract version from Cargo.toml
         id: version
         run: |
-          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="flextunnel-cli") | .version')
           if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
             echo "::error::Could not parse version from Cargo.toml"
             exit 1
@@ -104,7 +104,7 @@ jobs:
 
       - name: Build Release
         run: |
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --release -p flextunnel-cli --target ${{ matrix.target }}
 
       - name: Rename Binaries
         run: |
@@ -130,7 +130,7 @@ jobs:
 
       - name: Build Release
         run: |
-          cargo build --release --target aarch64-apple-darwin
+          cargo build --release -p flextunnel-cli --target aarch64-apple-darwin
 
       - name: Rename Binaries
         run: |
@@ -152,7 +152,7 @@ jobs:
 
       - name: Build Release
         run: |
-          cargo build --release --target x86_64-pc-windows-msvc
+          cargo build --release -p flextunnel-cli --target x86_64-pc-windows-msvc
 
       - name: Rename Binaries
         run: |
