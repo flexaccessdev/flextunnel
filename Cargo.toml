@@ -1,6 +1,30 @@
 [package]
 name = "flextunnel"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
+description = "SOCKS5-over-QUIC proxy via iroh P2P"
 
 [dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+iroh = "1.0.0"
+iroh-mdns-address-lookup = "0.4.0"
+log = "0.4"
+rand = "0.9"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3.24.0"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+panic = "abort"
