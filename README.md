@@ -183,6 +183,15 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
 `warn`. Override with `RUST_LOG`, e.g. `RUST_LOG=flextunnel=debug`.
 
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md) — how it works: connection
+  lifecycle (ALPN knock, auth handshake, per-stream protocol), module map,
+  concurrency model, reconnect policy, security boundaries, and reference
+  constants.
+- [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) — planned HTTP
+  proxy front-end (CONNECT tunneling, then absolute-URI forwarding).
+
 ## How it relates to ezvpn
 
 flextunnel is modeled on the sibling project **ezvpn** (an IP-over-QUIC VPN),
