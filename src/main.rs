@@ -172,6 +172,7 @@ async fn run_async(command: Command) -> Result<()> {
                 auth_tokens_file,
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
                 dns_server,
+                host_aliases: None, // config-file only; no CLI flag
             };
             let file = config::load_server_config(config_path.as_deref(), default_config)?;
             run_server(config::resolve_server(cli, file)).await
@@ -251,7 +252,10 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
         endpoint.id()
     );
 
-    let server = ProxyServer::new(valid_tokens);
+    if !r.host_aliases.is_empty() {
+        log::info!("Loaded {} host alias(es)", r.host_aliases.len());
+    }
+    let server = ProxyServer::new(valid_tokens, r.host_aliases);
     let run = async {
         server
             .run(&endpoint)

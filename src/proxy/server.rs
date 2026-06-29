@@ -6,7 +6,7 @@ use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::signaling::{self, HelloResponse, Target};
 use iroh::Endpoint;
 use iroh::endpoint::{Incoming, RecvStream, SendStream};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,11 +23,17 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct ProxyServer {
     valid_tokens: HashSet<String>,
+    /// Host aliases (lowercased keys) rewritten before connecting; see
+    /// [`apply_alias`].
+    host_aliases: HashMap<String, String>,
 }
 
 impl ProxyServer {
-    pub fn new(valid_tokens: HashSet<String>) -> Arc<Self> {
-        Arc::new(Self { valid_tokens })
+    pub fn new(valid_tokens: HashSet<String>, host_aliases: HashMap<String, String>) -> Arc<Self> {
+        Arc::new(Self {
+            valid_tokens,
+            host_aliases,
+        })
     }
 
     /// Accept connections until the endpoint closes.
@@ -98,8 +104,9 @@ impl ProxyServer {
         loop {
             match connection.accept_bi().await {
                 Ok((send, recv)) => {
+                    let server = self.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_socks_stream(send, recv).await {
+                        if let Err(e) = handle_socks_stream(send, recv, &server.host_aliases).await {
                             log::debug!("SOCKS5 stream ended: {e}");
                         }
                     });
@@ -113,10 +120,30 @@ impl ProxyServer {
     }
 }
 
+/// Rewrite a requested target through the server's host-alias map.
+///
+/// Only domain targets are aliased (literal IPs are already concrete). A domain
+/// whose lowercased name matches an alias key is replaced by the alias value
+/// (an IP or another hostname on the server's network), keeping the requested
+/// port; the value is then resolved + connected like any other domain.
+fn apply_alias(target: Target, aliases: &HashMap<String, String>) -> Target {
+    if let Target::Domain(host, port) = &target
+        && let Some(mapped) = aliases.get(&host.to_ascii_lowercase())
+    {
+        log::debug!("Aliasing host {host} -> {mapped}");
+        return Target::Domain(mapped.clone(), *port);
+    }
+    target
+}
+
 /// Handle one SOCKS5 stream: read the target, resolve + connect from the
 /// server's network, reply, then pipe bytes bidirectionally.
-async fn handle_socks_stream(mut send: SendStream, mut recv: RecvStream) -> io::Result<()> {
-    let target = signaling::read_request(&mut recv).await?;
+async fn handle_socks_stream(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    host_aliases: &HashMap<String, String>,
+) -> io::Result<()> {
+    let target = apply_alias(signaling::read_request(&mut recv).await?, host_aliases);
     log::debug!("Stream target: {target:?}");
 
     // Bound the dial (DNS + TCP connect) so a slow/black-holed target can't tie
@@ -170,4 +197,47 @@ async fn connect_resolved(host: &str, port: u16) -> io::Result<TcpStream> {
             format!("no addresses resolved for {host}:{port}"),
         )
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn aliases() -> HashMap<String, String> {
+        // Keys are lowercased at config-resolution time (see `resolve_server`).
+        HashMap::from([
+            ("server.ezvpn".to_string(), "127.0.0.1".to_string()),
+            ("node2.ezvpn".to_string(), "192.168.1.50".to_string()),
+        ])
+    }
+
+    #[test]
+    fn alias_rewrites_host_keeps_port() {
+        let got = apply_alias(Target::Domain("server.ezvpn".into(), 8000), &aliases());
+        assert_eq!(got, Target::Domain("127.0.0.1".into(), 8000));
+    }
+
+    #[test]
+    fn alias_to_internal_host() {
+        let got = apply_alias(Target::Domain("node2.ezvpn".into(), 22), &aliases());
+        assert_eq!(got, Target::Domain("192.168.1.50".into(), 22));
+    }
+
+    #[test]
+    fn alias_match_is_case_insensitive() {
+        let got = apply_alias(Target::Domain("Server.EzVPN".into(), 80), &aliases());
+        assert_eq!(got, Target::Domain("127.0.0.1".into(), 80));
+    }
+
+    #[test]
+    fn non_alias_domain_passes_through() {
+        let got = apply_alias(Target::Domain("example.com".into(), 443), &aliases());
+        assert_eq!(got, Target::Domain("example.com".into(), 443));
+    }
+
+    #[test]
+    fn ip_target_is_never_aliased() {
+        let t = Target::Ip("127.0.0.1:8000".parse().unwrap());
+        assert_eq!(apply_alias(t.clone(), &aliases()), t);
+    }
 }
