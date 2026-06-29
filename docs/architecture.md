@@ -62,9 +62,11 @@ checks the token against its accepted set (`auth::load_auth_tokens`). On rejecti
 it closes the connection gracefully (with a short drain) carrying the reason.
 `Hello`'s `Debug` impl redacts `auth_token`.
 
-Both sides bound this exchange with a 10s timeout (`HANDSHAKE_TIMEOUT` in
-`client.rs` / `server.rs`), because QUIC keep-alive otherwise prevents the idle
-timeout from firing on a peer that connects but never speaks.
+The server bounds accepting/reading the client `Hello` with a 10s timeout, and
+the client bounds waiting for the server `HelloResponse` with the same timeout
+(`HANDSHAKE_TIMEOUT` in `client.rs` / `server.rs`), because QUIC keep-alive
+otherwise prevents the idle timeout from firing on a peer that connects but
+never speaks.
 
 ### 3. Per-CONNECT data streams
 For each accepted SOCKS5 `CONNECT`, the client opens a new bi-stream and writes a

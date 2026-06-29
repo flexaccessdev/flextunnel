@@ -15,7 +15,8 @@ nor cares whether the client spoke SOCKS5 or HTTP.
 
 **Consequence:** HTTP proxy support is almost entirely a *client-side* feature.
 No server changes, no new wire messages, no `Target` changes for the tunneling
-(CONNECT) path. This keeps the addition low-risk and backward-compatible.
+(CONNECT) path. This keeps the addition low-risk and avoids a wire-protocol
+migration.
 
 ## Background: the two HTTP proxy modes
 

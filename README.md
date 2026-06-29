@@ -47,10 +47,12 @@ All payload is end-to-end encrypted by QUIC/TLS 1.3.
 
 ## Install
 
-Prebuilt binaries (Linux amd64/arm64, macOS arm64, Windows amd64) are published
-on the [GitHub Releases](https://github.com/andrewtheguy/flextunnel/releases)
-page. The install scripts download the latest release, verify its SHA-256
-checksum, and install to a per-user location (`~/.local/bin` on Linux/macOS,
+Prebuilt binaries are published on the
+[GitHub Releases](https://github.com/andrewtheguy/flextunnel/releases) page.
+Stable releases include Linux amd64/arm64, macOS arm64, and Windows amd64;
+automated prereleases currently include Linux amd64/arm64 and macOS arm64. The
+install scripts download the latest release, verify its SHA-256 checksum, and
+install to a per-user location (`~/.local/bin` on Linux/macOS,
 `%LOCALAPPDATA%\Programs\flextunnel` on Windows) — **no admin required**.
 
 **Linux / macOS:**
@@ -65,10 +67,11 @@ curl -sSL https://andrewtheguy.github.io/flextunnel/install.sh | bash
 irm https://andrewtheguy.github.io/flextunnel/install.ps1 | iex
 ```
 
-Options: append `-s -- --prerelease` (bash) / `-PreRelease` (pwsh) for the
-latest prerelease, a release tag to pin a version, or `--download-only` /
-`-DownloadOnly` to fetch the binary without installing. A container image is
-also published to `ghcr.io/andrewtheguy/flextunnel`.
+Options: append `-s -- --prerelease` (bash) for the latest prerelease, a release
+tag to pin a version, or `--download-only` / `-DownloadOnly` to fetch the binary
+without installing. `-PreRelease` is also accepted by the Windows installer when
+the selected prerelease includes a Windows asset. A container image is also
+published to `ghcr.io/andrewtheguy/flextunnel`.
 
 ## Build from source
 

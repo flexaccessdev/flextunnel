@@ -346,7 +346,7 @@ Download and install flextunnel binary
 
 Options:
   -DownloadOnly  Download binary to current directory without installing
-  -PreRelease    Use latest prerelease instead of latest stable release
+  -PreRelease    Use latest prerelease if it includes a Windows asset
   -Admin         Allow installation with administrator privileges (not recommended)
   -h, --help     Show this help message
 
