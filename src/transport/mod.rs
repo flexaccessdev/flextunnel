@@ -25,6 +25,14 @@ pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// (`1500 − 40 IPv6 − 8 UDP`) and matches quinn's DPLPMTUD upper-bound default.
 pub const QUIC_INITIAL_MTU: u16 = 1452;
 
+/// QUIC ALPN protocol identifier for flextunnel.
+///
+/// A plain protocol-negotiation label, sent unencrypted in the TLS/QUIC
+/// handshake — it is not a secret and provides no access control. Both peers
+/// must offer the same ALPN or negotiation fails; access control is enforced by
+/// the auth-token handshake, not by this value.
+pub const ALPN: &[u8] = b"flextunnel/1";
+
 /// Build a QUIC transport config with keep-alive, idle timeout, and a larger
 /// initial MTU. Shared by client and server endpoint creation so both sides
 /// apply identical settings.

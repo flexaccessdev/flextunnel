@@ -48,10 +48,10 @@ TCP connection.
 ## Connection lifecycle
 
 ### 1. ALPN
-The ALPN value is the fixed constant `flextunnel/1` (`signaling::ALPN`). It is a
-protocol identifier, not a secret: both peers must offer the same ALPN or the
-QUIC/TLS handshake fails **before any stream opens**. Access control is enforced
-by the auth handshake below, not by the ALPN.
+The ALPN value is the fixed constant `flextunnel/1` (`transport::ALPN`). It is a
+protocol-negotiation label sent **unencrypted** in the TLS/QUIC handshake, not a
+secret: both peers must offer the same ALPN or negotiation fails. Access control
+is enforced by the auth handshake below, not by the ALPN.
 
 ### 2. Auth handshake (control stream)
 On the first bi-stream the client sends `Hello { version, auth_token }` and the

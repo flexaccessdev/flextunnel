@@ -1,7 +1,6 @@
 //! Common endpoint helpers for iroh proxy connections.
 
-use crate::proxy::signaling;
-use crate::transport::build_quic_transport_config;
+use crate::transport::{ALPN, build_quic_transport_config};
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use iroh::{
@@ -147,7 +146,7 @@ pub async fn create_server_endpoint(
     print_relay_status(relay_urls, using_custom_relay);
 
     let builder = create_endpoint_builder(relay_mode, dns_server, Some(&secret))?
-        .alpns(vec![signaling::ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec()])
         .secret_key(secret);
 
     let endpoint = builder

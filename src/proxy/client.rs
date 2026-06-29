@@ -140,7 +140,7 @@ impl ProxyClient {
     async fn establish(&self, endpoint: &Endpoint) -> ProxyResult<Connection> {
         let endpoint_addr = self.resolve_server_addr()?;
         let connection = endpoint
-            .connect(endpoint_addr, signaling::ALPN)
+            .connect(endpoint_addr, crate::transport::ALPN)
             .await
             .map_err(|e| ProxyError::Signaling(format!("Failed to connect to server: {e}")))?;
         log::info!("Connected to server, authenticating...");

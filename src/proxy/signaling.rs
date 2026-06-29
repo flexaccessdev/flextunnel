@@ -38,12 +38,6 @@ pub const REP_CONN_REFUSED: u8 = 0x05;
 pub const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 pub const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 
-/// QUIC ALPN protocol identifier for flextunnel.
-///
-/// Acts as a lightweight pre-handshake guard: a peer offering a different ALPN
-/// fails the QUIC/TLS handshake before any stream opens.
-pub const ALPN: &[u8] = b"flextunnel/1";
-
 /// Client → server auth handshake (first bi-stream of the connection).
 ///
 /// `Debug` is implemented manually to redact `auth_token` (a bearer credential)
