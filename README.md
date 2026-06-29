@@ -196,6 +196,29 @@ auth_token     = "v…"          # or: auth_token_file = "~/.config/flextunnel/t
 Secrets may be inline (as above) or kept in separate files via the `*_file`
 keys. CLI flags still work and override any of these.
 
+## Host aliases (server-side)
+
+The server config can map hostnames to addresses on its own network, so a client
+can reach the server's loopback or internal hosts by a real name. Add a
+`[host_aliases]` table to `server.toml` (config-file only — there is no CLI flag):
+
+```toml
+[host_aliases]
+"server.ezvpn" = "127.0.0.1"      # the server's own loopback
+"node2.ezvpn"  = "192.168.1.50"   # another host on the server's network
+```
+
+When a requested hostname matches a key (case-insensitive), the server rewrites
+it to the value — an IP or another hostname — keeping the requested port, then
+resolves and connects like any other target. Only domain targets are aliased;
+literal IPs pass through unchanged.
+
+This is also the clean way around Firefox refusing to proxy literal
+`localhost` / `127.0.0.1`: alias `server.ezvpn` → `127.0.0.1` on the server and
+browse to `http://server.ezvpn:8000/`. Use `socks5h://` (or set Firefox's
+`network.proxy.socks_remote_dns = true`) so the name is resolved by the server,
+not locally.
+
 ## Reconnect behavior
 
 Auto-reconnect is **enabled by default** (`auto_reconnect = true`); pass

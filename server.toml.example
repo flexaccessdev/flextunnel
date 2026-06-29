@@ -16,3 +16,14 @@ auth_tokens = ["vXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"]
 # Optional iroh tuning.
 # relay_urls = ["https://relay.example"]   # custom relay(s) for failover
 # dns_server = "https://dns.example"        # custom discovery DNS, or "none"
+
+# Optional host aliases, resolved server-side. A requested hostname matching a
+# key (case-insensitive) is rewritten to its value — an IP or another hostname
+# on the server's network — keeping the requested port, then resolved/connected
+# like any other target. Lets clients reach the server's loopback or internal
+# hosts via a real name, which also avoids Firefox's refusal to proxy literal
+# `localhost`/`127.0.0.1` (use `socks5h://` / remote DNS so the name reaches the
+# server). Only domain targets are aliased; literal IPs pass through unchanged.
+# [host_aliases]
+# "server.ezvpn" = "127.0.0.1"      # -> the server's own loopback
+# "node2.ezvpn"  = "192.168.1.50"   # -> another host on the server's network

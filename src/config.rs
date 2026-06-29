@@ -11,6 +11,7 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,13 @@ pub struct ServerConfig {
     pub relay_urls: Option<Vec<String>>,
     /// Custom discovery DNS server URL ("none" to disable).
     pub dns_server: Option<String>,
+    /// Hostname aliases resolved on the server side: a requested host that
+    /// matches a key is rewritten to its value (an IP or another hostname on the
+    /// server's network) before connecting. Keeps the requested port. Lets a
+    /// client reach the server's loopback or internal hosts via a real name
+    /// (e.g. `server.ezvpn` → `127.0.0.1`), which also dodges Firefox's refusal
+    /// to proxy literal `localhost`/`127.0.0.1`.
+    pub host_aliases: Option<HashMap<String, String>>,
 }
 
 /// Client config file schema. Every field is optional; CLI flags override these.
@@ -63,6 +71,8 @@ pub struct ResolvedServer {
     pub auth_tokens_file: Option<PathBuf>,
     pub relay_urls: Vec<String>,
     pub dns_server: Option<String>,
+    /// Server-side host aliases, keys lowercased for case-insensitive matching.
+    pub host_aliases: HashMap<String, String>,
 }
 
 /// Fully-resolved client settings (CLI > file > default), paths tilde-expanded.
@@ -176,6 +186,15 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Resolved
         auth_tokens_file: auth_tokens_file.map(|p| expand_tilde(&p)),
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
         dns_server: cli.dns_server.or(file.dns_server),
+        // File-only (no CLI flag). Lowercase keys so matching is case-insensitive
+        // (DNS hostnames are case-insensitive), to compare against a lowercased host.
+        host_aliases: cli
+            .host_aliases
+            .or(file.host_aliases)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v))
+            .collect(),
     }
 }
 
@@ -262,6 +281,21 @@ mod tests {
         // CLI wins where set; file fills the rest.
         assert_eq!(r.dns_server.as_deref(), Some("https://cli.example"));
         assert_eq!(r.relay_urls, vec!["https://file-relay".to_string()]);
+    }
+
+    #[test]
+    fn host_aliases_parsed_and_lowercased() {
+        let toml = r#"
+            [host_aliases]
+            "Server.EzVPN" = "127.0.0.1"
+            "node2.ezvpn" = "192.168.1.50"
+        "#;
+        let file: ServerConfig = toml::from_str(toml).unwrap();
+        let r = resolve_server(ServerConfig::default(), Some(file));
+        // Keys are lowercased so matching against a lowercased host works.
+        assert_eq!(r.host_aliases.get("server.ezvpn").map(String::as_str), Some("127.0.0.1"));
+        assert_eq!(r.host_aliases.get("node2.ezvpn").map(String::as_str), Some("192.168.1.50"));
+        assert!(!r.host_aliases.contains_key("Server.EzVPN"));
     }
 
     #[test]
