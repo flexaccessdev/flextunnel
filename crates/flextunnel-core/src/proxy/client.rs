@@ -66,9 +66,22 @@ impl ProxyClient {
     /// rather than see connection-refused during the gap.
     pub async fn run(&self, endpoint: &Endpoint) -> ProxyResult<()> {
         let listener = TcpListener::bind(self.config.socks_listen).await?;
+        self.run_with_listener(endpoint, listener).await
+    }
+
+    /// Serve on an already-bound listener (see [`run`](Self::run) for the
+    /// reconnect policy). Callers that need the actual bound address — e.g. the
+    /// FFI binding to an ephemeral `127.0.0.1:0` and reporting the chosen port —
+    /// bind the [`TcpListener`] themselves, read `local_addr()`, then hand it
+    /// here. `run` is the thin convenience wrapper that binds `socks_listen`.
+    pub async fn run_with_listener(
+        &self,
+        endpoint: &Endpoint,
+        listener: TcpListener,
+    ) -> ProxyResult<()> {
         log::info!(
             "SOCKS5 proxy listening on {} (TCP CONNECT only)",
-            self.config.socks_listen
+            listener.local_addr()?
         );
 
         let mut ever_connected = false;

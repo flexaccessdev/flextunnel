@@ -106,6 +106,19 @@ pub async fn read_connect_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             )));
         }
     };
+
+    // Whether the SOCKS5 client sent a hostname (ATYP DOMAIN) or a pre-resolved
+    // address (ATYP IPv4/IPv6) decides *where* DNS happens: a domain is resolved
+    // on the server (flextunnel's whole point), an IP means the client already
+    // resolved it locally. Logged so the iOS POC can confirm server-side DNS.
+    match &target {
+        Target::Domain(host, port) => {
+            log::info!("SOCKS5 CONNECT {host}:{port} — ATYP_DOMAIN (remote DNS, resolved on server)")
+        }
+        Target::Ip(addr) => {
+            log::info!("SOCKS5 CONNECT {addr} — ATYP_IP (local DNS, client pre-resolved)")
+        }
+    }
     Ok(target)
 }
 

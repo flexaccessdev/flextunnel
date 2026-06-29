@@ -1,0 +1,17 @@
+[package]
+name = "flextunnel-cli"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+
+[[bin]]
+name = "flextunnel"
+path = "src/main.rs"
+
+[dependencies]
+flextunnel-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+log.workspace = true
+tokio.workspace = true

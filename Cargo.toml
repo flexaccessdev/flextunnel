@@ -1,10 +1,16 @@
-[package]
-name = "flextunnel"
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+# A bare `cargo build` skips the iOS staticlib (built explicitly via build-ios.sh
+# with `-p flextunnel-ffi`); `--workspace` still covers all three for clippy/test.
+default-members = ["crates/flextunnel-core", "crates/flextunnel-cli"]
+
+[workspace.package]
 version = "0.0.5"
 edition = "2024"
 description = "SOCKS5-over-QUIC proxy via iroh P2P"
 
-[dependencies]
+[workspace.dependencies]
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
@@ -21,10 +27,10 @@ thiserror = "1"
 tokio = { version = "1", features = ["full"] }
 toml = "1"
 url = "2"
-
-[dev-dependencies]
 tempfile = "3.24.0"
+flextunnel-core = { path = "crates/flextunnel-core" }
 
+# Profiles are only honored in the workspace root manifest.
 [profile.release]
 strip = true
 lto = "thin"

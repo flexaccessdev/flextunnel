@@ -1,7 +1,7 @@
 # Roadmap: HTTP proxy support
 
 Status: **proposed** (not yet implemented). flextunnel today exposes a **SOCKS5**
-listener on the client (`src/proxy/socks5.rs`, `src/proxy/client.rs`). This
+listener on the client (`crates/flextunnel-core/src/proxy/socks5.rs`, `crates/flextunnel-core/src/proxy/client.rs`). This
 document plans adding an **HTTP proxy** front-end alongside it.
 
 ## Key insight: the wire protocol does not change
@@ -9,7 +9,7 @@ document plans adding an **HTTP proxy** front-end alongside it.
 The client↔server protocol is front-end-agnostic. A SOCKS5 `CONNECT` is already
 reduced to a `signaling::Target` (`Ip` or `Domain`) and tunneled over one QUIC
 bi-stream via `signaling::write_request` → `signaling::read_reply` → byte pipe
-(`src/proxy/signaling.rs`). The **server** (`src/proxy/server.rs`) only ever sees
+(`crates/flextunnel-core/src/proxy/signaling.rs`). The **server** (`crates/flextunnel-core/src/proxy/server.rs`) only ever sees
 a `Target`, resolves DNS, and connects from its own network — it neither knows
 nor cares whether the client spoke SOCKS5 or HTTP.
 
@@ -41,7 +41,7 @@ explicitly rejected with `501 Not Implemented` until Phase 2.
 ### Refactor first (prep, no behavior change)
 - Make the per-connection tunnel plumbing reusable by both front-ends. Today
   `open_tunnel(conn, target) -> (SendStream, RecvStream, u8)` and the
-  reply-then-`copy_bidirectional` tail live inside `src/proxy/client.rs`. Extract
+  reply-then-`copy_bidirectional` tail live inside `crates/flextunnel-core/src/proxy/client.rs`. Extract
   a shared helper, e.g.
   `tunnel::dial(conn, &Target) -> io::Result<(SendStream, RecvStream, rep)>`,
   used by both the SOCKS5 and HTTP handlers.
@@ -51,10 +51,10 @@ explicitly rejected with `501 Not Implemented` until Phase 2.
   HTTP handler. The QUIC `Connection` and reconnect logic are shared unchanged;
   both listeners multiplex over the same connection.
 
-### New module: `src/proxy/http.rs`
+### New module: `crates/flextunnel-core/src/proxy/http.rs`
 - `negotiate(stream) -> HttpReq`: read the request line + headers (until
   `\r\n\r\n`), bounded by a max header size (mirror `MAX_HANDSHAKE_SIZE`-style
-  cap) and a read timeout (mirror `HANDSHAKE_TIMEOUT` in client.rs).
+  cap) and a read timeout (mirror `HANDSHAKE_TIMEOUT` in proxy/client.rs).
 - If method is `CONNECT`: parse `host:port` from the request target into a
   `signaling::Target` (host → `Target::Domain`, literal IP → `Target::Ip`), dial
   the tunnel, then:
@@ -67,7 +67,7 @@ explicitly rejected with `501 Not Implemented` until Phase 2.
   (`400`/`502`), never a silent drop — same principle as the SOCKS5 handler now
   sending a reply on `open_tunnel` failure.
 
-### CLI / config (`src/main.rs`)
+### CLI / config (`crates/flextunnel-cli/src/main.rs`)
 - Add `--http-listen <ADDR>` to `client` (e.g. `127.0.0.1:8081`), optional.
 - At least one of `--socks-listen` / `--http-listen` must be enabled; allow both
   simultaneously. Thread an `http_listen: Option<SocketAddr>` into `ClientConfig`.
@@ -120,10 +120,10 @@ clients work without TLS.
 
 | File | Change |
 |---|---|
-| `src/proxy/http.rs` | **new** — HTTP listener + `CONNECT`/forward handlers |
-| `src/proxy/mod.rs` | export the new module |
-| `src/proxy/client.rs` | extract shared `dial`/pipe helper; bind + dispatch the HTTP listener in `run` |
-| `src/proxy/signaling.rs` | unchanged (reuse `Target`, `write_request`, `read_reply`, `REP_*`) |
-| `src/proxy/server.rs` | **unchanged** |
-| `src/main.rs` | `--http-listen` flag, `ClientConfig.http_listen` |
+| `crates/flextunnel-core/src/proxy/http.rs` | **new** — HTTP listener + `CONNECT`/forward handlers |
+| `crates/flextunnel-core/src/proxy/mod.rs` | export the new module |
+| `crates/flextunnel-core/src/proxy/client.rs` | extract shared `dial`/pipe helper; bind + dispatch the HTTP listener in `run` |
+| `crates/flextunnel-core/src/proxy/signaling.rs` | unchanged (reuse `Target`, `write_request`, `read_reply`, `REP_*`) |
+| `crates/flextunnel-core/src/proxy/server.rs` | **unchanged** |
+| `crates/flextunnel-cli/src/main.rs` | `--http-listen` flag, `ClientConfig.http_listen` |
 | `README.md` | document HTTP proxy usage |

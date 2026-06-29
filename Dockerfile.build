@@ -4,12 +4,12 @@ ARG TARGETPLATFORM
 WORKDIR /build
 
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+COPY crates ./crates
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETPLATFORM} \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-${TARGETPLATFORM} \
     --mount=type=cache,target=/build/target,id=cargo-target-${TARGETPLATFORM} \
-    cargo build --release && \
+    cargo build --release -p flextunnel-cli && \
     cp target/release/flextunnel /flextunnel
 
 FROM scratch AS export

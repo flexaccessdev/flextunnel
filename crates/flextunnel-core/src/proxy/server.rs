@@ -166,7 +166,7 @@ async fn handle_socks_stream(
             s
         }
         Err(e) => {
-            log::debug!("Connect to {target:?} failed: {e}");
+            log::warn!("Connect to {target:?} failed: {e}");
             signaling::write_reply(&mut send, signaling::map_io_err(&e)).await?;
             send.flush().await?;
             return Ok(());

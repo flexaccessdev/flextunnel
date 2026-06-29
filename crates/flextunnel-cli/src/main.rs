@@ -6,23 +6,17 @@
 //! Uses a fixed ALPN for protocol selection, auth tokens for access control, and TLS 1.3/QUIC for
 //! encryption. Neither side needs admin/root (no TUN device).
 
-mod auth;
-mod config;
-mod error;
-mod proxy;
-mod secret;
-mod transport;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
-use crate::proxy::{ClientConfig, ProxyClient, ProxyServer};
-use crate::transport::endpoint::{
+use flextunnel_core::proxy::{ClientConfig, ProxyClient, ProxyServer};
+use flextunnel_core::transport::endpoint::{
     create_client_endpoint, create_server_endpoint, load_secret, load_secret_from_string,
 };
+use flextunnel_core::{auth, config, secret};
 
 #[derive(Parser)]
 #[command(name = "flextunnel")]
