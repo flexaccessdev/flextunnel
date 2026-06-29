@@ -3,7 +3,7 @@
 //! A SOCKS5-over-QUIC proxy via iroh P2P connections. The client runs a local
 //! SOCKS5 listener; each CONNECT is tunneled as a reliable QUIC bi-stream to the
 //! server, which resolves DNS and connects to the target from its own network.
-//! Uses a fixed ALPN + auth tokens for access control and TLS 1.3/QUIC for
+//! Uses a fixed ALPN for protocol selection, auth tokens for access control, and TLS 1.3/QUIC for
 //! encryption. Neither side needs admin/root (no TUN device).
 
 mod auth;

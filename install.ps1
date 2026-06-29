@@ -73,12 +73,15 @@ function Get-LatestPrereleaseTag {
         exit 1
     }
 
+    # Only consider prereleases that actually ship the Windows binary, so the
+    # tag we return can be installed (matches the -PreRelease help text).
+    $binaryName = Get-BinaryName -Arch (Get-Architecture)
     $latestPrerelease = $releases |
-        Where-Object { $_.prerelease -eq $true } |
+        Where-Object { $_.prerelease -eq $true -and ($_.assets | Where-Object { $_.name -eq $binaryName }) } |
         Select-Object -First 1 -ExpandProperty tag_name
 
     if (-not $latestPrerelease) {
-        Print-Error "Could not find any prerelease on GitHub"
+        Print-Error "Could not find a prerelease on GitHub that includes $binaryName"
         exit 1
     }
 
