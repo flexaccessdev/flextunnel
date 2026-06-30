@@ -17,17 +17,6 @@ auth_tokens = ["vXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"]
 # relay_urls = ["https://relay.example"]   # custom relay(s) for failover
 # dns_server = "https://dns.example"        # custom discovery DNS, or "none"
 
-# Optional host aliases, resolved server-side. A requested hostname matching a
-# key (case-insensitive) is rewritten to its value — an IP or another hostname
-# on the server's network — keeping the requested port, then resolved/connected
-# like any other target. Lets clients reach the server's loopback or internal
-# hosts via a real name, which also avoids Firefox's refusal to proxy literal
-# `localhost`/`127.0.0.1` (use `socks5h://` / remote DNS so the name reaches the
-# server). Only domain targets are aliased; literal IPs pass through unchanged.
-# [host_aliases]
-# "server.ezvpn" = "127.0.0.1"      # -> the server's own loopback
-# "node2.ezvpn"  = "192.168.1.50"   # -> another host on the server's network
-
 # Optional whitelist (the "tunnel set"). When either list below is non-empty the
 # server REJECTS any tunnel request whose target is not on the list (SOCKS5 reply
 # 0x02, "connection not allowed by ruleset"); both empty (the default) allows
@@ -40,5 +29,19 @@ auth_tokens = ["vXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"]
 # matches subdomains only — not the bare apex), case-insensitive. CIDR entries
 # match IP targets and accept a bare IP as a single host. Domains are matched
 # only against `whitelist_domains` and IPs only against `whitelist_cidrs`.
+#
+# NOTE: these are top-level keys, so they must appear BEFORE the [host_aliases]
+# table below (in TOML, bare keys after a [table] header belong to that table).
 # whitelist_domains = ["*.example.com", "httpbin.org"]
 # whitelist_cidrs = ["10.0.0.0/8", "192.168.1.5"]
+
+# Optional host aliases, resolved server-side. A requested hostname matching a
+# key (case-insensitive) is rewritten to its value — an IP or another hostname
+# on the server's network — keeping the requested port, then resolved/connected
+# like any other target. Lets clients reach the server's loopback or internal
+# hosts via a real name, which also avoids Firefox's refusal to proxy literal
+# `localhost`/`127.0.0.1` (use `socks5h://` / remote DNS so the name reaches the
+# server). Only domain targets are aliased; literal IPs pass through unchanged.
+# [host_aliases]
+# "server.ezvpn" = "127.0.0.1"      # -> the server's own loopback
+# "node2.ezvpn"  = "192.168.1.50"   # -> another host on the server's network
