@@ -51,8 +51,12 @@ impl Whitelist {
         for raw in domains {
             let entry = raw.trim();
             if let Some(suffix) = entry.strip_prefix("*.") {
-                if suffix.is_empty() {
-                    bail!("invalid whitelist domain pattern (nothing after `*.`): {raw:?}");
+                // The remainder after `*.` must be a single valid domain: one or
+                // more non-empty, wildcard-free labels. This rejects broken
+                // patterns like `*.*.example.com` or `*..example.com` that would
+                // otherwise become dead rules matching nothing.
+                if suffix.contains('*') || suffix.split('.').any(str::is_empty) {
+                    bail!("invalid whitelist wildcard pattern: {raw:?}");
                 }
                 domains_suffix.push(format!(".{}", suffix.to_ascii_lowercase()));
             } else if entry.is_empty() || entry.contains('*') {
@@ -184,6 +188,8 @@ mod tests {
     fn rejects_bad_patterns() {
         assert!(Whitelist::new(&["*.".to_string()], &[]).is_err());
         assert!(Whitelist::new(&["a*b.com".to_string()], &[]).is_err());
+        assert!(Whitelist::new(&["*.*.example.com".to_string()], &[]).is_err());
+        assert!(Whitelist::new(&["*..example.com".to_string()], &[]).is_err());
         assert!(Whitelist::new(&[], &["not-a-cidr".to_string()]).is_err());
     }
 }

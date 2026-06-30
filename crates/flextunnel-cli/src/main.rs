@@ -251,6 +251,12 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
 
     let secret_key = secret::resolve_secret_key(r.secret.as_deref(), r.secret_file.as_deref())?;
 
+    // Parse the whitelist before creating the endpoint: a parse failure here must
+    // not bypass the endpoint.close() cleanup below (an ungraceful drop panics
+    // under panic=abort).
+    let whitelist = Whitelist::new(&r.whitelist_domains, &r.whitelist_cidrs)
+        .context("Invalid whitelist configuration")?;
+
     let endpoint = create_server_endpoint(&r.relay_urls, secret_key, r.dns_server.as_deref())
         .await
         .context("Failed to create iroh endpoint")?;
@@ -264,8 +270,6 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
     if !r.host_aliases.is_empty() {
         log::info!("Loaded {} host alias(es)", r.host_aliases.len());
     }
-    let whitelist = Whitelist::new(&r.whitelist_domains, &r.whitelist_cidrs)
-        .context("Invalid whitelist configuration")?;
     if whitelist.is_active() {
         log::info!(
             "Whitelist active: {} domain rule(s), {} CIDR(s) — off-list tunnel requests are rejected",

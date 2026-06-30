@@ -244,8 +244,10 @@ which matches subdomains only — not the bare apex), case-insensitive; CIDR
 entries match IP targets and accept a bare IP as a single host. Domains are
 matched only against `whitelist_domains` and IPs only against `whitelist_cidrs`.
 
-Keep the client and server lists **in sync**: a target whitelisted on the client
-but not the server is tunneled by the client and then rejected by the server.
+Keep the client and server lists **in sync**: when the server whitelist is also
+active, a target whitelisted on the client but missing from the server's list is
+tunneled by the client and then rejected by the server. (If the server whitelist
+is inactive it allows every target, so the mismatch doesn't arise.)
 
 ### Roadmap
 
