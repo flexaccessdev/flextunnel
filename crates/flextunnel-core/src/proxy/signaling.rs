@@ -15,10 +15,11 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// flextunnel protocol version.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
-/// Maximum auth-handshake message size (16 KiB).
-pub const MAX_HANDSHAKE_SIZE: usize = 16 * 1024;
+/// Maximum auth-handshake message size (64 KiB). The server's whitelist rides
+/// the `HelloResponse`, so this is generous enough for a large operator list.
+pub const MAX_HANDSHAKE_SIZE: usize = 64 * 1024;
 
 /// Per-stream request/reply header version byte.
 const STREAM_VERSION: u8 = 1;
@@ -60,12 +61,23 @@ impl std::fmt::Debug for Hello {
 }
 
 /// Server → client auth handshake response.
+///
+/// On acceptance the server pushes its resolved whitelist (the *tunnel set*) so
+/// the client can make the split-tunnel decision without configuring its own
+/// list — the server is the single source of truth. Empty lists mean an
+/// inactive whitelist (the client tunnels everything).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloResponse {
     pub version: u16,
     pub accepted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reject_reason: Option<String>,
+    /// Domain rules the client should tunnel (exact or `*.` wildcard).
+    #[serde(default)]
+    pub whitelist_domains: Vec<String>,
+    /// CIDR / bare-IP rules the client should tunnel.
+    #[serde(default)]
+    pub whitelist_cidrs: Vec<String>,
 }
 
 impl Hello {
@@ -78,11 +90,14 @@ impl Hello {
 }
 
 impl HelloResponse {
-    pub fn accepted() -> Self {
+    /// Accept the client and push the server's whitelist (the *tunnel set*).
+    pub fn accepted(whitelist_domains: Vec<String>, whitelist_cidrs: Vec<String>) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             accepted: true,
             reject_reason: None,
+            whitelist_domains,
+            whitelist_cidrs,
         }
     }
 
@@ -91,6 +106,8 @@ impl HelloResponse {
             version: PROTOCOL_VERSION,
             accepted: false,
             reject_reason: Some(reason.into()),
+            whitelist_domains: Vec::new(),
+            whitelist_cidrs: Vec::new(),
         }
     }
 }
@@ -308,5 +325,26 @@ mod tests {
         let decoded = decode_hello(&encoded).unwrap();
         assert_eq!(decoded.auth_token, "token");
         assert_eq!(decoded.version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn hello_response_roundtrip() {
+        let resp = HelloResponse::accepted(
+            vec!["*.example.com".to_string(), "httpbin.org".to_string()],
+            vec!["10.0.0.0/8".to_string()],
+        );
+        let decoded = decode_hello_response(&encode_hello_response(&resp).unwrap()).unwrap();
+        assert!(decoded.accepted);
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
+        assert_eq!(decoded.whitelist_domains, vec!["*.example.com", "httpbin.org"]);
+        assert_eq!(decoded.whitelist_cidrs, vec!["10.0.0.0/8"]);
+
+        // A rejection carries no whitelist.
+        let rej = HelloResponse::rejected("nope");
+        let decoded = decode_hello_response(&encode_hello_response(&rej).unwrap()).unwrap();
+        assert!(!decoded.accepted);
+        assert_eq!(decoded.reject_reason.as_deref(), Some("nope"));
+        assert!(decoded.whitelist_domains.is_empty());
+        assert!(decoded.whitelist_cidrs.is_empty());
     }
 }

@@ -226,8 +226,6 @@ async fn run_async(command: Command) -> Result<()> {
                 dns_server,
                 auto_reconnect,
                 max_reconnect_attempts,
-                whitelist_domains: None, // config-file only; no CLI flag
-                whitelist_cidrs: None,   // config-file only; no CLI flag
             };
             let file = config::load_client_config(config_path.as_deref(), default_config)?;
             run_client(config::resolve_client(cli, file)).await
@@ -272,12 +270,18 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
     }
     if whitelist.is_active() {
         log::info!(
-            "Whitelist active: {} domain rule(s), {} CIDR(s) — off-list tunnel requests are rejected",
+            "Whitelist active: {} domain rule(s), {} CIDR(s) — off-list tunnel requests are rejected; pushed to clients on connect",
             r.whitelist_domains.len(),
             r.whitelist_cidrs.len()
         );
     }
-    let server = ProxyServer::new(valid_tokens, r.host_aliases, whitelist);
+    let server = ProxyServer::new(
+        valid_tokens,
+        r.host_aliases,
+        whitelist,
+        r.whitelist_domains,
+        r.whitelist_cidrs,
+    );
     let run = async {
         server
             .run(&endpoint)
@@ -322,15 +326,8 @@ async fn run_client(r: config::ResolvedClient) -> Result<()> {
         );
     };
 
-    let whitelist = Whitelist::new(&r.whitelist_domains, &r.whitelist_cidrs)
-        .context("Invalid whitelist configuration")?;
-    if whitelist.is_active() {
-        log::info!(
-            "Whitelist active: {} domain rule(s), {} CIDR(s) — off-list targets connect directly",
-            r.whitelist_domains.len(),
-            r.whitelist_cidrs.len()
-        );
-    }
+    // The whitelist (tunnel set) is no longer configured on the client; it is
+    // pushed by the server during the handshake (see ProxyClient::handshake).
 
     let endpoint = create_client_endpoint(&r.relay_urls, r.dns_server.as_deref())
         .await
@@ -344,7 +341,6 @@ async fn run_client(r: config::ResolvedClient) -> Result<()> {
         relay_urls: r.relay_urls,
         auto_reconnect: r.auto_reconnect,
         max_reconnect_attempts: r.max_reconnect_attempts,
-        whitelist,
     });
 
     let run = async {

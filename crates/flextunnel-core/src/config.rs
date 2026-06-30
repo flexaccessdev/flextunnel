@@ -70,15 +70,6 @@ pub struct ClientConfig {
     pub auto_reconnect: Option<bool>,
     /// Cap on reconnect attempts between successful connections.
     pub max_reconnect_attempts: Option<NonZeroU32>,
-    /// Domains to tunnel (the tunnel set). Exact (`example.com`) or wildcard
-    /// (`*.example.com`, subdomains only). When this and `whitelist_cidrs` are
-    /// both empty everything is tunneled; otherwise off-list targets connect
-    /// directly from this device (split-tunneling). Keep in sync with the
-    /// server's whitelist.
-    pub whitelist_domains: Option<Vec<String>>,
-    /// CIDRs / bare IPs to tunnel (matched against IP targets). See
-    /// `whitelist_domains`.
-    pub whitelist_cidrs: Option<Vec<String>>,
 }
 
 /// Fully-resolved server settings (CLI > file > default), paths tilde-expanded.
@@ -106,9 +97,6 @@ pub struct ResolvedClient {
     pub dns_server: Option<String>,
     pub auto_reconnect: bool,
     pub max_reconnect_attempts: Option<NonZeroU32>,
-    /// Raw whitelist entries (parsed into a `Whitelist` at startup).
-    pub whitelist_domains: Vec<String>,
-    pub whitelist_cidrs: Vec<String>,
 }
 
 /// Default SOCKS5 listen address when neither CLI nor config sets one.
@@ -250,11 +238,6 @@ pub fn resolve_client(cli: ClientConfig, file: Option<ClientConfig>) -> Resolved
         dns_server: cli.dns_server.or(file.dns_server),
         auto_reconnect: cli.auto_reconnect.or(file.auto_reconnect).unwrap_or(true),
         max_reconnect_attempts: cli.max_reconnect_attempts.or(file.max_reconnect_attempts),
-        whitelist_domains: cli
-            .whitelist_domains
-            .or(file.whitelist_domains)
-            .unwrap_or_default(),
-        whitelist_cidrs: cli.whitelist_cidrs.or(file.whitelist_cidrs).unwrap_or_default(),
     }
 }
 
@@ -343,7 +326,7 @@ mod tests {
         assert_eq!(r.whitelist_domains, vec!["*.example.com", "httpbin.org"]);
         assert_eq!(r.whitelist_cidrs, vec!["10.0.0.0/8"]);
         // Defaults to empty (inactive) when unset.
-        let empty = resolve_client(ClientConfig::default(), None);
+        let empty = resolve_server(ServerConfig::default(), None);
         assert!(empty.whitelist_domains.is_empty());
         assert!(empty.whitelist_cidrs.is_empty());
     }

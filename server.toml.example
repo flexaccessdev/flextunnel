@@ -17,13 +17,12 @@ auth_tokens = ["vXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"]
 # relay_urls = ["https://relay.example"]   # custom relay(s) for failover
 # dns_server = "https://dns.example"        # custom discovery DNS, or "none"
 
-# Optional whitelist (the "tunnel set"). When either list below is non-empty the
-# server REJECTS any tunnel request whose target is not on the list (SOCKS5 reply
-# 0x02, "connection not allowed by ruleset"); both empty (the default) allows
-# every target. This is a defense-in-depth boundary: a well-behaved client only
-# ever tunnels whitelisted targets (and connects the rest directly), so keep this
-# in sync with the client's whitelist — a target whitelisted on the client but
-# not here will be tunneled by the client and then rejected.
+# Optional whitelist (the "tunnel set"). This list is the single source of truth:
+# it is pushed to every client during the handshake (so clients split-tunnel
+# off-list targets directly) AND enforced here as defense-in-depth — the server
+# REJECTS any tunnel request whose target is not on the list (SOCKS5 reply 0x02,
+# "connection not allowed by ruleset"). Both empty (the default) allows every
+# target and tunnels everything. Clients configure no whitelist of their own.
 #
 # Domain entries are exact (`example.com`) or wildcard (`*.example.com`, which
 # matches subdomains only — not the bare apex), case-insensitive. CIDR entries
