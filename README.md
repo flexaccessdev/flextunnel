@@ -247,6 +247,19 @@ matched only against `whitelist_domains` and IPs only against `whitelist_cidrs`.
 Keep the client and server lists **in sync**: a target whitelisted on the client
 but not the server is tunneled by the client and then rejected by the server.
 
+### Roadmap
+
+- **Client blocking mode.** Today, when a whitelist is active the client
+  **always direct-connects** every off-list target (split-tunneling), and this is
+  the same for the desktop and iOS clients (they share the same core). A future
+  client option — likely `whitelist_mode = "block" | "direct"` (default
+  `"direct"`) — will let a client instead **refuse** an off-list connection,
+  returning a SOCKS5 error to the local app rather than falling back to a direct
+  connection. This is aimed mainly at the desktop client, where blocking off-list
+  traffic can be preferable to letting it leak out directly; the iOS client keeps
+  defaulting to direct-connect. (The server's `0x02` rejection above is a
+  separate, server-side control and is unaffected.)
+
 ## Reconnect behavior
 
 Auto-reconnect is **enabled by default** (`auto_reconnect = true`); pass
