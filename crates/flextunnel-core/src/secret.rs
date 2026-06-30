@@ -4,9 +4,9 @@ use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use iroh::SecretKey;
 use log::info;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::transport::endpoint::{load_secret, secret_to_endpoint_id};
+use crate::transport::endpoint::{load_secret, load_secret_from_string, secret_to_endpoint_id};
 
 fn write_secret_to_output(
     output: &PathBuf,
@@ -104,9 +104,26 @@ pub fn generate_secret(output: PathBuf, force: bool) -> Result<()> {
     )
 }
 
-/// Show the EndpointId for an existing secret key file
-pub fn show_id(secret_file: PathBuf) -> Result<()> {
-    let secret = load_secret(&secret_file)?;
+/// Resolve a server secret key from an inline base64 string and/or a key file,
+/// exactly one of which must be provided. Shared by `flextunnel server` and
+/// `flextunnel show-server-id` so both accept the same `secret`/`secret_file`
+/// config.
+pub fn resolve_secret_key(secret: Option<&str>, secret_file: Option<&Path>) -> Result<SecretKey> {
+    match (secret, secret_file) {
+        (Some(_), Some(_)) => anyhow::bail!("Provide only one of secret or secret_file, not both"),
+        (Some(s), None) => load_secret_from_string(s).context("Invalid inline secret key"),
+        (None, Some(path)) => load_secret(path).context("Failed to load secret key"),
+        (None, None) => anyhow::bail!(
+            "No secret key configured.\n\
+             Generate one with: flextunnel generate-server-key -o <FILE>\n\
+             Then pass --secret-file <FILE> or set secret_file/secret in the config."
+        ),
+    }
+}
+
+/// Show the EndpointId for a server secret resolved from `secret`/`secret_file`.
+pub fn show_id(secret: Option<&str>, secret_file: Option<&Path>) -> Result<()> {
+    let secret = resolve_secret_key(secret, secret_file)?;
     let endpoint_id = secret_to_endpoint_id(&secret);
     println!("{}", endpoint_id);
     Ok(())

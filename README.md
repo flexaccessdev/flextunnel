@@ -219,6 +219,49 @@ browse to `http://server.ezvpn:8000/`. Use `socks5h://` (or set Firefox's
 `network.proxy.socks_remote_dns = true`) so the name is resolved by the server,
 not locally.
 
+## Whitelist split-tunneling
+
+A whitelist (the **tunnel set**) restricts which destinations traverse the
+tunnel. It is useful when a client must send *all* its traffic to the local
+SOCKS5 proxy (e.g. an iOS WebView, whose proxy config is global) but only some
+hosts should actually be tunneled. Configure it in `server.toml` and/or
+`client.toml` (config-file only — there is no CLI flag):
+
+```toml
+whitelist_domains = ["*.example.com", "httpbin.org"]
+whitelist_cidrs   = ["10.0.0.0/8", "192.168.1.5"]
+```
+
+- **Client** — when the whitelist is active, the client tunnels only matching
+  targets and connects everything else **directly** from its own network
+  (split-tunneling). Both lists empty (the default) tunnels everything.
+- **Server** — when active, the server independently **rejects** any tunnel
+  request for a target not on the list (SOCKS5 reply `0x02`). This is a
+  defense-in-depth boundary against a misconfigured or untrusted client.
+
+Matching: domain entries are exact (`example.com`) or wildcard (`*.example.com`,
+which matches subdomains only — not the bare apex), case-insensitive; CIDR
+entries match IP targets and accept a bare IP as a single host. Domains are
+matched only against `whitelist_domains` and IPs only against `whitelist_cidrs`.
+
+Keep the client and server lists **in sync**: when the server whitelist is also
+active, a target whitelisted on the client but missing from the server's list is
+tunneled by the client and then rejected by the server. (If the server whitelist
+is inactive it allows every target, so the mismatch doesn't arise.)
+
+### Roadmap
+
+- **Client blocking mode.** Today, when a whitelist is active the client
+  **always direct-connects** every off-list target (split-tunneling), and this is
+  the same for the desktop and iOS clients (they share the same core). A future
+  client option — likely `whitelist_mode = "block" | "direct"` (default
+  `"direct"`) — will let a client instead **refuse** an off-list connection,
+  returning a SOCKS5 error to the local app rather than falling back to a direct
+  connection. This is aimed mainly at the desktop client, where blocking off-list
+  traffic can be preferable to letting it leak out directly; the iOS client keeps
+  defaulting to direct-connect. (The server's `0x02` rejection above is a
+  separate, server-side control and is unaffected.)
+
 ## Reconnect behavior
 
 Auto-reconnect is **enabled by default** (`auto_reconnect = true`); pass

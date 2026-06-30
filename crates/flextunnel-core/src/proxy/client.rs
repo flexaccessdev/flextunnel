@@ -3,13 +3,14 @@
 
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::signaling::{self, Hello};
-use crate::proxy::socks5;
+use crate::proxy::{dial, socks5, Whitelist};
 use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
 use rand::Rng;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -48,6 +49,10 @@ pub struct ClientConfig {
     pub auto_reconnect: bool,
     /// Cap on reconnect attempts between successful connections (unlimited if None).
     pub max_reconnect_attempts: Option<NonZeroU32>,
+    /// Destinations to tunnel (the tunnel set). When active, targets not on the
+    /// list are connected directly from this device instead of tunneled
+    /// (split-tunneling); see [`Whitelist`]. When inactive, everything tunnels.
+    pub whitelist: Whitelist,
 }
 
 /// Exponential backoff with jitter for the Nth (1-based) reconnect attempt.
@@ -60,11 +65,14 @@ fn calculate_backoff(attempt: u32) -> Duration {
 
 pub struct ProxyClient {
     config: ClientConfig,
+    /// Shared so each spawned connection task can cheaply clone the handle.
+    whitelist: Arc<Whitelist>,
 }
 
 impl ProxyClient {
     pub fn new(config: ClientConfig) -> Self {
-        Self { config }
+        let whitelist = Arc::new(config.whitelist.clone());
+        Self { config, whitelist }
     }
 
     /// Bind the local SOCKS5 listener once, then connect to the server and serve
@@ -186,8 +194,9 @@ impl ProxyClient {
             let (tcp, peer) = accept?;
             log::debug!("SOCKS5 connection from {peer}");
             let conn = connection.clone();
+            let whitelist = self.whitelist.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_local_conn(tcp, conn).await {
+                if let Err(e) = handle_local_conn(tcp, conn, whitelist).await {
                     log::debug!("SOCKS5 connection from {peer} ended: {e}");
                 }
             });
@@ -248,9 +257,15 @@ impl ProxyClient {
     }
 }
 
-/// Handle one local SOCKS5 connection: negotiate, parse CONNECT, open a stream
-/// to the server, relay the reply, then pipe bytes.
-async fn handle_local_conn(mut tcp: TcpStream, conn: Connection) -> Result<()> {
+/// Handle one local SOCKS5 connection: negotiate, parse CONNECT, then either
+/// tunnel the target to the server or — when a whitelist is active and the
+/// target is not on it — connect to it directly from this device, relaying the
+/// reply and piping bytes either way.
+async fn handle_local_conn(
+    mut tcp: TcpStream,
+    conn: Connection,
+    whitelist: Arc<Whitelist>,
+) -> Result<()> {
     // Bound the local SOCKS5 handshake so a peer that connects and sends nothing
     // can't pin this task and its socket indefinitely.
     let target = tokio::time::timeout(LOCAL_HANDSHAKE_TIMEOUT, async {
@@ -259,6 +274,14 @@ async fn handle_local_conn(mut tcp: TcpStream, conn: Connection) -> Result<()> {
     })
     .await
     .map_err(|_| anyhow::anyhow!("timed out during local SOCKS5 handshake"))??;
+
+    // Split-tunnel: a target not on an active whitelist bypasses the tunnel and
+    // is dialed directly from this device's own network (its DNS, its IP).
+    if whitelist.is_active() && !whitelist.allows(&target) {
+        log::debug!("Direct (off-whitelist): {target:?}");
+        return direct_connect(tcp, &target).await;
+    }
+    log::debug!("Tunneling: {target:?}");
 
     // Open the tunnel stream and read the server's reply. If any step fails the
     // local app hasn't been answered yet, so send a SOCKS5 general-failure reply
@@ -282,6 +305,30 @@ async fn handle_local_conn(mut tcp: TcpStream, conn: Connection) -> Result<()> {
 
     let mut iroh = tokio::io::join(recv, send);
     let _ = tokio::io::copy_bidirectional(&mut tcp, &mut iroh).await;
+    Ok(())
+}
+
+/// Connect to `target` directly from this device (bypassing the tunnel) and pipe
+/// bytes, answering the local app's SOCKS5 request with the matching reply code.
+/// Used for off-whitelist targets in split-tunnel mode. The dial is bounded by
+/// the same deadline as opening a tunnel so a slow target can't pin the task.
+async fn direct_connect(mut tcp: TcpStream, target: &signaling::Target) -> Result<()> {
+    let dialed = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, dial::dial_target(target)).await;
+    let mut upstream = match dialed {
+        Ok(Ok(s)) => {
+            socks5::write_reply(&mut tcp, signaling::REP_SUCCESS).await?;
+            s
+        }
+        Ok(Err(e)) => {
+            let _ = socks5::write_reply(&mut tcp, signaling::map_io_err(&e)).await;
+            return Ok(());
+        }
+        Err(_) => {
+            let _ = socks5::write_reply(&mut tcp, signaling::REP_HOST_UNREACHABLE).await;
+            return Ok(());
+        }
+    };
+    let _ = tokio::io::copy_bidirectional(&mut tcp, &mut upstream).await;
     Ok(())
 }
 

@@ -6,7 +6,7 @@ resolver = "3"
 default-members = ["crates/flextunnel-core", "crates/flextunnel-cli"]
 
 [workspace.package]
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
 description = "SOCKS5-over-QUIC proxy via iroh P2P"
 
@@ -16,6 +16,7 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 env_logger = "0.11"
+ipnetwork = "0.21"
 iroh = "1.0.0"
 iroh-mdns-address-lookup = "0.4.0"
 log = "0.4"

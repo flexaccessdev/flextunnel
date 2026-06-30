@@ -32,6 +32,8 @@ const ATYP_IPV6: u8 = 0x04;
 // forwards the server's reply byte straight into its SOCKS5 reply to the app.
 pub const REP_SUCCESS: u8 = 0x00;
 pub const REP_GENERAL_FAILURE: u8 = 0x01;
+/// Connection not allowed by ruleset — used when a whitelist rejects a target.
+pub const REP_NOT_ALLOWED: u8 = 0x02;
 pub const REP_NET_UNREACHABLE: u8 = 0x03;
 pub const REP_HOST_UNREACHABLE: u8 = 0x04;
 pub const REP_CONN_REFUSED: u8 = 0x05;

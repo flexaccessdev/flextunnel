@@ -4,6 +4,7 @@
 
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::signaling::{self, HelloResponse, Target};
+use crate::proxy::{dial, Whitelist};
 use iroh::Endpoint;
 use iroh::endpoint::{Incoming, RecvStream, SendStream};
 use std::collections::{HashMap, HashSet};
@@ -11,7 +12,6 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 
 /// Deadline for receiving the client's auth handshake once a connection opens.
@@ -33,13 +33,22 @@ pub struct ProxyServer {
     /// Host aliases (lowercased keys) rewritten before connecting; see
     /// [`apply_alias`].
     host_aliases: HashMap<String, String>,
+    /// Destinations allowed to tunnel. When active, a request for a target not
+    /// on the list is rejected (defense in depth — the client should already
+    /// have split it off; see [`Whitelist`]).
+    whitelist: Whitelist,
 }
 
 impl ProxyServer {
-    pub fn new(valid_tokens: HashSet<String>, host_aliases: HashMap<String, String>) -> Arc<Self> {
+    pub fn new(
+        valid_tokens: HashSet<String>,
+        host_aliases: HashMap<String, String>,
+        whitelist: Whitelist,
+    ) -> Arc<Self> {
         Arc::new(Self {
             valid_tokens,
             host_aliases,
+            whitelist,
         })
     }
 
@@ -125,7 +134,10 @@ impl ProxyServer {
                 Ok((send, recv)) => {
                     let server = self.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_socks_stream(send, recv, &server.host_aliases).await {
+                        if let Err(e) =
+                            handle_socks_stream(send, recv, &server.host_aliases, &server.whitelist)
+                                .await
+                        {
                             log::debug!("SOCKS5 stream ended: {e}");
                         }
                     });
@@ -161,20 +173,28 @@ async fn handle_socks_stream(
     mut send: SendStream,
     mut recv: RecvStream,
     host_aliases: &HashMap<String, String>,
+    whitelist: &Whitelist,
 ) -> io::Result<()> {
-    let target = apply_alias(signaling::read_request(&mut recv).await?, host_aliases);
+    let requested = signaling::read_request(&mut recv).await?;
+
+    // Enforce the whitelist on the requested target (before aliasing), as a
+    // defense-in-depth boundary: a well-behaved client only tunnels whitelisted
+    // targets, so a request for anything off-list means a misconfigured or
+    // untrusted client. Reject with the SOCKS5 "not allowed by ruleset" code.
+    if whitelist.is_active() && !whitelist.allows(&requested) {
+        log::warn!("Tunnel request rejected by whitelist");
+        log::debug!("Rejected {requested:?} by whitelist");
+        signaling::write_reply(&mut send, signaling::REP_NOT_ALLOWED).await?;
+        send.flush().await?;
+        return Ok(());
+    }
+
+    let target = apply_alias(requested, host_aliases);
     log::debug!("Stream target: {target:?}");
 
     // Bound the dial (DNS + TCP connect) so a slow/black-holed target can't tie
     // up this task and its sockets indefinitely.
-    let connected = match tokio::time::timeout(CONNECT_TIMEOUT, async {
-        match &target {
-            Target::Ip(sa) => TcpStream::connect(*sa).await,
-            Target::Domain(host, port) => connect_resolved(host, *port).await,
-        }
-    })
-    .await
-    {
+    let connected = match tokio::time::timeout(CONNECT_TIMEOUT, dial::dial_target(&target)).await {
         Ok(res) => res,
         Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")),
     };
@@ -199,26 +219,6 @@ async fn handle_socks_stream(
     let mut iroh = tokio::io::join(recv, send);
     let _ = tokio::io::copy_bidirectional(&mut iroh, &mut tcp).await;
     Ok(())
-}
-
-/// Resolve a host:port via the server's DNS and connect to the first address
-/// that accepts. Returns the last connect error, or a host-unreachable error if
-/// resolution yielded no addresses.
-async fn connect_resolved(host: &str, port: u16) -> io::Result<TcpStream> {
-    let addrs = tokio::net::lookup_host((host, port)).await?;
-    let mut last_err: Option<io::Error> = None;
-    for addr in addrs {
-        match TcpStream::connect(addr).await {
-            Ok(stream) => return Ok(stream),
-            Err(e) => last_err = Some(e),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::HostUnreachable,
-            format!("no addresses resolved for {host}:{port}"),
-        )
-    }))
 }
 
 #[cfg(test)]
