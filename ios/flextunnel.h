@@ -71,6 +71,20 @@ FlextunnelHandle *flextunnel_start(const char *config_json, char *out_buf, size_
 int flextunnel_health(const FlextunnelHandle *handle);
 
 /*
+ * Snapshot the tunnel's current forwarding set as JSON into out_buf:
+ *   {"connected":true,"domains":["*.example.com"],"cidrs":["10.0.0.0/8"]}
+ * This is the split-tunnel set the server pushes during the handshake — the
+ * domains/CIDRs routed through the tunnel (off-list targets connect directly).
+ * An empty domains+cidrs while connected==true means the server runs no
+ * whitelist and everything is tunneled. The set becomes available shortly after
+ * start once the handshake completes, so poll it.
+ *
+ * Returns 1 on success, 0 if out_buf was too small (retry larger), and -1 for a
+ * NULL handle. Always NUL-terminated when out_buf is usable.
+ */
+int flextunnel_routes(const FlextunnelHandle *handle, char *out_buf, size_t out_len);
+
+/*
  * Stop the proxy and free the handle. After this call the handle is invalid.
  * Passing NULL is a safe no-op.
  */

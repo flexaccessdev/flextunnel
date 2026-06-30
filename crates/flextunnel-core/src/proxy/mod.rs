@@ -7,6 +7,6 @@ pub mod signaling;
 pub mod socks5;
 pub mod whitelist;
 
-pub use client::{ClientConfig, ProxyClient};
+pub use client::{ClientConfig, ProxyClient, TunnelRoutes};
 pub use server::ProxyServer;
 pub use whitelist::Whitelist;

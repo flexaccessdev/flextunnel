@@ -50,12 +50,13 @@ use std::ffi::{CStr, c_char, c_int};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
 use flextunnel_core::error::ProxyResult;
-use flextunnel_core::proxy::{ClientConfig, ProxyClient};
+use flextunnel_core::proxy::{ClientConfig, ProxyClient, TunnelRoutes};
 use flextunnel_core::transport::endpoint::create_client_endpoint;
 
 /// Loopback SOCKS5 port used when the config omits `socks_port`. Fixed (not an
@@ -77,6 +78,9 @@ pub struct FlextunnelHandle {
     endpoint: iroh::Endpoint,
     /// The running connect/serve loop.
     task: tokio::task::JoinHandle<ProxyResult<()>>,
+    /// Live tunnel set (split-tunnel domains/CIDRs the server pushed), refreshed
+    /// by the serve loop on each (re)connect. Read by [`flextunnel_routes`].
+    routes: Arc<Mutex<TunnelRoutes>>,
 }
 
 #[derive(Deserialize)]
@@ -201,6 +205,10 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
         max_reconnect_attempts: None,
     });
 
+    // Share the live tunnel set out of the client before it moves into the task,
+    // so `flextunnel_routes` can read what the server pushes on connect.
+    let routes = client.routes();
+
     // Clone the endpoint into the task; the original stays in the handle so
     // `flextunnel_stop` can close it after aborting the task.
     let ep = endpoint.clone();
@@ -212,6 +220,7 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
             runtime,
             endpoint,
             task,
+            routes,
         },
         result_json,
     ))
@@ -250,6 +259,48 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
     }
     let handle = unsafe { &*handle };
     if handle.task.is_finished() { 0 } else { 1 }
+}
+
+/// Snapshot the tunnel's current forwarding set as JSON into `out_buf`:
+///
+/// ```json
+/// { "connected": true, "domains": ["*.example.com"], "cidrs": ["10.0.0.0/8"] }
+/// ```
+///
+/// This is the split-tunnel set the server pushes during the handshake — the
+/// domains/CIDRs routed through the tunnel (off-list targets connect directly).
+/// An empty `domains`+`cidrs` while `connected` is true means the server runs no
+/// whitelist and everything is tunneled. The set becomes available shortly after
+/// start, once the handshake completes, so the caller should poll it.
+///
+/// Returns `1` on success (full JSON written), `0` if `out_buf` was too small
+/// (retry with a larger buffer), and `-1` for a null handle. The buffer is
+/// always NUL-terminated when usable.
+///
+/// # Safety
+/// `handle` must be a valid pointer returned by [`flextunnel_start`] and not yet
+/// passed to [`flextunnel_stop`]. `out_buf` must point to at least `out_len`
+/// writable bytes (may be null only if `out_len` is 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flextunnel_routes(
+    handle: *const FlextunnelHandle,
+    out_buf: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    if handle.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*handle };
+    let json = match handle.routes.lock() {
+        Ok(routes) => serde_json::json!({
+            "connected": routes.connected,
+            "domains": routes.domains,
+            "cidrs": routes.cidrs,
+        })
+        .to_string(),
+        Err(_) => return -1,
+    };
+    if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
 }
 
 /// Abort the serve loop, close the endpoint gracefully, and shut the runtime
