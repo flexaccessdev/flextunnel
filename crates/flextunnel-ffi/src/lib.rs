@@ -97,14 +97,20 @@ struct FfiConfig {
 }
 
 /// Initialize logging (stderr -> unified log / Console). Honors `RUST_LOG`,
-/// defaults to `info`. Idempotent; safe to call more than once.
+/// otherwise keeps flextunnel's own crates at `info` while quieting noisy
+/// dependencies (iroh and friends) to `warn`. Idempotent; safe to call more
+/// than once.
 ///
 /// # Safety
 /// No arguments; always safe to call.
 #[unsafe(no_mangle)]
 pub extern "C" fn flextunnel_init_logging() {
-    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .try_init();
+    let default_filter =
+        "warn,flextunnel_core=info,flextunnel_ffi=info,flextunnel_cli=info";
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(default_filter),
+    )
+    .try_init();
 }
 
 /// Start the in-process SOCKS5 proxy.
