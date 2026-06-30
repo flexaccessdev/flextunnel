@@ -49,13 +49,10 @@ void flextunnel_init_logging(void);
  *
  * config_json : NUL-terminated UTF-8 JSON, e.g.
  *   {"server_node_id":"<id>","auth_token":"<token>",
- *    "socks_port":18080,"relay_urls":[],"dns_server":null,
- *    "whitelist_domains":["*.example.com"],"whitelist_cidrs":["10.0.0.0/8"]}
- *   socks_port is optional (defaults to 18080). whitelist_domains/whitelist_cidrs
- *   are the tunnel set: when either is non-empty only matching destinations are
- *   tunneled and the rest connect directly (split-tunneling); both empty tunnels
- *   everything. Domains are exact ("example.com") or wildcard ("*.example.com",
- *   subdomains only). Keep in sync with the server's whitelist.
+ *    "socks_port":18080,"relay_urls":[],"dns_server":null}
+ *   socks_port is optional (defaults to 18080). The split-tunnel whitelist (the
+ *   tunnel set) is configured on the server and pushed to the client during the
+ *   handshake, so the app sends no whitelist of its own.
  * out_buf/out_len : caller buffer. On success receives {"socks_port":N};
  *   on failure receives an error message. Always NUL-terminated. If out_buf is
  *   too small for the success JSON, this is treated as a failure (returns NULL,

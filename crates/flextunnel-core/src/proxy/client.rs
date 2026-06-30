@@ -49,10 +49,6 @@ pub struct ClientConfig {
     pub auto_reconnect: bool,
     /// Cap on reconnect attempts between successful connections (unlimited if None).
     pub max_reconnect_attempts: Option<NonZeroU32>,
-    /// Destinations to tunnel (the tunnel set). When active, targets not on the
-    /// list are connected directly from this device instead of tunneled
-    /// (split-tunneling); see [`Whitelist`]. When inactive, everything tunnels.
-    pub whitelist: Whitelist,
 }
 
 /// Exponential backoff with jitter for the Nth (1-based) reconnect attempt.
@@ -65,14 +61,11 @@ fn calculate_backoff(attempt: u32) -> Duration {
 
 pub struct ProxyClient {
     config: ClientConfig,
-    /// Shared so each spawned connection task can cheaply clone the handle.
-    whitelist: Arc<Whitelist>,
 }
 
 impl ProxyClient {
     pub fn new(config: ClientConfig) -> Self {
-        let whitelist = Arc::new(config.whitelist.clone());
-        Self { config, whitelist }
+        Self { config }
     }
 
     /// Bind the local SOCKS5 listener once, then connect to the server and serve
@@ -106,12 +99,13 @@ impl ProxyClient {
         let mut ever_connected = false;
         let mut attempt: u32 = 0;
         loop {
-            // Establish (connect + auth).
-            let connection = match self.establish(endpoint).await {
-                Ok(conn) => {
+            // Establish (connect + auth). The handshake also learns the server's
+            // whitelist, which drives split-tunneling for this connection.
+            let (connection, whitelist) = match self.establish(endpoint).await {
+                Ok(established) => {
                     ever_connected = true;
                     attempt = 0; // reset backoff on a successful connection
-                    conn
+                    established
                 }
                 Err(e) => match self.handle_failure(e, ever_connected, &mut attempt) {
                     Ok(backoff) => {
@@ -123,7 +117,7 @@ impl ProxyClient {
             };
 
             // Serve until the connection drops, then reconnect (or exit).
-            if let Err(e) = self.serve(&connection, &listener).await {
+            if let Err(e) = self.serve(&connection, &whitelist, &listener).await {
                 match self.handle_failure(e, ever_connected, &mut attempt) {
                     Ok(backoff) => {
                         tokio::time::sleep(backoff).await;
@@ -168,22 +162,28 @@ impl ProxyClient {
         Ok(backoff)
     }
 
-    /// Connect to the server and complete the auth handshake.
-    async fn establish(&self, endpoint: &Endpoint) -> ProxyResult<Connection> {
+    /// Connect to the server and complete the auth handshake, returning the
+    /// connection together with the whitelist the server pushed.
+    async fn establish(&self, endpoint: &Endpoint) -> ProxyResult<(Connection, Arc<Whitelist>)> {
         let endpoint_addr = self.resolve_server_addr()?;
         let connection = endpoint
             .connect(endpoint_addr, crate::transport::ALPN)
             .await
             .map_err(|e| ProxyError::Signaling(format!("Failed to connect to server: {e}")))?;
         log::info!("Connected to server, authenticating...");
-        self.handshake(&connection).await?;
+        let whitelist = self.handshake(&connection).await?;
         log::info!("Authenticated.");
-        Ok(connection)
+        Ok((connection, Arc::new(whitelist)))
     }
 
     /// Accept local SOCKS5 connections and tunnel each over its own bi-stream,
     /// until the QUIC connection drops.
-    async fn serve(&self, connection: &Connection, listener: &TcpListener) -> ProxyResult<()> {
+    async fn serve(
+        &self,
+        connection: &Connection,
+        whitelist: &Arc<Whitelist>,
+        listener: &TcpListener,
+    ) -> ProxyResult<()> {
         loop {
             let accept = tokio::select! {
                 r = listener.accept() => r,
@@ -194,7 +194,7 @@ impl ProxyClient {
             let (tcp, peer) = accept?;
             log::debug!("SOCKS5 connection from {peer}");
             let conn = connection.clone();
-            let whitelist = self.whitelist.clone();
+            let whitelist = whitelist.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_local_conn(tcp, conn, whitelist).await {
                     log::debug!("SOCKS5 connection from {peer} ended: {e}");
@@ -227,8 +227,11 @@ impl ProxyClient {
         Ok(addr)
     }
 
-    /// Perform the connection-level auth handshake on the first bi-stream.
-    async fn handshake(&self, connection: &Connection) -> ProxyResult<()> {
+    /// Perform the connection-level auth handshake on the first bi-stream,
+    /// returning the whitelist (the tunnel set) the server pushed in its
+    /// response. The client uses it to split-tunnel; it configures no list of
+    /// its own (the server is the single source of truth).
+    async fn handshake(&self, connection: &Connection) -> ProxyResult<Whitelist> {
         let (mut send, mut recv) = connection
             .open_bi()
             .await
@@ -253,7 +256,22 @@ impl ProxyClient {
             let reason = response.reject_reason.unwrap_or_else(|| "unknown".to_string());
             return Err(ProxyError::AuthenticationFailed(reason));
         }
-        Ok(())
+
+        // Build the tunnel set from the server's pushed list. The server
+        // validated these rules at startup, so a parse failure here is not
+        // expected; surface it as a signaling error rather than panicking.
+        let whitelist = Whitelist::new(&response.whitelist_domains, &response.whitelist_cidrs)
+            .map_err(|e| ProxyError::Signaling(format!("server pushed an invalid whitelist: {e}")))?;
+        if whitelist.is_active() {
+            log::info!(
+                "Server whitelist active: {} domain rule(s), {} CIDR(s) — off-list targets connect directly",
+                response.whitelist_domains.len(),
+                response.whitelist_cidrs.len()
+            );
+        } else {
+            log::info!("Server whitelist inactive — tunneling everything");
+        }
+        Ok(whitelist)
     }
 }
 

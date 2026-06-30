@@ -224,30 +224,30 @@ not locally.
 A whitelist (the **tunnel set**) restricts which destinations traverse the
 tunnel. It is useful when a client must send *all* its traffic to the local
 SOCKS5 proxy (e.g. an iOS WebView, whose proxy config is global) but only some
-hosts should actually be tunneled. Configure it in `server.toml` and/or
-`client.toml` (config-file only — there is no CLI flag):
+hosts should actually be tunneled. It is configured on the **server only**
+(config-file only — there is no CLI flag); the client configures nothing:
 
 ```toml
+# server.toml
 whitelist_domains = ["*.example.com", "httpbin.org"]
 whitelist_cidrs   = ["10.0.0.0/8", "192.168.1.5"]
 ```
 
-- **Client** — when the whitelist is active, the client tunnels only matching
-  targets and connects everything else **directly** from its own network
-  (split-tunneling). Both lists empty (the default) tunnels everything.
-- **Server** — when active, the server independently **rejects** any tunnel
-  request for a target not on the list (SOCKS5 reply `0x02`). This is a
+The server is the single source of truth. It **pushes** the list to every client
+in the handshake response, so there is no client list to keep in sync:
+
+- **Client** — on connect it learns the server's list. When it is active the
+  client tunnels only matching targets and connects everything else **directly**
+  from its own network (split-tunneling). An empty list (the default) tunnels
+  everything.
+- **Server** — it also enforces the same list independently, **rejecting** any
+  tunnel request for a target not on it (SOCKS5 reply `0x02`). This is a
   defense-in-depth boundary against a misconfigured or untrusted client.
 
 Matching: domain entries are exact (`example.com`) or wildcard (`*.example.com`,
 which matches subdomains only — not the bare apex), case-insensitive; CIDR
 entries match IP targets and accept a bare IP as a single host. Domains are
 matched only against `whitelist_domains` and IPs only against `whitelist_cidrs`.
-
-Keep the client and server lists **in sync**: when the server whitelist is also
-active, a target whitelisted on the client but missing from the server's list is
-tunneled by the client and then rejected by the server. (If the server whitelist
-is inactive it allows every target, so the mismatch doesn't arise.)
 
 ### Roadmap
 

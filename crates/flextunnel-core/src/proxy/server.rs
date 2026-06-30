@@ -37,6 +37,10 @@ pub struct ProxyServer {
     /// on the list is rejected (defense in depth — the client should already
     /// have split it off; see [`Whitelist`]).
     whitelist: Whitelist,
+    /// Raw whitelist rules, pushed verbatim to clients in the handshake so they
+    /// learn the tunnel set from the server (the single source of truth).
+    whitelist_domains: Vec<String>,
+    whitelist_cidrs: Vec<String>,
 }
 
 impl ProxyServer {
@@ -44,11 +48,15 @@ impl ProxyServer {
         valid_tokens: HashSet<String>,
         host_aliases: HashMap<String, String>,
         whitelist: Whitelist,
+        whitelist_domains: Vec<String>,
+        whitelist_cidrs: Vec<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
             valid_tokens,
             host_aliases,
             whitelist,
+            whitelist_domains,
+            whitelist_cidrs,
         })
     }
 
@@ -107,7 +115,9 @@ impl ProxyServer {
 
         let accepted = self.valid_tokens.contains(&hello.auth_token);
         let response = if accepted {
-            HelloResponse::accepted()
+            // Push the server's whitelist so the client can split-tunnel without
+            // configuring its own list.
+            HelloResponse::accepted(self.whitelist_domains.clone(), self.whitelist_cidrs.clone())
         } else {
             log::warn!("Rejecting {remote_id}: invalid auth token");
             HelloResponse::rejected("Invalid authentication token")
