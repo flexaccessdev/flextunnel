@@ -148,7 +148,11 @@ impl ProxyClient {
             };
 
             // Serve until the connection drops, then reconnect (or exit).
-            if let Err(e) = self.serve(&connection, &whitelist, &listener).await {
+            let served = self.serve(&connection, &whitelist, &listener).await;
+            // The connection is no longer live; clear the FFI-visible flag now so
+            // it never lingers as connected through a backoff or a fatal exit.
+            self.set_connected(false);
+            if let Err(e) = served {
                 match self.handle_failure(e, ever_connected, &mut attempt) {
                     Ok(backoff) => {
                         tokio::time::sleep(backoff).await;
