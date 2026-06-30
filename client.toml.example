@@ -20,3 +20,14 @@ auth_token = "vXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 # dns_server = "https://dns.example"        # or "none"
 # auto_reconnect = true                      # default: true. set false to exit on first disconnect
 # max_reconnect_attempts = 10                # default: unlimited (omit for no cap)
+
+# Optional split-tunnel whitelist (the "tunnel set"). When either list below is
+# non-empty, only matching destinations are tunneled to the server and every
+# other target is connected directly from this machine. Both empty (the default)
+# tunnels everything. Domain entries are exact (`example.com`) or wildcard
+# (`*.example.com`, which matches subdomains only — not the bare apex). CIDR
+# entries match IP targets and accept a bare IP as a single host. Keep these in
+# sync with the server's whitelist, or whitelisted-here-but-not-there targets
+# will be tunneled and then rejected by the server.
+# whitelist_domains = ["*.example.com", "httpbin.org"]
+# whitelist_cidrs = ["10.0.0.0/8", "192.168.1.5"]

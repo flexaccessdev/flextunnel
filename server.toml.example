@@ -27,3 +27,18 @@ auth_tokens = ["vXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"]
 # [host_aliases]
 # "server.ezvpn" = "127.0.0.1"      # -> the server's own loopback
 # "node2.ezvpn"  = "192.168.1.50"   # -> another host on the server's network
+
+# Optional whitelist (the "tunnel set"). When either list below is non-empty the
+# server REJECTS any tunnel request whose target is not on the list (SOCKS5 reply
+# 0x02, "connection not allowed by ruleset"); both empty (the default) allows
+# every target. This is a defense-in-depth boundary: a well-behaved client only
+# ever tunnels whitelisted targets (and connects the rest directly), so keep this
+# in sync with the client's whitelist — a target whitelisted on the client but
+# not here will be tunneled by the client and then rejected.
+#
+# Domain entries are exact (`example.com`) or wildcard (`*.example.com`, which
+# matches subdomains only — not the bare apex), case-insensitive. CIDR entries
+# match IP targets and accept a bare IP as a single host. Domains are matched
+# only against `whitelist_domains` and IPs only against `whitelist_cidrs`.
+# whitelist_domains = ["*.example.com", "httpbin.org"]
+# whitelist_cidrs = ["10.0.0.0/8", "192.168.1.5"]

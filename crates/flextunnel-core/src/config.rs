@@ -39,6 +39,15 @@ pub struct ServerConfig {
     /// (e.g. `server.ezvpn` → `127.0.0.1`), which also dodges Firefox's refusal
     /// to proxy literal `localhost`/`127.0.0.1`.
     pub host_aliases: Option<HashMap<String, String>>,
+    /// Domains allowed to tunnel (the tunnel set). Exact (`example.com`) or
+    /// wildcard (`*.example.com`, subdomains only). When this and
+    /// `whitelist_cidrs` are both empty the server allows every target;
+    /// otherwise it rejects any tunnel request not on the list. Keep in sync
+    /// with the client's whitelist.
+    pub whitelist_domains: Option<Vec<String>>,
+    /// CIDRs / bare IPs allowed to tunnel (matched against IP targets). See
+    /// `whitelist_domains`.
+    pub whitelist_cidrs: Option<Vec<String>>,
 }
 
 /// Client config file schema. Every field is optional; CLI flags override these.
@@ -61,6 +70,15 @@ pub struct ClientConfig {
     pub auto_reconnect: Option<bool>,
     /// Cap on reconnect attempts between successful connections.
     pub max_reconnect_attempts: Option<NonZeroU32>,
+    /// Domains to tunnel (the tunnel set). Exact (`example.com`) or wildcard
+    /// (`*.example.com`, subdomains only). When this and `whitelist_cidrs` are
+    /// both empty everything is tunneled; otherwise off-list targets connect
+    /// directly from this device (split-tunneling). Keep in sync with the
+    /// server's whitelist.
+    pub whitelist_domains: Option<Vec<String>>,
+    /// CIDRs / bare IPs to tunnel (matched against IP targets). See
+    /// `whitelist_domains`.
+    pub whitelist_cidrs: Option<Vec<String>>,
 }
 
 /// Fully-resolved server settings (CLI > file > default), paths tilde-expanded.
@@ -73,6 +91,9 @@ pub struct ResolvedServer {
     pub dns_server: Option<String>,
     /// Server-side host aliases, keys lowercased for case-insensitive matching.
     pub host_aliases: HashMap<String, String>,
+    /// Raw whitelist entries (parsed into a `Whitelist` at startup).
+    pub whitelist_domains: Vec<String>,
+    pub whitelist_cidrs: Vec<String>,
 }
 
 /// Fully-resolved client settings (CLI > file > default), paths tilde-expanded.
@@ -85,6 +106,9 @@ pub struct ResolvedClient {
     pub dns_server: Option<String>,
     pub auto_reconnect: bool,
     pub max_reconnect_attempts: Option<NonZeroU32>,
+    /// Raw whitelist entries (parsed into a `Whitelist` at startup).
+    pub whitelist_domains: Vec<String>,
+    pub whitelist_cidrs: Vec<String>,
 }
 
 /// Default SOCKS5 listen address when neither CLI nor config sets one.
@@ -195,6 +219,11 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Resolved
             .into_iter()
             .map(|(k, v)| (k.to_ascii_lowercase(), v))
             .collect(),
+        whitelist_domains: cli
+            .whitelist_domains
+            .or(file.whitelist_domains)
+            .unwrap_or_default(),
+        whitelist_cidrs: cli.whitelist_cidrs.or(file.whitelist_cidrs).unwrap_or_default(),
     }
 }
 
@@ -221,6 +250,11 @@ pub fn resolve_client(cli: ClientConfig, file: Option<ClientConfig>) -> Resolved
         dns_server: cli.dns_server.or(file.dns_server),
         auto_reconnect: cli.auto_reconnect.or(file.auto_reconnect).unwrap_or(true),
         max_reconnect_attempts: cli.max_reconnect_attempts.or(file.max_reconnect_attempts),
+        whitelist_domains: cli
+            .whitelist_domains
+            .or(file.whitelist_domains)
+            .unwrap_or_default(),
+        whitelist_cidrs: cli.whitelist_cidrs.or(file.whitelist_cidrs).unwrap_or_default(),
     }
 }
 
@@ -296,6 +330,22 @@ mod tests {
         assert_eq!(r.host_aliases.get("server.ezvpn").map(String::as_str), Some("127.0.0.1"));
         assert_eq!(r.host_aliases.get("node2.ezvpn").map(String::as_str), Some("192.168.1.50"));
         assert!(!r.host_aliases.contains_key("Server.EzVPN"));
+    }
+
+    #[test]
+    fn whitelist_keys_parsed_and_resolved() {
+        let toml = r#"
+            whitelist_domains = ["*.example.com", "httpbin.org"]
+            whitelist_cidrs = ["10.0.0.0/8"]
+        "#;
+        let file: ServerConfig = toml::from_str(toml).unwrap();
+        let r = resolve_server(ServerConfig::default(), Some(file));
+        assert_eq!(r.whitelist_domains, vec!["*.example.com", "httpbin.org"]);
+        assert_eq!(r.whitelist_cidrs, vec!["10.0.0.0/8"]);
+        // Defaults to empty (inactive) when unset.
+        let empty = resolve_client(ClientConfig::default(), None);
+        assert!(empty.whitelist_domains.is_empty());
+        assert!(empty.whitelist_cidrs.is_empty());
     }
 
     #[test]

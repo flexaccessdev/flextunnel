@@ -12,10 +12,8 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
-use flextunnel_core::proxy::{ClientConfig, ProxyClient, ProxyServer};
-use flextunnel_core::transport::endpoint::{
-    create_client_endpoint, create_server_endpoint, load_secret, load_secret_from_string,
-};
+use flextunnel_core::proxy::{ClientConfig, ProxyClient, ProxyServer, Whitelist};
+use flextunnel_core::transport::endpoint::{create_client_endpoint, create_server_endpoint};
 use flextunnel_core::{auth, config, secret};
 
 #[derive(Parser)]
@@ -100,9 +98,15 @@ enum Command {
     },
     /// Show the server's public EndpointId derived from a private key.
     ShowServerId {
-        /// Path to the private key file.
+        /// Config file path (TOML). CLI flags override file values.
+        #[arg(short = 'c', long)]
+        config: Option<PathBuf>,
+        /// Load config from ~/.config/flextunnel/server.toml.
+        #[arg(long)]
+        default_config: bool,
+        /// Path to the private key file (overrides secret_file/secret in the config).
         #[arg(short, long)]
-        secret_file: PathBuf,
+        secret_file: Option<PathBuf>,
     },
     /// Generate client authentication token(s).
     GenerateAuthToken {
@@ -136,7 +140,23 @@ fn main() -> Result<()> {
 
     match args.command {
         Command::GenerateServerKey { output, force } => secret::generate_secret(output, force),
-        Command::ShowServerId { secret_file } => secret::show_id(secret_file),
+        Command::ShowServerId {
+            config,
+            default_config,
+            secret_file,
+        } => {
+            // Resolve the secret the same way the server does: an explicit
+            // --secret-file wins, otherwise fall back to secret_file/secret in
+            // the config file. Reuses `resolve_server` for the merge + tilde
+            // expansion; no async runtime needed for this path.
+            let cli = config::ServerConfig {
+                secret_file,
+                ..Default::default()
+            };
+            let file = config::load_server_config(config.as_deref(), default_config)?;
+            let r = config::resolve_server(cli, file);
+            secret::show_id(r.secret.as_deref(), r.secret_file.as_deref())
+        }
         Command::GenerateAuthToken { count } => {
             for _ in 0..count {
                 println!("{}", auth::generate_token());
@@ -167,6 +187,8 @@ async fn run_async(command: Command) -> Result<()> {
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
                 dns_server,
                 host_aliases: None, // config-file only; no CLI flag
+                whitelist_domains: None, // config-file only; no CLI flag
+                whitelist_cidrs: None,   // config-file only; no CLI flag
             };
             let file = config::load_server_config(config_path.as_deref(), default_config)?;
             run_server(config::resolve_server(cli, file)).await
@@ -204,6 +226,8 @@ async fn run_async(command: Command) -> Result<()> {
                 dns_server,
                 auto_reconnect,
                 max_reconnect_attempts,
+                whitelist_domains: None, // config-file only; no CLI flag
+                whitelist_cidrs: None,   // config-file only; no CLI flag
             };
             let file = config::load_client_config(config_path.as_deref(), default_config)?;
             run_client(config::resolve_client(cli, file)).await
@@ -225,16 +249,7 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
     }
     log::info!("Loaded {} authentication token(s)", valid_tokens.len());
 
-    let secret_key = match (r.secret.as_deref(), r.secret_file.as_deref()) {
-        (Some(_), Some(_)) => anyhow::bail!("Provide only one of secret or secret_file, not both"),
-        (Some(s), None) => load_secret_from_string(s).context("Invalid inline secret key")?,
-        (None, Some(path)) => load_secret(path).context("Failed to load secret key")?,
-        (None, None) => anyhow::bail!(
-            "The server requires a secret key.\n\
-             Generate one with: flextunnel generate-server-key -o <FILE>\n\
-             Then pass --secret-file <FILE> or set secret_file/secret in the config."
-        ),
-    };
+    let secret_key = secret::resolve_secret_key(r.secret.as_deref(), r.secret_file.as_deref())?;
 
     let endpoint = create_server_endpoint(&r.relay_urls, secret_key, r.dns_server.as_deref())
         .await
@@ -249,7 +264,16 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
     if !r.host_aliases.is_empty() {
         log::info!("Loaded {} host alias(es)", r.host_aliases.len());
     }
-    let server = ProxyServer::new(valid_tokens, r.host_aliases);
+    let whitelist = Whitelist::new(&r.whitelist_domains, &r.whitelist_cidrs)
+        .context("Invalid whitelist configuration")?;
+    if whitelist.is_active() {
+        log::info!(
+            "Whitelist active: {} domain rule(s), {} CIDR(s) — off-list tunnel requests are rejected",
+            r.whitelist_domains.len(),
+            r.whitelist_cidrs.len()
+        );
+    }
+    let server = ProxyServer::new(valid_tokens, r.host_aliases, whitelist);
     let run = async {
         server
             .run(&endpoint)
@@ -294,6 +318,16 @@ async fn run_client(r: config::ResolvedClient) -> Result<()> {
         );
     };
 
+    let whitelist = Whitelist::new(&r.whitelist_domains, &r.whitelist_cidrs)
+        .context("Invalid whitelist configuration")?;
+    if whitelist.is_active() {
+        log::info!(
+            "Whitelist active: {} domain rule(s), {} CIDR(s) — off-list targets connect directly",
+            r.whitelist_domains.len(),
+            r.whitelist_cidrs.len()
+        );
+    }
+
     let endpoint = create_client_endpoint(&r.relay_urls, r.dns_server.as_deref())
         .await
         .context("Failed to create iroh endpoint")?;
@@ -306,6 +340,7 @@ async fn run_client(r: config::ResolvedClient) -> Result<()> {
         relay_urls: r.relay_urls,
         auto_reconnect: r.auto_reconnect,
         max_reconnect_attempts: r.max_reconnect_attempts,
+        whitelist,
     });
 
     let run = async {

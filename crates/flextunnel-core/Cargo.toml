@@ -12,6 +12,7 @@ crate-type = ["rlib"]
 anyhow.workspace = true
 base64.workspace = true
 dirs.workspace = true
+ipnetwork.workspace = true
 iroh.workspace = true
 iroh-mdns-address-lookup.workspace = true
 log.workspace = true

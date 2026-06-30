@@ -25,8 +25,12 @@
 //!
 //! ## Config JSON (input to `flextunnel_start`)
 //!
-//! `auth_token` and `server_node_id` are required; `relay_urls` and `dns_server`
-//! are optional.
+//! `auth_token` and `server_node_id` are required; the rest are optional.
+//! `whitelist_domains`/`whitelist_cidrs` are the *tunnel set*: when either is
+//! non-empty, only matching destinations are tunneled and everything else
+//! connects directly from the device (split-tunneling). Domain entries are
+//! exact (`example.com`) or wildcard (`*.example.com`, subdomains only). Keep
+//! these in sync with the server's whitelist.
 //!
 //! ```json
 //! {
@@ -34,7 +38,9 @@
 //!   "auth_token": "<flextunnel auth token>",
 //!   "socks_port": 18080,
 //!   "relay_urls": ["https://relay.example/"],
-//!   "dns_server": null
+//!   "dns_server": null,
+//!   "whitelist_domains": ["*.example.com", "httpbin.org"],
+//!   "whitelist_cidrs": ["10.0.0.0/8"]
 //! }
 //! ```
 //!
@@ -53,7 +59,7 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 
 use flextunnel_core::error::ProxyResult;
-use flextunnel_core::proxy::{ClientConfig, ProxyClient};
+use flextunnel_core::proxy::{ClientConfig, ProxyClient, Whitelist};
 use flextunnel_core::transport::endpoint::create_client_endpoint;
 
 /// Loopback SOCKS5 port used when the config omits `socks_port`. Fixed (not an
@@ -88,6 +94,14 @@ struct FfiConfig {
     relay_urls: Vec<String>,
     #[serde(default)]
     dns_server: Option<String>,
+    /// Domains to tunnel (the tunnel set): exact (`example.com`) or wildcard
+    /// (`*.example.com`, subdomains only). Empty (with `whitelist_cidrs`) =
+    /// tunnel everything; otherwise off-list targets connect directly.
+    #[serde(default)]
+    whitelist_domains: Vec<String>,
+    /// CIDRs / bare IPs to tunnel (matched against IP targets).
+    #[serde(default)]
+    whitelist_cidrs: Vec<String>,
 }
 
 /// Initialize logging (stderr -> unified log / Console). Honors `RUST_LOG`,
@@ -185,6 +199,9 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
         .block_on(TcpListener::bind((Ipv4Addr::LOCALHOST, port)))
         .map_err(|e| format!("failed to bind 127.0.0.1:{port} (already in use?): {e}"))?;
 
+    let whitelist = Whitelist::new(&cfg.whitelist_domains, &cfg.whitelist_cidrs)
+        .map_err(|e| format!("invalid whitelist config: {e}"))?;
+
     let endpoint = runtime
         .block_on(create_client_endpoint(&cfg.relay_urls, cfg.dns_server.as_deref()))
         .map_err(|e| format!("failed to create iroh endpoint: {e}"))?;
@@ -197,6 +214,7 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
         relay_urls: cfg.relay_urls,
         auto_reconnect: true,
         max_reconnect_attempts: None,
+        whitelist,
     });
 
     // Clone the endpoint into the task; the original stays in the handle so
