@@ -10,7 +10,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
 use rand::Rng;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -59,13 +59,42 @@ fn calculate_backoff(attempt: u32) -> Duration {
     Duration::from_secs(secs) + Duration::from_millis(jitter)
 }
 
+/// Snapshot of what the tunnel currently forwards: the split-tunnel set the
+/// server pushed on the last successful handshake, plus whether a connection is
+/// live right now. Shared with the FFI so the app can display the routed
+/// domains/CIDRs. An empty set while `connected` is true means the server runs
+/// no whitelist and everything is tunneled.
+#[derive(Clone, Default)]
+pub struct TunnelRoutes {
+    pub connected: bool,
+    pub domains: Vec<String>,
+    pub cidrs: Vec<String>,
+}
+
 pub struct ProxyClient {
     config: ClientConfig,
+    routes: Arc<Mutex<TunnelRoutes>>,
 }
 
 impl ProxyClient {
     pub fn new(config: ClientConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            routes: Arc::new(Mutex::new(TunnelRoutes::default())),
+        }
+    }
+
+    /// Shared handle to the live tunnel set, for callers (the FFI) that want to
+    /// display what is routed. Refreshed on every (re)connect.
+    pub fn routes(&self) -> Arc<Mutex<TunnelRoutes>> {
+        self.routes.clone()
+    }
+
+    /// Flip the connected flag without disturbing the last-known route set.
+    fn set_connected(&self, connected: bool) {
+        if let Ok(mut routes) = self.routes.lock() {
+            routes.connected = connected;
+        }
     }
 
     /// Bind the local SOCKS5 listener once, then connect to the server and serve
@@ -99,6 +128,8 @@ impl ProxyClient {
         let mut ever_connected = false;
         let mut attempt: u32 = 0;
         loop {
+            // Until (re)authenticated, nothing is being forwarded.
+            self.set_connected(false);
             // Establish (connect + auth). The handshake also learns the server's
             // whitelist, which drives split-tunneling for this connection.
             let (connection, whitelist) = match self.establish(endpoint).await {
@@ -117,7 +148,11 @@ impl ProxyClient {
             };
 
             // Serve until the connection drops, then reconnect (or exit).
-            if let Err(e) = self.serve(&connection, &whitelist, &listener).await {
+            let served = self.serve(&connection, &whitelist, &listener).await;
+            // The connection is no longer live; clear the FFI-visible flag now so
+            // it never lingers as connected through a backoff or a fatal exit.
+            self.set_connected(false);
+            if let Err(e) = served {
                 match self.handle_failure(e, ever_connected, &mut attempt) {
                     Ok(backoff) => {
                         tokio::time::sleep(backoff).await;
@@ -270,6 +305,13 @@ impl ProxyClient {
             );
         } else {
             log::info!("Server whitelist inactive — tunneling everything");
+        }
+
+        // Publish the live tunnel set so the FFI/app can show what's forwarded.
+        if let Ok(mut routes) = self.routes.lock() {
+            routes.connected = true;
+            routes.domains = response.whitelist_domains.clone();
+            routes.cidrs = response.whitelist_cidrs.clone();
         }
         Ok(whitelist)
     }
