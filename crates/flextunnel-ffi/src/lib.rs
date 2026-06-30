@@ -280,8 +280,10 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
 /// start, once the handshake completes, so the caller should poll it.
 ///
 /// Returns `1` on success (full JSON written), `0` if `out_buf` was too small
-/// (retry with a larger buffer), and `-1` for a null handle. The buffer is
-/// always NUL-terminated when usable.
+/// (the JSON is truncated; retry with a larger buffer), and `-1` for a null
+/// handle or if the route snapshot could not be read (internal lock error).
+/// `out_buf` is always NUL-terminated when usable (non-null, `out_len > 0`):
+/// the error returns write an empty string.
 ///
 /// # Safety
 /// `handle` must be a valid pointer returned by [`flextunnel_start`] and not yet
@@ -294,6 +296,7 @@ pub unsafe extern "C" fn flextunnel_routes(
     out_len: usize,
 ) -> c_int {
     if handle.is_null() {
+        write_cstr(out_buf, out_len, "");
         return -1;
     }
     let handle = unsafe { &*handle };
@@ -304,7 +307,10 @@ pub unsafe extern "C" fn flextunnel_routes(
             "cidrs": routes.cidrs,
         })
         .to_string(),
-        Err(_) => return -1,
+        Err(_) => {
+            write_cstr(out_buf, out_len, "");
+            return -1;
+        }
     };
     if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
 }

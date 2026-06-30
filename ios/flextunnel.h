@@ -79,8 +79,10 @@ int flextunnel_health(const FlextunnelHandle *handle);
  * whitelist and everything is tunneled. The set becomes available shortly after
  * start once the handshake completes, so poll it.
  *
- * Returns 1 on success, 0 if out_buf was too small (retry larger), and -1 for a
- * NULL handle. Always NUL-terminated when out_buf is usable.
+ * Returns 1 on success (full JSON written), 0 if out_buf was too small (the JSON
+ * is truncated; retry larger), and -1 for a NULL handle or if the route snapshot
+ * could not be read. out_buf is always NUL-terminated when usable (non-NULL,
+ * out_len > 0): the error returns write an empty string.
  */
 int flextunnel_routes(const FlextunnelHandle *handle, char *out_buf, size_t out_len);
 
