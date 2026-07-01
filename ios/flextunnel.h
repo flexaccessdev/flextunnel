@@ -1,8 +1,8 @@
 /*
- * flextunnel.h — C interface to libflextunnel.a for the iOS app.
+ * flextunnel.h — C interface to libflextunnel.xcframework for the iOS app.
  *
- * Build the static library with ./build-ios.sh (produces
- * dist/ios/libflextunnel.a alongside a copy of this header).
+ * Build the static library slices with ./build-ios.sh (produces
+ * dist/ios/libflextunnel.xcframework alongside a copy of this header).
  *
  * Unlike a VPN, there is no Network Extension and no utun fd: flextunnel runs a
  * SOCKS5 listener entirely inside the app process. Point a WKWebView at it via
@@ -73,11 +73,11 @@ int flextunnel_health(const FlextunnelHandle *handle);
 /*
  * Snapshot the tunnel's current forwarding set as JSON into out_buf:
  *   {"connected":true,"domains":["*.example.com"],"cidrs":["10.0.0.0/8"]}
- * This is the split-tunnel set the server pushes during the handshake — the
- * domains/CIDRs routed through the tunnel (off-list targets connect directly).
- * An empty domains+cidrs while connected==true means the server runs no
- * routed set and everything is tunneled. The set becomes available shortly after
- * start once the handshake completes, so poll it.
+ * This is the required split-tunnel set the server pushes during the handshake
+ * — the domains/CIDRs routed through the tunnel (off-list targets connect
+ * directly). Before the first successful handshake, connected is false and the
+ * lists are empty. The set becomes available shortly after start once the
+ * handshake completes, so poll it.
  *
  * Returns 1 on success (full JSON written), 0 if out_buf was too small (the JSON
  * is truncated; retry larger), and -1 for a NULL handle or if the route snapshot

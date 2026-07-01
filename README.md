@@ -59,12 +59,14 @@ All payload is end-to-end encrypted by QUIC/TLS 1.3.
 
 ## Install
 
-Prebuilt binaries are published on the
+Prebuilt release assets are published on the
 [GitHub Releases](https://github.com/andrewtheguy/flextunnel/releases) page.
-Stable releases include Linux amd64/arm64, macOS arm64, and Windows amd64;
-automated prereleases currently include Linux amd64/arm64 and macOS arm64. The
-install scripts download the latest release, verify its SHA-256 checksum, and
-install to a per-user location (`~/.local/bin` on Linux/macOS,
+Stable releases include `flextunnel` and `flextunnel-agent` for Linux
+amd64/arm64, macOS arm64, and Windows amd64, plus the iOS xcframework asset.
+Automated prereleases currently include Linux amd64/arm64, macOS arm64, and the
+iOS xcframework, but skip Windows. The install scripts download the latest
+`flextunnel` binary, verify its SHA-256 checksum, and install to a per-user
+location (`~/.local/bin` on Linux/macOS,
 `%LOCALAPPDATA%\Programs\flextunnel` on Windows) — **no admin required**.
 
 **Linux / macOS:**
@@ -90,10 +92,15 @@ published to `ghcr.io/andrewtheguy/flextunnel`.
 ```sh
 cargo build --release
 # binary: target/release/flextunnel
+
+cargo build --release -p flextunnel-agent
+# binary: target/release/flextunnel-agent
 ```
 
-Requires a recent Rust toolchain (edition 2024). To cross-build static Linux
-binaries for amd64 + arm64 via Docker, use `./build-linux.sh`.
+Requires a recent Rust toolchain (edition 2024). A bare `cargo build --release`
+uses the workspace's default members and builds the main CLI, not the agent or
+iOS static library. To cross-build static Linux binaries for amd64 + arm64 via
+Docker, use `./build-linux.sh`.
 
 ## Quick start
 
@@ -170,6 +177,7 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `--agent-auth-tokens-file <FILE>` | File of accepted agent tokens, one per line. |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). |
 | `--dns-server <URL>` | Custom discovery DNS server, or `none` to disable. |
+| `--blocklist-file <FILE>` | Duplicate-id blocklist path (default `~/.config/flextunnel/blocklist.json`). |
 
 ### `client`
 
@@ -197,9 +205,11 @@ flextunnel client --default-config   # ~/.config/flextunnel/client.toml
 ```
 
 Precedence is **CLI flag > config file > built-in default**, so you can keep a
-file and override individual settings on the command line. Unknown/misspelled
-keys are rejected (`deny_unknown_fields`) rather than silently ignored. Paths
-support `~` expansion.
+file and override settings on the command line. Credential groups are replaced
+as a unit: for example, if the CLI supplies either `--auth-token` or
+`--auth-token-file`, the config file's client token fields are ignored. Unknown
+or misspelled keys are rejected (`deny_unknown_fields`) rather than silently
+ignored. Paths support `~` expansion.
 
 See [`server.toml.example`](server.toml.example) and
 [`client.toml.example`](client.toml.example) for the full set of keys. A minimal

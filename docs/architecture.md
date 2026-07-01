@@ -39,9 +39,9 @@ TCP connection.
 | `blocklist.rs` | persisted duplicate-id blocklist (JSON): confirmed duplicate client ids, duplicate agent machine ids, + the server's own conflicted id |
 | `secret.rs` | server secret-key (iroh identity) generation and loading; prints the `EndpointId` |
 | `error.rs` | `ProxyError` (`Network`/`Config`/`Signaling`/`AuthenticationFailed`/`ConnectionLost`) + `is_recoverable()` |
-| `transport/mod.rs` | QUIC transport config (keep-alive, idle timeout, initial MTU) |
+| `transport/mod.rs` | QUIC transport config, ALPN, heartbeat/liveness timing |
 | `transport/endpoint.rs` | iroh `Endpoint` creation (relay mode, DNS discovery), secret/relay helpers |
-| `proxy/signaling.rs` | fixed `ALPN` constant, length-prefixed `Hello`/`HelloResponse`, per-stream `Target` codec, `REP_*` codes |
+| `proxy/signaling.rs` | length-prefixed `Hello`/`HelloResponse`, control frames, per-stream `Target` codec, `REP_*` codes |
 | `proxy/socks5.rs` | client-side RFC 1928: method negotiation + `CONNECT` parsing + replies |
 | `proxy/client.rs` | connect + auth + SOCKS5 listener + reconnect loop |
 | `proxy/server.rs` | accept + auth + per-stream DNS/connect/pipe; agent registry + reverse routing |
@@ -63,15 +63,18 @@ secret: both peers must offer the same ALPN or negotiation fails. Access control
 is enforced by the auth handshake below, not by the ALPN.
 
 ### 2. Auth handshake (control stream)
-The protocol version is `PROTOCOL_VERSION = 3`. On the first bi-stream the client
-sends `Hello { version, auth_token, client_instance_nonce, duplicate_server_observed }`
+The protocol version is `PROTOCOL_VERSION = 4`. On the first bi-stream the
+connecting peer sends
+`Hello { version, auth_token, client_instance_nonce, duplicate_server_observed, role, machine_id }`
 and the server replies
 `HelloResponse { version, accepted, reject_reason, server_instance_nonce, routed_* }`,
 both length-prefixed JSON via `signaling::write_message` / `read_message` (4-byte
 big-endian length + payload, capped at `MAX_HANDSHAKE_SIZE` = 64 KiB). The server
-checks the token against its accepted set (`auth::load_auth_tokens`). On rejection
-it closes the connection gracefully (with a short drain) carrying the reason.
-`Hello`'s `Debug` impl redacts `auth_token`.
+checks the token against the role's accepted set (`ftc` client tokens or `fta`
+agent tokens). Clients send `role = Client` with no machine id; agents send
+`role = Agent` plus their stable machine id. On rejection it closes the
+connection gracefully (with a short drain) carrying the reason. `Hello`'s
+`Debug` impl redacts `auth_token`.
 
 The `*_instance_nonce` fields are random per-process ids (distinct from the iroh
 node id) that drive duplicate-id detection (see below); `duplicate_server_observed`
@@ -121,12 +124,13 @@ After the handshake the control bi-stream stays open. The client sends a
 `ControlMsg::Heartbeat { seq }` every `HEARTBEAT_INTERVAL` (10s) and the server
 replies `HeartbeatAck { seq }`, framed with the same length-prefixed helpers
 (capped at `MAX_CONTROL_MSG_SIZE`). This is an app-level liveness signal *on top
-of* QUIC keep-alive: it lets each side notice a dead peer within `LIVENESS_WINDOW`
-(30s) rather than only at the 30s QUIC idle timeout, and — on the server — it
-refreshes the per-client connection registry used for duplicate detection (below).
-A missing heartbeat surfaces as a recoverable `ConnectionLost`, so the client's
-normal reconnect path applies. The heartbeat runs concurrently with the SOCKS5
-stream loop via `tokio::select!` on both sides.
+of* QUIC keep-alive: it lets each side notice a dead peer within
+`LIVENESS_WINDOW` (33s: three heartbeat intervals plus 3s grace), with the 30s
+QUIC idle timeout still acting as the backstop for a silent peer. On the server,
+heartbeats also refresh the per-client connection registry used for duplicate
+detection (below). A missing heartbeat surfaces as a recoverable
+`ConnectionLost`, so the client's normal reconnect path applies. The heartbeat
+runs concurrently with the SOCKS5 stream loop via `tokio::select!` on both sides.
 
 ## Duplicate-id detection
 
@@ -246,16 +250,16 @@ defenses.
 | `QUIC_IDLE_TIMEOUT` | 30s | `transport/mod.rs` |
 | `QUIC_INITIAL_MTU` | 1452 | `transport/mod.rs` |
 | `HEARTBEAT_INTERVAL` | 10s | `transport/mod.rs` |
-| `LIVENESS_WINDOW` | 30s | `transport/mod.rs` |
+| `LIVENESS_WINDOW` | 33s | `transport/mod.rs` |
 | `RELAY_CONNECT_TIMEOUT` (`endpoint.online()`) | 10s | `transport/endpoint.rs` |
-| `HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs`, `proxy/server.rs` |
-| `CONNECT_TIMEOUT` (server dial) | 10s | `proxy/server.rs` |
+| `HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs`, `proxy/server.rs`, `proxy/agent.rs` |
+| `CONNECT_TIMEOUT` (server/agent dial) | 10s | `proxy/dial.rs` |
 | reconnect backoff | 1s → 60s + ≤500ms jitter | `proxy/client.rs` |
 | `MAX_HANDSHAKE_SIZE` | 64 KiB | `proxy/signaling.rs` |
 | `MAX_CONTROL_MSG_SIZE` | 1 KiB | `proxy/signaling.rs` |
-| `PROTOCOL_VERSION` | 3 | `proxy/signaling.rs` |
+| `PROTOCOL_VERSION` | 4 | `proxy/signaling.rs` |
 | auth token length | 49 chars | `auth.rs` |
-| `ALPN` | `flextunnel/1` | `proxy/signaling.rs` |
+| `ALPN` | `flextunnel/1` | `transport/mod.rs` |
 
 ## Relation to ezvpn
 

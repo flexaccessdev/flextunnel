@@ -1,7 +1,7 @@
 //! C FFI surface for the iOS app (`aarch64-apple-ios`).
 //!
-//! The app links `libflextunnel.a` and drives the in-process SOCKS5 proxy with
-//! two calls:
+//! The app links `libflextunnel.xcframework` (containing `libflextunnel.a`
+//! slices) and drives the in-process SOCKS5 proxy primarily with these calls:
 //!
 //! 1. [`flextunnel_start`] — parse the JSON config, create an iroh endpoint,
 //!    bind a loopback SOCKS5 listener on a **fixed** port, and spawn the
@@ -11,7 +11,8 @@
 //!    instance may run at a time (a process-global guard rejects a second).
 //! 2. [`flextunnel_health`] — cheap liveness probe: is the serve loop still
 //!    running, or did it give up (bad node id / auth / unreachable server)?
-//! 3. [`flextunnel_stop`] — abort the loop, close the endpoint, free the handle.
+//! 3. [`flextunnel_routes`] — snapshot the server-pushed split-tunnel set for UI.
+//! 4. [`flextunnel_stop`] — abort the loop, close the endpoint, free the handle.
 //!
 //! Unlike the ezvpn FFI there is **no VPN / Network Extension and no `utun` fd**:
 //! flextunnel is pure-userspace SOCKS5-over-QUIC, so the listener runs entirely
@@ -273,11 +274,11 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
 /// { "connected": true, "domains": ["*.example.com"], "cidrs": ["10.0.0.0/8"] }
 /// ```
 ///
-/// This is the split-tunnel set the server pushes during the handshake — the
-/// domains/CIDRs routed through the tunnel (off-list targets connect directly).
-/// An empty `domains`+`cidrs` while `connected` is true means the server runs no
-/// routed set and everything is tunneled. The set becomes available shortly after
-/// start, once the handshake completes, so the caller should poll it.
+/// This is the required split-tunnel set the server pushes during the handshake
+/// — the domains/CIDRs routed through the tunnel (off-list targets connect
+/// directly). Before the first successful handshake, `connected` is false and
+/// the lists are empty. The set becomes available shortly after start, once the
+/// handshake completes, so the caller should poll it.
 ///
 /// Returns `1` on success (full JSON written), `0` if `out_buf` was too small
 /// (the JSON is truncated; retry with a larger buffer), and `-1` for a null
