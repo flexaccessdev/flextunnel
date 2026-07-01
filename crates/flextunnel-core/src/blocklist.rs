@@ -10,11 +10,12 @@
 //!   client ids are ephemeral (a fresh key per process), such an id never
 //!   recurs, so these entries are mostly an **audit record**; they are still
 //!   rejected up-front if seen again.
-//! * **`blocked_agents`** — machine ids (`/etc/machine-id`) the server saw as a
-//!   *confirmed duplicate agent* (two concurrent connections presenting the same
-//!   machine id — e.g. a cloned VM image). Unlike client ids a machine id is
-//!   **stable**, so a listed id keeps being rejected up-front until the operator
-//!   fixes the duplicate `/etc/machine-id` and clears the entry.
+//! * **`blocked_agents`** — agent **network ids** (`ftm1…`, the hashed machine
+//!   id — see [`crate::machine_id`]) the server saw as a *confirmed duplicate
+//!   agent* (two concurrent connections presenting the same network id — e.g. a
+//!   cloned VM image whose underlying machine id was never regenerated). Unlike
+//!   client ids it is **stable**, so a listed id keeps being rejected up-front
+//!   until the operator fixes the duplicate machine id and clears the entry.
 //! * **`conflicted_server_ids`** — the server's *own* `EndpointId` when it
 //!   detects it is a duplicate of another server sharing its secret key. On the
 //!   next launch the server refuses to start if its id is listed here, forcing an

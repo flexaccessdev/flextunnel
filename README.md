@@ -267,19 +267,19 @@ connection, and the server pushes streams back over it. Reverse routing is
 **loopback-only** in v1.
 
 The agent is a **separate binary** (`flextunnel-agent`, for Linux, macOS, and
-Windows) and identifies itself by its stable, OS-native **machine id**
-(`/etc/machine-id` on Linux, `IOPlatformUUID` on macOS, `MachineGuid` on Windows —
-no elevation needed). Its iroh node id is ephemeral, so there is no key file to
-manage. Only one agent runs per machine (enforced by a file lock). It
-authenticates with its **own** token pool (prefix `fta`, separate from client
-`ftc` tokens).
+Windows) and identifies itself by a stable **network id** (`ftm1…`) — a one-way
+hash, with a version prefix, of its OS-native machine id (`/etc/machine-id` on
+Linux, `IOPlatformUUID` on macOS, `MachineGuid` on Windows; no elevation needed).
+The raw machine id never leaves the host; only the network id is sent. Its iroh
+node id is ephemeral, so there is no key file to manage. Only one agent runs per
+machine (enforced by a file lock). It authenticates with its **own** token pool
+(prefix `fta`, separate from client `ftc` tokens).
 
 ```sh
-# On the server host: generate an agent token and reserve the agent's machine id.
-flextunnel-agent generate-token          # -> fta…   (add to agent_auth_tokens)
-# (get the agent's id on the agent host: `cat /etc/machine-id` (Linux),
-#  `ioreg -rd1 -c IOPlatformExpertDevice | grep IOPlatformUUID` (macOS), or
-#  reg query HKLM\SOFTWARE\Microsoft\Cryptography /v MachineGuid (Windows))
+# On the agent host: get this agent's network id to reserve on the server.
+flextunnel-agent machine-id              # -> shows the raw id + derived ftm1… id
+# On the server host: generate an agent token (add to agent_auth_tokens).
+flextunnel-agent generate-token          # -> fta…
 ```
 
 ```toml
@@ -288,7 +288,7 @@ agent_auth_tokens = ["fta…"]
 routed_domains    = ["web.ezvpn", "*.example.com"]   # the alias must be on the routed set
 
 [agent_routes]
-"web.ezvpn" = { machine_id = "<agent /etc/machine-id>" }
+"web.ezvpn" = { machine_id = "ftm1…" }   # from `flextunnel-agent machine-id`
 ```
 
 ```sh
@@ -297,8 +297,8 @@ flextunnel-agent run --server-node-id <server id> --auth-token fta…
 # then from a client: curl -x socks5h://127.0.0.1:1080 http://web.ezvpn:8000/
 ```
 
-A second agent presenting the **same** machine id (e.g. a cloned VM image whose
-`/etc/machine-id` was never regenerated) is rejected and the machine id is recorded
+A second agent presenting the **same** network id (e.g. a cloned VM image whose
+machine id was never regenerated) is rejected and the network id is recorded
 in the blocklist — fix the duplicate id and clear the entry to recover. See
 [`agent.toml.example`](agent.toml.example).
 

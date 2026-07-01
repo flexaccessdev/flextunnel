@@ -16,6 +16,7 @@ pub mod blocklist;
 pub mod config;
 pub mod error;
 pub mod lock;
+pub mod machine_id;
 pub mod proxy;
 pub mod secret;
 pub mod transport;

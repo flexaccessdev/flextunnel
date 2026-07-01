@@ -28,8 +28,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct AgentConfig {
     /// Server's iroh EndpointId (as a string) — the agent still dials the server.
     pub server_node_id: String,
-    /// This agent's stable machine id (`/etc/machine-id`), sent in the handshake
-    /// and used by the server to identify and route to this agent.
+    /// This agent's **derived network id** (`ftm1…`, a one-way hash of the raw OS
+    /// machine id — see [`crate::machine_id`]), sent in the handshake and used by
+    /// the server to identify and route to this agent. The raw id is never sent.
     pub machine_id: String,
     /// Authentication token sent in the connection handshake (an `fta` token).
     pub auth_token: String,

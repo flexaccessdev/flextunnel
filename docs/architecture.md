@@ -45,14 +45,17 @@ TCP connection.
 | `proxy/socks5.rs` | client-side RFC 1928: method negotiation + `CONNECT` parsing + replies |
 | `proxy/client.rs` | connect + auth + SOCKS5 listener + reconnect loop |
 | `proxy/server.rs` | accept + auth + per-stream DNS/connect/pipe; agent registry + reverse routing |
-| `proxy/agent.rs` | reverse-routing exit point: dial + auth (`role=Agent`, machine id) + accept server-opened streams + dial loopback |
+| `proxy/agent.rs` | reverse-routing exit point: dial + auth (`role=Agent`, derived network id) + accept server-opened streams + dial loopback |
 | `proxy/dial.rs` | `Target` → TCP dial + `connect_and_pipe` (the shared server/agent exit-point body) |
 
 The reverse-routing agent ships as a **separate binary crate** (`flextunnel-agent`,
 Linux/macOS/Windows, not in the module map above): it reads the OS-native machine
 id (via the `machine-uid` crate — `/etc/machine-id`, `IOPlatformUUID`, or
-`MachineGuid`), holds a single-instance file lock, and drives
-`proxy::agent::ProxyAgent` over an ephemeral `create_client_endpoint`.
+`MachineGuid`), derives a one-way, versioned **network id** from it
+(`machine_id::network_machine_id` → `ftm1…`) so the raw id never leaves the host,
+holds a single-instance file lock, and drives `proxy::agent::ProxyAgent` over an
+ephemeral `create_client_endpoint`. `flextunnel-agent machine-id` prints the raw
+id and its derived network id locally.
 
 ## Connection lifecycle
 
@@ -63,7 +66,7 @@ secret: both peers must offer the same ALPN or negotiation fails. Access control
 is enforced by the auth handshake below, not by the ALPN.
 
 ### 2. Auth handshake (control stream)
-The protocol version is `PROTOCOL_VERSION = 4`. On the first bi-stream the
+The protocol version is `PROTOCOL_VERSION = 5`. On the first bi-stream the
 connecting peer sends
 `Hello { version, auth_token, client_instance_nonce, duplicate_server_observed, role, machine_id }`
 and the server replies
@@ -72,7 +75,8 @@ both length-prefixed JSON via `signaling::write_message` / `read_message` (4-byt
 big-endian length + payload, capped at `MAX_HANDSHAKE_SIZE` = 64 KiB). The server
 checks the token against the role's accepted set (`ftc` client tokens or `fta`
 agent tokens). Clients send `role = Client` with no machine id; agents send
-`role = Agent` plus their stable machine id. On rejection it closes the
+`role = Agent` plus their derived network id (`ftm1…`, the hashed machine id — the
+raw id never goes on the wire). On rejection it closes the
 connection gracefully (with a short drain) carrying the reason. `Hello`'s
 `Debug` impl redacts `auth_token`.
 
@@ -152,17 +156,18 @@ a blocklisted node id is rejected up-front. Because ephemeral ids never recur,
 the persisted client entry is largely an audit record.
 
 **Duplicate agent (server-side).** An agent's iroh id is ephemeral and irrelevant
-to its identity — it is identified by its stable, OS-native **machine id**
-(`/etc/machine-id` on Linux, `IOPlatformUUID` on macOS, `MachineGuid` on Windows).
-A single-instance file lock in the `flextunnel-agent` binary already guarantees one
-agent *process* per machine, so the server needs no nonce/liveness machinery: it
-tracks the one active connection per machine id, and a *second concurrent*
-connection presenting the same id is necessarily a **different machine** (e.g. a
-cloned VM image whose `/etc/machine-id` was never regenerated). On that collision
-the server tears both down and records the machine id in the blocklist
-(`blocked_agents`). Because a machine id is stable (unlike an ephemeral client id),
-that block keeps rejecting the id until the operator fixes the duplicate and clears
-the entry. A benign reconnect is not a collision: its prior connection is already
+to its identity — it is identified by its stable **network id** (`ftm1…`), a
+one-way, versioned hash of its OS-native machine id (`/etc/machine-id` on Linux,
+`IOPlatformUUID` on macOS, `MachineGuid` on Windows) that the agent derives so the
+raw id never reaches the server. A single-instance file lock in the
+`flextunnel-agent` binary already guarantees one agent *process* per machine, so
+the server needs no nonce/liveness machinery: it tracks the one active connection
+per network id, and a *second concurrent* connection presenting the same id is
+necessarily a **different machine** (e.g. a cloned VM image whose machine id was
+never regenerated). On that collision the server tears both down and records the
+network id in the blocklist (`blocked_agents`). Because the network id is stable
+(unlike an ephemeral client id), that block keeps rejecting the id until the
+operator fixes the duplicate and clears the entry. A benign reconnect is not a collision: its prior connection is already
 gone (the reconnect backoff outlasts QUIC dead-connection detection), so it
 registers fresh.
 

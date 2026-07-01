@@ -79,14 +79,16 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 
 # Optional reverse-routing reservations. Unlike [host_aliases] (which resolve to a
 # host on the SERVER's network), an [agent_routes] alias resolves to a connected
-# AGENT — a `flextunnel-agent` process, identified by its stable machine id
-# (`/etc/machine-id`). When a client requests the alias, the server forwards the
-# stream over the agent's live connection and the agent dials `127.0.0.1:<requested
-# port>` on ITS OWN machine (reverse routing is loopback-only in v1). This lets a
-# client reach a service behind NAT that the server cannot dial directly.
+# AGENT — a `flextunnel-agent` process, identified by its derived network id
+# (`ftm1…`, a one-way hash of the agent's machine id). When a client requests the
+# alias, the server forwards the stream over the agent's live connection and the
+# agent dials `127.0.0.1:<requested port>` on ITS OWN machine (reverse routing is
+# loopback-only in v1). This lets a client reach a service behind NAT that the
+# server cannot dial directly.
 #
+# Get the network id by running `flextunnel-agent machine-id` on the agent host.
 # Checked BEFORE [host_aliases]; a name should appear in only one. When a routed
 # set is active (it always is), add the alias name to routed_domains above too —
 # filtering happens on the requested hostname first.
 # [agent_routes]
-# "web.ezvpn" = { machine_id = "<agent /etc/machine-id>" }
+# "web.ezvpn" = { machine_id = "ftm1…" }   # from `flextunnel-agent machine-id`

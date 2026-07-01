@@ -2,16 +2,18 @@
 //!
 //! A reverse-routing exit point for flextunnel (Linux, macOS, and Windows).
 //! Unlike the client it runs no local SOCKS5 listener: it dials the server with
-//! an **ephemeral** iroh identity, identifies itself by its stable **machine id**,
+//! an **ephemeral** iroh identity, identifies itself by a stable **network id**,
 //! and accepts the streams the server opens back to it, connecting each to
 //! `127.0.0.1` on this machine (reverse routing is loopback-only in v1).
 //!
-//! The machine id is the OS-native per-install identifier (via the `machine-uid`
-//! crate): `/etc/machine-id` on Linux, `IOPlatformUUID` on macOS, and
-//! `MachineGuid` on Windows — no elevation required. The operator reserves this
-//! agent's machine id in the server's `[agent_routes]` and gives it an agent auth
-//! token (`fta` prefix, `flextunnel-agent generate-token`). Only one agent runs
-//! per machine, enforced by a file lock.
+//! The network id is a one-way hash (with a version prefix, `ftm1…`) of the
+//! OS-native machine id (via the `machine-uid` crate: `/etc/machine-id` on Linux,
+//! `IOPlatformUUID` on macOS, `MachineGuid` on Windows — no elevation required).
+//! The raw machine id never leaves the host; only the derived network id is sent.
+//! Run `flextunnel-agent machine-id` to see the raw id and its derived network id,
+//! then reserve the network id in the server's `[agent_routes]`. The operator also
+//! gives the agent an auth token (`fta` prefix, `flextunnel-agent generate-token`).
+//! Only one agent runs per machine, enforced by a file lock.
 
 mod lock;
 
@@ -74,6 +76,9 @@ enum Command {
         #[arg(short, long, default_value = "1")]
         count: usize,
     },
+    /// Show this host's raw machine id and the derived network id (`ftm1…`) to
+    /// reserve in the server's [agent_routes]. Nothing is sent anywhere.
+    MachineId,
 }
 
 fn log_version() {
@@ -91,6 +96,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::MachineId => show_machine_id(),
         command => app::build_runtime()?.block_on(run_async(command)),
     }
 }
@@ -129,7 +135,9 @@ async fn run_async(command: Command) -> Result<()> {
             let file = config::load_agent_config(config_path.as_deref(), default_config)?;
             run_agent(config::resolve_agent(cli, file)).await
         }
-        Command::GenerateToken { .. } => unreachable!("handled synchronously in main()"),
+        Command::GenerateToken { .. } | Command::MachineId => {
+            unreachable!("handled synchronously in main()")
+        }
     }
 }
 
@@ -138,10 +146,13 @@ async fn run_agent(r: config::ResolvedAgent) -> Result<()> {
     // for the whole run; released automatically on exit/crash.
     let _lock = lock::acquire()?;
 
-    // The agent's identity is its stable machine id (its iroh node id is
-    // ephemeral). This is what the server routes to and reserves in [agent_routes].
-    let machine_id = read_machine_id()?;
-    log::info!("Agent machine id: {machine_id}");
+    // The agent's identity is the derived network id (a one-way hash of the raw OS
+    // machine id — the raw id never leaves the host). Its iroh node id is
+    // ephemeral. This is what the server routes to and reserves in [agent_routes].
+    let raw_machine_id = read_machine_id()?;
+    let machine_id = flextunnel_core::machine_id::network_machine_id(&raw_machine_id);
+    log::debug!("Local machine id: {raw_machine_id}");
+    log::info!("Agent network id: {machine_id}");
 
     let server_node_id = r.server_node_id.context(
         "The agent requires a server node id (--server-node-id or server_node_id in the config).",
@@ -216,4 +227,26 @@ fn read_machine_id() -> Result<String> {
         anyhow::bail!("The OS returned an empty machine id");
     }
     Ok(id)
+}
+
+/// Print the raw machine id and its derived network id, plus how the network id
+/// is derived — so an operator can obtain the value to reserve in the server's
+/// `[agent_routes]` without the raw id ever leaving this host. Nothing is sent.
+fn show_machine_id() -> Result<()> {
+    let raw = read_machine_id()?;
+    let network_id = flextunnel_core::machine_id::network_machine_id(&raw);
+    println!("Local machine id : {raw}");
+    println!(
+        "  source         : /etc/machine-id (Linux) · IOPlatformUUID (macOS) · MachineGuid (Windows)"
+    );
+    println!();
+    println!("Network id       : {network_id}");
+    println!(
+        "  reserve this value in the server's [agent_routes]; the raw id above never leaves this host"
+    );
+    println!(
+        "  derivation     : \"ftm\" + version({}) + base64url(SHA-256(\"flextunnel-agent-machine-id\\0\" + local machine id)[..16])",
+        flextunnel_core::machine_id::NETWORK_ID_VERSION
+    );
+    Ok(())
 }

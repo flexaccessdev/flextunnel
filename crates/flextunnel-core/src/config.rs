@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRoute {
-    /// The agent's stable machine id (`/etc/machine-id`), as a string.
+    /// The agent's derived **network id** (`ftm1…`) — a one-way hash of its raw
+    /// OS machine id, matched as an opaque string. Get it by running
+    /// `flextunnel-agent machine-id` on the agent host. See [`crate::machine_id`].
     pub machine_id: String,
 }
 
@@ -47,11 +49,11 @@ pub struct ServerConfig {
     /// File of accepted agent auth tokens (one per line).
     pub agent_auth_tokens_file: Option<PathBuf>,
     /// Reverse-routing reservations: an alias resolved to a connected **agent**
-    /// (by machine id) instead of to a host on the server's own network. A
-    /// requested hostname matching a key is forwarded over the agent's live
-    /// connection; the agent dials `127.0.0.1` on its own network, keeping the
-    /// requested port. Checked *before* `host_aliases`; a name should appear in
-    /// only one. See [`AgentRoute`].
+    /// (by its derived network id) instead of to a host on the server's own
+    /// network. A requested hostname matching a key is forwarded over the agent's
+    /// live connection; the agent dials `127.0.0.1` on its own network, keeping
+    /// the requested port. Checked *before* `host_aliases`; a name should appear
+    /// in only one. See [`AgentRoute`].
     pub agent_routes: Option<HashMap<String, AgentRoute>>,
     /// Custom relay URL(s) for failover.
     pub relay_urls: Option<Vec<String>>,

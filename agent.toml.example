@@ -8,11 +8,13 @@
 # opens back to it and connects each to `127.0.0.1` on THIS machine. This lets
 # clients reach a service behind NAT that the server cannot dial directly.
 #
-# The agent is identified by its stable, OS-native machine id (`/etc/machine-id`
-# on Linux, IOPlatformUUID on macOS, MachineGuid on Windows) — its iroh node id
-# is ephemeral, so there is no key file to manage. Reserve this machine's
-# id in the server's [agent_routes] to make it reachable. Only one agent runs per
-# machine (enforced by a file lock).
+# The agent is identified by its derived network id (`ftm1…`, a one-way hash of
+# the OS-native machine id — `/etc/machine-id` on Linux, IOPlatformUUID on macOS,
+# MachineGuid on Windows). The raw machine id never leaves this host; only the
+# network id is sent. Its iroh node id is ephemeral, so there is no key file to
+# manage. Run `flextunnel-agent machine-id` to print the network id, then reserve
+# it in the server's [agent_routes] to make this agent reachable. Only one agent
+# runs per machine (enforced by a file lock).
 
 # EndpointId of the server to connect to.
 server_node_id = "<server endpoint id>"

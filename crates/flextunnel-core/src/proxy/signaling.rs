@@ -15,7 +15,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// flextunnel protocol version.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Maximum auth-handshake message size (64 KiB). The server's routed set rides
 /// the `HelloResponse`, so this is generous enough for a large operator list.
@@ -85,9 +85,11 @@ pub struct Hello {
     /// pool the token is checked against.
     #[serde(default)]
     pub role: PeerRole,
-    /// The agent's stable machine id (`/etc/machine-id`), sent only by agents
-    /// (`role == Agent`). It is how the server identifies and routes to an agent
-    /// whose iroh node id is ephemeral. `None` for clients.
+    /// The agent's **derived network id** (`ftm1…`, see [`crate::machine_id`]),
+    /// sent only by agents (`role == Agent`). It is a one-way hash of the agent's
+    /// raw OS machine id — the raw id never travels on the wire. It is how the
+    /// server identifies and routes to an agent whose iroh node id is ephemeral.
+    /// `None` for clients.
     #[serde(default)]
     pub machine_id: Option<String>,
 }
