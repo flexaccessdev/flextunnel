@@ -302,6 +302,16 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
         }
     }
 
+    // Fixed at the default (~/.config/flextunnel/blocklist.json) and NOT
+    // overridable via CLI or config: the blocklist is a security guard rail, and
+    // letting it be pointed elsewhere would let it be bypassed. Fail fast if the
+    // home dir can't be determined rather than silently falling back to a
+    // cwd-relative path a later run from another directory wouldn't share.
+    let blocklist_file = crate::blocklist::default_blocklist_path().context(
+        "Could not determine the home directory for the duplicate-id blocklist \
+         (~/.config/flextunnel/blocklist.json); set HOME",
+    )?;
+
     Ok(ResolvedServer {
         secret_file: secret_file.map(|p| expand_tilde(&p)),
         secret,
@@ -318,12 +328,7 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
             .or(file.routed_domains)
             .unwrap_or_default(),
         routed_cidrs: cli.routed_cidrs.or(file.routed_cidrs).unwrap_or_default(),
-        // Fixed at the default (~/.config/flextunnel/blocklist.json) and NOT
-        // overridable via CLI or config: the blocklist is a security guard rail,
-        // and letting it be pointed elsewhere would let it be bypassed. Fall back
-        // to a cwd-relative name only if the home dir can't be determined.
-        blocklist_file: crate::blocklist::default_blocklist_path()
-            .unwrap_or_else(|| PathBuf::from("blocklist.json")),
+        blocklist_file,
     })
 }
 

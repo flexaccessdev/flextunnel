@@ -270,8 +270,10 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
 /// ```
 ///
 /// This is the required split-tunnel set the server pushes during the handshake
-/// — the domains/CIDRs routed through the tunnel (off-list targets connect
-/// directly). Before the first successful handshake, `connected` is false and
+/// — the domains/CIDRs routed through the tunnel. The caller owns the split:
+/// off-list targets must bypass the proxy and be connected directly from the
+/// caller side, because the server rejects any off-list target sent through the
+/// SOCKS proxy. Before the first successful handshake, `connected` is false and
 /// the lists are empty. The set becomes available shortly after start, once the
 /// handshake completes, so the caller should poll it.
 ///

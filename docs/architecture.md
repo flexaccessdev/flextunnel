@@ -124,9 +124,11 @@ After the handshake the control bi-stream stays open. The client sends a
 `ControlMsg::Heartbeat { seq }` every `HEARTBEAT_INTERVAL` (10s) and the server
 replies `HeartbeatAck { seq }`, framed with the same length-prefixed helpers
 (capped at `MAX_CONTROL_MSG_SIZE`). This is an app-level liveness signal *on top
-of* QUIC keep-alive: it lets each side notice a dead peer within
-`LIVENESS_WINDOW` (33s: three heartbeat intervals plus 3s grace), with the 30s
-QUIC idle timeout still acting as the backstop for a silent peer. On the server,
+of* QUIC keep-alive: it catches an *application-level* stall — a peer still
+answering QUIC keep-alive at the transport level but no longer sending
+heartbeats — within `LIVENESS_WINDOW` (33s: three heartbeat intervals plus 3s
+grace). A fully silent peer is caught sooner by the 30s QUIC idle timeout, which
+fires first. On the server,
 heartbeats also refresh the per-client connection registry used for duplicate
 detection (below). A missing heartbeat surfaces as a recoverable
 `ConnectionLost`, so the client's normal reconnect path applies. The heartbeat
