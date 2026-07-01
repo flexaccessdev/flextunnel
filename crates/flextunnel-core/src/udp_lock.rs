@@ -13,9 +13,10 @@
 //! `SO_REUSEPORT`, so a second bind to the same `127.0.0.1:PORT` reliably fails
 //! with [`io::ErrorKind::AddrInUse`] on all three platforms.
 //!
-//! Callers must bind IPv4 `127.0.0.1` (never `0.0.0.0` or `::`) to keep the guard
-//! strictly machine-local. Core owns the mechanics; the caller picks the port,
-//! mirroring how [`crate::lock::InstanceLock`] takes a path.
+//! The guard always binds IPv4 `127.0.0.1` (never `0.0.0.0` or `::`) so it stays
+//! strictly machine-local — enforced by the API, which takes only a port. Core
+//! owns the mechanics; the caller supplies the port, mirroring how
+//! [`crate::lock::InstanceLock`] takes a path.
 //!
 //! Unlike the file lock, this leaves no artifact recording the holder's PID. To
 //! find which process holds the port, query the OS socket table:
@@ -28,7 +29,7 @@
 
 use anyhow::{Context, Result};
 use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 
 /// Holds a UDP socket bound to a loopback address for the lifetime of the
 /// process. The single-instance guarantee *is* the exclusive bind; the port is
@@ -39,10 +40,13 @@ pub struct UdpInstanceLock {
 }
 
 impl UdpInstanceLock {
-    /// Acquire the singleton by exclusively binding `addr` (a loopback address).
-    /// Returns `contended_msg` if the port is already bound (another instance is
-    /// running), or the underlying error with context otherwise.
-    pub fn acquire(addr: SocketAddr, contended_msg: &str) -> Result<Self> {
+    /// Acquire the singleton by exclusively binding `127.0.0.1:port`. The
+    /// loopback address is fixed by this function (never `0.0.0.0`/`::`) so the
+    /// guard is always strictly machine-local. Returns `contended_msg` if the
+    /// port is already bound (another instance is running), or the underlying
+    /// error with context otherwise.
+    pub fn acquire(port: u16, contended_msg: &str) -> Result<Self> {
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
         match UdpSocket::bind(addr) {
             Ok(socket) => {
                 log::debug!("Acquired UDP single-instance lock on {addr}");
@@ -63,28 +67,26 @@ impl UdpInstanceLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddrV4};
 
-    /// While the port is held, a second bind to the same address must be rejected;
+    /// While the port is held, a second bind to the same port must be rejected;
     /// after the first guard is dropped, binding succeeds again.
     #[test]
     fn second_bind_rejected_then_succeeds_after_drop() {
         // Port 0 => the OS assigns a free ephemeral port, unique per run, so
         // concurrent `cargo test` processes never collide on a fixed number.
-        let ephemeral = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
-        let first = UdpInstanceLock::acquire(ephemeral, "held").expect("first acquire");
+        let first = UdpInstanceLock::acquire(0, "held").expect("first acquire");
 
         // Re-target the actual assigned port for the contention check.
-        let addr = first.local_addr().expect("local_addr");
+        let port = first.local_addr().expect("local_addr").port();
         assert!(
-            UdpInstanceLock::acquire(addr, "held").is_err(),
+            UdpInstanceLock::acquire(port, "held").is_err(),
             "a second bind must fail while the port is held"
         );
 
         drop(first);
         // UDP has no TIME_WAIT: the port is immediately re-bindable.
         assert!(
-            UdpInstanceLock::acquire(addr, "held").is_ok(),
+            UdpInstanceLock::acquire(port, "held").is_ok(),
             "bind should succeed after the guard is released"
         );
     }

@@ -15,7 +15,6 @@
 
 use anyhow::Result;
 use flextunnel_core::udp_lock::UdpInstanceLock;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 /// Fixed loopback UDP port for the machine-wide agent singleton. Arbitrary but
 /// fixed, chosen in the private/dynamic range (49152-65535).
@@ -26,9 +25,8 @@ pub const AGENT_SINGLETON_PORT: u16 = 59274;
 /// released automatically on exit or crash. Fails if another agent already holds
 /// the port.
 pub fn acquire() -> Result<UdpInstanceLock> {
-    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, AGENT_SINGLETON_PORT));
     UdpInstanceLock::acquire(
-        addr,
+        AGENT_SINGLETON_PORT,
         "Another flextunnel-agent is already running. Only one agent per machine is allowed.",
     )
 }
