@@ -143,7 +143,6 @@ jobs:
 
   build-ios:
     needs: setup
-    if: needs.setup.outputs.is_prerelease == 'false'
     runs-on: macos-latest
 
     steps:

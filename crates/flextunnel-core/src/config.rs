@@ -39,13 +39,14 @@ pub struct ServerConfig {
     /// (e.g. `server.ezvpn` → `127.0.0.1`), which also dodges Firefox's refusal
     /// to proxy literal `localhost`/`127.0.0.1`.
     pub host_aliases: Option<HashMap<String, String>>,
-    /// Domains allowed to tunnel (the tunnel set). Exact (`example.com`) or
-    /// wildcard (`*.example.com`, subdomains only). When this and
-    /// `whitelist_cidrs` are both empty the server allows every target;
-    /// otherwise it rejects any tunnel request not on the list. Keep in sync
-    /// with the client's whitelist.
+    /// Domains routed through the tunnel (the tunnel set). Exact (`example.com`),
+    /// wildcard (`*.example.com`, subdomains only), or `*` to match every host
+    /// (full tunnel). The tunnel set is required — a server with an empty set
+    /// refuses to start. Off-list targets are rejected server-side and
+    /// direct-connected client-side. Keep in sync with `whitelist_cidrs`.
     pub whitelist_domains: Option<Vec<String>>,
-    /// CIDRs / bare IPs allowed to tunnel (matched against IP targets). See
+    /// CIDRs / bare IPs routed through the tunnel (matched against IP targets).
+    /// A default route (`0.0.0.0/0` / `::/0`) matches every IP. See
     /// `whitelist_domains`.
     pub whitelist_cidrs: Option<Vec<String>>,
     /// Path to the persistent duplicate-id blocklist (JSON). Defaults to
