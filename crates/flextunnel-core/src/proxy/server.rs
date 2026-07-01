@@ -92,9 +92,9 @@ pub struct ProxyServer {
     /// Host aliases (lowercased keys) rewritten before connecting; see
     /// [`apply_alias`].
     host_aliases: HashMap<String, String>,
-    /// Destinations routed through the tunnel. When active, a request for a
-    /// target not on the set is rejected (defense in depth — the client should
-    /// already have split it off; see [`RoutedSet`]).
+    /// Destinations routed through the tunnel, enforced here as a whitelist: a
+    /// request for a target not on the set is rejected (defense in depth — the
+    /// client should already have split it off; see [`RoutedSet`]).
     routed_set: RoutedSet,
     /// Raw routed-set rules, pushed verbatim to clients in the handshake so they
     /// learn the tunnel set from the server (the single source of truth).
@@ -516,13 +516,14 @@ async fn handle_socks_stream(
 ) -> io::Result<()> {
     let requested = signaling::read_request(&mut recv).await?;
 
-    // Enforce the tunnel set on the requested target (before aliasing), as a
-    // defense-in-depth boundary: a well-behaved client only tunnels on-list
-    // targets, so a request for anything off-list means a misconfigured or
-    // untrusted client. Reject with the SOCKS5 "not allowed by ruleset" code.
+    // Enforce the routed set as a whitelist on the requested target (before
+    // aliasing), as a defense-in-depth boundary: a well-behaved client only
+    // tunnels on-list targets, so a request for anything off-list means a
+    // misconfigured or untrusted client. Reject with the SOCKS5 "not allowed by
+    // ruleset" code.
     if !routed_set.allows(&requested) {
-        log::warn!("Tunnel request rejected: target not in routed set");
-        log::debug!("Rejected {requested:?}: not in routed set");
+        log::warn!("Tunnel request rejected by routed-set whitelist");
+        log::debug!("Rejected {requested:?}: not in routed-set whitelist");
         signaling::write_reply(&mut send, signaling::REP_NOT_ALLOWED).await?;
         send.flush().await?;
         return Ok(());

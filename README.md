@@ -267,9 +267,11 @@ in the handshake response, so there is no client list to keep in sync:
   targets keep connecting even while the tunnel is down; an on-list target during
   a drop/backoff gets a SOCKS5 network-unreachable reply (`0x03`) rather than
   hanging.
-- **Server** — it also enforces the same list independently, **rejecting** any
-  tunnel request for a target not on it (SOCKS5 reply `0x02`). This is a
-  defense-in-depth boundary against a misconfigured or untrusted client.
+- **Server** — it also enforces the same list independently as a **whitelist**,
+  **rejecting** any tunnel request for a target not on it (SOCKS5 reply `0x02`).
+  This is a defense-in-depth boundary against a misconfigured or untrusted
+  client. (Note the asymmetry: the client falls back to a direct connection for
+  off-list targets, whereas the server rejects them outright.)
 
 Matching: domain entries are exact (`example.com`), wildcard (`*.example.com`,
 which matches subdomains only — not the bare apex), or `*` (matches every

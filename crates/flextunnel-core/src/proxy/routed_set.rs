@@ -4,9 +4,9 @@
 //! the QUIC tunnel. The client uses it to decide per-connection whether to
 //! tunnel a target or connect directly from the device (split-tunneling);
 //! targets not on the set are **not** rejected client-side, they fall back to a
-//! direct connection. The server uses the same rules to reject any tunnel
-//! request for a target that is not on the set (defense in depth). For both
-//! roles the lists should be kept in sync.
+//! direct connection. The server, by contrast, enforces the same rules as a
+//! **whitelist**: it rejects any tunnel request for a target that is not on the
+//! set (defense in depth). For both roles the lists should be kept in sync.
 //!
 //! Two independent lists are matched against the requested [`Target`]. A
 //! *hostname* is matched only against domain rules and an *IP* only against CIDR

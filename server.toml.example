@@ -27,10 +27,12 @@ auth_tokens = ["vXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"]
 # Routed set (the "tunnel set") — REQUIRED. This is a VPN-style split-tunnel
 # "included routes" list and the single source of truth: it is pushed to every
 # client during the handshake (clients tunnel on-list targets and direct-connect
-# off-list ones) AND enforced here as defense-in-depth — the server REJECTS any
-# tunnel request whose target is not on the list (SOCKS5 reply 0x02, "connection
-# not allowed by ruleset"). The server refuses to start with an empty tunnel set.
-# Clients configure no routed set of their own.
+# off-list ones) AND enforced here as a defense-in-depth whitelist — the server
+# REJECTS any tunnel request whose target is not on the list (SOCKS5 reply 0x02,
+# "connection not allowed by ruleset"). Note the asymmetry: clients fall back to
+# a direct connection for off-list targets, whereas the server rejects them
+# outright. The server refuses to start with an empty tunnel set. Clients
+# configure no routed set of their own.
 #
 # Domain entries are exact (`example.com`), wildcard (`*.example.com`, subdomains
 # only — not the bare apex), or `*` to match every hostname; case-insensitive.
