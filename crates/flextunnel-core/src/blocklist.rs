@@ -21,6 +21,7 @@
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One blocklist entry: an identity plus why/when it was recorded.
@@ -141,16 +142,37 @@ impl BlockList {
 
 /// Atomically write `json` to `path`: create parent dirs, write a sibling temp
 /// file, then `rename` it into place so a reader never sees a partial file.
+///
+/// The temp file name is **unique per writer** (pid + a process-local counter),
+/// so two writers racing on the same `path` — concurrent tasks, or two server
+/// processes sharing one blocklist file — never write the same temp file and so
+/// can't corrupt each other's snapshot. Because `rename` is atomic, the final
+/// file is always a complete, valid snapshot from one of the writers (a
+/// simultaneous write from a second process can still be a last-writer-wins lost
+/// update, but never a torn/corrupt file). Callers that need writes ordered
+/// within a process should hold their in-memory lock across this call.
 pub fn write_atomic(path: &Path, json: &str) -> io::Result<()> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Sibling temp in the same directory so the rename is atomic (same filesystem).
+    // Sibling temp in the same directory so the rename is atomic (same
+    // filesystem), with a unique suffix so concurrent writers don't collide.
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.{seq}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, path)
+
+    if let Err(e) = std::fs::write(&tmp, json) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -186,6 +208,53 @@ mod tests {
         assert!(reloaded.is_client_blocked("client-node-id"));
         assert!(reloaded.is_server_conflicted("server-endpoint-id"));
         assert!(!reloaded.is_client_blocked("other"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn concurrent_writes_never_corrupt() {
+        let path = tmp_path("concurrent");
+        let _ = std::fs::remove_file(&path);
+
+        // Two distinct valid snapshots; each writer writes a whole snapshot.
+        let mut a = BlockList::load(tmp_path("ca")).unwrap();
+        a.add_blocked_client("aaaaaaaa", "a");
+        let json_a = a.to_json().unwrap();
+        let mut b = BlockList::load(tmp_path("cb")).unwrap();
+        b.add_conflicted_server("bbbbbbbb", "b");
+        let json_b = b.to_json().unwrap();
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let p = path.clone();
+                let json = if i % 2 == 0 { json_a.clone() } else { json_b.clone() };
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        write_atomic(&p, &json).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Whatever the last writer was, the file must be a complete, valid
+        // snapshot (never a torn/corrupt one) that reloads cleanly.
+        let reloaded = BlockList::load(path.clone()).unwrap();
+        let ok = reloaded.is_client_blocked("aaaaaaaa") || reloaded.is_server_conflicted("bbbbbbbb");
+        assert!(ok, "reloaded blocklist should be one of the valid snapshots");
+
+        // No orphan temp files should be left in the directory.
+        let dir = path.parent().unwrap();
+        let leftover: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("flextunnel-blocklist-test-concurrent") && n.contains(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "orphan temp files left: {leftover:?}");
 
         let _ = std::fs::remove_file(&path);
     }

@@ -177,22 +177,10 @@ impl ProxyServer {
     /// Record this server's own id as conflicted (duplicate server detected),
     /// persist the blocklist, and trip the shutdown so [`run`](Self::run) exits.
     fn self_block(&self, reason: &str) {
-        let to_write = {
+        {
             let mut bl = self.blocklist.lock().expect("blocklist lock");
             if bl.add_conflicted_server(&self.own_id.to_string(), reason) {
-                Some((bl.path().to_path_buf(), bl.to_json()))
-            } else {
-                None
-            }
-        };
-        if let Some((path, json)) = to_write {
-            match json {
-                Ok(json) => {
-                    if let Err(e) = blocklist::write_atomic(&path, &json) {
-                        log::error!("Failed to persist self-block to {}: {e}", path.display());
-                    }
-                }
-                Err(e) => log::error!("Failed to serialize blocklist for self-block: {e}"),
+                persist_blocklist(&bl);
             }
         }
         log::error!("Duplicate server id detected: {reason}");
@@ -201,23 +189,9 @@ impl ProxyServer {
 
     /// Record a confirmed duplicate client id and persist the blocklist.
     fn block_client(&self, id: &EndpointId, reason: &str) {
-        let to_write = {
-            let mut bl = self.blocklist.lock().expect("blocklist lock");
-            if bl.add_blocked_client(&id.to_string(), reason) {
-                Some((bl.path().to_path_buf(), bl.to_json()))
-            } else {
-                None
-            }
-        };
-        if let Some((path, json)) = to_write {
-            match json {
-                Ok(json) => {
-                    if let Err(e) = blocklist::write_atomic(&path, &json) {
-                        log::error!("Failed to persist client block to {}: {e}", path.display());
-                    }
-                }
-                Err(e) => log::error!("Failed to serialize blocklist for client block: {e}"),
-            }
+        let mut bl = self.blocklist.lock().expect("blocklist lock");
+        if bl.add_blocked_client(&id.to_string(), reason) {
+            persist_blocklist(&bl);
         }
     }
 
@@ -466,6 +440,22 @@ async fn server_heartbeat_loop(
             // The server does not expect acks; ignore anything unexpected.
             ControlMsg::HeartbeatAck { .. } => {}
         }
+    }
+}
+
+/// Serialize + atomically persist the blocklist. Call this **while holding the
+/// blocklist lock** so writes are serialized within the process (no reordering
+/// or lost updates between concurrent detections); `write_atomic` additionally
+/// uses a unique temp file so it is safe against a second process writing the
+/// same path.
+fn persist_blocklist(bl: &BlockList) {
+    match bl.to_json() {
+        Ok(json) => {
+            if let Err(e) = blocklist::write_atomic(bl.path(), &json) {
+                log::error!("Failed to persist blocklist to {}: {e}", bl.path().display());
+            }
+        }
+        Err(e) => log::error!("Failed to serialize blocklist: {e}"),
     }
 }
 
