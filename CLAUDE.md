@@ -1,4 +1,4 @@
 - strict no backward compatibility
 - run cargo clippy and test after rust code changes
 - no cargo fmt
-- after rust changes that affect iOS (flextunnel-core or flextunnel-ffi, including the FFI config schema and `ios/flextunnel.h`), run `./build-ios.sh release` to rebuild `libflextunnel.xcframework` and sync it + the header into `../flextunnel-ios/vendor/`. The Xcode app links the vendored static lib, so it keeps running the old code until this is rebuilt (then clean-rebuild the app in Xcode).
+- after rust changes that affect iOS (flextunnel-core or flextunnel-ffi, including the FFI config schema and `ios/flextunnel.h`), run `./build-ios.sh release` to rebuild `libflextunnel.xcframework` and sync it + the header into `../flextunnel-ios/vendor/`. The Xcode app links the vendored static lib, so it keeps running the old code until this is rebuilt (then clean-rebuild the app in Xcode). This is an **extra step only needed when actively working on the iOS app side by side** (and only possible on macOS with Xcode + the iOS Rust targets); otherwise just skip it.
