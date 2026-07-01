@@ -456,8 +456,15 @@ async fn server_heartbeat_loop(
                 signaling::write_message(&mut send, &signaling::encode_control(&ack)?).await?;
                 send.flush().await?;
             }
-            // The server does not expect acks; ignore anything unexpected.
-            ControlMsg::HeartbeatAck { .. } => {}
+            // A client only ever sends heartbeats; the server is the sole sender
+            // of acks. Receiving one means a broken/mismatched peer — reject it as
+            // a protocol error so it can't hold the connection open (resetting the
+            // read timeout) without refreshing registry liveness.
+            other @ ControlMsg::HeartbeatAck { .. } => {
+                return Err(ProxyError::ConnectionLost(format!(
+                    "unexpected control message from client: {other:?}"
+                )));
+            }
         }
     }
 }
