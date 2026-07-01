@@ -20,3 +20,4 @@ pub mod machine_id;
 pub mod proxy;
 pub mod secret;
 pub mod transport;
+pub mod udp_lock;

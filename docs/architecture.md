@@ -53,17 +53,15 @@ Linux/macOS/Windows, not in the module map above): it reads the OS-native machin
 id (via the `machine-uid` crate — `/etc/machine-id`, `IOPlatformUUID`, or
 `MachineGuid`), derives a one-way, versioned **network id** from it
 (`machine_id::network_machine_id` → `ftm1…`) so the raw id never leaves the host,
-holds a single-instance file lock, and drives `proxy::agent::ProxyAgent` over an
-ephemeral `create_client_endpoint`. `flextunnel-agent machine-id` prints the raw
-id and its derived network id locally.
+holds a machine-wide single-instance lock, and drives `proxy::agent::ProxyAgent`
+over an ephemeral `create_client_endpoint`. `flextunnel-agent machine-id` prints
+the raw id and its derived network id locally.
 
-As a machine-global daemon (one per machine), `flextunnel-agent run` uses
-root-owned global paths and must run as root on Unix: config at
-`/etc/flextunnel/agent.toml` and the single-instance lock at
-`/var/run/flextunnel-agent.lock` (Windows uses `%ProgramData%\flextunnel`). This
-contrasts with the per-user server, whose config and lock live under
-`~/.config/flextunnel/`. Root is enforced implicitly — a non-root run fails to
-open the global paths, so there is no separate privilege check.
+The agent's one-per-machine guarantee is a **loopback-UDP singleton**
+(`udp_lock::UdpInstanceLock`): it exclusively binds a fixed `127.0.0.1` UDP port,
+which is machine-wide by nature and needs no filesystem and no root, working
+identically on Linux/macOS/Windows. This contrasts with the per-user server,
+whose single-instance guarantee is a file lock under `~/.config/flextunnel/`.
 
 ## Connection lifecycle
 

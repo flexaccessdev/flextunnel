@@ -189,34 +189,12 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// Per-user default config path for a role file (e.g.
-/// `~/.config/flextunnel/server.toml`). Used by the per-user server and client.
+/// Default config path for a role file (e.g. `~/.config/flextunnel/server.toml`).
 ///
 /// Always uses `~/.config` (not the platform config dir) to match tunnel-rs,
 /// so the same location works across Linux and macOS.
 fn default_config_path(file_name: &str) -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".config").join("flextunnel").join(file_name))
-}
-
-/// Machine-global default config path for the agent — a root-run, per-machine
-/// daemon whose state must not be tied to any one user's home dir:
-/// `/etc/flextunnel/agent.toml` on Unix, `%ProgramData%\flextunnel\agent.toml`
-/// on Windows. `None` on other systems.
-fn agent_global_config_path(file_name: &str) -> Option<PathBuf> {
-    #[cfg(unix)]
-    {
-        Some(PathBuf::from("/etc/flextunnel").join(file_name))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var_os("ProgramData")
-            .map(|p| PathBuf::from(p).join("flextunnel").join(file_name))
-    }
-    #[cfg(not(any(unix, target_os = "windows")))]
-    {
-        let _ = file_name;
-        None
-    }
 }
 
 /// Read and parse a TOML config file, with the path in any error.
@@ -227,18 +205,17 @@ fn load_config<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
         .with_context(|| format!("Failed to parse config file: {}", path.display()))
 }
 
-/// Resolve the config file to load, if any: an explicit `path`, else the location
-/// computed by `default_path` when `default_config` is set, else `None`. Each role
-/// supplies its own `default_path` closure (per-user home dir vs machine-global).
+/// Resolve the config file to load, if any: an explicit `path`, else the default
+/// location when `default_config` is set, else `None`.
 fn resolve_config_path(
     path: Option<&Path>,
     default_config: bool,
-    default_path: impl FnOnce() -> Option<PathBuf>,
+    default_name: &str,
 ) -> Result<Option<PathBuf>> {
     if let Some(p) = path {
         Ok(Some(expand_tilde(p)))
     } else if default_config {
-        Ok(Some(default_path().context(
+        Ok(Some(default_config_path(default_name).context(
             "Could not determine the default config directory; pass -c <FILE> instead",
         )?))
     } else {
@@ -248,7 +225,7 @@ fn resolve_config_path(
 
 /// Load the server config file (explicit path or `--default-config`), or `None`.
 pub fn load_server_config(path: Option<&Path>, default_config: bool) -> Result<Option<ServerConfig>> {
-    match resolve_config_path(path, default_config, || default_config_path("server.toml"))? {
+    match resolve_config_path(path, default_config, "server.toml")? {
         Some(p) => Ok(Some(load_config(&p)?)),
         None => Ok(None),
     }
@@ -256,18 +233,15 @@ pub fn load_server_config(path: Option<&Path>, default_config: bool) -> Result<O
 
 /// Load the client config file (explicit path or `--default-config`), or `None`.
 pub fn load_client_config(path: Option<&Path>, default_config: bool) -> Result<Option<ClientConfig>> {
-    match resolve_config_path(path, default_config, || default_config_path("client.toml"))? {
+    match resolve_config_path(path, default_config, "client.toml")? {
         Some(p) => Ok(Some(load_config(&p)?)),
         None => Ok(None),
     }
 }
 
 /// Load the agent config file (explicit path or `--default-config`), or `None`.
-///
-/// The agent is a machine-global, root-run daemon, so its default config lives at
-/// a machine-global path (`/etc/flextunnel/agent.toml`), not in a user's home dir.
 pub fn load_agent_config(path: Option<&Path>, default_config: bool) -> Result<Option<AgentConfig>> {
-    match resolve_config_path(path, default_config, || agent_global_config_path("agent.toml"))? {
+    match resolve_config_path(path, default_config, "agent.toml")? {
         Some(p) => Ok(Some(load_config(&p)?)),
         None => Ok(None),
     }

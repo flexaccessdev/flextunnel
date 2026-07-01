@@ -65,12 +65,9 @@ Stable releases include `flextunnel` and `flextunnel-agent` for Linux
 amd64/arm64, macOS arm64, and Windows amd64, plus the iOS xcframework asset.
 Automated prereleases currently include Linux amd64/arm64, macOS arm64, and the
 iOS xcframework, but skip Windows. The install scripts download the latest
-binary and verify its SHA-256 checksum. The `flextunnel` (server / client)
-installer installs to a per-user location
+binary, verify its SHA-256 checksum, and install to a per-user location
 (`~/.local/bin` on Linux/macOS, `%LOCALAPPDATA%\Programs\flextunnel` on Windows)
-— **no admin required**. The `flextunnel-agent` installer installs to
-`/usr/local/bin` on Linux/macOS (using `sudo` when needed, since the agent runs
-as root on Unix).
+— **no admin required**.
 
 **`flextunnel` (server / client) — Linux / macOS:**
 
@@ -275,16 +272,9 @@ hash, with a version prefix, of its OS-native machine id (`/etc/machine-id` on
 Linux, `IOPlatformUUID` on macOS, `MachineGuid` on Windows; no elevation needed).
 The raw machine id never leaves the host; only the network id is sent. Its iroh
 node id is ephemeral, so there is no key file to manage. Only one agent runs per
-machine (enforced by a file lock). It authenticates with its **own** token pool
+machine (enforced by a machine-wide loopback-UDP singleton lock, so no elevated
+privileges are needed). It authenticates with its **own** token pool
 (prefix `fta`, separate from client `ftc` tokens).
-
-Because the agent is a **machine-global daemon** (one per machine, keyed by the
-machine id), `flextunnel-agent run` must run as **root** on Unix: its default
-config lives at `/etc/flextunnel/agent.toml` and its single-instance lock at
-`/var/run/flextunnel-agent.lock` (both root-owned); on Windows it uses
-`%ProgramData%\flextunnel`. There is no privilege check in the code — a non-root
-run simply fails to open those global paths. (`machine-id` and `generate-token`
-touch no global state and run unprivileged.)
 
 ```sh
 # On the agent host: get this agent's network id to reserve on the server.
@@ -303,8 +293,8 @@ routed_domains    = ["web.homelab", "*.example.com"]   # the alias must be on th
 ```
 
 ```sh
-# On the agent host (Linux/macOS/Windows). Run as root on Unix (machine-global daemon):
-sudo flextunnel-agent run --server-node-id <server id> --auth-token fta…
+# On the agent host (Linux/macOS/Windows):
+flextunnel-agent run --server-node-id <server id> --auth-token fta…
 # then from a client: curl -x socks5h://127.0.0.1:1080 http://web.homelab:8000/
 ```
 

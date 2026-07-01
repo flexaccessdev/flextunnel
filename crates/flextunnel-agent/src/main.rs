@@ -13,15 +13,8 @@
 //! Run `flextunnel-agent machine-id` to see the raw id and its derived network id,
 //! then reserve the network id in the server's `[agent_routes]`. The operator also
 //! gives the agent an auth token (`fta` prefix, `flextunnel-agent generate-token`).
-//! Only one agent runs per machine, enforced by a file lock.
-//!
-//! The agent is a machine-global daemon and `flextunnel-agent run` must run as
-//! **root** on Unix: its default config lives at `/etc/flextunnel/agent.toml` and
-//! its single-instance lock at `/var/run/flextunnel-agent.lock` (both root-owned),
-//! and on Windows it uses `%ProgramData%\flextunnel`. There is no explicit
-//! privilege check — a non-root run simply fails to open those global paths. The
-//! `machine-id` and `generate-token` subcommands touch no global state and run
-//! unprivileged.
+//! Only one agent runs per machine, enforced by a machine-wide loopback-UDP
+//! singleton lock — so `flextunnel-agent run` needs no elevated privileges.
 
 mod lock;
 
@@ -50,9 +43,7 @@ enum Command {
         /// Config file path (TOML). CLI flags override file values.
         #[arg(short = 'c', long)]
         config: Option<PathBuf>,
-        /// Load config from the machine-global path (/etc/flextunnel/agent.toml on
-        /// Unix, %ProgramData%\flextunnel\agent.toml on Windows). On Unix this
-        /// requires running as root.
+        /// Load config from ~/.config/flextunnel/agent.toml.
         #[arg(long)]
         default_config: bool,
         /// EndpointId of the server to connect to.
