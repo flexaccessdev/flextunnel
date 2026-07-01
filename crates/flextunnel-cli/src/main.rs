@@ -12,6 +12,8 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
+mod lock;
+
 use flextunnel_core::blocklist::BlockList;
 use flextunnel_core::proxy::{ClientConfig, ProxyClient, ProxyServer, RoutedSet};
 use flextunnel_core::transport::endpoint::{
@@ -249,6 +251,10 @@ async fn run_async(command: Command) -> Result<()> {
 }
 
 async fn run_server(r: config::ResolvedServer) -> Result<()> {
+    // Enforce one server per user before doing any work. Held for the process
+    // lifetime; released automatically on exit or crash.
+    let _lock = lock::acquire()?;
+
     let valid_tokens = auth::load_auth_tokens(
         &r.auth_tokens,
         r.auth_tokens_file.as_deref(),

@@ -183,7 +183,7 @@ async fn run_async(command: Command) -> Result<()> {
 async fn run_agent(r: ResolvedAgent) -> Result<()> {
     // Enforce a single agent process per machine before doing anything else. Held
     // for the whole run; released automatically on exit/crash.
-    let _lock = lock::AgentLock::acquire()?;
+    let _lock = lock::acquire()?;
 
     // The agent's identity is its stable machine id (its iroh node id is
     // ephemeral). This is what the server routes to and reserves in [agent_routes].

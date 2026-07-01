@@ -957,6 +957,7 @@ version = "0.0.15"
 dependencies = [
  "anyhow",
  "clap",
+ "dirs",
  "env_logger",
  "flextunnel-core",
  "log",
