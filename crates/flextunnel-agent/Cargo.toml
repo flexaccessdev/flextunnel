@@ -1,17 +1,17 @@
 [package]
-name = "flextunnel-cli"
+name = "flextunnel-agent"
 version.workspace = true
 edition.workspace = true
-description.workspace = true
+description = "flextunnel reverse-routing agent"
 
 [[bin]]
-name = "flextunnel"
+name = "flextunnel-agent"
 path = "src/main.rs"
 
 [dependencies]
 flextunnel-core.workspace = true
 anyhow.workspace = true
 clap.workspace = true
-dirs.workspace = true
 log.workspace = true
 tokio.workspace = true
+machine-uid = "0.6.0"

@@ -12,6 +12,9 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
+mod lock;
+
+use flextunnel_core::app;
 use flextunnel_core::blocklist::BlockList;
 use flextunnel_core::proxy::{ClientConfig, ProxyClient, ProxyServer, RoutedSet};
 use flextunnel_core::transport::endpoint::{
@@ -47,16 +50,18 @@ enum Command {
         /// File of accepted client auth tokens (one per line).
         #[arg(long)]
         auth_tokens_file: Option<PathBuf>,
+        /// Accepted agent auth token (repeatable). Separate pool from clients.
+        #[arg(long = "agent-auth-token")]
+        agent_auth_tokens: Vec<String>,
+        /// File of accepted agent auth tokens (one per line).
+        #[arg(long)]
+        agent_auth_tokens_file: Option<PathBuf>,
         /// Custom relay server URL(s) for failover (repeatable).
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
         /// Custom DNS server URL for peer discovery ("none" to disable).
         #[arg(long)]
         dns_server: Option<String>,
-        /// Path to the duplicate-id blocklist file (JSON). Defaults to
-        /// ~/.config/flextunnel/blocklist.json.
-        #[arg(long)]
-        blocklist_file: Option<PathBuf>,
     },
     /// Start the proxy client (local SOCKS5 listener).
     Client {
@@ -123,27 +128,13 @@ enum Command {
     },
 }
 
-fn init_logger() {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,iroh=warn,tracing=warn"),
-    )
-    .init();
-}
-
-fn build_runtime() -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(Into::into)
-}
-
 fn log_version() {
-    log::info!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    app::log_version(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    init_logger();
+    app::init_logger(app::DEFAULT_LOG_FILTER);
 
     match args.command {
         Command::GenerateServerKey { output, force } => secret::generate_secret(output, force),
@@ -161,16 +152,16 @@ fn main() -> Result<()> {
                 ..Default::default()
             };
             let file = config::load_server_config(config.as_deref(), default_config)?;
-            let r = config::resolve_server(cli, file);
+            let r = config::resolve_server(cli, file)?;
             secret::show_id(r.secret.as_deref(), r.secret_file.as_deref())
         }
         Command::GenerateAuthToken { count } => {
             for _ in 0..count {
-                println!("{}", auth::generate_token());
+                println!("{}", auth::generate_client_token());
             }
             Ok(())
         }
-        command => build_runtime()?.block_on(run_async(command)),
+        command => app::build_runtime()?.block_on(run_async(command)),
     }
 }
 
@@ -182,9 +173,10 @@ async fn run_async(command: Command) -> Result<()> {
             secret_file,
             auth_tokens,
             auth_tokens_file,
+            agent_auth_tokens,
+            agent_auth_tokens_file,
             relay_urls,
             dns_server,
-            blocklist_file,
         } => {
             log_version();
             let cli = config::ServerConfig {
@@ -192,15 +184,17 @@ async fn run_async(command: Command) -> Result<()> {
                 secret: None, // no inline-secret CLI flag; config file only
                 auth_tokens: (!auth_tokens.is_empty()).then_some(auth_tokens),
                 auth_tokens_file,
+                agent_auth_tokens: (!agent_auth_tokens.is_empty()).then_some(agent_auth_tokens),
+                agent_auth_tokens_file,
+                agent_routes: None, // config-file only; no CLI flag
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
                 dns_server,
                 host_aliases: None, // config-file only; no CLI flag
                 routed_domains: None, // config-file only; no CLI flag
                 routed_cidrs: None,   // config-file only; no CLI flag
-                blocklist_file,
             };
             let file = config::load_server_config(config_path.as_deref(), default_config)?;
-            run_server(config::resolve_server(cli, file)).await
+            run_server(config::resolve_server(cli, file)?).await
         }
         Command::Client {
             config: config_path,
@@ -244,17 +238,53 @@ async fn run_async(command: Command) -> Result<()> {
 }
 
 async fn run_server(r: config::ResolvedServer) -> Result<()> {
-    let valid_tokens = auth::load_auth_tokens(&r.auth_tokens, r.auth_tokens_file.as_deref())
-        .context("Failed to load authentication tokens")?;
+    // Enforce one server per user before doing any work. Held for the process
+    // lifetime; released automatically on exit or crash.
+    let _lock = lock::acquire()?;
+
+    let valid_tokens = auth::load_auth_tokens(
+        &r.auth_tokens,
+        r.auth_tokens_file.as_deref(),
+        auth::CLIENT_TOKEN_PREFIX,
+    )
+    .context("Failed to load client authentication tokens")?;
     if valid_tokens.is_empty() {
         anyhow::bail!(
-            "The server requires at least one authentication token.\n\
+            "The server requires at least one client authentication token.\n\
              Generate one with: flextunnel generate-auth-token\n\
              Then pass --auth-token <TOKEN>, --auth-tokens-file <FILE>, or set \
              auth_tokens/auth_tokens_file in the config."
         );
     }
-    log::info!("Loaded {} authentication token(s)", valid_tokens.len());
+    log::info!("Loaded {} client authentication token(s)", valid_tokens.len());
+
+    // Agent tokens are optional (a server may run no reverse routes). Loaded from
+    // a separate pool with the `fta` prefix so a client token can't act as an agent.
+    let agent_valid_tokens = auth::load_auth_tokens(
+        &r.agent_auth_tokens,
+        r.agent_auth_tokens_file.as_deref(),
+        auth::AGENT_TOKEN_PREFIX,
+    )
+    .context("Failed to load agent authentication tokens")?;
+    if !agent_valid_tokens.is_empty() {
+        log::info!("Loaded {} agent authentication token(s)", agent_valid_tokens.len());
+    }
+    if !r.agent_routes.is_empty() {
+        // Reverse routes forward to agents, which must authenticate with an agent
+        // token. Routes with no agent token are unusable dead config — fail loudly
+        // rather than start with reverse routes no agent can ever serve.
+        if agent_valid_tokens.is_empty() {
+            anyhow::bail!(
+                "{} agent route(s) are configured but no agent authentication token was \
+                 provided, so no agent can connect to serve them.\n\
+                 Add at least one agent token (--agent-auth-token <TOKEN>, \
+                 --agent-auth-tokens-file <FILE>, or agent_auth_tokens/agent_auth_tokens_file \
+                 in the config), or remove the agent_routes.",
+                r.agent_routes.len()
+            );
+        }
+        log::info!("Loaded {} agent route(s)", r.agent_routes.len());
+    }
 
     let secret_key = secret::resolve_secret_key(r.secret.as_deref(), r.secret_file.as_deref())?;
     let own_id = secret_to_endpoint_id(&secret_key);
@@ -308,6 +338,8 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
     let server = ProxyServer::new(
         own_id,
         valid_tokens,
+        agent_valid_tokens,
+        r.agent_routes,
         r.host_aliases,
         routed_set,
         r.routed_domains,
@@ -323,7 +355,8 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
 
     let res = tokio::select! {
         res = run => res,
-        _ = shutdown_signal() => {
+        sig = app::shutdown_signal() => {
+            sig?;
             log::info!("Received shutdown signal, stopping server");
             Ok(())
         }
@@ -345,10 +378,10 @@ async fn run_client(r: config::ResolvedClient) -> Result<()> {
         anyhow::bail!("Provide only one of auth_token or auth_token_file, not both");
     }
     let token = if let Some(token) = r.auth_token {
-        auth::validate_token(&token).context("Invalid authentication token")?;
+        auth::validate_client_token(&token).context("Invalid authentication token")?;
         token
     } else if let Some(path) = r.auth_token_file {
-        auth::load_auth_token_from_file(&path)
+        auth::load_auth_token_from_file(&path, auth::CLIENT_TOKEN_PREFIX)
             .context("Failed to load authentication token from file")?
     } else {
         anyhow::bail!(
@@ -384,7 +417,8 @@ async fn run_client(r: config::ResolvedClient) -> Result<()> {
 
     let res = tokio::select! {
         res = run => res,
-        _ = shutdown_signal() => {
+        sig = app::shutdown_signal() => {
+            sig?;
             log::info!("Received shutdown signal, stopping client");
             Ok(())
         }
@@ -393,20 +427,4 @@ async fn run_client(r: config::ResolvedClient) -> Result<()> {
     // Close the endpoint gracefully before it is dropped (see run_server).
     endpoint.close().await;
     res
-}
-
-#[cfg(unix)]
-async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = int.recv() => {}
-    }
-}
-
-#[cfg(not(unix))]
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
 }

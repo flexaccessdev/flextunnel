@@ -4,13 +4,18 @@
 //!
 //! ## Token Format
 //! - Exactly 49 characters
-//! - Starts with `ftc`
+//! - Starts with a 3-char role prefix: `ftc` (client) or `fta` (agent)
 //! - Remaining 46 characters are Base64URL (no padding)
 //! - Decoded payload is exactly 34 bytes:
 //!   - First 32 bytes: random entropy
 //!   - Last 2 bytes: CRC16-CCITT-FALSE checksum (big-endian) of the 32 random bytes
 //!
-//! Generate tokens with: `flextunnel generate-auth-token`
+//! Client and agent tokens share this format but use distinct prefixes so a
+//! client credential can never authenticate as an agent (or vice versa) — the
+//! server validates each against the prefix for the connecting peer's role.
+//!
+//! Generate client tokens with `flextunnel generate-auth-token`, agent tokens
+//! with `flextunnel-agent generate-token`.
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -21,8 +26,11 @@ use std::path::Path;
 /// Required length for authentication tokens.
 pub const TOKEN_LENGTH: usize = 49;
 
-/// Required prefix for tokens.
-pub const TOKEN_PREFIX: &str = "ftc";
+/// Required prefix for client tokens.
+pub const CLIENT_TOKEN_PREFIX: &str = "ftc";
+
+/// Required prefix for agent tokens.
+pub const AGENT_TOKEN_PREFIX: &str = "fta";
 
 /// Number of random bytes in token payload.
 const RANDOM_BYTES_LEN: usize = 32;
@@ -58,10 +66,21 @@ fn crc16_ccitt_false(data: &[u8]) -> u16 {
     crc
 }
 
-/// Generate a new authentication token.
+/// Generate a new client authentication token (prefix `ftc`).
+pub fn generate_client_token() -> String {
+    generate_token_with_prefix(CLIENT_TOKEN_PREFIX)
+}
+
+/// Generate a new agent authentication token (prefix `fta`).
+pub fn generate_agent_token() -> String {
+    generate_token_with_prefix(AGENT_TOKEN_PREFIX)
+}
+
+/// Generate a new authentication token with the given 3-char role prefix.
 ///
-/// Format: `ftc` + base64url_no_pad(32 random bytes + 2-byte CRC16) = 49 characters total.
-pub fn generate_token() -> String {
+/// Format: `<prefix>` + base64url_no_pad(32 random bytes + 2-byte CRC16) = 49
+/// characters total.
+pub fn generate_token_with_prefix(prefix: &str) -> String {
     let mut random = [0u8; RANDOM_BYTES_LEN];
     let mut rng = rand::rng();
     rng.fill_bytes(&mut random);
@@ -71,13 +90,23 @@ pub fn generate_token() -> String {
     payload[..RANDOM_BYTES_LEN].copy_from_slice(&random);
     payload[RANDOM_BYTES_LEN..].copy_from_slice(&checksum);
 
-    format!("{}{}", TOKEN_PREFIX, URL_SAFE_NO_PAD.encode(payload))
+    format!("{}{}", prefix, URL_SAFE_NO_PAD.encode(payload))
 }
 
-/// Validate token format.
+/// Validate a client token (prefix `ftc`).
+pub fn validate_client_token(token: &str) -> Result<()> {
+    validate_token_with_prefix(token, CLIENT_TOKEN_PREFIX)
+}
+
+/// Validate an agent token (prefix `fta`).
+pub fn validate_agent_token(token: &str) -> Result<()> {
+    validate_token_with_prefix(token, AGENT_TOKEN_PREFIX)
+}
+
+/// Validate token format against a specific role prefix.
 ///
 /// Returns Ok(()) if valid, Err with description if invalid.
-pub fn validate_token(token: &str) -> Result<()> {
+pub fn validate_token_with_prefix(token: &str, prefix: &str) -> Result<()> {
     // Early ASCII check - all valid tokens are ASCII
     if !token.is_ascii() {
         anyhow::bail!("Token must contain only ASCII characters");
@@ -92,15 +121,15 @@ pub fn validate_token(token: &str) -> Result<()> {
     }
 
     // Check prefix
-    if !token.starts_with(TOKEN_PREFIX) {
+    if !token.starts_with(prefix) {
         anyhow::bail!(
             "Token must start with '{}', got '{}'",
-            TOKEN_PREFIX,
-            &token[..TOKEN_PREFIX.len().min(token.len())]
+            prefix,
+            &token[..prefix.len().min(token.len())]
         );
     }
 
-    let encoded_payload = &token[TOKEN_PREFIX.len()..];
+    let encoded_payload = &token[prefix.len()..];
     let payload = URL_SAFE_NO_PAD
         .decode(encoded_payload)
         .context("Token payload is not valid base64url without padding")?;
@@ -124,18 +153,24 @@ pub fn validate_token(token: &str) -> Result<()> {
     Ok(())
 }
 
-/// Load auth tokens from CLI arguments and/or a file.
+/// Load auth tokens from CLI arguments and/or a file, validating each against
+/// the given role `prefix` (`ftc` for clients, `fta` for agents).
 ///
 /// # Arguments
 /// * `cli_tokens` - Tokens specified via CLI `--auth-tokens` flags
 /// * `file` - Optional path to a file containing tokens (one per line)
+/// * `prefix` - Required role prefix every token must carry
 ///
 /// # Returns
 /// A HashSet of all valid authentication tokens
 ///
 /// # Errors
 /// Returns an error if the file cannot be read or any token is invalid
-pub fn load_auth_tokens(cli_tokens: &[String], file: Option<&Path>) -> Result<HashSet<String>> {
+pub fn load_auth_tokens(
+    cli_tokens: &[String],
+    file: Option<&Path>,
+    prefix: &str,
+) -> Result<HashSet<String>> {
     let mut tokens = HashSet::new();
 
     // Load from CLI arguments. Identify a bad token by its position, never by
@@ -143,7 +178,7 @@ pub fn load_auth_tokens(cli_tokens: &[String], file: Option<&Path>) -> Result<Ha
     for (idx, token) in cli_tokens.iter().enumerate() {
         let trimmed = token.trim();
         if !trimmed.is_empty() && !trimmed.starts_with('#') {
-            validate_token(trimmed)
+            validate_token_with_prefix(trimmed, prefix)
                 .with_context(|| format!("Invalid token at CLI argument #{}", idx + 1))?;
             tokens.insert(trimmed.to_string());
         }
@@ -151,7 +186,7 @@ pub fn load_auth_tokens(cli_tokens: &[String], file: Option<&Path>) -> Result<Ha
 
     // Load from file if specified
     if let Some(file_path) = file {
-        let file_tokens = load_auth_tokens_from_file(file_path)?;
+        let file_tokens = load_auth_tokens_from_file(file_path, prefix)?;
         tokens.extend(file_tokens);
     }
 
@@ -172,7 +207,7 @@ pub fn load_auth_tokens(cli_tokens: &[String], file: Option<&Path>) -> Result<Ha
 /// vmfNFxTPDKB3jsM1Q8kzAvZnQHbmJ1W49Rk8i1S2Jzrze9Q
 /// vh9SwOUD1nHkQpl4Gf0fQrVrRIt6QctNfPzIlcwkPhzv0ig
 /// ```
-pub fn load_auth_tokens_from_file(path: &Path) -> Result<HashSet<String>> {
+pub fn load_auth_tokens_from_file(path: &Path, prefix: &str) -> Result<HashSet<String>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read auth tokens file: {}", path.display()))?;
 
@@ -180,7 +215,7 @@ pub fn load_auth_tokens_from_file(path: &Path) -> Result<HashSet<String>> {
 
     for (line_num, token) in meaningful_token_lines(&content) {
         // Locate by file:line only; never echo the token value (a credential).
-        validate_token(token)
+        validate_token_with_prefix(token, prefix)
             .with_context(|| format!("Invalid token at {}:{}", path.display(), line_num))?;
         tokens.insert(token.to_string());
     }
@@ -218,13 +253,13 @@ fn meaningful_token_lines(content: &str) -> impl Iterator<Item = (usize, &str)> 
 /// - Lines starting with `#` are treated as comments
 /// - Empty lines are ignored
 /// - Inline comments (after token) are supported with `#`
-pub fn load_auth_token_from_file(path: &Path) -> Result<String> {
+pub fn load_auth_token_from_file(path: &Path, prefix: &str) -> Result<String> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read auth token file: {}", path.display()))?;
 
     if let Some((line_num, token)) = meaningful_token_lines(&content).next() {
         // Locate by file:line only; never echo the token value (a credential).
-        validate_token(token)
+        validate_token_with_prefix(token, prefix)
             .with_context(|| format!("Invalid token at {}:{}", path.display(), line_num))?;
         return Ok(token.to_string());
     }
@@ -243,12 +278,12 @@ mod tests {
         let mut payload = [0u8; TOKEN_PAYLOAD_LEN];
         payload[..RANDOM_BYTES_LEN].copy_from_slice(&random);
         payload[RANDOM_BYTES_LEN..].copy_from_slice(&checksum);
-        format!("{}{}", TOKEN_PREFIX, URL_SAFE_NO_PAD.encode(payload))
+        format!("{}{}", CLIENT_TOKEN_PREFIX, URL_SAFE_NO_PAD.encode(payload))
     }
 
     fn decode_payload(token: &str) -> Vec<u8> {
         URL_SAFE_NO_PAD
-            .decode(&token[TOKEN_PREFIX.len()..])
+            .decode(&token[CLIENT_TOKEN_PREFIX.len()..])
             .unwrap()
     }
 
@@ -260,28 +295,28 @@ mod tests {
 
     #[test]
     fn test_generate_token_format() {
-        let token = generate_token();
+        let token = generate_client_token();
         assert_eq!(token.len(), TOKEN_LENGTH);
-        assert!(token.starts_with(TOKEN_PREFIX));
-        assert!(validate_token(&token).is_ok());
+        assert!(token.starts_with(CLIENT_TOKEN_PREFIX));
+        assert!(validate_client_token(&token).is_ok());
     }
 
     #[test]
     fn test_generate_token_uniqueness() {
-        let token1 = generate_token();
-        let token2 = generate_token();
+        let token1 = generate_client_token();
+        let token2 = generate_client_token();
         assert_ne!(token1, token2);
     }
 
     #[test]
     fn test_validate_token_valid() {
         let token = make_test_token([0xAB; RANDOM_BYTES_LEN]);
-        assert!(validate_token(&token).is_ok());
+        assert!(validate_client_token(&token).is_ok());
     }
 
     #[test]
     fn test_validate_token_too_short() {
-        let result = validate_token("ftcshort");
+        let result = validate_client_token("ftcshort");
         assert!(result.is_err());
         assert!(
             result
@@ -293,8 +328,8 @@ mod tests {
 
     #[test]
     fn test_validate_token_too_long() {
-        let token = format!("{}{}", TOKEN_PREFIX, "A".repeat(TOKEN_LENGTH));
-        let result = validate_token(&token);
+        let token = format!("{}{}", CLIENT_TOKEN_PREFIX, "A".repeat(TOKEN_LENGTH));
+        let result = validate_client_token(&token);
         assert!(result.is_err());
         assert!(
             result
@@ -306,11 +341,11 @@ mod tests {
 
     #[test]
     fn test_validate_token_wrong_prefix() {
-        let mut token = generate_token().chars().collect::<Vec<_>>();
+        let mut token = generate_client_token().chars().collect::<Vec<_>>();
         token[0] = 'x';
         let token: String = token.into_iter().collect();
 
-        let result = validate_token(&token);
+        let result = validate_client_token(&token);
         assert!(result.is_err());
         assert!(
             result
@@ -322,48 +357,48 @@ mod tests {
 
     #[test]
     fn test_validate_token_invalid_base64url_chars() {
-        let token = format!("{}{}", TOKEN_PREFIX, "!".repeat(TOKEN_LENGTH - TOKEN_PREFIX.len()));
-        let result = validate_token(&token);
+        let token = format!("{}{}", CLIENT_TOKEN_PREFIX, "!".repeat(TOKEN_LENGTH - CLIENT_TOKEN_PREFIX.len()));
+        let result = validate_client_token(&token);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("base64url"));
     }
 
     #[test]
     fn test_validate_token_non_ascii() {
-        let result = validate_token("ftc🔐notascii");
+        let result = validate_client_token("ftc🔐notascii");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("ASCII"));
     }
 
     #[test]
     fn test_validate_token_bad_checksum() {
-        let mut payload = decode_payload(&generate_token());
+        let mut payload = decode_payload(&generate_client_token());
         payload[RANDOM_BYTES_LEN] ^= 0x01;
-        let bad = format!("{}{}", TOKEN_PREFIX, URL_SAFE_NO_PAD.encode(payload));
+        let bad = format!("{}{}", CLIENT_TOKEN_PREFIX, URL_SAFE_NO_PAD.encode(payload));
 
-        let result = validate_token(&bad);
+        let result = validate_client_token(&bad);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("checksum"));
     }
 
     #[test]
     fn test_validate_token_rejects_mutated_random_byte() {
-        let mut payload = decode_payload(&generate_token());
+        let mut payload = decode_payload(&generate_client_token());
         payload[0] ^= 0x80;
-        let bad = format!("{}{}", TOKEN_PREFIX, URL_SAFE_NO_PAD.encode(payload));
+        let bad = format!("{}{}", CLIENT_TOKEN_PREFIX, URL_SAFE_NO_PAD.encode(payload));
 
-        let result = validate_token(&bad);
+        let result = validate_client_token(&bad);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("checksum"));
     }
 
     #[test]
     fn test_validate_token_rejects_mutated_checksum_byte() {
-        let mut payload = decode_payload(&generate_token());
+        let mut payload = decode_payload(&generate_client_token());
         payload[TOKEN_PAYLOAD_LEN - 1] ^= 0x01;
-        let bad = format!("{}{}", TOKEN_PREFIX, URL_SAFE_NO_PAD.encode(payload));
+        let bad = format!("{}{}", CLIENT_TOKEN_PREFIX, URL_SAFE_NO_PAD.encode(payload));
 
-        let result = validate_token(&bad);
+        let result = validate_client_token(&bad);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("checksum"));
     }
@@ -375,15 +410,15 @@ mod tests {
         writeln!(file).unwrap();
         writeln!(file, "  # Another comment with leading space").unwrap();
 
-        let result = load_auth_tokens_from_file(file.path()).unwrap();
+        let result = load_auth_tokens_from_file(file.path(), CLIENT_TOKEN_PREFIX).unwrap();
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_load_from_file_with_tokens() {
-        let token_a = generate_token();
-        let token_b = generate_token();
-        let token_c = generate_token();
+        let token_a = generate_client_token();
+        let token_b = generate_client_token();
+        let token_c = generate_client_token();
 
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "# Auth tokens").unwrap();
@@ -391,7 +426,7 @@ mod tests {
         writeln!(file, "{}  # inline comment", token_b).unwrap();
         writeln!(file, "  {}  ", token_c).unwrap();
 
-        let result = load_auth_tokens_from_file(file.path()).unwrap();
+        let result = load_auth_tokens_from_file(file.path(), CLIENT_TOKEN_PREFIX).unwrap();
         assert_eq!(result.len(), 3);
         assert!(result.contains(&token_a));
         assert!(result.contains(&token_b));
@@ -403,14 +438,14 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "short").unwrap();
 
-        let result = load_auth_tokens_from_file(file.path());
+        let result = load_auth_tokens_from_file(file.path(), CLIENT_TOKEN_PREFIX);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_load_single_token_from_file() {
-        let token_a = generate_token();
-        let token_b = generate_token();
+        let token_a = generate_client_token();
+        let token_b = generate_client_token();
 
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "# My auth token").unwrap();
@@ -418,7 +453,7 @@ mod tests {
         writeln!(file, "{}  # comment", token_a).unwrap();
         writeln!(file, "{}", token_b).unwrap(); // ignored
 
-        let result = load_auth_token_from_file(file.path()).unwrap();
+        let result = load_auth_token_from_file(file.path(), CLIENT_TOKEN_PREFIX).unwrap();
         assert_eq!(result, token_a);
     }
 
@@ -427,20 +462,20 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "bad").unwrap();
 
-        let result = load_auth_token_from_file(file.path());
+        let result = load_auth_token_from_file(file.path(), CLIENT_TOKEN_PREFIX);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_load_auth_tokens_cli_and_file() {
-        let token_a = generate_token();
-        let token_b = generate_token();
+        let token_a = generate_client_token();
+        let token_b = generate_client_token();
 
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "{}", token_a).unwrap();
 
         let cli_tokens = vec![token_b.clone()];
-        let result = load_auth_tokens(&cli_tokens, Some(file.path())).unwrap();
+        let result = load_auth_tokens(&cli_tokens, Some(file.path()), CLIENT_TOKEN_PREFIX).unwrap();
 
         assert_eq!(result.len(), 2);
         assert!(result.contains(&token_a));
@@ -450,8 +485,31 @@ mod tests {
     #[test]
     fn test_load_auth_tokens_cli_invalid() {
         let cli_tokens = vec!["short".to_string()];
-        let result = load_auth_tokens(&cli_tokens, None);
+        let result = load_auth_tokens(&cli_tokens, None, CLIENT_TOKEN_PREFIX);
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_agent_token_format_and_prefix_isolation() {
+        // Agent tokens are well-formed with the `fta` prefix...
+        let agent = generate_agent_token();
+        assert_eq!(agent.len(), TOKEN_LENGTH);
+        assert!(agent.starts_with(AGENT_TOKEN_PREFIX));
+        assert!(validate_agent_token(&agent).is_ok());
+
+        // ...and the two pools are mutually exclusive: an agent token is not a
+        // valid client token, and a client token is not a valid agent token.
+        assert!(validate_client_token(&agent).is_err());
+        let client = generate_client_token();
+        assert!(validate_agent_token(&client).is_err());
+    }
+
+    #[test]
+    fn test_load_agent_tokens_rejects_client_prefix() {
+        // A client token in an agent-token file must fail prefix validation.
+        let client = generate_client_token();
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "{}", client).unwrap();
+        assert!(load_auth_tokens_from_file(file.path(), AGENT_TOKEN_PREFIX).is_err());
+    }
 }

@@ -15,7 +15,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// flextunnel protocol version.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Maximum auth-handshake message size (64 KiB). The server's routed set rides
 /// the `HelloResponse`, so this is generous enough for a large operator list.
@@ -46,7 +46,22 @@ pub const REP_CONN_REFUSED: u8 = 0x05;
 pub const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 pub const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 
-/// Client → server auth handshake (first bi-stream of the connection).
+/// Which kind of peer is connecting. A **client** runs a local SOCKS5 listener
+/// and *opens* tunnel streams to the server; an **agent** dials the server with
+/// an ephemeral identity, is identified by its `machine_id`, and *accepts* the
+/// streams the server opens back to it, connecting each to a target on the
+/// agent's own network (reverse routing — see `proxy::agent` and the server's
+/// `agent_routes`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerRole {
+    /// Local SOCKS5 listener; opens tunnel streams to the server.
+    #[default]
+    Client,
+    /// Reverse-routing exit point; accepts server-opened streams.
+    Agent,
+}
+
+/// Client/agent → server auth handshake (first bi-stream of the connection).
 ///
 /// `Debug` is implemented manually to redact `auth_token` (a bearer credential)
 /// so it can never leak into logs or error context.
@@ -65,6 +80,18 @@ pub struct Hello {
     /// not a command; the server decides whether to self-block on it.
     #[serde(default)]
     pub duplicate_server_observed: bool,
+    /// Whether this peer is a client (SOCKS5 listener) or an agent (reverse exit
+    /// point). Drives the server's post-handshake handling and which auth-token
+    /// pool the token is checked against.
+    #[serde(default)]
+    pub role: PeerRole,
+    /// The agent's **derived network id** (`ftm1…`, see [`crate::machine_id`]),
+    /// sent only by agents (`role == Agent`). It is a one-way hash of the agent's
+    /// raw OS machine id — the raw id never travels on the wire. It is how the
+    /// server identifies and routes to an agent whose iroh node id is ephemeral.
+    /// `None` for clients.
+    #[serde(default)]
+    pub machine_id: Option<String>,
 }
 
 impl std::fmt::Debug for Hello {
@@ -74,6 +101,8 @@ impl std::fmt::Debug for Hello {
             .field("auth_token", &"<redacted>")
             .field("client_instance_nonce", &self.client_instance_nonce)
             .field("duplicate_server_observed", &self.duplicate_server_observed)
+            .field("role", &self.role)
+            .field("machine_id", &self.machine_id)
             .finish()
     }
 }
@@ -106,12 +135,30 @@ pub struct HelloResponse {
 }
 
 impl Hello {
+    /// A client `Hello` (`role = Client`, no machine id).
     pub fn new(auth_token: impl Into<String>, client_instance_nonce: u128) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             auth_token: auth_token.into(),
             client_instance_nonce,
             duplicate_server_observed: false,
+            role: PeerRole::Client,
+            machine_id: None,
+        }
+    }
+
+    /// An agent `Hello` (`role = Agent`) carrying the agent's stable machine id.
+    /// Agents never emit the duplicate-server advisory (that detection is
+    /// client-side), so it stays `false`.
+    pub fn new_agent(
+        auth_token: impl Into<String>,
+        client_instance_nonce: u128,
+        machine_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            role: PeerRole::Agent,
+            machine_id: Some(machine_id.into()),
+            ..Self::new(auth_token, client_instance_nonce)
         }
     }
 }

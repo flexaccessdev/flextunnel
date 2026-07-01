@@ -4,7 +4,7 @@
 
 use crate::blocklist::{self, BlockList};
 use crate::error::{ProxyError, ProxyResult};
-use crate::proxy::signaling::{self, ControlMsg, HelloResponse, Target};
+use crate::proxy::signaling::{self, ControlMsg, Hello, HelloResponse, PeerRole, Target};
 use crate::proxy::{dial, RoutedSet};
 use crate::transport::LIVENESS_WINDOW;
 use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
@@ -22,9 +22,6 @@ use tokio::sync::{Notify, Semaphore};
 /// The QUIC keep-alive keeps the connection from idling out, so without this a
 /// peer that never opens the handshake stream would hang the task forever.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Deadline for dialing an outbound target (DNS resolution + TCP connect), so a
-/// slow or black-holed target can't tie up a task and its sockets indefinitely.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on concurrent connection handlers. A flood of inbound connections would
 /// otherwise spawn unbounded handler tasks; once this many are live the accept
 /// loop waits for a slot (backpressure) instead of spawning more. Per-connection
@@ -35,6 +32,11 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 /// QUIC close code used when the server tears a connection down for a
 /// duplicate-id conflict (distinct from the auth-failure code `1`).
 const CLOSE_DUPLICATE: u32 = 2;
+
+/// QUIC close code used when the server tears down a stale agent connection that
+/// a benign reconnect (same instance nonce) has superseded. Not a conflict — the
+/// same agent process simply came back before its old connection was reaped.
+const CLOSE_SUPERSEDED: u32 = 3;
 
 /// Monotonic per-connection sequence, assigned to each accepted connection so
 /// the registry can key entries by connection instance (not just by node id or
@@ -79,6 +81,62 @@ impl Drop for ConnGuard {
     }
 }
 
+/// One live **agent** connection, tracked by its machine id. There is at most one
+/// per machine id. A second connection for the same id with the *same* instance
+/// nonce is a benign reconnect (it replaces this entry); one with a *different*
+/// nonce is a genuine duplicate (see [`ProxyServer::register_agent`]).
+struct AgentEntry {
+    /// The connection's monotonic sequence, so the RAII guard only evicts the
+    /// entry it created (a newer registration under the same id is not clobbered).
+    conn_seq: u64,
+    /// The agent process's instance nonce (from its `Hello`). Distinguishes a
+    /// same-process reconnect (same nonce) from a different agent instance sharing
+    /// the machine id (different nonce → a duplicate).
+    nonce: u128,
+    /// Handle to the agent connection, so the server can open reverse-route
+    /// streams to it and tear it down on a duplicate or reconnect.
+    connection: Connection,
+}
+
+/// `machine_id → entry`. Keyed by the agent's stable machine id (its ephemeral
+/// iroh node id is irrelevant to identity).
+type AgentRegistry = HashMap<String, AgentEntry>;
+
+/// Outcome of trying to register an agent connection.
+enum AgentReg {
+    /// No prior connection for this machine id; the entry was inserted.
+    Fresh,
+    /// A prior connection for this machine id existed with the *same* instance
+    /// nonce — a benign reconnect of the same agent process. The stale entry has
+    /// been replaced with the new connection; the old connection is carried back
+    /// so the caller can close it. Not a duplicate; nothing is blocklisted.
+    Replaced(Connection),
+    /// A connection for this machine id is already active with a *different*
+    /// instance nonce — a genuine duplicate (a distinct agent instance sharing the
+    /// machine id). Carries the existing connection so the caller can tear it down.
+    Duplicate(Connection),
+}
+
+/// RAII cleanup for a registered agent connection: removes its registry entry on
+/// every handler exit path, but only if the entry still carries *this*
+/// connection's `conn_seq` (so it never evicts a newer registration).
+struct AgentGuard {
+    registry: Arc<Mutex<AgentRegistry>>,
+    machine_id: String,
+    conn_seq: u64,
+}
+
+impl Drop for AgentGuard {
+    fn drop(&mut self) {
+        if let Ok(mut reg) = self.registry.lock()
+            && let Some(entry) = reg.get(&self.machine_id)
+            && entry.conn_seq == self.conn_seq
+        {
+            reg.remove(&self.machine_id);
+        }
+    }
+}
+
 pub struct ProxyServer {
     /// This server's own iroh `EndpointId` (persistent identity), used for the
     /// duplicate-server self-block record.
@@ -88,7 +146,16 @@ pub struct ProxyServer {
     /// server instances that share this identity — how a duplicate server is
     /// detected client-side.
     server_instance_nonce: u128,
+    /// Accepted **client** auth tokens (`ftc` prefix).
     valid_tokens: HashSet<String>,
+    /// Accepted **agent** auth tokens (`fta` prefix) — a separate pool so a client
+    /// credential can never authenticate as an agent, or vice versa.
+    agent_valid_tokens: HashSet<String>,
+    /// Reverse-routing reservations: a requested hostname (lowercased key) that
+    /// matches is forwarded over the connected agent whose machine id is the
+    /// value, instead of dialed from the server's own network. Checked *before*
+    /// [`apply_alias`]. See [`route_to_agent`].
+    agent_routes: HashMap<String, String>,
     /// Host aliases (lowercased keys) rewritten before connecting; see
     /// [`apply_alias`].
     host_aliases: HashMap<String, String>,
@@ -102,6 +169,9 @@ pub struct ProxyServer {
     routed_cidrs: Vec<String>,
     /// Live-connection registry for duplicate-client detection.
     registry: Arc<Mutex<Registry>>,
+    /// Live agent registry (one connection per machine id) for reverse routing +
+    /// duplicate-agent detection.
+    agent_registry: Arc<Mutex<AgentRegistry>>,
     /// Persistent duplicate-id blocklist (shared, synced to disk on mutation).
     blocklist: Arc<Mutex<BlockList>>,
     /// Tripped when the server must stop itself (duplicate-server self-block);
@@ -110,9 +180,12 @@ pub struct ProxyServer {
 }
 
 impl ProxyServer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         own_id: EndpointId,
         valid_tokens: HashSet<String>,
+        agent_valid_tokens: HashSet<String>,
+        agent_routes: HashMap<String, String>,
         host_aliases: HashMap<String, String>,
         routed_set: RoutedSet,
         routed_domains: Vec<String>,
@@ -123,11 +196,14 @@ impl ProxyServer {
             own_id,
             server_instance_nonce: rand::rng().random(),
             valid_tokens,
+            agent_valid_tokens,
+            agent_routes,
             host_aliases,
             routed_set,
             routed_domains,
             routed_cidrs,
             registry: Arc::new(Mutex::new(Registry::new())),
+            agent_registry: Arc::new(Mutex::new(AgentRegistry::new())),
             blocklist: Arc::new(Mutex::new(blocklist)),
             shutdown: Arc::new(Notify::new()),
         })
@@ -228,6 +304,84 @@ impl ProxyServer {
             .is_client_blocked(&id.to_string())
     }
 
+    /// Whether an agent machine id is currently blocked (in-memory check).
+    fn is_agent_blocked(&self, machine_id: &str) -> bool {
+        self.blocklist
+            .lock()
+            .expect("blocklist lock")
+            .is_agent_blocked(machine_id)
+    }
+
+    /// Record a confirmed duplicate agent machine id and persist the blocklist.
+    fn block_agent(&self, machine_id: &str, reason: &str) {
+        let mut bl = self.blocklist.lock().expect("blocklist lock");
+        if bl.add_blocked_agent(machine_id, reason)
+            && let Err(e) = persist_blocklist(&bl)
+        {
+            // Runtime rejection already works from the in-memory block; the disk
+            // write keeps the machine id blocked across restarts (a machine id is
+            // stable, unlike an ephemeral client id), so surface a failure loudly.
+            log::error!(
+                "Blocked duplicate agent {machine_id} in memory but could not persist it to {}: \
+                 {e}. The block will not survive a restart — resolve the duplicate machine id.",
+                bl.path().display()
+            );
+        }
+    }
+
+    /// Register a live agent connection under its machine id. Returns
+    /// [`AgentReg::Fresh`] after inserting; [`AgentReg::Replaced`] (with the old
+    /// connection) if the same agent process (same instance nonce) reconnected
+    /// before its stale entry was reaped — the entry is refreshed to this
+    /// connection; or [`AgentReg::Duplicate`] (with the existing connection) if a
+    /// *different* agent instance is already active for this id. The check and
+    /// insert run under one lock so two simultaneous connects can't both slip in.
+    fn register_agent(
+        &self,
+        machine_id: &str,
+        conn_seq: u64,
+        nonce: u128,
+        connection: Connection,
+    ) -> AgentReg {
+        let mut reg = self.agent_registry.lock().expect("agent registry lock");
+        if let Some(existing) = reg.get(machine_id) {
+            if existing.nonce != nonce {
+                return AgentReg::Duplicate(existing.connection.clone());
+            }
+            // Same instance nonce: the same agent process reconnecting. Replace the
+            // stale entry (new conn_seq so its guard owns the entry) and hand the
+            // old connection back to be closed.
+            let old = existing.connection.clone();
+            reg.insert(
+                machine_id.to_string(),
+                AgentEntry {
+                    conn_seq,
+                    nonce,
+                    connection,
+                },
+            );
+            return AgentReg::Replaced(old);
+        }
+        reg.insert(
+            machine_id.to_string(),
+            AgentEntry {
+                conn_seq,
+                nonce,
+                connection,
+            },
+        );
+        AgentReg::Fresh
+    }
+
+    /// The live connection for an agent machine id, if one is registered.
+    fn active_agent_conn(&self, machine_id: &str) -> Option<Connection> {
+        self.agent_registry
+            .lock()
+            .expect("agent registry lock")
+            .get(machine_id)
+            .map(|e| e.connection.clone())
+    }
+
     /// Atomically register a live connection, or report a confirmed duplicate.
     ///
     /// Returns `Ok(())` after inserting the entry, or `Err(conns)` with the
@@ -286,6 +440,15 @@ impl ProxyServer {
         .await
         .map_err(|_| ProxyError::Signaling("timed out waiting for client handshake".into()))??;
         let hello = signaling::decode_hello(&data)?;
+
+        // Agents take a separate path: their own token pool (`fta`), machine-id
+        // identity + blocklist, and reverse routing (the server opens streams to
+        // them; they never open data streams to us). Handled fully in there.
+        if hello.role == PeerRole::Agent {
+            return self
+                .handle_agent(connection, remote_id, conn_seq, send, recv, hello)
+                .await;
+        }
 
         // Authenticate first: only a validated, non-blocklisted peer may influence
         // server behavior — including the duplicate-server self-block below. The
@@ -391,14 +554,142 @@ impl ProxyServer {
         let heartbeat = server_heartbeat_loop(
             send,
             recv,
-            self.registry.clone(),
-            remote_id,
-            conn_seq,
+            Some((self.registry.clone(), remote_id, conn_seq)),
         );
         tokio::select! {
             r = socks => r,
             r = heartbeat => r,
         }
+    }
+
+    /// Serve an authenticated **agent** connection: validate its `fta` token and
+    /// machine id, register it as the reverse-route exit point for that machine id
+    /// (a same instance-nonce reconnect supersedes its stale connection; only a
+    /// *different* instance under the same id — e.g. a cloned image — is rejected +
+    /// blocklisted), accept it, then run only the heartbeat loop. The agent never opens data streams to us; routing
+    /// tasks open streams *to* it via [`Self::active_agent_conn`]. The
+    /// [`AgentGuard`] removes it from the registry on any exit.
+    async fn handle_agent(
+        self: Arc<Self>,
+        connection: Connection,
+        remote_id: EndpointId,
+        conn_seq: u64,
+        mut send: SendStream,
+        recv: RecvStream,
+        hello: Hello,
+    ) -> ProxyResult<()> {
+        // An agent must present a non-empty machine id — it is the identity the
+        // server routes to and blocks on.
+        let machine_id = match hello.machine_id.as_deref().map(str::trim) {
+            Some(mid) if !mid.is_empty() => mid.to_string(),
+            _ => {
+                return self
+                    .reject_agent(&connection, &mut send, remote_id, "agent did not present a machine id")
+                    .await;
+            }
+        };
+
+        // Authenticate against the agent token pool + machine-id blocklist.
+        if !self.agent_valid_tokens.contains(&hello.auth_token) {
+            return self
+                .reject_agent(&connection, &mut send, remote_id, "Invalid authentication token")
+                .await;
+        }
+        if self.is_agent_blocked(&machine_id) {
+            return self
+                .reject_agent(
+                    &connection,
+                    &mut send,
+                    remote_id,
+                    "machine id is blocklisted (duplicate id previously detected)",
+                )
+                .await;
+        }
+
+        // Register as the exit point for this machine id, superseding a stale
+        // same-instance reconnect or detecting a genuine duplicate.
+        let _guard = match self.register_agent(
+            &machine_id,
+            conn_seq,
+            hello.client_instance_nonce,
+            connection.clone(),
+        ) {
+            AgentReg::Fresh => AgentGuard {
+                registry: self.agent_registry.clone(),
+                machine_id: machine_id.clone(),
+                conn_seq,
+            },
+            AgentReg::Replaced(old) => {
+                log::info!(
+                    "Agent {machine_id} reconnected (same instance); superseding its stale \
+                     connection"
+                );
+                // Close the stale connection; the entry now carries this newer
+                // conn_seq, so the old connection's guard won't evict it.
+                old.close(CLOSE_SUPERSEDED.into(), b"superseded by agent reconnect");
+                AgentGuard {
+                    registry: self.agent_registry.clone(),
+                    machine_id: machine_id.clone(),
+                    conn_seq,
+                }
+            }
+            AgentReg::Duplicate(existing) => {
+                log::warn!(
+                    "Duplicate agent machine id {machine_id} (another agent is already connected \
+                     with it); blocklisting"
+                );
+                self.block_agent(
+                    &machine_id,
+                    "duplicate agent machine id (concurrent live connections)",
+                );
+                // Tear down the other live connection sharing this machine id, then
+                // reject and close this one.
+                existing.close(CLOSE_DUPLICATE.into(), b"duplicate agent machine id");
+                return self
+                    .reject_agent(&connection, &mut send, remote_id, "duplicate agent machine id detected")
+                    .await;
+            }
+        };
+
+        if !self.agent_routes.values().any(|m| *m == machine_id) {
+            log::warn!(
+                "Agent {machine_id} authenticated but no agent_routes entry references its \
+                 machine id — it is connected but unroutable"
+            );
+        }
+
+        // Accept: agents get no routed set (the server decides their targets). The
+        // control stream stays open for heartbeats.
+        let resp = HelloResponse::accepted(self.server_instance_nonce, Vec::new(), Vec::new());
+        signaling::write_message(&mut send, &signaling::encode_hello_response(&resp)?).await?;
+        send.flush().await?;
+        log::info!("Agent {machine_id} authenticated");
+
+        // Keep the connection alive (and detect its death) via the heartbeat; no
+        // registry-liveness refresh — the agent registry carries no last_seen.
+        // `_guard` removes the registry entry on return via Drop.
+        server_heartbeat_loop(send, recv, None).await
+    }
+
+    /// Reject an agent handshake: write a rejection response, close gracefully,
+    /// and return the auth-failure error. Mirrors the client rejection path.
+    async fn reject_agent(
+        &self,
+        connection: &Connection,
+        send: &mut SendStream,
+        remote_id: EndpointId,
+        reason: &str,
+    ) -> ProxyResult<()> {
+        log::warn!("Rejecting agent {remote_id}: {reason}");
+        let resp = HelloResponse::rejected(self.server_instance_nonce, reason);
+        let _ = signaling::write_message(send, &signaling::encode_hello_response(&resp)?).await;
+        let _ = send.finish();
+        // Give the agent a moment to read the rejection, then close with the reason.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        connection.close(1u32.into(), b"authentication rejected");
+        Err(ProxyError::AuthenticationFailed(format!(
+            "agent {remote_id} rejected: {reason}"
+        )))
     }
 
     /// Accept and dispatch SOCKS5 bi-streams until the connection closes.
@@ -408,10 +699,7 @@ impl ProxyServer {
                 Ok((send, recv)) => {
                     let server = Arc::clone(self);
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_socks_stream(send, recv, &server.host_aliases, &server.routed_set)
-                                .await
-                        {
+                        if let Err(e) = handle_socks_stream(send, recv, &server).await {
                             log::debug!("SOCKS5 stream ended: {e}");
                         }
                     });
@@ -425,16 +713,19 @@ impl ProxyServer {
     }
 }
 
-/// Server-side heartbeat loop over the retained control stream: refresh the
-/// registry entry's liveness on each `Heartbeat` and reply `HeartbeatAck`. A
-/// heartbeat gap beyond [`LIVENESS_WINDOW`] (or a stream error) ends the loop,
-/// which tears the connection handler down.
+/// Server-side heartbeat loop over the retained control stream: reply
+/// `HeartbeatAck` to each `Heartbeat` and, for a **client** connection, refresh
+/// its registry entry's liveness. A heartbeat gap beyond [`LIVENESS_WINDOW`] (or
+/// a stream error) ends the loop, which tears the connection handler down.
+///
+/// `client_entry` is `Some((registry, id, conn_seq))` for a client (whose
+/// duplicate-detection registry carries a `last_seen`) and `None` for an agent
+/// (its registry has no liveness field — the connection lifecycle alone keeps it
+/// accurate).
 async fn server_heartbeat_loop(
     mut send: SendStream,
     mut recv: RecvStream,
-    registry: Arc<Mutex<Registry>>,
-    remote_id: EndpointId,
-    conn_seq: u64,
+    client_entry: Option<(Arc<Mutex<Registry>>, EndpointId, u64)>,
 ) -> ProxyResult<()> {
     loop {
         let data = match tokio::time::timeout(
@@ -457,8 +748,9 @@ async fn server_heartbeat_loop(
         };
         match signaling::decode_control(&data)? {
             ControlMsg::Heartbeat { seq } => {
-                if let Ok(mut reg) = registry.lock()
-                    && let Some(entry) = reg.get_mut(&remote_id).and_then(|p| p.get_mut(&conn_seq))
+                if let Some((registry, remote_id, conn_seq)) = &client_entry
+                    && let Ok(mut reg) = registry.lock()
+                    && let Some(entry) = reg.get_mut(remote_id).and_then(|p| p.get_mut(conn_seq))
                 {
                     entry.last_seen = Instant::now();
                 }
@@ -506,22 +798,23 @@ fn apply_alias(target: Target, aliases: &HashMap<String, String>) -> Target {
     target
 }
 
-/// Handle one SOCKS5 stream: read the target, resolve + connect from the
-/// server's network, reply, then pipe bytes bidirectionally.
+/// Handle one SOCKS5 stream from a client: read the target, then either route it
+/// to a reserved **agent** (reverse routing) or, for everything else, resolve +
+/// connect from the server's own network and pipe bytes.
 async fn handle_socks_stream(
     mut send: SendStream,
     mut recv: RecvStream,
-    host_aliases: &HashMap<String, String>,
-    routed_set: &RoutedSet,
+    server: &Arc<ProxyServer>,
 ) -> io::Result<()> {
     let requested = signaling::read_request(&mut recv).await?;
 
     // Enforce the routed set as a whitelist on the requested target (before
-    // aliasing), as a defense-in-depth boundary: a well-behaved client only
-    // tunnels on-list targets, so a request for anything off-list means a
+    // aliasing/routing), as a defense-in-depth boundary: a well-behaved client
+    // only tunnels on-list targets, so a request for anything off-list means a
     // misconfigured or untrusted client. Reject with the SOCKS5 "not allowed by
-    // ruleset" code.
-    if !routed_set.allows(&requested) {
+    // ruleset" code. (When a routed set is active, agent-route hostnames must also
+    // be on it.)
+    if !server.routed_set.allows(&requested) {
         log::warn!("Tunnel request rejected by routed-set whitelist");
         log::debug!("Rejected {requested:?}: not in routed-set whitelist");
         signaling::write_reply(&mut send, signaling::REP_NOT_ALLOWED).await?;
@@ -529,35 +822,63 @@ async fn handle_socks_stream(
         return Ok(());
     }
 
-    let target = apply_alias(requested, host_aliases);
+    // Agent routes take precedence over host aliases: a domain reserved for an
+    // agent is forwarded over that agent's live connection instead of dialed.
+    if let Target::Domain(host, port) = &requested
+        && let Some(machine_id) = server.agent_routes.get(&host.to_ascii_lowercase())
+    {
+        return route_to_agent(send, recv, server, machine_id, *port).await;
+    }
+
+    let target = apply_alias(requested, &server.host_aliases);
     log::debug!("Stream target: {target:?}");
+    dial::connect_and_pipe(send, recv, &target).await
+}
 
-    // Bound the dial (DNS + TCP connect) so a slow/black-holed target can't tie
-    // up this task and its sockets indefinitely.
-    let connected = match tokio::time::timeout(CONNECT_TIMEOUT, dial::dial_target(&target)).await {
-        Ok(res) => res,
-        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")),
-    };
-
-    let mut tcp = match connected {
-        Ok(s) => {
-            signaling::write_reply(&mut send, signaling::REP_SUCCESS).await?;
-            s
-        }
-        Err(e) => {
-            // Keep the failure visible at warn, but don't expose the requested
-            // target there; log the target-specific detail at debug instead.
-            log::warn!("Connect to target failed: {e}");
-            log::debug!("Connect to {target:?} failed: {e}");
-            signaling::write_reply(&mut send, signaling::map_io_err(&e)).await?;
-            send.flush().await?;
+/// Route a client stream to a reserved agent: find the agent's live connection,
+/// open a stream to it, forward the request rewritten to the agent's loopback
+/// (keeping the client's port), then splice the two QUIC streams so the agent's
+/// reply byte and payload flow straight back to the client. Reverse routing is
+/// loopback-only in v1. The server is a byte relay: it never re-terminates.
+async fn route_to_agent(
+    mut client_send: SendStream,
+    client_recv: RecvStream,
+    server: &Arc<ProxyServer>,
+    machine_id: &str,
+    port: u16,
+) -> io::Result<()> {
+    let agent_conn = match server.active_agent_conn(machine_id) {
+        Some(c) => c,
+        None => {
+            log::warn!(
+                "No connected agent for reverse route (machine {machine_id}); host-unreachable"
+            );
+            signaling::write_reply(&mut client_send, signaling::REP_HOST_UNREACHABLE).await?;
+            client_send.flush().await?;
             return Ok(());
         }
     };
-    send.flush().await?;
 
-    let mut iroh = tokio::io::join(recv, send);
-    let _ = tokio::io::copy_bidirectional(&mut iroh, &mut tcp).await;
+    let (mut agent_send, agent_recv) = match agent_conn.open_bi().await {
+        Ok(pair) => pair,
+        Err(e) => {
+            log::warn!("Failed to open stream to agent {machine_id}: {e}; host-unreachable");
+            signaling::write_reply(&mut client_send, signaling::REP_HOST_UNREACHABLE).await?;
+            client_send.flush().await?;
+            return Ok(());
+        }
+    };
+
+    // Forward the request rewritten to the agent's loopback. The agent replies
+    // and pipes using the same wire format the client expects, so we splice raw.
+    let target = Target::Domain("127.0.0.1".to_string(), port);
+    log::debug!("Routing to agent {machine_id} -> {target:?}");
+    signaling::write_request(&mut agent_send, &target).await?;
+    agent_send.flush().await?;
+
+    let mut client_side = tokio::io::join(client_recv, client_send);
+    let mut agent_side = tokio::io::join(agent_recv, agent_send);
+    let _ = tokio::io::copy_bidirectional(&mut client_side, &mut agent_side).await;
     Ok(())
 }
 

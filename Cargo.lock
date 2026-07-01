@@ -764,6 +764,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer",
+ "const-oid",
  "crypto-common 0.2.2",
 ]
 
@@ -936,12 +937,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
-name = "flextunnel-cli"
-version = "0.0.14"
+name = "flextunnel-agent"
+version = "0.0.15"
 dependencies = [
  "anyhow",
  "clap",
- "env_logger",
+ "flextunnel-core",
+ "log",
+ "machine-uid",
+ "tokio",
+]
+
+[[package]]
+name = "flextunnel-cli"
+version = "0.0.15"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs",
  "flextunnel-core",
  "log",
  "tokio",
@@ -949,11 +962,12 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-core"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "anyhow",
  "base64",
  "dirs",
+ "env_logger",
  "ipnetwork",
  "iroh",
  "iroh-mdns-address-lookup",
@@ -962,6 +976,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -971,9 +986,8 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-ffi"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
- "env_logger",
  "flextunnel-core",
  "iroh",
  "log",
@@ -2026,6 +2040,17 @@ name = "mac-addr"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3d25b0e0b648a86960ac23b7ad4abb9717601dec6f66c165f5b037f3f03065f"
+
+[[package]]
+name = "machine-uid"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfe0d6336d341b10ae80e099b8f3c59f34bf8aef66ef25e83aa98bf2955c0ae7"
+dependencies = [
+ "libc",
+ "windows-registry",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "matchers"

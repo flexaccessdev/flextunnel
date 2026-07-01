@@ -59,24 +59,38 @@ All payload is end-to-end encrypted by QUIC/TLS 1.3.
 
 ## Install
 
-Prebuilt binaries are published on the
+Prebuilt release assets are published on the
 [GitHub Releases](https://github.com/andrewtheguy/flextunnel/releases) page.
-Stable releases include Linux amd64/arm64, macOS arm64, and Windows amd64;
-automated prereleases currently include Linux amd64/arm64 and macOS arm64. The
-install scripts download the latest release, verify its SHA-256 checksum, and
-install to a per-user location (`~/.local/bin` on Linux/macOS,
-`%LOCALAPPDATA%\Programs\flextunnel` on Windows) — **no admin required**.
+Stable releases include `flextunnel` and `flextunnel-agent` for Linux
+amd64/arm64, macOS arm64, and Windows amd64, plus the iOS xcframework asset.
+Automated prereleases currently include Linux amd64/arm64, macOS arm64, and the
+iOS xcframework, but skip Windows. The install scripts download the latest
+binary, verify its SHA-256 checksum, and install to a per-user location
+(`~/.local/bin` on Linux/macOS, `%LOCALAPPDATA%\Programs\flextunnel` on Windows)
+— **no admin required**.
 
-**Linux / macOS:**
+**`flextunnel` (server / client) — Linux / macOS:**
 
 ```sh
 curl -sSL https://andrewtheguy.github.io/flextunnel/install.sh | bash
 ```
 
-**Windows (PowerShell):**
+**`flextunnel` (server / client) — Windows (PowerShell):**
 
 ```powershell
 irm https://andrewtheguy.github.io/flextunnel/install.ps1 | iex
+```
+
+**`flextunnel-agent` (reverse-routing agent) — Linux / macOS:**
+
+```sh
+curl -sSL https://andrewtheguy.github.io/flextunnel/install-agent.sh | bash
+```
+
+**`flextunnel-agent` (reverse-routing agent) — Windows (PowerShell):**
+
+```powershell
+irm https://andrewtheguy.github.io/flextunnel/install-agent.ps1 | iex
 ```
 
 Options: append `-s -- --prerelease` (bash) for the latest prerelease, a release
@@ -89,11 +103,13 @@ published to `ghcr.io/andrewtheguy/flextunnel`.
 
 ```sh
 cargo build --release
-# binary: target/release/flextunnel
+# binaries: target/release/flextunnel, target/release/flextunnel-agent
 ```
 
-Requires a recent Rust toolchain (edition 2024). To cross-build static Linux
-binaries for amd64 + arm64 via Docker, use `./build-linux.sh`.
+Requires a recent Rust toolchain (edition 2024). A bare `cargo build --release`
+uses the workspace's default members and builds the CLI and the agent, but not
+the iOS static library. To cross-build static Linux binaries for amd64 + arm64
+via Docker, use `./build-linux.sh`.
 
 ## Quick start
 
@@ -151,7 +167,11 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 | `client` | Run the proxy client (local SOCKS5 listener). |
 | `generate-server-key -o <FILE> [--force]` | Generate the server identity key. |
 | `show-server-id --secret-file <FILE>` | Print the EndpointId for a key. |
-| `generate-auth-token [-c N]` | Generate N auth tokens. |
+| `generate-auth-token [-c N]` | Generate N client auth tokens (prefix `ftc`). |
+
+The reverse-routing **agent** is a separate binary, `flextunnel-agent`
+(subcommands `run` and `generate-token`) — see
+[Reverse-routing agent](#reverse-routing-agent) below.
 
 ### `server`
 
@@ -161,7 +181,9 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 | `--default-config` | Load `~/.config/flextunnel/server.toml`. |
 | `--secret-file <FILE>` | Server identity key. |
 | `--auth-token <TOKEN>` | Accepted client token (repeatable). |
-| `--auth-tokens-file <FILE>` | File of accepted tokens, one per line. |
+| `--auth-tokens-file <FILE>` | File of accepted client tokens, one per line. |
+| `--agent-auth-token <TOKEN>` | Accepted agent token (repeatable). Separate pool from clients. |
+| `--agent-auth-tokens-file <FILE>` | File of accepted agent tokens, one per line. |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). |
 | `--dns-server <URL>` | Custom discovery DNS server, or `none` to disable. |
 
@@ -191,9 +213,11 @@ flextunnel client --default-config   # ~/.config/flextunnel/client.toml
 ```
 
 Precedence is **CLI flag > config file > built-in default**, so you can keep a
-file and override individual settings on the command line. Unknown/misspelled
-keys are rejected (`deny_unknown_fields`) rather than silently ignored. Paths
-support `~` expansion.
+file and override settings on the command line. Credential groups are replaced
+as a unit: for example, if the CLI supplies either `--auth-token` or
+`--auth-token-file`, the config file's client token fields are ignored. Unknown
+or misspelled keys are rejected (`deny_unknown_fields`) rather than silently
+ignored. Paths support `~` expansion.
 
 See [`server.toml.example`](server.toml.example) and
 [`client.toml.example`](client.toml.example) for the full set of keys. A minimal
@@ -230,6 +254,53 @@ This is also the clean way around Firefox refusing to proxy literal
 browse to `http://server.ezvpn:8000/`. Use `socks5h://` (or set Firefox's
 `network.proxy.socks_remote_dns = true`) so the name is resolved by the server,
 not locally.
+
+## Reverse-routing agent
+
+Where a `[host_aliases]` entry resolves to a host on the **server's** network, an
+`[agent_routes]` entry resolves to a connected **agent** — a `flextunnel-agent`
+process on some other machine. The agent dials the server (like a client) but runs
+no SOCKS5 listener; instead it accepts the streams the server opens back to it and
+connects each to `127.0.0.1` on its own machine. This lets a client reach a service
+behind NAT that the server cannot dial directly: the agent makes the outbound
+connection, and the server pushes streams back over it. Reverse routing is
+**loopback-only** in v1.
+
+The agent is a **separate binary** (`flextunnel-agent`, for Linux, macOS, and
+Windows) and identifies itself by a stable **network id** (`ftm1…`) — a one-way
+hash, with a version prefix, of its OS-native machine id (`/etc/machine-id` on
+Linux, `IOPlatformUUID` on macOS, `MachineGuid` on Windows; no elevation needed).
+The raw machine id never leaves the host; only the network id is sent. Its iroh
+node id is ephemeral, so there is no key file to manage. Only one agent runs per
+machine (enforced by a file lock). It authenticates with its **own** token pool
+(prefix `fta`, separate from client `ftc` tokens).
+
+```sh
+# On the agent host: get this agent's network id to reserve on the server.
+flextunnel-agent machine-id              # -> shows the raw id + derived ftm1… id
+# On the server host: generate an agent token (add to agent_auth_tokens).
+flextunnel-agent generate-token          # -> fta…
+```
+
+```toml
+# server.toml
+agent_auth_tokens = ["fta…"]
+routed_domains    = ["web.ezvpn", "*.example.com"]   # the alias must be on the routed set
+
+[agent_routes]
+"web.ezvpn" = { machine_id = "ftm1…" }   # from `flextunnel-agent machine-id`
+```
+
+```sh
+# On the agent host (Linux/macOS/Windows):
+flextunnel-agent run --server-node-id <server id> --auth-token fta…
+# then from a client: curl -x socks5h://127.0.0.1:1080 http://web.ezvpn:8000/
+```
+
+A second agent presenting the **same** network id (e.g. a cloned VM image whose
+machine id was never regenerated) is rejected and the network id is recorded
+in the blocklist — fix the duplicate id and clear the entry to recover. See
+[`agent.toml.example`](agent.toml.example).
 
 ## Routed-set split-tunneling
 
@@ -300,6 +371,11 @@ tunnels those hostnames but direct-connects every bare-IP target, and
   traffic can be preferable to letting it leak out directly; the iOS client keeps
   defaulting to direct-connect. (The server's `0x02` rejection above is a
   separate, server-side control and is unaffected.)
+- **Richer agent routes.** Reverse routing is loopback-only in v1: every
+  `[agent_routes]` entry dials `127.0.0.1` on the agent. A follow-up will let one
+  agent (one machine id) expose several hostnames, each mapped to a chosen host/IP
+  on the agent's own network (an `agent_ip` field, default `127.0.0.1`) — likely
+  either per-domain entries or a grouped `[[agent]]` array-of-tables.
 
 ## Reconnect behavior
 

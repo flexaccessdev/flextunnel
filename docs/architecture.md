@@ -35,16 +35,27 @@ TCP connection.
 |---|---|
 | `main.rs` | clap CLI, command dispatch, logger/runtime, graceful `endpoint.close()`, shutdown signal |
 | `config.rs` | TOML config files (`-c`/`--default-config`), `deny_unknown_fields`, CLI>file>default merge, `~` expansion |
-| `auth.rs` | auth-token generation/validation/file-loading (CRC16-checksummed Base64URL tokens) |
-| `blocklist.rs` | persisted duplicate-id blocklist (JSON): confirmed duplicate client ids + the server's own conflicted id |
+| `auth.rs` | auth-token generation/validation/file-loading (CRC16-checksummed Base64URL tokens); separate client (`ftc`) and agent (`fta`) prefixes |
+| `blocklist.rs` | persisted duplicate-id blocklist (JSON): confirmed duplicate client ids, duplicate agent machine ids, + the server's own conflicted id |
 | `secret.rs` | server secret-key (iroh identity) generation and loading; prints the `EndpointId` |
 | `error.rs` | `ProxyError` (`Network`/`Config`/`Signaling`/`AuthenticationFailed`/`ConnectionLost`) + `is_recoverable()` |
-| `transport/mod.rs` | QUIC transport config (keep-alive, idle timeout, initial MTU) |
+| `transport/mod.rs` | QUIC transport config, ALPN, heartbeat/liveness timing |
 | `transport/endpoint.rs` | iroh `Endpoint` creation (relay mode, DNS discovery), secret/relay helpers |
-| `proxy/signaling.rs` | fixed `ALPN` constant, length-prefixed `Hello`/`HelloResponse`, per-stream `Target` codec, `REP_*` codes |
+| `proxy/signaling.rs` | length-prefixed `Hello`/`HelloResponse`, control frames, per-stream `Target` codec, `REP_*` codes |
 | `proxy/socks5.rs` | client-side RFC 1928: method negotiation + `CONNECT` parsing + replies |
 | `proxy/client.rs` | connect + auth + SOCKS5 listener + reconnect loop |
-| `proxy/server.rs` | accept + auth + per-stream DNS/connect/pipe |
+| `proxy/server.rs` | accept + auth + per-stream DNS/connect/pipe; agent registry + reverse routing |
+| `proxy/agent.rs` | reverse-routing exit point: dial + auth (`role=Agent`, derived network id) + accept server-opened streams + dial loopback |
+| `proxy/dial.rs` | `Target` → TCP dial + `connect_and_pipe` (the shared server/agent exit-point body) |
+
+The reverse-routing agent ships as a **separate binary crate** (`flextunnel-agent`,
+Linux/macOS/Windows, not in the module map above): it reads the OS-native machine
+id (via the `machine-uid` crate — `/etc/machine-id`, `IOPlatformUUID`, or
+`MachineGuid`), derives a one-way, versioned **network id** from it
+(`machine_id::network_machine_id` → `ftm1…`) so the raw id never leaves the host,
+holds a single-instance file lock, and drives `proxy::agent::ProxyAgent` over an
+ephemeral `create_client_endpoint`. `flextunnel-agent machine-id` prints the raw
+id and its derived network id locally.
 
 ## Connection lifecycle
 
@@ -55,15 +66,19 @@ secret: both peers must offer the same ALPN or negotiation fails. Access control
 is enforced by the auth handshake below, not by the ALPN.
 
 ### 2. Auth handshake (control stream)
-The protocol version is `PROTOCOL_VERSION = 3`. On the first bi-stream the client
-sends `Hello { version, auth_token, client_instance_nonce, duplicate_server_observed }`
+The protocol version is `PROTOCOL_VERSION = 5`. On the first bi-stream the
+connecting peer sends
+`Hello { version, auth_token, client_instance_nonce, duplicate_server_observed, role, machine_id }`
 and the server replies
 `HelloResponse { version, accepted, reject_reason, server_instance_nonce, routed_* }`,
 both length-prefixed JSON via `signaling::write_message` / `read_message` (4-byte
 big-endian length + payload, capped at `MAX_HANDSHAKE_SIZE` = 64 KiB). The server
-checks the token against its accepted set (`auth::load_auth_tokens`). On rejection
-it closes the connection gracefully (with a short drain) carrying the reason.
-`Hello`'s `Debug` impl redacts `auth_token`.
+checks the token against the role's accepted set (`ftc` client tokens or `fta`
+agent tokens). Clients send `role = Client` with no machine id; agents send
+`role = Agent` plus their derived network id (`ftm1…`, the hashed machine id — the
+raw id never goes on the wire). On rejection it closes the
+connection gracefully (with a short drain) carrying the reason. `Hello`'s
+`Debug` impl redacts `auth_token`.
 
 The `*_instance_nonce` fields are random per-process ids (distinct from the iroh
 node id) that drive duplicate-id detection (see below); `duplicate_server_observed`
@@ -113,12 +128,15 @@ After the handshake the control bi-stream stays open. The client sends a
 `ControlMsg::Heartbeat { seq }` every `HEARTBEAT_INTERVAL` (10s) and the server
 replies `HeartbeatAck { seq }`, framed with the same length-prefixed helpers
 (capped at `MAX_CONTROL_MSG_SIZE`). This is an app-level liveness signal *on top
-of* QUIC keep-alive: it lets each side notice a dead peer within `LIVENESS_WINDOW`
-(30s) rather than only at the 30s QUIC idle timeout, and — on the server — it
-refreshes the per-client connection registry used for duplicate detection (below).
-A missing heartbeat surfaces as a recoverable `ConnectionLost`, so the client's
-normal reconnect path applies. The heartbeat runs concurrently with the SOCKS5
-stream loop via `tokio::select!` on both sides.
+of* QUIC keep-alive: it catches an *application-level* stall — a peer still
+answering QUIC keep-alive at the transport level but no longer sending
+heartbeats — within `LIVENESS_WINDOW` (33s: three heartbeat intervals plus 3s
+grace). A fully silent peer is caught sooner by the 30s QUIC idle timeout, which
+fires first. On the server,
+heartbeats also refresh the per-client connection registry used for duplicate
+detection (below). A missing heartbeat surfaces as a recoverable
+`ConnectionLost`, so the client's normal reconnect path applies. The heartbeat
+runs concurrently with the SOCKS5 stream loop via `tokio::select!` on both sides.
 
 ## Duplicate-id detection
 
@@ -137,6 +155,22 @@ connections and records the node id in the persisted blocklist (`blocklist.rs`);
 a blocklisted node id is rejected up-front. Because ephemeral ids never recur,
 the persisted client entry is largely an audit record.
 
+**Duplicate agent (server-side).** An agent's iroh id is ephemeral and irrelevant
+to its identity — it is identified by its stable **network id** (`ftm1…`), a
+one-way, versioned hash of its OS-native machine id (`/etc/machine-id` on Linux,
+`IOPlatformUUID` on macOS, `MachineGuid` on Windows) that the agent derives so the
+raw id never reaches the server. A single-instance file lock in the
+`flextunnel-agent` binary already guarantees one agent *process* per machine, so
+the server needs no nonce/liveness machinery: it tracks the one active connection
+per network id, and a *second concurrent* connection presenting the same id is
+necessarily a **different machine** (e.g. a cloned VM image whose machine id was
+never regenerated). On that collision the server tears both down and records the
+network id in the blocklist (`blocked_agents`). Because the network id is stable
+(unlike an ephemeral client id), that block keeps rejecting the id until the
+operator fixes the duplicate and clears the entry. A benign reconnect is not a collision: its prior connection is already
+gone (the reconnect backoff outlasts QUIC dead-connection detection), so it
+registers fresh.
+
 **Duplicate server (self-block).** Server identity is persistent, so two servers
 sharing one secret key is a plausible misconfiguration — but only observable when
 both are reachable by the *same client over a shared discovery/relay path*
@@ -152,9 +186,10 @@ listed. Detection is best-effort and delayed (it needs client churn to observe
 both instances); prompt, robust detection would require a signaling server. See
 [`duplicate-detection-roadmap.md`](./duplicate-detection-roadmap.md).
 
-The blocklist is a JSON file (default `~/.config/flextunnel/blocklist.json`,
-overridable via `blocklist_file`), written atomically (temp + rename) and loaded
-at startup.
+The blocklist is a JSON file at the fixed path
+`~/.config/flextunnel/blocklist.json` — deliberately **not** configurable, since
+relocating this security guard rail would let it be bypassed. It is written
+atomically (temp + rename) and loaded at startup.
 
 ## Concurrency model
 
@@ -223,16 +258,16 @@ defenses.
 | `QUIC_IDLE_TIMEOUT` | 30s | `transport/mod.rs` |
 | `QUIC_INITIAL_MTU` | 1452 | `transport/mod.rs` |
 | `HEARTBEAT_INTERVAL` | 10s | `transport/mod.rs` |
-| `LIVENESS_WINDOW` | 30s | `transport/mod.rs` |
+| `LIVENESS_WINDOW` | 33s | `transport/mod.rs` |
 | `RELAY_CONNECT_TIMEOUT` (`endpoint.online()`) | 10s | `transport/endpoint.rs` |
-| `HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs`, `proxy/server.rs` |
-| `CONNECT_TIMEOUT` (server dial) | 10s | `proxy/server.rs` |
+| `HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs`, `proxy/server.rs`, `proxy/agent.rs` |
+| `CONNECT_TIMEOUT` (server/agent dial) | 10s | `proxy/dial.rs` |
 | reconnect backoff | 1s → 60s + ≤500ms jitter | `proxy/client.rs` |
 | `MAX_HANDSHAKE_SIZE` | 64 KiB | `proxy/signaling.rs` |
 | `MAX_CONTROL_MSG_SIZE` | 1 KiB | `proxy/signaling.rs` |
-| `PROTOCOL_VERSION` | 3 | `proxy/signaling.rs` |
+| `PROTOCOL_VERSION` | 4 | `proxy/signaling.rs` |
 | auth token length | 49 chars | `auth.rs` |
-| `ALPN` | `flextunnel/1` | `proxy/signaling.rs` |
+| `ALPN` | `flextunnel/1` | `transport/mod.rs` |
 
 ## Relation to ezvpn
 
@@ -245,6 +280,12 @@ the project `README.md` for the user-facing comparison.
 
 HTTP proxy support is planned; the wire protocol and server are unaffected. See
 [`http-proxy-roadmap.md`](./http-proxy-roadmap.md).
+
+Reverse routing is loopback-only in v1. A follow-up will let one agent (machine
+id) expose several hostnames each mapped to a chosen host/IP on the agent's own
+network (an `agent_ip` target, default `127.0.0.1`); the server already rewrites
+the routed target before opening the agent stream, so this is a server-side
+config + rewrite change with no agent-side protocol change.
 
 Future work on duplicate-id detection — non-ephemeral client ids and their
 pitfalls, the signaling-server path for prompt server-dup detection, and
