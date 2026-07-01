@@ -9,6 +9,34 @@
 //! This module owns only the mechanics; each binary chooses the *scope* by
 //! passing the lock path — the agent uses a machine-wide path (one agent per
 //! machine), the server a per-user path (one server per user).
+//!
+//! # Alternative mechanisms (if the file lock ever becomes inconvenient)
+//!
+//! A file lock was chosen because it is std-only, portable, and — crucially —
+//! auto-released when the fd closes on exit/crash, so it never leaves stale state
+//! that wedges a restart (a leftover lock *file* is harmless; the lock is the fd,
+//! not the file's existence). Its only wart is filesystem path/permission friction
+//! (see the agent's use of a world-writable `/tmp` path). If that friction ever
+//! outweighs the portability, these are the cleaner OS-native singleton primitives.
+//! They are all also auto-released on process death, which is the property that
+//! disqualifies PID files and POSIX/SysV semaphores (both persist and go stale):
+//!
+//! | OS          | Cleanest native choice                                    |
+//! |-------------|-----------------------------------------------------------|
+//! | Linux       | abstract-namespace Unix socket (`\0flextunnel-agent`) —   |
+//! |             | no filesystem entry, no stale socket file, machine-wide.  |
+//! | macOS / BSD | loopback UDP port (`127.0.0.1:N`); UDP dodges TCP         |
+//! |             | `TIME_WAIT`. Or, for a launchd-managed daemon, rely on    |
+//! |             | launchd's own single-instance-per-job guarantee and skip  |
+//! |             | the lock entirely. (No abstract UDS on macOS; a Mach       |
+//! |             | bootstrap port is the true analog but needs Mach FFI.)    |
+//! | Windows     | named mutex (`Global\flextunnel-agent`) or loopback UDP.  |
+//!
+//! A single portable option across all three is **loopback UDP on a fixed high
+//! port**: no filesystem at all, machine-wide by nature, auto-released. Its only
+//! risk is an unrelated app squatting the port (a false "already running"), which
+//! is negligible under this project's "catch accidental misconfiguration" trust
+//! model. The per-OS split above is only worth it if that risk is unacceptable.
 
 use anyhow::{Context, Result};
 use std::fs::{File, OpenOptions, TryLockError};
