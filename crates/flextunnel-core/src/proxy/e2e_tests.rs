@@ -70,7 +70,13 @@ fn spawn_server(endpoint: Endpoint, blocklist_path: std::path::PathBuf) -> iroh:
         BlockList::load(blocklist_path).unwrap(),
     );
     tokio::spawn(async move {
-        let _ = server.run(&endpoint).await;
+        // Surface why the server task ended — captured by the test harness and
+        // shown on failure, aiding diagnosis. This must NOT panic: a
+        // duplicate-server self-block legitimately returns `Err` here (it's the
+        // expected outcome of one test), so it's informational, not an assertion.
+        if let Err(e) = server.run(&endpoint).await {
+            eprintln!("e2e test server task ended: {e}");
+        }
     });
     own_id
 }
