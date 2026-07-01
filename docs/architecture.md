@@ -58,7 +58,7 @@ is enforced by the auth handshake below, not by the ALPN.
 The protocol version is `PROTOCOL_VERSION = 3`. On the first bi-stream the client
 sends `Hello { version, auth_token, client_instance_nonce, duplicate_server_observed }`
 and the server replies
-`HelloResponse { version, accepted, reject_reason, server_instance_nonce, whitelist_* }`,
+`HelloResponse { version, accepted, reject_reason, server_instance_nonce, routed_* }`,
 both length-prefixed JSON via `signaling::write_message` / `read_message` (4-byte
 big-endian length + payload, capped at `MAX_HANDSHAKE_SIZE` = 64 KiB). The server
 checks the token against its accepted set (`auth::load_auth_tokens`). On rejection

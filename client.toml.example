@@ -21,6 +21,6 @@ auth_token = "vXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 # auto_reconnect = true                      # default: true. set false to exit on first disconnect
 # max_reconnect_attempts = 10                # default: unlimited (omit for no cap)
 
-# The split-tunnel whitelist (the "tunnel set") is configured on the server and
-# pushed to this client during the handshake — there is no client-side whitelist
+# The split-tunnel routed set (the "tunnel set") is configured on the server and
+# pushed to this client during the handshake — there is no client-side routed-set
 # config. See server.toml.example.

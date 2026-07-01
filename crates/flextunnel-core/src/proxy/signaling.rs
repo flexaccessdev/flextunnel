@@ -17,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// flextunnel protocol version.
 pub const PROTOCOL_VERSION: u16 = 3;
 
-/// Maximum auth-handshake message size (64 KiB). The server's whitelist rides
+/// Maximum auth-handshake message size (64 KiB). The server's routed set rides
 /// the `HelloResponse`, so this is generous enough for a large operator list.
 pub const MAX_HANDSHAKE_SIZE: usize = 64 * 1024;
 
@@ -37,7 +37,8 @@ const ATYP_IPV6: u8 = 0x04;
 // forwards the server's reply byte straight into its SOCKS5 reply to the app.
 pub const REP_SUCCESS: u8 = 0x00;
 pub const REP_GENERAL_FAILURE: u8 = 0x01;
-/// Connection not allowed by ruleset — used when a whitelist rejects a target.
+/// Connection not allowed by ruleset — used when the server's routed-set
+/// whitelist rejects a target.
 pub const REP_NOT_ALLOWED: u8 = 0x02;
 pub const REP_NET_UNREACHABLE: u8 = 0x03;
 pub const REP_HOST_UNREACHABLE: u8 = 0x04;
@@ -79,10 +80,10 @@ impl std::fmt::Debug for Hello {
 
 /// Server → client auth handshake response.
 ///
-/// On acceptance the server pushes its resolved whitelist (the *tunnel set*) so
+/// On acceptance the server pushes its resolved routed set (the *tunnel set*) so
 /// the client can make the split-tunnel decision without configuring its own
 /// list — the server is the single source of truth. Empty lists mean an
-/// inactive whitelist (the client tunnels everything).
+/// inactive routed set (the client tunnels everything).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloResponse {
     pub version: u16,
@@ -98,10 +99,10 @@ pub struct HelloResponse {
     pub server_instance_nonce: u128,
     /// Domain rules the client should tunnel (exact or `*.` wildcard).
     #[serde(default)]
-    pub whitelist_domains: Vec<String>,
+    pub routed_domains: Vec<String>,
     /// CIDR / bare-IP rules the client should tunnel.
     #[serde(default)]
-    pub whitelist_cidrs: Vec<String>,
+    pub routed_cidrs: Vec<String>,
 }
 
 impl Hello {
@@ -116,19 +117,19 @@ impl Hello {
 }
 
 impl HelloResponse {
-    /// Accept the client and push the server's whitelist (the *tunnel set*).
+    /// Accept the client and push the server's routed set (the *tunnel set*).
     pub fn accepted(
         server_instance_nonce: u128,
-        whitelist_domains: Vec<String>,
-        whitelist_cidrs: Vec<String>,
+        routed_domains: Vec<String>,
+        routed_cidrs: Vec<String>,
     ) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             accepted: true,
             reject_reason: None,
             server_instance_nonce,
-            whitelist_domains,
-            whitelist_cidrs,
+            routed_domains,
+            routed_cidrs,
         }
     }
 
@@ -138,8 +139,8 @@ impl HelloResponse {
             accepted: false,
             reject_reason: Some(reason.into()),
             server_instance_nonce,
-            whitelist_domains: Vec::new(),
-            whitelist_cidrs: Vec::new(),
+            routed_domains: Vec::new(),
+            routed_cidrs: Vec::new(),
         }
     }
 }
@@ -402,17 +403,17 @@ mod tests {
         assert!(decoded.accepted);
         assert_eq!(decoded.version, PROTOCOL_VERSION);
         assert_eq!(decoded.server_instance_nonce, 42);
-        assert_eq!(decoded.whitelist_domains, vec!["*.example.com", "httpbin.org"]);
-        assert_eq!(decoded.whitelist_cidrs, vec!["10.0.0.0/8"]);
+        assert_eq!(decoded.routed_domains, vec!["*.example.com", "httpbin.org"]);
+        assert_eq!(decoded.routed_cidrs, vec!["10.0.0.0/8"]);
 
-        // A rejection carries no whitelist but still carries the server nonce.
+        // A rejection carries no routed set but still carries the server nonce.
         let rej = HelloResponse::rejected(7, "nope");
         let decoded = decode_hello_response(&encode_hello_response(&rej).unwrap()).unwrap();
         assert!(!decoded.accepted);
         assert_eq!(decoded.reject_reason.as_deref(), Some("nope"));
         assert_eq!(decoded.server_instance_nonce, 7);
-        assert!(decoded.whitelist_domains.is_empty());
-        assert!(decoded.whitelist_cidrs.is_empty());
+        assert!(decoded.routed_domains.is_empty());
+        assert!(decoded.routed_cidrs.is_empty());
     }
 
     #[test]

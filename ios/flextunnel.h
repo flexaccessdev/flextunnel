@@ -50,9 +50,9 @@ void flextunnel_init_logging(void);
  * config_json : NUL-terminated UTF-8 JSON, e.g.
  *   {"server_node_id":"<id>","auth_token":"<token>",
  *    "socks_port":18080,"relay_urls":[],"dns_server":null}
- *   socks_port is optional (defaults to 18080). The split-tunnel whitelist (the
+ *   socks_port is optional (defaults to 18080). The split-tunnel routed set (the
  *   tunnel set) is configured on the server and pushed to the client during the
- *   handshake, so the app sends no whitelist of its own.
+ *   handshake, so the app sends no routed set of its own.
  * out_buf/out_len : caller buffer. On success receives {"socks_port":N};
  *   on failure receives an error message. Always NUL-terminated. If out_buf is
  *   too small for the success JSON, this is treated as a failure (returns NULL,
@@ -76,7 +76,7 @@ int flextunnel_health(const FlextunnelHandle *handle);
  * This is the split-tunnel set the server pushes during the handshake — the
  * domains/CIDRs routed through the tunnel (off-list targets connect directly).
  * An empty domains+cidrs while connected==true means the server runs no
- * whitelist and everything is tunneled. The set becomes available shortly after
+ * routed set and everything is tunneled. The set becomes available shortly after
  * start once the handshake completes, so poll it.
  *
  * Returns 1 on success (full JSON written), 0 if out_buf was too small (the JSON

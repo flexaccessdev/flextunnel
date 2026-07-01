@@ -231,19 +231,20 @@ browse to `http://server.ezvpn:8000/`. Use `socks5h://` (or set Firefox's
 `network.proxy.socks_remote_dns = true`) so the name is resolved by the server,
 not locally.
 
-## Whitelist split-tunneling
+## Routed-set split-tunneling
 
-The whitelist (the **tunnel set**) is a VPN-style split-tunnel "included routes"
-list that decides which destinations traverse the tunnel. It is useful when a
-client must send *all* its traffic to the local SOCKS5 proxy (e.g. an iOS
-WebView, whose proxy config is global) but only some hosts should actually be
-tunneled. It is **required** and configured on the **server only** (config-file
+The routed set (the **tunnel set**) is a VPN-style split-tunnel "included routes"
+list that decides which destinations traverse the tunnel. Targets not on it are
+**not** rejected — the client falls back to a direct connection for them. It is
+useful when a client must send *all* its traffic to the local SOCKS5 proxy (e.g.
+an iOS WebView, whose proxy config is global) but only some hosts should actually
+be tunneled. It is **required** and configured on the **server only** (config-file
 only — there is no CLI flag); the client configures nothing:
 
 ```toml
 # server.toml
-whitelist_domains = ["*.example.com", "httpbin.org"]
-whitelist_cidrs   = ["10.0.0.0/8", "192.168.1.5"]
+routed_domains = ["*.example.com", "httpbin.org"]
+routed_cidrs   = ["10.0.0.0/8", "192.168.1.5"]
 ```
 
 The tunnel set is required: a server started with an empty set **refuses to
@@ -253,8 +254,8 @@ everything. To route **all** traffic through the tunnel (full tunnel), use the
 catch-alls:
 
 ```toml
-whitelist_domains = ["*"]
-whitelist_cidrs   = ["0.0.0.0/0", "::/0"]
+routed_domains = ["*"]
+routed_cidrs   = ["0.0.0.0/0", "::/0"]
 ```
 
 The server is the single source of truth. It **pushes** the list to every client
@@ -266,31 +267,33 @@ in the handshake response, so there is no client list to keep in sync:
   targets keep connecting even while the tunnel is down; an on-list target during
   a drop/backoff gets a SOCKS5 network-unreachable reply (`0x03`) rather than
   hanging.
-- **Server** — it also enforces the same list independently, **rejecting** any
-  tunnel request for a target not on it (SOCKS5 reply `0x02`). This is a
-  defense-in-depth boundary against a misconfigured or untrusted client.
+- **Server** — it also enforces the same list independently as a **whitelist**,
+  **rejecting** any tunnel request for a target not on it (SOCKS5 reply `0x02`).
+  This is a defense-in-depth boundary against a misconfigured or untrusted
+  client. (Note the asymmetry: the client falls back to a direct connection for
+  off-list targets, whereas the server rejects them outright.)
 
 Matching: domain entries are exact (`example.com`), wildcard (`*.example.com`,
 which matches subdomains only — not the bare apex), or `*` (matches every
 hostname), case-insensitive; CIDR entries match IP targets, accept a bare IP as a
 single host, and a default route (`0.0.0.0/0` / `::/0`) matches every IP.
-Hostnames are matched only against `whitelist_domains` and IPs only against
-`whitelist_cidrs`. A numeric IP literal is always gated by `whitelist_cidrs` even
+Hostnames are matched only against `routed_domains` and IPs only against
+`routed_cidrs`. A numeric IP literal is always gated by `routed_cidrs` even
 when a client sends it in hostname form (SOCKS5 `ATYP_DOMAIN`), so `*` never lets
 a raw IP through — it can only route real hostnames.
 
 Only the **combined** set must be non-empty — setting just one list is fine. The
 two never cross: an omitted/empty list means that whole category is off-list and
-always direct-connected. So `whitelist_domains` alone (no `whitelist_cidrs`)
+always direct-connected. So `routed_domains` alone (no `routed_cidrs`)
 tunnels those hostnames but direct-connects every bare-IP target, and
-`whitelist_cidrs` alone tunnels those IPs but direct-connects every hostname.
+`routed_cidrs` alone tunnels those IPs but direct-connects every hostname.
 
 ### Roadmap
 
 - **Client blocking mode.** Today the client **always direct-connects** every
   off-list target (split-tunneling), and this is
   the same for the desktop and iOS clients (they share the same core). A future
-  client option — likely `whitelist_mode = "block" | "direct"` (default
+  client option — likely `routed_mode = "block" | "direct"` (default
   `"direct"`) — will let a client instead **refuse** an off-list connection,
   returning a SOCKS5 error to the local app rather than falling back to a direct
   connection. This is aimed mainly at the desktop client, where blocking off-list

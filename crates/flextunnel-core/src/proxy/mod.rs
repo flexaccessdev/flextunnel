@@ -3,13 +3,13 @@
 pub mod client;
 pub mod dial;
 pub mod server;
+pub mod routed_set;
 pub mod signaling;
 pub mod socks5;
-pub mod whitelist;
 
 #[cfg(test)]
 mod e2e_tests;
 
 pub use client::{ClientConfig, ProxyClient, TunnelRoutes};
+pub use routed_set::RoutedSet;
 pub use server::ProxyServer;
-pub use whitelist::Whitelist;
