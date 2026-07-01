@@ -51,6 +51,12 @@ pub enum ProxyError {
     /// Connection lost during the session.
     #[error("Connection lost: {0}")]
     ConnectionLost(String),
+
+    /// The server detected its own identity is a duplicate and self-blocked.
+    /// Permanent: the id is recorded in the blocklist and future starts are
+    /// refused until an operator resolves the conflict.
+    #[error("Duplicate server identity: {0}")]
+    DuplicateServerId(String),
 }
 
 impl ProxyError {

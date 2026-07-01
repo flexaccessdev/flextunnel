@@ -168,7 +168,13 @@ impl ProxyServer {
                          Its id has been recorded in the blocklist and future starts \
                          with it will be refused until the conflict is resolved."
                     );
-                    return Ok(());
+                    // Report a failure exit, not a clean shutdown, so a
+                    // supervisor/monitor can see this was a fault (duplicate id),
+                    // not a graceful stop.
+                    return Err(ProxyError::DuplicateServerId(
+                        "server id detected as a duplicate; recorded in the blocklist and stopping"
+                            .into(),
+                    ));
                 }
             }
         }
