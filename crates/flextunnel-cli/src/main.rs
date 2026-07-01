@@ -355,7 +355,8 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
 
     let res = tokio::select! {
         res = run => res,
-        _ = app::shutdown_signal() => {
+        sig = app::shutdown_signal() => {
+            sig?;
             log::info!("Received shutdown signal, stopping server");
             Ok(())
         }
@@ -416,7 +417,8 @@ async fn run_client(r: config::ResolvedClient) -> Result<()> {
 
     let res = tokio::select! {
         res = run => res,
-        _ = app::shutdown_signal() => {
+        sig = app::shutdown_signal() => {
+            sig?;
             log::info!("Received shutdown signal, stopping client");
             Ok(())
         }

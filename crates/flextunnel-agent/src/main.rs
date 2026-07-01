@@ -190,7 +190,8 @@ async fn run_agent(r: config::ResolvedAgent) -> Result<()> {
 
     let res = tokio::select! {
         res = run => res,
-        _ = app::shutdown_signal() => {
+        sig = app::shutdown_signal() => {
+            sig?;
             log::info!("Received shutdown signal, stopping agent");
             Ok(())
         }

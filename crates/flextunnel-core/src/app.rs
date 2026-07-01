@@ -3,7 +3,7 @@
 //! and a graceful-shutdown signal future. These are pure boilerplate that every
 //! entry point needs; keeping one copy here avoids drift between crates.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 /// Default `env_logger` filter for the binaries: flextunnel's own crates at
 /// `info`, the noisy transport deps (iroh and its tracing bridge) at `warn`.
@@ -36,20 +36,24 @@ pub fn log_version(pkg_name: &str, pkg_version: &str) {
 }
 
 /// Resolve when a shutdown signal arrives: SIGTERM or SIGINT on Unix, Ctrl-C
-/// elsewhere. Await this alongside the main task in a `tokio::select!`.
+/// elsewhere. Await this alongside the main task in a `tokio::select!`. Returns
+/// an error if the signal handlers can't be registered, so the caller can log
+/// and exit cleanly instead of the process panicking.
 #[cfg(unix)]
-pub async fn shutdown_signal() {
+pub async fn shutdown_signal() -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
-    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    let mut term = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    let mut int = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
     tokio::select! {
         _ = term.recv() => {}
         _ = int.recv() => {}
     }
+    Ok(())
 }
 
 /// Resolve when a shutdown signal arrives (non-Unix: Ctrl-C only).
 #[cfg(not(unix))]
-pub async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+pub async fn shutdown_signal() -> Result<()> {
+    tokio::signal::ctrl_c().await.context("installing Ctrl-C handler")?;
+    Ok(())
 }
