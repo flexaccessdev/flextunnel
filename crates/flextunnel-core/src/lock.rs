@@ -7,8 +7,9 @@
 //! never wedges a restart.
 //!
 //! This module owns only the mechanics; each binary chooses the *scope* by
-//! passing the lock path — the agent uses a machine-wide, root-owned path (one
-//! agent per machine), the server a per-user path (one server per user).
+//! passing the lock path. The server uses a per-user path (one server per user).
+//! (The agent's one-per-machine guarantee instead uses a loopback-UDP singleton —
+//! see [`crate::udp_lock`] — so it needs no root-writable lock path.)
 //!
 //! # Alternative mechanisms (if the file lock ever becomes inconvenient)
 //!
@@ -56,9 +57,9 @@ impl InstanceLock {
     /// operator visibility. Fails if the path can't be opened, or with
     /// `contended_msg` if another process already holds the lock.
     ///
-    /// Each scope owns its own single-user path (the server's per-user config dir,
-    /// the agent's root-owned `/var/run`), so ordinary umask-created permissions
-    /// suffice — no cross-user sharing is required.
+    /// The scope owns its own single-user path (the server's per-user config dir),
+    /// so ordinary umask-created permissions suffice — no cross-user sharing is
+    /// required.
     pub fn acquire(path: &Path, contended_msg: &str) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {

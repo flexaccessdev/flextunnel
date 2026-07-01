@@ -1,58 +1,34 @@
 //! Machine-wide single-instance lock for the agent: only one
 //! `flextunnel-agent` process per machine.
 //!
-//! The agent is a machine-global, root-run daemon, so the lock lives in a
-//! standard root-owned runtime location: `/var/run/flextunnel-agent.lock` on Unix
-//! (`/var/run` exists and is root-writable on both Linux — a symlink to `/run` —
-//! and macOS) and `%ProgramData%\flextunnel\agent.lock` on Windows. The guarantee
-//! is "one agent per machine". This is the machine-local counterpart to the
-//! server's duplicate-machine-id block: the lock stops a second *local* process;
-//! the server block catches two *different* machines colliding on one machine id.
+//! The guarantee is "one agent per machine". This is the machine-local
+//! counterpart to the server's duplicate-machine-id block: the lock stops a
+//! second *local* process; the server block catches two *different* machines
+//! colliding on one machine id.
 //!
-//! Because the agent runs as root, the lock file needs no world-writable dance:
-//! only root writes it, so ordinary umask-created permissions are fine. A non-root
-//! invocation fails here (it cannot create the file under `/var/run`), which is
-//! how the "run as root" expectation is enforced — there is no separate privilege
-//! check in the code.
-//!
-//! The locking mechanics live in [`flextunnel_core::lock`]; this module only
-//! picks the machine-wide path.
+//! It is enforced by a loopback-UDP singleton ([`UdpInstanceLock`]): the agent
+//! exclusively binds a fixed `127.0.0.1` UDP port, which is machine-wide by
+//! nature and — unlike a lock file under `/var/run` — needs no filesystem and no
+//! root. It works identically on Linux, macOS, and Windows. The port is released
+//! automatically when the process exits or crashes, so a stale lock never wedges
+//! a restart. See [`flextunnel_core::udp_lock`] for the mechanics.
 
-use anyhow::{Context, Result};
-use flextunnel_core::lock::InstanceLock;
-use std::path::PathBuf;
+use anyhow::Result;
+use flextunnel_core::udp_lock::UdpInstanceLock;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
-/// The machine-wide lock path for this OS, if one exists.
-/// `/var/run/flextunnel-agent.lock` on Unix (a root-owned, machine-wide runtime
-/// dir) and `%ProgramData%\flextunnel\agent.lock` on Windows. `None` on other
-/// systems.
-fn machine_wide_lock_path() -> Option<PathBuf> {
-    #[cfg(unix)]
-    {
-        Some(PathBuf::from("/var/run/flextunnel-agent.lock"))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var_os("ProgramData")
-            .map(|p| PathBuf::from(p).join("flextunnel").join("agent.lock"))
-    }
-    #[cfg(not(any(unix, target_os = "windows")))]
-    {
-        None
-    }
-}
+/// Fixed loopback UDP port for the machine-wide agent singleton. Arbitrary but
+/// fixed, chosen in the private/dynamic range (49152-65535).
+pub const AGENT_SINGLETON_PORT: u16 = 59274;
 
 /// Acquire the machine-wide single-instance lock, held for the process lifetime.
-/// Fails fast if this OS has no machine-wide lock path, if the path cannot be
-/// opened (e.g. running as a non-root user, who cannot write under `/var/run`), or
-/// if another agent already holds the lock.
-pub fn acquire() -> Result<InstanceLock> {
-    let path = machine_wide_lock_path().context(
-        "No machine-wide lock path is defined for this operating system, so the \
-         single-instance guarantee cannot be enforced",
-    )?;
-    InstanceLock::acquire(
-        &path,
+/// Machine-wide by nature (a fixed loopback UDP port), needs no root, and is
+/// released automatically on exit or crash. Fails if another agent already holds
+/// the port.
+pub fn acquire() -> Result<UdpInstanceLock> {
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, AGENT_SINGLETON_PORT));
+    UdpInstanceLock::acquire(
+        addr,
         "Another flextunnel-agent is already running. Only one agent per machine is allowed.",
     )
 }
