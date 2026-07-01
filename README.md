@@ -233,11 +233,12 @@ not locally.
 
 ## Whitelist split-tunneling
 
-A whitelist (the **tunnel set**) restricts which destinations traverse the
-tunnel. It is useful when a client must send *all* its traffic to the local
-SOCKS5 proxy (e.g. an iOS WebView, whose proxy config is global) but only some
-hosts should actually be tunneled. It is configured on the **server only**
-(config-file only — there is no CLI flag); the client configures nothing:
+The whitelist (the **tunnel set**) is a VPN-style split-tunnel "included routes"
+list that decides which destinations traverse the tunnel. It is useful when a
+client must send *all* its traffic to the local SOCKS5 proxy (e.g. an iOS
+WebView, whose proxy config is global) but only some hosts should actually be
+tunneled. It is **required** and configured on the **server only** (config-file
+only — there is no CLI flag); the client configures nothing:
 
 ```toml
 # server.toml
@@ -245,26 +246,40 @@ whitelist_domains = ["*.example.com", "httpbin.org"]
 whitelist_cidrs   = ["10.0.0.0/8", "192.168.1.5"]
 ```
 
+The tunnel set is required: a server started with an empty set **refuses to
+start**, and a client that receives an empty set from a (misconfigured or old)
+server **aborts the handshake** rather than silently direct-connecting
+everything. To route **all** traffic through the tunnel (full tunnel), use the
+catch-alls:
+
+```toml
+whitelist_domains = ["*"]
+whitelist_cidrs   = ["0.0.0.0/0", "::/0"]
+```
+
 The server is the single source of truth. It **pushes** the list to every client
 in the handshake response, so there is no client list to keep in sync:
 
-- **Client** — on connect it learns the server's list. When it is active the
-  client tunnels only matching targets and connects everything else **directly**
-  from its own network (split-tunneling). An empty list (the default) tunnels
-  everything.
+- **Client** — on connect it learns the server's list. It tunnels only matching
+  targets and connects everything else **directly** from its own network
+  (split-tunneling). The direct path is independent of the tunnel, so off-list
+  targets keep connecting even while the tunnel is down; an on-list target during
+  a drop/backoff gets a SOCKS5 network-unreachable reply (`0x03`) rather than
+  hanging.
 - **Server** — it also enforces the same list independently, **rejecting** any
   tunnel request for a target not on it (SOCKS5 reply `0x02`). This is a
   defense-in-depth boundary against a misconfigured or untrusted client.
 
-Matching: domain entries are exact (`example.com`) or wildcard (`*.example.com`,
-which matches subdomains only — not the bare apex), case-insensitive; CIDR
-entries match IP targets and accept a bare IP as a single host. Domains are
+Matching: domain entries are exact (`example.com`), wildcard (`*.example.com`,
+which matches subdomains only — not the bare apex), or `*` (matches every host),
+case-insensitive; CIDR entries match IP targets, accept a bare IP as a single
+host, and a default route (`0.0.0.0/0` / `::/0`) matches every IP. Domains are
 matched only against `whitelist_domains` and IPs only against `whitelist_cidrs`.
 
 ### Roadmap
 
-- **Client blocking mode.** Today, when a whitelist is active the client
-  **always direct-connects** every off-list target (split-tunneling), and this is
+- **Client blocking mode.** Today the client **always direct-connects** every
+  off-list target (split-tunneling), and this is
   the same for the desktop and iOS clients (they share the same core). A future
   client option — likely `whitelist_mode = "block" | "direct"` (default
   `"direct"`) — will let a client instead **refuse** an off-list connection,
