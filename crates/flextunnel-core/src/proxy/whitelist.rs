@@ -7,15 +7,20 @@
 //! request for a target that is not on the list (defense in depth). For both
 //! roles the lists should be kept in sync.
 //!
-//! Two independent lists are matched against the requested [`Target`] *as
-//! presented* — a [`Target::Domain`] is only ever matched against domain rules
-//! and a [`Target::Ip`] only against CIDR rules (no post-DNS re-check):
+//! Two independent lists are matched against the requested [`Target`]. A
+//! *hostname* is matched only against domain rules and an *IP* only against CIDR
+//! rules. A numeric IP literal that arrives in domain form ([`Target::Domain`]
+//! via SOCKS5 `ATYP_DOMAIN`) is recognized as an IP and gated by the CIDR rules
+//! too — so it can't slip past a narrow CIDR set by masquerading as a hostname.
+//! There is no post-DNS re-check: a genuine hostname that later resolves to an
+//! IP is still matched only against the domain rules.
 //!
 //! * **Domains** — explicit-wildcard matching. A bare `example.com` matches that
 //!   host exactly; a `*.example.com` entry matches any subdomain
 //!   (`api.example.com`, `a.b.example.com`) but **not** the apex `example.com`; a
-//!   lone `*` matches *every* domain (the full-tunnel catch-all for hostnames).
-//!   Matching is case-insensitive.
+//!   lone `*` matches *every hostname* (the full-tunnel catch-all). Domain rules
+//!   match hostnames only — an IP literal sent in domain form is gated by the
+//!   CIDRs, never by `*`. Matching is case-insensitive.
 //! * **CIDRs** — an IP target matches if it falls in any configured network. A
 //!   bare IP (`192.168.1.5`) is accepted as a single-host network (`/32`/`/128`);
 //!   a default route (`0.0.0.0/0` / `::/0`) matches every IP of its family.
@@ -108,16 +113,25 @@ impl Whitelist {
     }
 
     /// Whether `target` is on the whitelist (i.e. should be tunneled / allowed).
-    /// A domain is matched only against domain rules (with `*` matching all), an
-    /// IP only against CIDRs (with `0.0.0.0/0` / `::/0` matching all).
+    /// A hostname is matched against the domain rules (with `*` matching every
+    /// hostname); an IP — whether presented as [`Target::Ip`] or as a numeric
+    /// [`Target::Domain`] — is matched against the CIDRs (with `0.0.0.0/0` /
+    /// `::/0` matching all).
     pub fn allows(&self, target: &Target) -> bool {
         match target {
-            Target::Domain(host, _) => self.allows_domain(host),
-            Target::Ip(sa) => self.cidrs.iter().any(|net| net.contains(sa.ip())),
+            Target::Domain(host, _) => self.allows_host(host),
+            Target::Ip(sa) => self.allows_ip(sa.ip()),
         }
     }
 
-    fn allows_domain(&self, host: &str) -> bool {
+    /// Match a host string from a domain-form target. A numeric IP literal
+    /// (including a bracketed IPv6 form like `[::1]`) is gated by the CIDR rules
+    /// rather than the domain rules, so `*` and other hostname rules never let an
+    /// IP through in domain form.
+    fn allows_host(&self, host: &str) -> bool {
+        if let Some(ip) = parse_ip_literal(host) {
+            return self.allows_ip(ip);
+        }
         if self.domains_all {
             return true;
         }
@@ -128,6 +142,20 @@ impl Whitelist {
                 .iter()
                 .any(|suffix| host.ends_with(suffix.as_str()))
     }
+
+    fn allows_ip(&self, ip: IpAddr) -> bool {
+        self.cidrs.iter().any(|net| net.contains(ip))
+    }
+}
+
+/// Parse a host string as an IP literal, tolerating a single bracketed IPv6 form
+/// (`[2606:4700::1]`). Returns `None` for genuine hostnames.
+fn parse_ip_literal(host: &str) -> Option<IpAddr> {
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    IpAddr::from_str(unbracketed).ok()
 }
 
 #[cfg(test)]
@@ -228,9 +256,34 @@ mod tests {
     #[test]
     fn domains_and_ips_match_separate_lists() {
         let w = wl(&["example.com"], &["10.0.0.0/8"]);
-        // A domain is never matched against CIDRs, and vice versa.
-        assert!(!w.allows(&domain("10.0.0.1")));
+        // A real hostname is matched only against domain rules; a bare IP only
+        // against CIDRs. Neither rule set leaks into the other.
+        assert!(!w.allows(&domain("other.com")));
+        assert!(w.allows(&domain("example.com")));
         assert!(!w.allows(&ip("1.2.3.4")));
+        assert!(w.allows(&ip("10.1.2.3")));
+    }
+
+    #[test]
+    fn ip_literal_in_domain_form_is_gated_by_cidr() {
+        // A numeric host sent as ATYP_DOMAIN is treated as an IP: matched against
+        // the CIDRs, never the domain rules — not even the `*` catch-all.
+        let w = wl(&["*"], &["10.0.0.0/8"]);
+        assert!(w.allows(&domain("10.0.0.1"))); // inside the CIDR → allowed
+        assert!(!w.allows(&domain("8.8.8.8"))); // `*` does NOT cover IP literals
+        assert!(w.allows(&domain("real.hostname"))); // genuine host still matched by `*`
+
+        // Bracketed and bare IPv6 literals in domain form are handled too.
+        let w6 = wl(&["*"], &["fd00::/8"]);
+        assert!(w6.allows(&domain("[fd00::1]")));
+        assert!(w6.allows(&domain("fd00::1")));
+        assert!(!w6.allows(&domain("[fe80::1]")));
+
+        // With no CIDRs configured, an IP literal in domain form matches nothing
+        // even under `*`.
+        let w_dom_only = wl(&["*"], &[]);
+        assert!(!w_dom_only.allows(&domain("10.0.0.1")));
+        assert!(w_dom_only.allows(&domain("real.hostname")));
     }
 
     #[test]

@@ -271,10 +271,13 @@ in the handshake response, so there is no client list to keep in sync:
   defense-in-depth boundary against a misconfigured or untrusted client.
 
 Matching: domain entries are exact (`example.com`), wildcard (`*.example.com`,
-which matches subdomains only — not the bare apex), or `*` (matches every host),
-case-insensitive; CIDR entries match IP targets, accept a bare IP as a single
-host, and a default route (`0.0.0.0/0` / `::/0`) matches every IP. Domains are
-matched only against `whitelist_domains` and IPs only against `whitelist_cidrs`.
+which matches subdomains only — not the bare apex), or `*` (matches every
+hostname), case-insensitive; CIDR entries match IP targets, accept a bare IP as a
+single host, and a default route (`0.0.0.0/0` / `::/0`) matches every IP.
+Hostnames are matched only against `whitelist_domains` and IPs only against
+`whitelist_cidrs`. A numeric IP literal is always gated by `whitelist_cidrs` even
+when a client sends it in hostname form (SOCKS5 `ATYP_DOMAIN`), so `*` never lets
+a raw IP through — it can only route real hostnames.
 
 Only the **combined** set must be non-empty — setting just one list is fine. The
 two never cross: an omitted/empty list means that whole category is off-list and
