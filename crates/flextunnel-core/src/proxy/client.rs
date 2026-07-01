@@ -41,9 +41,12 @@ const LOCAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// disconnected (during a drop/backoff), so off-list targets still connect
 /// directly and on-list targets get a clean unreachable reply.
 type SharedConn = Arc<Mutex<Option<Connection>>>;
-/// The last-known tunnel set shared with the accept loop. Retained across drops
-/// so split-tunnel routing keeps working while the connection is down.
-type SharedWhitelist = Arc<Mutex<Arc<Whitelist>>>;
+/// The route policy (tunnel set) shared with the accept loop. `None` until the
+/// first handshake learns it, then `Some` for the rest of the process — retained
+/// across drops so split-tunnel routing keeps working while the connection is
+/// down. While it is `None` the client **fails closed**: no connection is routed
+/// (directly or tunneled) before the policy is known, so nothing leaks out.
+type SharedWhitelist = Arc<Mutex<Option<Arc<Whitelist>>>>;
 
 /// Configuration for the proxy client.
 pub struct ClientConfig {
@@ -200,11 +203,13 @@ impl ProxyClient {
 
         // Shared state between the always-on accept loop and the connection
         // manager: the current live connection (None during a drop/backoff) and
-        // the last-known tunnel set. Keeping the accept loop independent of the
-        // connection is what lets off-list targets keep connecting directly while
-        // the tunnel is down — only on-list targets fail until it recovers.
+        // the route policy (None until the first handshake learns it). Keeping the
+        // accept loop independent of the connection is what lets off-list targets
+        // keep connecting directly while the tunnel is down — only on-list targets
+        // fail until it recovers. The policy starts None so the client fails closed
+        // until it is known.
         let current: SharedConn = Arc::new(Mutex::new(None));
-        let whitelist: SharedWhitelist = Arc::new(Mutex::new(Arc::new(Whitelist::default())));
+        let whitelist: SharedWhitelist = Arc::new(Mutex::new(None));
 
         // One task, two concurrent futures. When the manager returns (a fatal
         // first-connect failure or a clean stop) the accept loop is dropped with
@@ -252,9 +257,10 @@ impl ProxyClient {
                 },
             };
 
-            // Publish the live connection + tunnel set so the accept loop routes
-            // against them; the tunnel set is retained on the next drop.
-            *whitelist_shared.lock().expect("whitelist lock") = whitelist;
+            // Publish the live connection + route policy so the accept loop routes
+            // against them; the policy is retained on the next drop (never reset to
+            // None once known, so we only fail closed before the *first* connect).
+            *whitelist_shared.lock().expect("whitelist lock") = Some(whitelist);
             *current.lock().expect("connection lock") = Some(connection.clone());
 
             // Keep the connection alive until it drops, then reconnect (or exit).
@@ -486,9 +492,10 @@ async fn client_heartbeat_loop(
 }
 
 /// Accept local SOCKS5 connections for the lifetime of the listener, routing each
-/// against the current tunnel set and live connection. Runs independently of the
+/// against the current route policy and live connection. Runs independently of the
 /// QUIC connection, so off-list targets keep connecting directly while the tunnel
-/// is down. Returns only on a listener error.
+/// is down. Until the first handshake learns the route policy the client fails
+/// closed and refuses every connection. Returns only on a listener error.
 async fn accept_loop(
     listener: &TcpListener,
     current: &SharedConn,
@@ -508,9 +515,10 @@ async fn accept_loop(
 }
 
 /// Handle one local SOCKS5 connection: negotiate, parse CONNECT, then route by the
-/// current tunnel set — an on-list target is tunneled to the server (or answered
-/// with a network-unreachable reply if the tunnel is down), an off-list target is
-/// dialed directly from this device.
+/// current route policy — refused with a general-failure reply until the policy is
+/// known (fail closed), otherwise an on-list target is tunneled to the server (or
+/// answered with a network-unreachable reply if the tunnel is down) and an
+/// off-list target is dialed directly from this device.
 async fn handle_local_conn(
     mut tcp: TcpStream,
     current: SharedConn,
@@ -525,9 +533,19 @@ async fn handle_local_conn(
     .await
     .map_err(|_| anyhow::anyhow!("timed out during local SOCKS5 handshake"))??;
 
+    // Fail closed until the route policy is known: before the first handshake
+    // learns the tunnel set we don't route anything, so no traffic leaks out
+    // (directly or tunneled) before we know how it should be routed. Answer with a
+    // SOCKS5 general-failure reply rather than leaving the app hanging.
+    let policy = { whitelist_shared.lock().expect("whitelist lock").clone() };
+    let Some(whitelist) = policy else {
+        log::debug!("Route policy not yet known; refusing: {target:?}");
+        let _ = socks5::write_reply(&mut tcp, signaling::REP_GENERAL_FAILURE).await;
+        return Ok(());
+    };
+
     // Split-tunnel: a target not in the tunnel set is dialed directly from this
     // device's own network (its DNS, its IP) — works even when the tunnel is down.
-    let whitelist = { whitelist_shared.lock().expect("whitelist lock").clone() };
     if !whitelist.allows(&target) {
         log::debug!("Direct (off tunnel set): {target:?}");
         return direct_connect(tcp, &target).await;
