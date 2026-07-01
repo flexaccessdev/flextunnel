@@ -6,7 +6,7 @@ resolver = "3"
 default-members = ["crates/flextunnel-core", "crates/flextunnel-cli"]
 
 [workspace.package]
-version = "0.0.14"
+version = "0.0.15"
 edition = "2024"
 description = "SOCKS5-over-QUIC proxy via iroh P2P"
 
