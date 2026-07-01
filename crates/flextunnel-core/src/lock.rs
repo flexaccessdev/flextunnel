@@ -27,7 +27,14 @@ impl InstanceLock {
     /// directory and the file as needed, then records the current PID for
     /// operator visibility. Fails if the path can't be opened, or with
     /// `contended_msg` if another process already holds the lock.
-    pub fn acquire(path: &Path, contended_msg: &str) -> Result<Self> {
+    ///
+    /// When `world_writable` is set (Unix only), the lock file is forced to mode
+    /// `0666`. This is for a shared machine-wide lock in a world-writable dir like
+    /// `/tmp`: without it, umask would leave the file `0644` and a *second* user's
+    /// agent could not open the first user's lock file, silently defeating the
+    /// one-agent-per-machine check. It is a no-op on Windows and for per-user locks.
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    pub fn acquire(path: &Path, contended_msg: &str, world_writable: bool) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("Failed to create the lock directory {}", parent.display())
@@ -35,15 +42,27 @@ impl InstanceLock {
         }
         // Open or create the lock file WITHOUT truncating — truncation must happen
         // only after we hold the lock, so a concurrent holder's PID isn't clobbered.
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        if world_writable {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o666);
+        }
+        let mut file = opts
             .open(path)
             .with_context(|| format!("Failed to open the lock file {}", path.display()))?;
 
         match file.try_lock() {
             Ok(()) => {
+                // Force 0666 even if umask masked the create mode above, so any user
+                // can open the shared lock. Best-effort: only the file's owner can
+                // chmod, but the file is already 0666 for everyone else.
+                #[cfg(unix)]
+                if world_writable {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = file.set_permissions(std::fs::Permissions::from_mode(0o666));
+                }
                 // We hold the lock: record our PID for operator visibility.
                 let _ = file.set_len(0);
                 let _ = file.seek(SeekFrom::Start(0));
@@ -68,16 +87,24 @@ mod tests {
     /// one process); after the first is dropped, acquiring succeeds again.
     #[test]
     fn second_acquire_rejected_while_held() {
-        let path = std::env::temp_dir().join("flextunnel-instance-lock-test.lock");
-        let first = InstanceLock::acquire(&path, "held").expect("first acquire");
+        // Unique per-run path: the fixed name would collide across concurrent
+        // `cargo test` processes (advisory locks conflict across processes), making
+        // the "first acquire" flakily fail. PID + a high-res timestamp is enough.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir()
+            .join(format!("flextunnel-instance-lock-test-{}-{nanos}.lock", std::process::id()));
+        let first = InstanceLock::acquire(&path, "held", true).expect("first acquire");
         assert!(
-            InstanceLock::acquire(&path, "held").is_err(),
+            InstanceLock::acquire(&path, "held", true).is_err(),
             "a second acquire must fail while the lock is held"
         );
         drop(first);
         // Released: acquiring again should now succeed.
         assert!(
-            InstanceLock::acquire(&path, "held").is_ok(),
+            InstanceLock::acquire(&path, "held", true).is_ok(),
             "acquire should succeed after the lock is released"
         );
         let _ = std::fs::remove_file(&path);
