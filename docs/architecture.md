@@ -231,7 +231,7 @@ defenses.
 | `MAX_HANDSHAKE_SIZE` | 64 KiB | `proxy/signaling.rs` |
 | `MAX_CONTROL_MSG_SIZE` | 1 KiB | `proxy/signaling.rs` |
 | `PROTOCOL_VERSION` | 3 | `proxy/signaling.rs` |
-| auth token length | 47 chars | `auth.rs` |
+| auth token length | 49 chars | `auth.rs` |
 | `ALPN` | `flextunnel/1` | `proxy/signaling.rs` |
 
 ## Relation to ezvpn

@@ -263,7 +263,7 @@ mod tests {
     fn parse_server_config() {
         let toml = r#"
             secret_file = "./server.key"
-            auth_tokens = ["vAAA", "vBBB"]
+            auth_tokens = ["ftcAAA", "ftcBBB"]
             relay_urls = ["https://relay.example"]
             dns_server = "none"
         "#;
@@ -279,7 +279,7 @@ mod tests {
         let toml = r#"
             server_node_id = "abc123"
             socks_listen = "127.0.0.1:1085"
-            auth_token = "vTOKEN"
+            auth_token = "ftcTOKEN"
             auto_reconnect = false
             max_reconnect_attempts = 5
         "#;

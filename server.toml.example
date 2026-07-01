@@ -10,7 +10,7 @@ secret_file = "./server.key"
 # secret = "<base64-encoded 32-byte key>"   # inline alternative to secret_file
 
 # Accepted client auth tokens. Provide inline list and/or a file (they combine).
-auth_tokens = ["vXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"]
+auth_tokens = ["ftcXXXXXXX"]
 # auth_tokens_file = "/etc/flextunnel/auth_tokens.txt"
 
 # Optional iroh tuning.
