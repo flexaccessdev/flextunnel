@@ -373,6 +373,41 @@ async fn duplicate_agent_machine_id_is_detected_and_blocklisted() {
     let _ = std::fs::remove_file(&bl_path);
 }
 
+/// A same-instance agent reconnect (same instance nonce) must NOT be treated as a
+/// duplicate: the stale connection is superseded and the machine id is never
+/// blocklisted, so a legitimate reconnect after a network blip keeps working.
+#[tokio::test]
+async fn agent_reconnect_same_nonce_is_not_blocklisted() {
+    let bl_path = temp_blocklist("agentreconnect");
+    let agent_tokens = HashSet::from([AGENT_TOKEN.to_string()]);
+
+    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
+    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
+    spawn_server_full(server_ep, bl_path.clone(), agent_tokens, HashMap::new(), Vec::new());
+
+    let machine_id = "reconnect-machine-id";
+    let nonce = 42u128;
+
+    // First connection authenticates and stays live (held in scope, mimicking a
+    // stale connection not yet reaped when the agent reconnects).
+    let ep1 = loopback_endpoint(SecretKey::generate(), false).await;
+    let (_c1, _s1, _r1, resp1) = agent_handshake(&ep1, server_addr.clone(), machine_id, nonce).await;
+    assert!(resp1.accepted, "first agent should be accepted");
+
+    // Reconnect: a fresh (ephemeral) node id but the SAME machine id and nonce.
+    let ep2 = loopback_endpoint(SecretKey::generate(), false).await;
+    let (_c2, _s2, _r2, resp2) = agent_handshake(&ep2, server_addr, machine_id, nonce).await;
+    assert!(resp2.accepted, "same-instance reconnect must be accepted: {:?}", resp2.reject_reason);
+
+    // The machine id must NOT have been blocklisted.
+    assert!(
+        !BlockList::load(bl_path.clone()).unwrap().is_agent_blocked(machine_id),
+        "a same-instance reconnect must never blocklist the machine id"
+    );
+
+    let _ = std::fs::remove_file(&bl_path);
+}
+
 /// The startup guard: a server whose own id is already recorded as conflicted
 /// must be refused. (The CLI performs the same check in `run_server`; here we
 /// assert the underlying predicate the guard relies on.)

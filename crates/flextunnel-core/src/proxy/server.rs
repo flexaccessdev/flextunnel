@@ -33,6 +33,11 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 /// duplicate-id conflict (distinct from the auth-failure code `1`).
 const CLOSE_DUPLICATE: u32 = 2;
 
+/// QUIC close code used when the server tears down a stale agent connection that
+/// a benign reconnect (same instance nonce) has superseded. Not a conflict — the
+/// same agent process simply came back before its old connection was reaped.
+const CLOSE_SUPERSEDED: u32 = 3;
+
 /// Monotonic per-connection sequence, assigned to each accepted connection so
 /// the registry can key entries by connection instance (not just by node id or
 /// nonce). This lets a benign same-process reconnect overlap keep two distinct
@@ -77,14 +82,19 @@ impl Drop for ConnGuard {
 }
 
 /// One live **agent** connection, tracked by its machine id. There is at most one
-/// per machine id — a second concurrent connection for the same id is a
-/// duplicate (see [`ProxyServer::register_agent`]).
+/// per machine id. A second connection for the same id with the *same* instance
+/// nonce is a benign reconnect (it replaces this entry); one with a *different*
+/// nonce is a genuine duplicate (see [`ProxyServer::register_agent`]).
 struct AgentEntry {
     /// The connection's monotonic sequence, so the RAII guard only evicts the
     /// entry it created (a newer registration under the same id is not clobbered).
     conn_seq: u64,
+    /// The agent process's instance nonce (from its `Hello`). Distinguishes a
+    /// same-process reconnect (same nonce) from a different agent instance sharing
+    /// the machine id (different nonce → a duplicate).
+    nonce: u128,
     /// Handle to the agent connection, so the server can open reverse-route
-    /// streams to it and tear it down on a duplicate.
+    /// streams to it and tear it down on a duplicate or reconnect.
     connection: Connection,
 }
 
@@ -96,8 +106,14 @@ type AgentRegistry = HashMap<String, AgentEntry>;
 enum AgentReg {
     /// No prior connection for this machine id; the entry was inserted.
     Fresh,
-    /// A connection for this machine id is already active — a duplicate. Carries
-    /// the existing connection so the caller can tear it down.
+    /// A prior connection for this machine id existed with the *same* instance
+    /// nonce — a benign reconnect of the same agent process. The stale entry has
+    /// been replaced with the new connection; the old connection is carried back
+    /// so the caller can close it. Not a duplicate; nothing is blocklisted.
+    Replaced(Connection),
+    /// A connection for this machine id is already active with a *different*
+    /// instance nonce — a genuine duplicate (a distinct agent instance sharing the
+    /// machine id). Carries the existing connection so the caller can tear it down.
     Duplicate(Connection),
 }
 
@@ -314,18 +330,43 @@ impl ProxyServer {
     }
 
     /// Register a live agent connection under its machine id. Returns
-    /// [`AgentReg::Fresh`] after inserting, or [`AgentReg::Duplicate`] (with the
-    /// existing connection) if one is already active for this id — the check and
+    /// [`AgentReg::Fresh`] after inserting; [`AgentReg::Replaced`] (with the old
+    /// connection) if the same agent process (same instance nonce) reconnected
+    /// before its stale entry was reaped — the entry is refreshed to this
+    /// connection; or [`AgentReg::Duplicate`] (with the existing connection) if a
+    /// *different* agent instance is already active for this id. The check and
     /// insert run under one lock so two simultaneous connects can't both slip in.
-    fn register_agent(&self, machine_id: &str, conn_seq: u64, connection: Connection) -> AgentReg {
+    fn register_agent(
+        &self,
+        machine_id: &str,
+        conn_seq: u64,
+        nonce: u128,
+        connection: Connection,
+    ) -> AgentReg {
         let mut reg = self.agent_registry.lock().expect("agent registry lock");
         if let Some(existing) = reg.get(machine_id) {
-            return AgentReg::Duplicate(existing.connection.clone());
+            if existing.nonce != nonce {
+                return AgentReg::Duplicate(existing.connection.clone());
+            }
+            // Same instance nonce: the same agent process reconnecting. Replace the
+            // stale entry (new conn_seq so its guard owns the entry) and hand the
+            // old connection back to be closed.
+            let old = existing.connection.clone();
+            reg.insert(
+                machine_id.to_string(),
+                AgentEntry {
+                    conn_seq,
+                    nonce,
+                    connection,
+                },
+            );
+            return AgentReg::Replaced(old);
         }
         reg.insert(
             machine_id.to_string(),
             AgentEntry {
                 conn_seq,
+                nonce,
                 connection,
             },
         );
@@ -523,9 +564,9 @@ impl ProxyServer {
 
     /// Serve an authenticated **agent** connection: validate its `fta` token and
     /// machine id, register it as the reverse-route exit point for that machine id
-    /// (rejecting + blocking a duplicate — a second concurrent connection for the
-    /// same id is a different machine, e.g. a cloned image), accept it, then run
-    /// only the heartbeat loop. The agent never opens data streams to us; routing
+    /// (a same instance-nonce reconnect supersedes its stale connection; only a
+    /// *different* instance under the same id — e.g. a cloned image — is rejected +
+    /// blocklisted), accept it, then run only the heartbeat loop. The agent never opens data streams to us; routing
     /// tasks open streams *to* it via [`Self::active_agent_conn`]. The
     /// [`AgentGuard`] removes it from the registry on any exit.
     async fn handle_agent(
@@ -565,13 +606,33 @@ impl ProxyServer {
                 .await;
         }
 
-        // Register as the exit point for this machine id, or detect a duplicate.
-        let _guard = match self.register_agent(&machine_id, conn_seq, connection.clone()) {
+        // Register as the exit point for this machine id, superseding a stale
+        // same-instance reconnect or detecting a genuine duplicate.
+        let _guard = match self.register_agent(
+            &machine_id,
+            conn_seq,
+            hello.client_instance_nonce,
+            connection.clone(),
+        ) {
             AgentReg::Fresh => AgentGuard {
                 registry: self.agent_registry.clone(),
                 machine_id: machine_id.clone(),
                 conn_seq,
             },
+            AgentReg::Replaced(old) => {
+                log::info!(
+                    "Agent {machine_id} reconnected (same instance); superseding its stale \
+                     connection"
+                );
+                // Close the stale connection; the entry now carries this newer
+                // conn_seq, so the old connection's guard won't evict it.
+                old.close(CLOSE_SUPERSEDED.into(), b"superseded by agent reconnect");
+                AgentGuard {
+                    registry: self.agent_registry.clone(),
+                    machine_id: machine_id.clone(),
+                    conn_seq,
+                }
+            }
             AgentReg::Duplicate(existing) => {
                 log::warn!(
                     "Duplicate agent machine id {machine_id} (another agent is already connected \

@@ -167,7 +167,7 @@ fn main() -> Result<()> {
                 ..Default::default()
             };
             let file = config::load_server_config(config.as_deref(), default_config)?;
-            let r = config::resolve_server(cli, file);
+            let r = config::resolve_server(cli, file)?;
             secret::show_id(r.secret.as_deref(), r.secret_file.as_deref())
         }
         Command::GenerateAuthToken { count } => {
@@ -211,7 +211,7 @@ async fn run_async(command: Command) -> Result<()> {
                 blocklist_file,
             };
             let file = config::load_server_config(config_path.as_deref(), default_config)?;
-            run_server(config::resolve_server(cli, file)).await
+            run_server(config::resolve_server(cli, file)?).await
         }
         Command::Client {
             config: config_path,

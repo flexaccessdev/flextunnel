@@ -102,6 +102,7 @@ pub struct ClientConfig {
 }
 
 /// Fully-resolved server settings (CLI > file > default), paths tilde-expanded.
+#[derive(Debug)]
 pub struct ResolvedServer {
     pub secret_file: Option<PathBuf>,
     pub secret: Option<String>,
@@ -208,7 +209,7 @@ pub fn load_client_config(path: Option<&Path>, default_config: bool) -> Result<O
 /// `cli` carries the CLI flags as a `ServerConfig` (a field is `Some`/non-empty
 /// only when the user passed it). For each field CLI wins, then the file; list
 /// fields are replaced wholesale (not appended), matching tunnel-rs.
-pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> ResolvedServer {
+pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<ResolvedServer> {
     let file = file.unwrap_or_default();
 
     // Credential groups are merged as a *unit* per source: if the CLI set any
@@ -233,33 +234,44 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Resolved
             (file.agent_auth_tokens, file.agent_auth_tokens_file)
         };
 
-    ResolvedServer {
+    // File-only (no CLI flag). Lowercase keys so matching is case-insensitive
+    // against a lowercased requested host. Reject entries that collide only by
+    // case — silently dropping one would shadow a distinct reservation.
+    let agent_routes = collect_lowercased(
+        cli.agent_routes
+            .or(file.agent_routes)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| (k, v.machine_id)),
+        "agent_routes",
+    )?;
+    // Same treatment for host aliases (DNS hostnames are case-insensitive).
+    let host_aliases = collect_lowercased(
+        cli.host_aliases.or(file.host_aliases).unwrap_or_default(),
+        "host_aliases",
+    )?;
+    // A name must not appear in both: agent_routes is checked first at request
+    // time, so an overlap would silently shadow the host alias.
+    for key in agent_routes.keys() {
+        if host_aliases.contains_key(key) {
+            anyhow::bail!(
+                "alias '{key}' is defined in both [agent_routes] and [host_aliases]; \
+                 a name may appear in only one"
+            );
+        }
+    }
+
+    Ok(ResolvedServer {
         secret_file: secret_file.map(|p| expand_tilde(&p)),
         secret,
         auth_tokens: auth_tokens.unwrap_or_default(),
         auth_tokens_file: auth_tokens_file.map(|p| expand_tilde(&p)),
         agent_auth_tokens: agent_auth_tokens.unwrap_or_default(),
         agent_auth_tokens_file: agent_auth_tokens_file.map(|p| expand_tilde(&p)),
-        // File-only (no CLI flag). Lowercase keys so matching is case-insensitive
-        // against a lowercased requested host.
-        agent_routes: cli
-            .agent_routes
-            .or(file.agent_routes)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(k, v)| (k.to_ascii_lowercase(), v.machine_id))
-            .collect(),
+        agent_routes,
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
         dns_server: cli.dns_server.or(file.dns_server),
-        // File-only (no CLI flag). Lowercase keys so matching is case-insensitive
-        // (DNS hostnames are case-insensitive), to compare against a lowercased host.
-        host_aliases: cli
-            .host_aliases
-            .or(file.host_aliases)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(k, v)| (k.to_ascii_lowercase(), v))
-            .collect(),
+        host_aliases,
         routed_domains: cli
             .routed_domains
             .or(file.routed_domains)
@@ -273,7 +285,29 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Resolved
             .map(|p| expand_tilde(&p))
             .or_else(crate::blocklist::default_blocklist_path)
             .unwrap_or_else(|| PathBuf::from("blocklist.json")),
+    })
+}
+
+/// Lowercase each source key and collect into a map, failing if two source keys
+/// normalize (ASCII-lowercase) to the same key. Aliases are matched
+/// case-insensitively, so a case-only duplicate would otherwise let one entry
+/// silently shadow the other.
+fn collect_lowercased<V>(
+    entries: impl IntoIterator<Item = (String, V)>,
+    what: &str,
+) -> Result<HashMap<String, V>> {
+    let mut out = HashMap::new();
+    for (k, v) in entries {
+        let key = k.to_ascii_lowercase();
+        if out.contains_key(&key) {
+            anyhow::bail!(
+                "duplicate [{what}] alias '{key}': aliases are matched case-insensitively, \
+                 so entries differing only by case collide"
+            );
+        }
+        out.insert(key, v);
     }
+    Ok(out)
 }
 
 /// Merge CLI-provided values over file values over defaults for the client.
@@ -355,7 +389,7 @@ mod tests {
             dns_server: Some("https://cli.example".into()),
             ..Default::default()
         };
-        let r = resolve_server(cli, Some(file));
+        let r = resolve_server(cli, Some(file)).unwrap();
         // CLI wins where set; file fills the rest.
         assert_eq!(r.dns_server.as_deref(), Some("https://cli.example"));
         assert_eq!(r.relay_urls, vec!["https://file-relay".to_string()]);
@@ -369,7 +403,7 @@ mod tests {
             "node2.ezvpn" = "192.168.1.50"
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
-        let r = resolve_server(ServerConfig::default(), Some(file));
+        let r = resolve_server(ServerConfig::default(), Some(file)).unwrap();
         // Keys are lowercased so matching against a lowercased host works.
         assert_eq!(r.host_aliases.get("server.ezvpn").map(String::as_str), Some("127.0.0.1"));
         assert_eq!(r.host_aliases.get("node2.ezvpn").map(String::as_str), Some("192.168.1.50"));
@@ -386,12 +420,50 @@ mod tests {
             "nas.ezvpn" = { machine_id = "999888777" }
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
-        let r = resolve_server(ServerConfig::default(), Some(file));
+        let r = resolve_server(ServerConfig::default(), Some(file)).unwrap();
         // Keys lowercased for case-insensitive matching; values are machine ids.
         assert_eq!(r.agent_routes.get("web.ezvpn").map(String::as_str), Some("abc123def"));
         assert_eq!(r.agent_routes.get("nas.ezvpn").map(String::as_str), Some("999888777"));
         assert!(!r.agent_routes.contains_key("Web.EzVPN"));
         assert_eq!(r.agent_auth_tokens, vec!["ftaAAA".to_string()]);
+    }
+
+    #[test]
+    fn agent_routes_case_only_duplicate_is_rejected() {
+        let toml = r#"
+            [agent_routes]
+            "Web.EzVPN" = { machine_id = "abc" }
+            "web.ezvpn" = { machine_id = "def" }
+        "#;
+        let file: ServerConfig = toml::from_str(toml).unwrap();
+        let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
+        assert!(err.to_string().contains("agent_routes"), "{err}");
+    }
+
+    #[test]
+    fn host_aliases_case_only_duplicate_is_rejected() {
+        let toml = r#"
+            [host_aliases]
+            "Server.EzVPN" = "127.0.0.1"
+            "server.ezvpn" = "192.168.1.50"
+        "#;
+        let file: ServerConfig = toml::from_str(toml).unwrap();
+        let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
+        assert!(err.to_string().contains("host_aliases"), "{err}");
+    }
+
+    #[test]
+    fn agent_route_and_host_alias_overlap_is_rejected() {
+        let toml = r#"
+            [agent_routes]
+            "shared.ezvpn" = { machine_id = "abc" }
+
+            [host_aliases]
+            "Shared.EzVPN" = "127.0.0.1"
+        "#;
+        let file: ServerConfig = toml::from_str(toml).unwrap();
+        let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
+        assert!(err.to_string().contains("both"), "{err}");
     }
 
     #[test]
@@ -401,11 +473,11 @@ mod tests {
             routed_cidrs = ["10.0.0.0/8"]
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
-        let r = resolve_server(ServerConfig::default(), Some(file));
+        let r = resolve_server(ServerConfig::default(), Some(file)).unwrap();
         assert_eq!(r.routed_domains, vec!["*.example.com", "httpbin.org"]);
         assert_eq!(r.routed_cidrs, vec!["10.0.0.0/8"]);
         // Defaults to empty (inactive) when unset.
-        let empty = resolve_server(ServerConfig::default(), None);
+        let empty = resolve_server(ServerConfig::default(), None).unwrap();
         assert!(empty.routed_domains.is_empty());
         assert!(empty.routed_cidrs.is_empty());
     }

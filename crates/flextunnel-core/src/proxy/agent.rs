@@ -238,8 +238,63 @@ async fn accept_server_streams(connection: &Connection) -> ProxyResult<()> {
 /// Handle one server-routed stream: read the target the server forwarded (a
 /// loopback address in v1) and connect + pipe on this agent's own machine (the
 /// shared exit-point body).
+///
+/// Reverse routing is loopback-only in v1, so the forwarded target is validated
+/// against that contract *before* dialing: a compromised or misbehaving server
+/// must not be able to pivot the agent into its local network. The check is kept
+/// right next to `Target` parsing so no non-loopback target ever reaches
+/// [`dial::connect_and_pipe`].
 async fn handle_routed_stream(send: SendStream, mut recv: RecvStream) -> std::io::Result<()> {
     let target: Target = signaling::read_request(&mut recv).await?;
+    if !is_loopback_target(&target) {
+        log::warn!("Rejecting non-loopback routed target from server: {target:?}");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("routed target is not loopback (reverse routing is loopback-only): {target:?}"),
+        ));
+    }
     log::debug!("Agent dialing routed target: {target:?}");
     dial::connect_and_pipe(send, recv, &target).await
+}
+
+/// Whether a server-forwarded target is loopback, enforcing the v1 loopback-only
+/// reverse-routing contract. Accepts a loopback IP or the literal `localhost`
+/// host; a domain that is not a loopback literal is rejected (it could resolve
+/// anywhere, defeating the check).
+fn is_loopback_target(target: &Target) -> bool {
+    match target {
+        Target::Ip(addr) => addr.ip().is_loopback(),
+        Target::Domain(host, _) => {
+            if host.eq_ignore_ascii_case("localhost") {
+                return true;
+            }
+            host.parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_targets_are_allowed() {
+        // The server rewrites routed targets to this in v1.
+        assert!(is_loopback_target(&Target::Domain("127.0.0.1".into(), 8000)));
+        assert!(is_loopback_target(&Target::Domain("::1".into(), 8000)));
+        assert!(is_loopback_target(&Target::Domain("LocalHost".into(), 22)));
+        assert!(is_loopback_target(&Target::Ip("127.0.0.1:80".parse().unwrap())));
+        assert!(is_loopback_target(&Target::Ip("[::1]:80".parse().unwrap())));
+    }
+
+    #[test]
+    fn non_loopback_targets_are_rejected() {
+        assert!(!is_loopback_target(&Target::Ip("93.184.216.34:443".parse().unwrap())));
+        assert!(!is_loopback_target(&Target::Ip("192.168.1.50:22".parse().unwrap())));
+        assert!(!is_loopback_target(&Target::Domain("example.com".into(), 443)));
+        // A domain that merely *looks* loopback-ish but isn't a loopback literal.
+        assert!(!is_loopback_target(&Target::Domain("127.0.0.1.evil.com".into(), 80)));
+    }
 }

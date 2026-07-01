@@ -2,7 +2,7 @@
 name = "flextunnel-agent"
 version.workspace = true
 edition.workspace = true
-description = "flextunnel reverse-routing agent (Linux-only exit point)"
+description = "flextunnel reverse-routing agent"
 
 [[bin]]
 name = "flextunnel-agent"
