@@ -12,7 +12,8 @@
 //! v1/v2 values ever colliding, and without versioning the hashed bytes.
 //!
 //! Format: `ftm` + `VERSION` + base64url-nopad(first 16 bytes of
-//! `SHA-256(DOMAIN_SEP ++ raw_machine_id)`), e.g. `ftm1aGVsbG9tYWNoaWQx`.
+//! `SHA-256(DOMAIN_SEP ++ raw_machine_id)`) — 26 chars total (4-char prefix + a
+//! 22-char body), e.g. `ftm1HKpypPhTDNLCtMS6MZjxYQ`.
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
