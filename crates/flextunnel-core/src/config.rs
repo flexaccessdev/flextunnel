@@ -467,7 +467,7 @@ mod tests {
     fn host_aliases_parsed_and_lowercased() {
         let toml = r#"
             [host_aliases]
-            "Server.EzVPN" = "127.0.0.1"
+            "Server.Homelab" = "127.0.0.1"
             "node2.homelab" = "192.168.1.50"
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
@@ -475,7 +475,7 @@ mod tests {
         // Keys are lowercased so matching against a lowercased host works.
         assert_eq!(r.host_aliases.get("server.homelab").map(String::as_str), Some("127.0.0.1"));
         assert_eq!(r.host_aliases.get("node2.homelab").map(String::as_str), Some("192.168.1.50"));
-        assert!(!r.host_aliases.contains_key("Server.EzVPN"));
+        assert!(!r.host_aliases.contains_key("Server.Homelab"));
     }
 
     #[test]
@@ -484,7 +484,7 @@ mod tests {
             agent_auth_tokens = ["ftaAAA"]
 
             [agent_routes]
-            "Web.EzVPN" = { machine_id = "abc123def" }
+            "Web.Homelab" = { machine_id = "abc123def" }
             "nas.homelab" = { machine_id = "999888777" }
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
@@ -492,7 +492,7 @@ mod tests {
         // Keys lowercased for case-insensitive matching; values are machine ids.
         assert_eq!(r.agent_routes.get("web.homelab").map(String::as_str), Some("abc123def"));
         assert_eq!(r.agent_routes.get("nas.homelab").map(String::as_str), Some("999888777"));
-        assert!(!r.agent_routes.contains_key("Web.EzVPN"));
+        assert!(!r.agent_routes.contains_key("Web.Homelab"));
         assert_eq!(r.agent_auth_tokens, vec!["ftaAAA".to_string()]);
     }
 
@@ -500,7 +500,7 @@ mod tests {
     fn agent_routes_case_only_duplicate_is_rejected() {
         let toml = r#"
             [agent_routes]
-            "Web.EzVPN" = { machine_id = "abc" }
+            "Web.Homelab" = { machine_id = "abc" }
             "web.homelab" = { machine_id = "def" }
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
@@ -512,7 +512,7 @@ mod tests {
     fn host_aliases_case_only_duplicate_is_rejected() {
         let toml = r#"
             [host_aliases]
-            "Server.EzVPN" = "127.0.0.1"
+            "Server.Homelab" = "127.0.0.1"
             "server.homelab" = "192.168.1.50"
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
@@ -527,7 +527,7 @@ mod tests {
             "shared.homelab" = { machine_id = "abc" }
 
             [host_aliases]
-            "Shared.EzVPN" = "127.0.0.1"
+            "Shared.Homelab" = "127.0.0.1"
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();

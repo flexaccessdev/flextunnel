@@ -908,7 +908,7 @@ mod tests {
 
     #[test]
     fn alias_match_is_case_insensitive() {
-        let got = apply_alias(Target::Domain("Server.EzVPN".into(), 80), &aliases());
+        let got = apply_alias(Target::Domain("Server.Homelab".into(), 80), &aliases());
         assert_eq!(got, Target::Domain("127.0.0.1".into(), 80));
     }
 
