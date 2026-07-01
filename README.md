@@ -153,9 +153,9 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 | `show-server-id --secret-file <FILE>` | Print the EndpointId for a key. |
 | `generate-auth-token [-c N]` | Generate N client auth tokens (prefix `ftc`). |
 
-The reverse-routing **agent** is a separate Linux-only binary, `flextunnel-agent`
+The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 (subcommands `run` and `generate-token`) — see
-[Reverse-routing agent](#reverse-routing-agent-linux) below.
+[Reverse-routing agent](#reverse-routing-agent) below.
 
 ### `server`
 
@@ -237,7 +237,7 @@ browse to `http://server.ezvpn:8000/`. Use `socks5h://` (or set Firefox's
 `network.proxy.socks_remote_dns = true`) so the name is resolved by the server,
 not locally.
 
-## Reverse-routing agent (Linux)
+## Reverse-routing agent
 
 Where a `[host_aliases]` entry resolves to a host on the **server's** network, an
 `[agent_routes]` entry resolves to a connected **agent** — a `flextunnel-agent`
@@ -248,16 +248,20 @@ behind NAT that the server cannot dial directly: the agent makes the outbound
 connection, and the server pushes streams back over it. Reverse routing is
 **loopback-only** in v1.
 
-The agent is a **separate, Linux-only binary** (`flextunnel-agent`) and identifies
-itself by its stable **machine id** (`/etc/machine-id`) — its iroh node id is
-ephemeral, so there is no key file to manage. Only one agent runs per machine
-(enforced by a file lock). It authenticates with its **own** token pool (prefix
-`fta`, separate from client `ftc` tokens).
+The agent is a **separate binary** (`flextunnel-agent`, for Linux, macOS, and
+Windows) and identifies itself by its stable, OS-native **machine id**
+(`/etc/machine-id` on Linux, `IOPlatformUUID` on macOS, `MachineGuid` on Windows —
+no elevation needed). Its iroh node id is ephemeral, so there is no key file to
+manage. Only one agent runs per machine (enforced by a file lock). It
+authenticates with its **own** token pool (prefix `fta`, separate from client
+`ftc` tokens).
 
 ```sh
 # On the server host: generate an agent token and reserve the agent's machine id.
 flextunnel-agent generate-token          # -> fta…   (add to agent_auth_tokens)
-# (get the agent's id from `cat /etc/machine-id` on the agent host)
+# (get the agent's id on the agent host: `cat /etc/machine-id` (Linux),
+#  `ioreg -rd1 -c IOPlatformExpertDevice | grep IOPlatformUUID` (macOS), or
+#  reg query HKLM\SOFTWARE\Microsoft\Cryptography /v MachineGuid (Windows))
 ```
 
 ```toml
@@ -270,7 +274,7 @@ routed_domains    = ["web.ezvpn", "*.example.com"]   # the alias must be on the 
 ```
 
 ```sh
-# On the agent host (Linux):
+# On the agent host (Linux/macOS/Windows):
 flextunnel-agent run --server-node-id <server id> --auth-token fta…
 # then from a client: curl -x socks5h://127.0.0.1:1080 http://web.ezvpn:8000/
 ```

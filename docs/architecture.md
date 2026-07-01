@@ -48,10 +48,11 @@ TCP connection.
 | `proxy/agent.rs` | reverse-routing exit point: dial + auth (`role=Agent`, machine id) + accept server-opened streams + dial loopback |
 | `proxy/dial.rs` | `Target` → TCP dial + `connect_and_pipe` (the shared server/agent exit-point body) |
 
-The reverse-routing agent ships as a **separate Linux-only binary crate**
-(`flextunnel-agent`, not in the module map above): it reads `/etc/machine-id`,
-holds a single-instance file lock, and drives `proxy::agent::ProxyAgent` over an
-ephemeral `create_client_endpoint`.
+The reverse-routing agent ships as a **separate binary crate** (`flextunnel-agent`,
+Linux/macOS/Windows, not in the module map above): it reads the OS-native machine
+id (via the `machine-uid` crate — `/etc/machine-id`, `IOPlatformUUID`, or
+`MachineGuid`), holds a single-instance file lock, and drives
+`proxy::agent::ProxyAgent` over an ephemeral `create_client_endpoint`.
 
 ## Connection lifecycle
 
@@ -145,7 +146,8 @@ a blocklisted node id is rejected up-front. Because ephemeral ids never recur,
 the persisted client entry is largely an audit record.
 
 **Duplicate agent (server-side).** An agent's iroh id is ephemeral and irrelevant
-to its identity — it is identified by its stable **machine id** (`/etc/machine-id`).
+to its identity — it is identified by its stable, OS-native **machine id**
+(`/etc/machine-id` on Linux, `IOPlatformUUID` on macOS, `MachineGuid` on Windows).
 A single-instance file lock in the `flextunnel-agent` binary already guarantees one
 agent *process* per machine, so the server needs no nonce/liveness machinery: it
 tracks the one active connection per machine id, and a *second concurrent*

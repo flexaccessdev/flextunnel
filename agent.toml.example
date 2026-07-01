@@ -1,4 +1,4 @@
-# flextunnel agent config (TOML). Linux-only.
+# flextunnel agent config (TOML). Runs on Linux, macOS, and Windows.
 #
 # Load with:  flextunnel-agent run -c agent.toml
 #         or: flextunnel-agent run --default-config   (~/.config/flextunnel/agent.toml)
@@ -8,8 +8,9 @@
 # opens back to it and connects each to `127.0.0.1` on THIS machine. This lets
 # clients reach a service behind NAT that the server cannot dial directly.
 #
-# The agent is identified by its stable machine id (`/etc/machine-id`) — its iroh
-# node id is ephemeral, so there is no key file to manage. Reserve this machine's
+# The agent is identified by its stable, OS-native machine id (`/etc/machine-id`
+# on Linux, IOPlatformUUID on macOS, MachineGuid on Windows) — its iroh node id
+# is ephemeral, so there is no key file to manage. Reserve this machine's
 # id in the server's [agent_routes] to make it reachable. Only one agent runs per
 # machine (enforced by a file lock).
 

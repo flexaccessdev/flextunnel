@@ -20,16 +20,47 @@ pub struct AgentLock {
     file: File,
 }
 
-/// Candidate lock-file locations, most-preferred first. A machine-wide path
-/// (`/run`) enforces "one agent per machine"; the fallbacks keep the agent
-/// usable when `/run` is not writable (e.g. an unprivileged run).
+/// Candidate lock-file locations, most-preferred first. The machine-wide path
+/// enforces "one agent per machine"; the fallbacks keep the agent usable when
+/// that path is not writable (e.g. an unprivileged run on macOS/Windows), at
+/// which point the guarantee narrows to "one agent per user".
 fn candidate_lock_paths() -> Vec<PathBuf> {
-    let mut paths = vec![PathBuf::from("/run/flextunnel-agent.lock")];
+    let mut paths = Vec::new();
+    if let Some(p) = machine_wide_lock_path() {
+        paths.push(p);
+    }
+    // Per-user fallback under ~/.config/flextunnel (flextunnel uses ~/.config on
+    // every platform for its config, so the lock lives alongside it).
     if let Some(home) = dirs::home_dir() {
         paths.push(home.join(".config").join("flextunnel").join("agent.lock"));
     }
+    // Last resort: the temp dir.
     paths.push(std::env::temp_dir().join("flextunnel-agent.lock"));
     paths
+}
+
+/// The preferred machine-wide lock path for this OS, if one exists. `/run` on
+/// Linux, `/var/run` on macOS (both typically need privileges, else we fall
+/// back), and `%ProgramData%\flextunnel` on Windows. `None` on other systems
+/// (e.g. BSD), which fall straight through to the per-user / temp candidates.
+fn machine_wide_lock_path() -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(PathBuf::from("/run/flextunnel-agent.lock"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some(PathBuf::from("/var/run/flextunnel-agent.lock"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("ProgramData")
+            .map(|p| PathBuf::from(p).join("flextunnel").join("agent.lock"))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
 }
 
 impl AgentLock {

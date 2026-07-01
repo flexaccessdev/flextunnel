@@ -1,18 +1,17 @@
 //! flextunnel-agent
 //!
-//! A Linux-only reverse-routing exit point for flextunnel. Unlike the client it
-//! runs no local SOCKS5 listener: it dials the server with an **ephemeral** iroh
-//! identity, identifies itself by its stable **machine id** (`/etc/machine-id`),
+//! A reverse-routing exit point for flextunnel (Linux, macOS, and Windows).
+//! Unlike the client it runs no local SOCKS5 listener: it dials the server with
+//! an **ephemeral** iroh identity, identifies itself by its stable **machine id**,
 //! and accepts the streams the server opens back to it, connecting each to
 //! `127.0.0.1` on this machine (reverse routing is loopback-only in v1).
 //!
-//! The operator reserves this agent's machine id in the server's `[agent_routes]`
-//! and gives it an agent auth token (`fta` prefix, `flextunnel-agent
-//! generate-token`). Only one agent runs per machine, enforced by a file lock.
-
-// The agent reads Linux machine-id paths and is only built/released for Linux.
-#[cfg(not(target_os = "linux"))]
-compile_error!("flextunnel-agent is Linux-only");
+//! The machine id is the OS-native per-install identifier (via the `machine-uid`
+//! crate): `/etc/machine-id` on Linux, `IOPlatformUUID` on macOS, and
+//! `MachineGuid` on Windows — no elevation required. The operator reserves this
+//! agent's machine id in the server's `[agent_routes]` and gives it an agent auth
+//! token (`fta` prefix, `flextunnel-agent generate-token`). Only one agent runs
+//! per machine, enforced by a file lock.
 
 mod lock;
 
@@ -26,11 +25,6 @@ use flextunnel_core::auth;
 use flextunnel_core::config::expand_tilde;
 use flextunnel_core::proxy::{AgentConfig, ProxyAgent};
 use flextunnel_core::transport::endpoint::create_client_endpoint;
-
-/// Primary machine-id source (systemd).
-const MACHINE_ID_PATH: &str = "/etc/machine-id";
-/// Fallback machine-id source (D-Bus), for systems without the systemd file.
-const DBUS_MACHINE_ID_PATH: &str = "/var/lib/dbus/machine-id";
 
 #[derive(Parser)]
 #[command(name = "flextunnel-agent")]
@@ -254,25 +248,20 @@ async fn run_agent(r: ResolvedAgent) -> Result<()> {
     res
 }
 
-/// Read this machine's stable id: `/etc/machine-id`, falling back to
-/// `/var/lib/dbus/machine-id`. Errors if both are missing or empty.
+/// Read this machine's stable, OS-native id via the `machine-uid` crate
+/// (`/etc/machine-id` on Linux, `IOPlatformUUID` on macOS, `MachineGuid` on
+/// Windows). Errors if it can't be determined or is empty.
 fn read_machine_id() -> Result<String> {
-    for path in [MACHINE_ID_PATH, DBUS_MACHINE_ID_PATH] {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => {
-                let id = contents.trim().to_string();
-                if !id.is_empty() {
-                    return Ok(id);
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e).with_context(|| format!("Failed to read {path}")),
-        }
+    // `machine_uid::get()` returns a `Box<dyn Error>` (not Send+Sync), so flatten
+    // it to a message rather than propagating it directly through `anyhow`.
+    let id = machine_uid::get()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("Failed to determine this machine's id")?;
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        anyhow::bail!("The OS returned an empty machine id");
     }
-    anyhow::bail!(
-        "Could not determine a machine id: {MACHINE_ID_PATH} and {DBUS_MACHINE_ID_PATH} are \
-         missing or empty"
-    );
+    Ok(id)
 }
 
 /// Resolve the config file to load, if any (explicit path or `--default-config`).
@@ -324,8 +313,9 @@ fn resolve_agent(cli: AgentFileConfig, file: Option<AgentFileConfig>) -> Resolve
     }
 }
 
-/// Wait for SIGTERM or SIGINT (the agent is Linux-only, so Unix signals always
-/// apply).
+/// Wait for a shutdown signal: SIGTERM/SIGINT on Unix, Ctrl-C elsewhere
+/// (mirrors the CLI's handler).
+#[cfg(unix)]
 async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
@@ -334,4 +324,9 @@ async fn shutdown_signal() {
         _ = term.recv() => {}
         _ = int.recv() => {}
     }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
