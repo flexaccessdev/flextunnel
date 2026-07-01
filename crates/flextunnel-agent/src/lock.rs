@@ -20,29 +20,14 @@ pub struct AgentLock {
     file: File,
 }
 
-/// Candidate lock-file locations, most-preferred first. The machine-wide path
-/// enforces "one agent per machine"; the fallbacks keep the agent usable when
-/// that path is not writable (e.g. an unprivileged run on macOS/Windows), at
-/// which point the guarantee narrows to "one agent per user".
-fn candidate_lock_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(p) = machine_wide_lock_path() {
-        paths.push(p);
-    }
-    // Per-user fallback under ~/.config/flextunnel (flextunnel uses ~/.config on
-    // every platform for its config, so the lock lives alongside it).
-    if let Some(home) = dirs::home_dir() {
-        paths.push(home.join(".config").join("flextunnel").join("agent.lock"));
-    }
-    // Last resort: the temp dir.
-    paths.push(std::env::temp_dir().join("flextunnel-agent.lock"));
-    paths
-}
-
-/// The preferred machine-wide lock path for this OS, if one exists. `/run` on
-/// Linux, `/var/run` on macOS (both typically need privileges, else we fall
-/// back), and `%ProgramData%\flextunnel` on Windows. `None` on other systems
-/// (e.g. BSD), which fall straight through to the per-user / temp candidates.
+/// The machine-wide lock path for this OS, if one exists. `/run` on Linux,
+/// `/var/run` on macOS (both typically need privileges), and
+/// `%ProgramData%\flextunnel` on Windows. `None` on other systems (e.g. BSD).
+///
+/// There is deliberately no per-user or temp-dir fallback: the single-instance
+/// guarantee is "one agent per machine", so if this path is unavailable the agent
+/// fails fast rather than silently narrowing the guarantee to a fallback lock
+/// that a second process could sidestep.
 fn machine_wide_lock_path() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -64,61 +49,54 @@ fn machine_wide_lock_path() -> Option<PathBuf> {
 }
 
 impl AgentLock {
-    /// Acquire the single-instance lock, trying each candidate path until one can
-    /// be opened. Fails if another agent already holds the lock, or if no
-    /// candidate path could be opened.
+    /// Acquire the machine-wide single-instance lock. Fails fast if this OS has no
+    /// machine-wide lock path, if the path cannot be opened (e.g. insufficient
+    /// privileges — no fallback is attempted), or if another agent already holds
+    /// the lock.
     pub fn acquire() -> Result<Self> {
-        let mut last_open_err = None;
-        for path in candidate_lock_paths() {
-            if let Some(parent) = path.parent() {
-                // Best-effort: if we can't create the dir, this candidate is
-                // simply unusable and we try the next one.
-                let _ = std::fs::create_dir_all(parent);
-            }
-            // Open or create the lock file WITHOUT truncating — truncation must
-            // happen only after we hold the lock, so a concurrent holder's PID
-            // isn't clobbered.
-            let mut file = match OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)
-            {
-                Ok(f) => f,
-                Err(e) => {
-                    last_open_err = Some((path, e));
-                    continue;
-                }
-            };
+        let path = machine_wide_lock_path().context(
+            "No machine-wide lock path is defined for this operating system, so the \
+             single-instance guarantee cannot be enforced",
+        )?;
 
-            match file.try_lock() {
-                Ok(()) => {
-                    // We hold the lock: record our PID for operator visibility.
-                    let _ = file.set_len(0);
-                    let _ = file.seek(SeekFrom::Start(0));
-                    let _ = writeln!(file, "{}", std::process::id());
-                    log::debug!("Acquired agent lock: {}", path.display());
-                    return Ok(Self { file });
-                }
-                Err(TryLockError::WouldBlock) => {
-                    anyhow::bail!(
-                        "Another flextunnel-agent is already running (lock held at {}). \
-                         Only one agent per machine is allowed.",
-                        path.display()
-                    );
-                }
-                Err(TryLockError::Error(e)) => {
-                    last_open_err = Some((path, e));
-                    continue;
-                }
-            }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create the lock directory {}", parent.display())
+            })?;
         }
+        // Open or create the lock file WITHOUT truncating — truncation must happen
+        // only after we hold the lock, so a concurrent holder's PID isn't clobbered.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| {
+                format!(
+                    "Failed to open the machine-wide lock file {} (it typically requires \
+                     elevated privileges); refusing to start rather than fall back to a \
+                     weaker per-user lock",
+                    path.display()
+                )
+            })?;
 
-        match last_open_err {
-            Some((path, e)) => Err(e).with_context(|| {
+        match file.try_lock() {
+            Ok(()) => {
+                // We hold the lock: record our PID for operator visibility.
+                let _ = file.set_len(0);
+                let _ = file.seek(SeekFrom::Start(0));
+                let _ = writeln!(file, "{}", std::process::id());
+                log::debug!("Acquired agent lock: {}", path.display());
+                Ok(Self { file })
+            }
+            Err(TryLockError::WouldBlock) => anyhow::bail!(
+                "Another flextunnel-agent is already running (lock held at {}). \
+                 Only one agent per machine is allowed.",
+                path.display()
+            ),
+            Err(TryLockError::Error(e)) => Err(e).with_context(|| {
                 format!("Failed to acquire the single-instance lock ({})", path.display())
             }),
-            None => anyhow::bail!("Failed to acquire the single-instance lock: no candidate path"),
         }
     }
 }
