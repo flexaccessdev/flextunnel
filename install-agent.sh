@@ -310,55 +310,31 @@ download_only() {
     print_info "Binary saved to: ${output_file}"
 }
 
-# Check if sourcing a profile would add target_dir to PATH
-check_profile_has_path() {
-    local profile="$1"
-    local target_dir="$2"
+# Determine the command prefix (empty or "sudo") needed to write to a directory
+get_sudo_prefix() {
+    local target_dir="$1"
 
-    if [ -z "$profile" ] || [ ! -f "$profile" ]; then
-        return 1
-    fi
-
-    # Source the profile in a subshell and check if target_dir is in PATH
-    local new_path
-    new_path=$(HOME="$HOME" SHELL="$SHELL" bash -c "source '$profile' 2>/dev/null; echo \"\$PATH\"" 2>/dev/null)
-
-    if [[ ":$new_path:" == *":$target_dir:"* ]]; then
+    # Already root: no sudo needed
+    if [ "$EUID" -eq 0 ]; then
+        echo ""
         return 0
     fi
-    return 1
-}
 
-# Find a profile file that has .local/bin configured
-find_profile_with_local_bin() {
-    local target_dir="$1"
-    local shell_name
-    shell_name=$(basename "$SHELL")
+    # Writable directory (or creatable parent): no sudo needed
+    if [ -w "$target_dir" ] || { [ ! -e "$target_dir" ] && [ -w "$(dirname "$target_dir")" ]; }; then
+        echo ""
+        return 0
+    fi
 
-    # List of profile files to check (order matters - check login profiles first)
-    local profiles=()
+    # Need elevated privileges
+    if command -v sudo >/dev/null 2>&1; then
+        echo "sudo"
+        return 0
+    fi
 
-    case "$shell_name" in
-        bash)
-            profiles=("$HOME/.bash_profile" "$HOME/.profile" "$HOME/.bashrc")
-            ;;
-        zsh)
-            profiles=("$HOME/.zprofile" "$HOME/.zshrc")
-            ;;
-        *)
-            profiles=("$HOME/.profile")
-            ;;
-    esac
-
-    # Find first profile that has .local/bin configured
-    for profile in "${profiles[@]}"; do
-        if check_profile_has_path "$profile" "$target_dir"; then
-            echo "$profile"
-            return 0
-        fi
-    done
-
-    return 1
+    print_error "Installing to ${target_dir} requires root privileges, but 'sudo' is not available."
+    print_error "Re-run this script as root."
+    exit 1
 }
 
 # Download binary to temporary location, test it, and install
@@ -366,7 +342,8 @@ download_and_install() {
     local temp_dir
     temp_dir=$(mktemp -d)
     local temp_binary="${temp_dir}/${BINARY_NAME}"
-    local final_path="$HOME/.local/bin/flextunnel-agent"
+    local target_dir="/usr/local/bin"
+    local final_path="${target_dir}/flextunnel-agent"
 
     # Set up trap to clean up temp directory on exit
     trap 'rm -rf "$temp_dir"' EXIT
@@ -387,43 +364,42 @@ download_and_install() {
 
     print_info "Binary test successful: $version_info"
 
+    # Determine whether we need sudo to install into the target directory
+    local sudo_prefix
+    sudo_prefix=$(get_sudo_prefix "$target_dir")
+
+    if [ -n "$sudo_prefix" ]; then
+        print_info "Installing to ${target_dir} requires elevated privileges; using sudo."
+    fi
+
     # Create target directory if it doesn't exist
-    local target_dir="$HOME/.local/bin"
-    mkdir -p "$target_dir"
+    if ! $sudo_prefix mkdir -p "$target_dir"; then
+        print_error "Failed to create ${target_dir}"
+        exit 1
+    fi
 
     # Move the tested binary to final location
-    if ! mv "$temp_binary" "$final_path"; then
+    if ! $sudo_prefix mv "$temp_binary" "$final_path"; then
         print_error "Failed to move binary to final location"
         exit 1
     fi
+
+    # Ensure the installed binary is executable
+    $sudo_prefix chmod +x "$final_path"
 
     # Clean up temp directory (trap will also handle this)
     rm -rf "$temp_dir"
 
     print_info "Binary installed successfully to ${final_path}"
 
-    # Check PATH and suggest how to fix if needed
+    # /usr/local/bin is normally on PATH; warn only if it isn't
     if [[ ":$PATH:" != *":$target_dir:"* ]]; then
-        local profile
-        profile=$(find_profile_with_local_bin "$target_dir")
-
-        if [ -n "$profile" ]; then
-            # Profile already has .local/bin configured, just needs reload
-            print_warn "${target_dir} is not in your current PATH, but is configured in your profile."
-            print_warn "To use flextunnel-agent now, reload your profile:"
-            echo ""
-            echo "    source $profile"
-            echo ""
-            print_warn "Or start a new terminal session."
-        else
-            # Profile doesn't have .local/bin, need to add it
-            print_warn "${target_dir} is not in your PATH"
-            print_warn "Add the following line to your shell profile (.bashrc, .zshrc, etc.):"
-            echo ""
-            echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
-            echo ""
-            print_warn "Then reload your profile or start a new terminal session."
-        fi
+        print_warn "${target_dir} is not in your current PATH."
+        print_warn "Add it to your shell profile (.bashrc, .zshrc, etc.):"
+        echo ""
+        echo "    export PATH=\"${target_dir}:\$PATH\""
+        echo ""
+        print_warn "Then reload your profile or start a new terminal session."
     fi
 }
 
@@ -497,13 +473,6 @@ install() {
     fi
 }
 
-# Check if running with proper privileges
-check_privileges() {
-    if [ "$EUID" -eq 0 ]; then
-        print_warn "Running as root. It's recommended to install as a regular user."
-    fi
-}
-
 # Main execution
 main() {
     parse_args "$@"
@@ -512,7 +481,7 @@ main() {
         print_info "Starting flextunnel-agent download..."
     else
         print_info "Starting flextunnel-agent installation..."
-        check_privileges
+        print_info "flextunnel-agent will be installed to /usr/local/bin (sudo may be required)."
     fi
 
     install

@@ -65,9 +65,12 @@ Stable releases include `flextunnel` and `flextunnel-agent` for Linux
 amd64/arm64, macOS arm64, and Windows amd64, plus the iOS xcframework asset.
 Automated prereleases currently include Linux amd64/arm64, macOS arm64, and the
 iOS xcframework, but skip Windows. The install scripts download the latest
-binary, verify its SHA-256 checksum, and install to a per-user location
+binary and verify its SHA-256 checksum. The `flextunnel` (server / client)
+installer installs to a per-user location
 (`~/.local/bin` on Linux/macOS, `%LOCALAPPDATA%\Programs\flextunnel` on Windows)
-— **no admin required**.
+— **no admin required**. The `flextunnel-agent` installer installs to
+`/usr/local/bin` on Linux/macOS (using `sudo` when needed, since the agent runs
+as root on Unix).
 
 **`flextunnel` (server / client) — Linux / macOS:**
 
