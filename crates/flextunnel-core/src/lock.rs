@@ -87,7 +87,15 @@ mod tests {
     /// one process); after the first is dropped, acquiring succeeds again.
     #[test]
     fn second_acquire_rejected_while_held() {
-        let path = std::env::temp_dir().join("flextunnel-instance-lock-test.lock");
+        // Unique per-run path: the fixed name would collide across concurrent
+        // `cargo test` processes (advisory locks conflict across processes), making
+        // the "first acquire" flakily fail. PID + a high-res timestamp is enough.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir()
+            .join(format!("flextunnel-instance-lock-test-{}-{nanos}.lock", std::process::id()));
         let first = InstanceLock::acquire(&path, "held", true).expect("first acquire");
         assert!(
             InstanceLock::acquire(&path, "held", true).is_err(),
