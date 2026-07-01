@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 mod lock;
 
+use flextunnel_core::app;
 use flextunnel_core::blocklist::BlockList;
 use flextunnel_core::proxy::{ClientConfig, ProxyClient, ProxyServer, RoutedSet};
 use flextunnel_core::transport::endpoint::{
@@ -127,27 +128,13 @@ enum Command {
     },
 }
 
-fn init_logger() {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,iroh=warn,tracing=warn"),
-    )
-    .init();
-}
-
-fn build_runtime() -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(Into::into)
-}
-
 fn log_version() {
-    log::info!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    app::log_version(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    init_logger();
+    app::init_logger(app::DEFAULT_LOG_FILTER);
 
     match args.command {
         Command::GenerateServerKey { output, force } => secret::generate_secret(output, force),
@@ -174,7 +161,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        command => build_runtime()?.block_on(run_async(command)),
+        command => app::build_runtime()?.block_on(run_async(command)),
     }
 }
 
@@ -368,7 +355,7 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
 
     let res = tokio::select! {
         res = run => res,
-        _ = shutdown_signal() => {
+        _ = app::shutdown_signal() => {
             log::info!("Received shutdown signal, stopping server");
             Ok(())
         }
@@ -429,7 +416,7 @@ async fn run_client(r: config::ResolvedClient) -> Result<()> {
 
     let res = tokio::select! {
         res = run => res,
-        _ = shutdown_signal() => {
+        _ = app::shutdown_signal() => {
             log::info!("Received shutdown signal, stopping client");
             Ok(())
         }
@@ -438,20 +425,4 @@ async fn run_client(r: config::ResolvedClient) -> Result<()> {
     // Close the endpoint gracefully before it is dropped (see run_server).
     endpoint.close().await;
     res
-}
-
-#[cfg(unix)]
-async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = int.recv() => {}
-    }
-}
-
-#[cfg(not(unix))]
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
 }

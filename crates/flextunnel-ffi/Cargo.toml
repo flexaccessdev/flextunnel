@@ -12,7 +12,6 @@ crate-type = ["staticlib"]
 
 [dependencies]
 flextunnel-core.workspace = true
-env_logger.workspace = true
 iroh.workspace = true
 log.workspace = true
 serde.workspace = true

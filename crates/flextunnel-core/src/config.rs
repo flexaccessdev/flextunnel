@@ -98,6 +98,28 @@ pub struct ClientConfig {
     pub max_reconnect_attempts: Option<NonZeroU32>,
 }
 
+/// Agent config file schema. Every field is optional; CLI flags override these.
+/// Like the client but with no local listener (the agent serves reverse-routed
+/// streams the server opens back to it), so there is no `socks_listen`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentConfig {
+    /// EndpointId of the server to connect to.
+    pub server_node_id: Option<String>,
+    /// Agent auth token to send to the server (an `fta` token).
+    pub auth_token: Option<String>,
+    /// File containing the agent auth token.
+    pub auth_token_file: Option<PathBuf>,
+    /// Custom relay URL(s) for failover.
+    pub relay_urls: Option<Vec<String>>,
+    /// Custom discovery DNS server URL ("none" to disable).
+    pub dns_server: Option<String>,
+    /// Reconnect with backoff on a transient drop (default true).
+    pub auto_reconnect: Option<bool>,
+    /// Cap on reconnect attempts between successful connections.
+    pub max_reconnect_attempts: Option<NonZeroU32>,
+}
+
 /// Fully-resolved server settings (CLI > file > default), paths tilde-expanded.
 #[derive(Debug)]
 pub struct ResolvedServer {
@@ -128,6 +150,17 @@ pub struct ResolvedServer {
 pub struct ResolvedClient {
     pub server_node_id: Option<String>,
     pub socks_listen: SocketAddr,
+    pub auth_token: Option<String>,
+    pub auth_token_file: Option<PathBuf>,
+    pub relay_urls: Vec<String>,
+    pub dns_server: Option<String>,
+    pub auto_reconnect: bool,
+    pub max_reconnect_attempts: Option<NonZeroU32>,
+}
+
+/// Fully-resolved agent settings (CLI > file > default), paths tilde-expanded.
+pub struct ResolvedAgent {
+    pub server_node_id: Option<String>,
     pub auth_token: Option<String>,
     pub auth_token_file: Option<PathBuf>,
     pub relay_urls: Vec<String>,
@@ -199,6 +232,14 @@ pub fn load_server_config(path: Option<&Path>, default_config: bool) -> Result<O
 /// Load the client config file (explicit path or `--default-config`), or `None`.
 pub fn load_client_config(path: Option<&Path>, default_config: bool) -> Result<Option<ClientConfig>> {
     match resolve_config_path(path, default_config, "client.toml")? {
+        Some(p) => Ok(Some(load_config(&p)?)),
+        None => Ok(None),
+    }
+}
+
+/// Load the agent config file (explicit path or `--default-config`), or `None`.
+pub fn load_agent_config(path: Option<&Path>, default_config: bool) -> Result<Option<AgentConfig>> {
+    match resolve_config_path(path, default_config, "agent.toml")? {
         Some(p) => Ok(Some(load_config(&p)?)),
         None => Ok(None),
     }
@@ -325,6 +366,28 @@ pub fn resolve_client(cli: ClientConfig, file: Option<ClientConfig>) -> Resolved
             .socks_listen
             .or(file.socks_listen)
             .unwrap_or_else(|| DEFAULT_SOCKS_LISTEN.parse().expect("valid default addr")),
+        auth_token,
+        auth_token_file: auth_token_file.map(|p| expand_tilde(&p)),
+        relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
+        dns_server: cli.dns_server.or(file.dns_server),
+        auto_reconnect: cli.auto_reconnect.or(file.auto_reconnect).unwrap_or(true),
+        max_reconnect_attempts: cli.max_reconnect_attempts.or(file.max_reconnect_attempts),
+    }
+}
+
+/// Merge CLI-provided values over file values over defaults for the agent.
+pub fn resolve_agent(cli: AgentConfig, file: Option<AgentConfig>) -> ResolvedAgent {
+    let file = file.unwrap_or_default();
+
+    // Token group merged as a unit per source (see `resolve_server`).
+    let (auth_token, auth_token_file) = if cli.auth_token.is_some() || cli.auth_token_file.is_some() {
+        (cli.auth_token, cli.auth_token_file)
+    } else {
+        (file.auth_token, file.auth_token_file)
+    };
+
+    ResolvedAgent {
+        server_node_id: cli.server_node_id.or(file.server_node_id),
         auth_token,
         auth_token_file: auth_token_file.map(|p| expand_tilde(&p)),
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),

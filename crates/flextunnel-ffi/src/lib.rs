@@ -106,12 +106,9 @@ struct FfiConfig {
 /// No arguments; always safe to call.
 #[unsafe(no_mangle)]
 pub extern "C" fn flextunnel_init_logging() {
-    let default_filter =
-        "warn,flextunnel_core=info,flextunnel_ffi=info,flextunnel_cli=info";
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(default_filter),
-    )
-    .try_init();
+    flextunnel_core::app::init_logger(
+        "warn,flextunnel_core=info,flextunnel_ffi=info,flextunnel_cli=info",
+    );
 }
 
 /// Start the in-process SOCKS5 proxy.
@@ -184,9 +181,7 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
     let cfg: FfiConfig =
         serde_json::from_str(json).map_err(|e| format!("invalid config JSON: {e}"))?;
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
+    let runtime = flextunnel_core::app::build_runtime()
         .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
 
     // Bind the loopback listener on the fixed port. The listener backlog queues

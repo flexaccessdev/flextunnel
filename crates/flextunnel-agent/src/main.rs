@@ -17,14 +17,12 @@ mod lock;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
 use std::num::NonZeroU32;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use flextunnel_core::auth;
-use flextunnel_core::config::expand_tilde;
 use flextunnel_core::proxy::{AgentConfig, ProxyAgent};
 use flextunnel_core::transport::endpoint::create_client_endpoint;
+use flextunnel_core::{app, auth, config};
 
 #[derive(Parser)]
 #[command(name = "flextunnel-agent")]
@@ -78,58 +76,13 @@ enum Command {
     },
 }
 
-/// Agent config file schema. Every field is optional; CLI flags override these.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AgentFileConfig {
-    /// EndpointId of the server to connect to.
-    server_node_id: Option<String>,
-    /// Agent auth token to send to the server.
-    auth_token: Option<String>,
-    /// File containing the agent auth token.
-    auth_token_file: Option<PathBuf>,
-    /// Custom relay URL(s) for failover.
-    relay_urls: Option<Vec<String>>,
-    /// Custom discovery DNS server URL ("none" to disable).
-    dns_server: Option<String>,
-    /// Reconnect with backoff on a transient drop (default true).
-    auto_reconnect: Option<bool>,
-    /// Cap on reconnect attempts between successful connections.
-    max_reconnect_attempts: Option<NonZeroU32>,
-}
-
-/// Fully-resolved agent settings (CLI > file > default), paths tilde-expanded.
-struct ResolvedAgent {
-    server_node_id: Option<String>,
-    auth_token: Option<String>,
-    auth_token_file: Option<PathBuf>,
-    relay_urls: Vec<String>,
-    dns_server: Option<String>,
-    auto_reconnect: bool,
-    max_reconnect_attempts: Option<NonZeroU32>,
-}
-
-fn init_logger() {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,iroh=warn,tracing=warn"),
-    )
-    .init();
-}
-
-fn build_runtime() -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(Into::into)
-}
-
 fn log_version() {
-    log::info!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    app::log_version(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    init_logger();
+    app::init_logger(app::DEFAULT_LOG_FILTER);
 
     match args.command {
         Command::GenerateToken { count } => {
@@ -138,7 +91,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        command => build_runtime()?.block_on(run_async(command)),
+        command => app::build_runtime()?.block_on(run_async(command)),
     }
 }
 
@@ -164,7 +117,7 @@ async fn run_async(command: Command) -> Result<()> {
             } else {
                 None
             };
-            let cli = AgentFileConfig {
+            let cli = config::AgentConfig {
                 server_node_id,
                 auth_token,
                 auth_token_file,
@@ -173,14 +126,14 @@ async fn run_async(command: Command) -> Result<()> {
                 auto_reconnect,
                 max_reconnect_attempts,
             };
-            let file = load_agent_config(config_path.as_deref(), default_config)?;
-            run_agent(resolve_agent(cli, file)).await
+            let file = config::load_agent_config(config_path.as_deref(), default_config)?;
+            run_agent(config::resolve_agent(cli, file)).await
         }
         Command::GenerateToken { .. } => unreachable!("handled synchronously in main()"),
     }
 }
 
-async fn run_agent(r: ResolvedAgent) -> Result<()> {
+async fn run_agent(r: config::ResolvedAgent) -> Result<()> {
     // Enforce a single agent process per machine before doing anything else. Held
     // for the whole run; released automatically on exit/crash.
     let _lock = lock::acquire()?;
@@ -237,7 +190,7 @@ async fn run_agent(r: ResolvedAgent) -> Result<()> {
 
     let res = tokio::select! {
         res = run => res,
-        _ = shutdown_signal() => {
+        _ = app::shutdown_signal() => {
             log::info!("Received shutdown signal, stopping agent");
             Ok(())
         }
@@ -262,71 +215,4 @@ fn read_machine_id() -> Result<String> {
         anyhow::bail!("The OS returned an empty machine id");
     }
     Ok(id)
-}
-
-/// Resolve the config file to load, if any (explicit path or `--default-config`).
-fn resolve_config_path(path: Option<&Path>, default_config: bool) -> Result<Option<PathBuf>> {
-    if let Some(p) = path {
-        Ok(Some(expand_tilde(p)))
-    } else if default_config {
-        let home = dirs::home_dir()
-            .context("Could not determine the default config directory; pass -c <FILE> instead")?;
-        Ok(Some(home.join(".config").join("flextunnel").join("agent.toml")))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Load the agent config file (explicit path or `--default-config`), or `None`.
-fn load_agent_config(path: Option<&Path>, default_config: bool) -> Result<Option<AgentFileConfig>> {
-    match resolve_config_path(path, default_config)? {
-        Some(p) => {
-            let content = std::fs::read_to_string(&p)
-                .with_context(|| format!("Failed to read config file: {}", p.display()))?;
-            let cfg = toml::from_str(&content)
-                .with_context(|| format!("Failed to parse config file: {}", p.display()))?;
-            Ok(Some(cfg))
-        }
-        None => Ok(None),
-    }
-}
-
-/// Merge CLI-provided values over file values over defaults.
-fn resolve_agent(cli: AgentFileConfig, file: Option<AgentFileConfig>) -> ResolvedAgent {
-    let file = file.unwrap_or_default();
-
-    // Token group merged as a unit per source (mirrors flextunnel-core's config).
-    let (auth_token, auth_token_file) = if cli.auth_token.is_some() || cli.auth_token_file.is_some() {
-        (cli.auth_token, cli.auth_token_file)
-    } else {
-        (file.auth_token, file.auth_token_file)
-    };
-
-    ResolvedAgent {
-        server_node_id: cli.server_node_id.or(file.server_node_id),
-        auth_token,
-        auth_token_file: auth_token_file.map(|p| expand_tilde(&p)),
-        relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
-        dns_server: cli.dns_server.or(file.dns_server),
-        auto_reconnect: cli.auto_reconnect.or(file.auto_reconnect).unwrap_or(true),
-        max_reconnect_attempts: cli.max_reconnect_attempts.or(file.max_reconnect_attempts),
-    }
-}
-
-/// Wait for a shutdown signal: SIGTERM/SIGINT on Unix, Ctrl-C elsewhere
-/// (mirrors the CLI's handler).
-#[cfg(unix)]
-async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = int.recv() => {}
-    }
-}
-
-#[cfg(not(unix))]
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
 }

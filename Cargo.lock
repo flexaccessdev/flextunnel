@@ -941,14 +941,10 @@ version = "0.0.15"
 dependencies = [
  "anyhow",
  "clap",
- "dirs",
- "env_logger",
  "flextunnel-core",
  "log",
  "machine-uid",
- "serde",
  "tokio",
- "toml",
 ]
 
 [[package]]
@@ -958,7 +954,6 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
- "env_logger",
  "flextunnel-core",
  "log",
  "tokio",
@@ -971,6 +966,7 @@ dependencies = [
  "anyhow",
  "base64",
  "dirs",
+ "env_logger",
  "ipnetwork",
  "iroh",
  "iroh-mdns-address-lookup",
@@ -990,7 +986,6 @@ dependencies = [
 name = "flextunnel-ffi"
 version = "0.0.15"
 dependencies = [
- "env_logger",
  "flextunnel-core",
  "iroh",
  "log",
