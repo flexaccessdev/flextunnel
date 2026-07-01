@@ -276,6 +276,12 @@ case-insensitive; CIDR entries match IP targets, accept a bare IP as a single
 host, and a default route (`0.0.0.0/0` / `::/0`) matches every IP. Domains are
 matched only against `whitelist_domains` and IPs only against `whitelist_cidrs`.
 
+Only the **combined** set must be non-empty — setting just one list is fine. The
+two never cross: an omitted/empty list means that whole category is off-list and
+always direct-connected. So `whitelist_domains` alone (no `whitelist_cidrs`)
+tunnels those hostnames but direct-connects every bare-IP target, and
+`whitelist_cidrs` alone tunnels those IPs but direct-connects every hostname.
+
 ### Roadmap
 
 - **Client blocking mode.** Today the client **always direct-connects** every
