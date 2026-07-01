@@ -3,8 +3,8 @@
 //! Provides pre-shared token authentication for the iroh multi-source server.
 //!
 //! ## Token Format
-//! - Exactly 47 characters
-//! - Starts with lowercase `v`
+//! - Exactly 49 characters
+//! - Starts with `ftc`
 //! - Remaining 46 characters are Base64URL (no padding)
 //! - Decoded payload is exactly 34 bytes:
 //!   - First 32 bytes: random entropy
@@ -19,10 +19,10 @@ use std::collections::HashSet;
 use std::path::Path;
 
 /// Required length for authentication tokens.
-pub const TOKEN_LENGTH: usize = 47;
+pub const TOKEN_LENGTH: usize = 49;
 
-/// Required prefix character for tokens.
-pub const TOKEN_PREFIX: char = 'v';
+/// Required prefix for tokens.
+pub const TOKEN_PREFIX: &str = "ftc";
 
 /// Number of random bytes in token payload.
 const RANDOM_BYTES_LEN: usize = 32;
@@ -60,7 +60,7 @@ fn crc16_ccitt_false(data: &[u8]) -> u16 {
 
 /// Generate a new authentication token.
 ///
-/// Format: `v` + base64url_no_pad(32 random bytes + 2-byte CRC16) = 47 characters total.
+/// Format: `ftc` + base64url_no_pad(32 random bytes + 2-byte CRC16) = 49 characters total.
 pub fn generate_token() -> String {
     let mut random = [0u8; RANDOM_BYTES_LEN];
     let mut rng = rand::rng();
@@ -96,11 +96,11 @@ pub fn validate_token(token: &str) -> Result<()> {
         anyhow::bail!(
             "Token must start with '{}', got '{}'",
             TOKEN_PREFIX,
-            token.chars().next().unwrap_or('?')
+            &token[..TOKEN_PREFIX.len().min(token.len())]
         );
     }
 
-    let encoded_payload = &token[TOKEN_PREFIX.len_utf8()..];
+    let encoded_payload = &token[TOKEN_PREFIX.len()..];
     let payload = URL_SAFE_NO_PAD
         .decode(encoded_payload)
         .context("Token payload is not valid base64url without padding")?;
@@ -248,7 +248,7 @@ mod tests {
 
     fn decode_payload(token: &str) -> Vec<u8> {
         URL_SAFE_NO_PAD
-            .decode(&token[TOKEN_PREFIX.len_utf8()..])
+            .decode(&token[TOKEN_PREFIX.len()..])
             .unwrap()
     }
 
@@ -281,13 +281,13 @@ mod tests {
 
     #[test]
     fn test_validate_token_too_short() {
-        let result = validate_token("vshort");
+        let result = validate_token("ftcshort");
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
                 .to_string()
-                .contains("exactly 47 characters")
+                .contains("exactly 49 characters")
         );
     }
 
@@ -300,7 +300,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("exactly 47 characters")
+                .contains("exactly 49 characters")
         );
     }
 
@@ -316,13 +316,13 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("must start with 'v'")
+                .contains("must start with 'ftc'")
         );
     }
 
     #[test]
     fn test_validate_token_invalid_base64url_chars() {
-        let token = format!("{}{}", TOKEN_PREFIX, "!".repeat(TOKEN_LENGTH - 1));
+        let token = format!("{}{}", TOKEN_PREFIX, "!".repeat(TOKEN_LENGTH - TOKEN_PREFIX.len()));
         let result = validate_token(&token);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("base64url"));
@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_validate_token_non_ascii() {
-        let result = validate_token("v🔐notascii");
+        let result = validate_token("ftc🔐notascii");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("ASCII"));
     }
