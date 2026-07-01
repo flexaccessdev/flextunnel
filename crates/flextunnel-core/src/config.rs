@@ -74,9 +74,6 @@ pub struct ServerConfig {
     /// A default route (`0.0.0.0/0` / `::/0`) matches every IP. See
     /// `routed_domains`.
     pub routed_cidrs: Option<Vec<String>>,
-    /// Path to the persistent duplicate-id blocklist (JSON). Defaults to
-    /// `~/.config/flextunnel/blocklist.json` when unset. See [`crate::blocklist`].
-    pub blocklist_file: Option<PathBuf>,
 }
 
 /// Client config file schema. Every field is optional; CLI flags override these.
@@ -120,7 +117,10 @@ pub struct ResolvedServer {
     /// Raw routed-set entries (parsed into a `RoutedSet` at startup).
     pub routed_domains: Vec<String>,
     pub routed_cidrs: Vec<String>,
-    /// Resolved path to the duplicate-id blocklist file (default applied).
+    /// Path to the duplicate-id blocklist file. Always the fixed default
+    /// (`~/.config/flextunnel/blocklist.json`); it is deliberately **not**
+    /// configurable, since relocating this security guard rail would let it be
+    /// bypassed. See [`crate::blocklist`].
     pub blocklist_file: PathBuf,
 }
 
@@ -277,13 +277,11 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
             .or(file.routed_domains)
             .unwrap_or_default(),
         routed_cidrs: cli.routed_cidrs.or(file.routed_cidrs).unwrap_or_default(),
-        // CLI > file > default (~/.config/flextunnel/blocklist.json). Fall back to
-        // a cwd-relative name only if the home dir can't be determined.
-        blocklist_file: cli
-            .blocklist_file
-            .or(file.blocklist_file)
-            .map(|p| expand_tilde(&p))
-            .or_else(crate::blocklist::default_blocklist_path)
+        // Fixed at the default (~/.config/flextunnel/blocklist.json) and NOT
+        // overridable via CLI or config: the blocklist is a security guard rail,
+        // and letting it be pointed elsewhere would let it be bypassed. Fall back
+        // to a cwd-relative name only if the home dir can't be determined.
+        blocklist_file: crate::blocklist::default_blocklist_path()
             .unwrap_or_else(|| PathBuf::from("blocklist.json")),
     })
 }

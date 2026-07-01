@@ -59,10 +59,6 @@ enum Command {
         /// Custom DNS server URL for peer discovery ("none" to disable).
         #[arg(long)]
         dns_server: Option<String>,
-        /// Path to the duplicate-id blocklist file (JSON). Defaults to
-        /// ~/.config/flextunnel/blocklist.json.
-        #[arg(long)]
-        blocklist_file: Option<PathBuf>,
     },
     /// Start the proxy client (local SOCKS5 listener).
     Client {
@@ -192,7 +188,6 @@ async fn run_async(command: Command) -> Result<()> {
             agent_auth_tokens_file,
             relay_urls,
             dns_server,
-            blocklist_file,
         } => {
             log_version();
             let cli = config::ServerConfig {
@@ -208,7 +203,6 @@ async fn run_async(command: Command) -> Result<()> {
                 host_aliases: None, // config-file only; no CLI flag
                 routed_domains: None, // config-file only; no CLI flag
                 routed_cidrs: None,   // config-file only; no CLI flag
-                blocklist_file,
             };
             let file = config::load_server_config(config_path.as_deref(), default_config)?;
             run_server(config::resolve_server(cli, file)?).await

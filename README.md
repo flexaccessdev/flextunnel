@@ -177,7 +177,6 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `--agent-auth-tokens-file <FILE>` | File of accepted agent tokens, one per line. |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). |
 | `--dns-server <URL>` | Custom discovery DNS server, or `none` to disable. |
-| `--blocklist-file <FILE>` | Duplicate-id blocklist path (default `~/.config/flextunnel/blocklist.json`). |
 
 ### `client`
 

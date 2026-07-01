@@ -179,9 +179,10 @@ listed. Detection is best-effort and delayed (it needs client churn to observe
 both instances); prompt, robust detection would require a signaling server. See
 [`duplicate-detection-roadmap.md`](./duplicate-detection-roadmap.md).
 
-The blocklist is a JSON file (default `~/.config/flextunnel/blocklist.json`,
-overridable via `blocklist_file`), written atomically (temp + rename) and loaded
-at startup.
+The blocklist is a JSON file at the fixed path
+`~/.config/flextunnel/blocklist.json` — deliberately **not** configurable, since
+relocating this security guard rail would let it be bypassed. It is written
+atomically (temp + rename) and loaded at startup.
 
 ## Concurrency model
 
