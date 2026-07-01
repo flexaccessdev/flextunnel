@@ -35,8 +35,8 @@ TCP connection.
 |---|---|
 | `main.rs` | clap CLI, command dispatch, logger/runtime, graceful `endpoint.close()`, shutdown signal |
 | `config.rs` | TOML config files (`-c`/`--default-config`), `deny_unknown_fields`, CLI>file>default merge, `~` expansion |
-| `auth.rs` | auth-token generation/validation/file-loading (CRC16-checksummed Base64URL tokens) |
-| `blocklist.rs` | persisted duplicate-id blocklist (JSON): confirmed duplicate client ids + the server's own conflicted id |
+| `auth.rs` | auth-token generation/validation/file-loading (CRC16-checksummed Base64URL tokens); separate client (`ftc`) and agent (`fta`) prefixes |
+| `blocklist.rs` | persisted duplicate-id blocklist (JSON): confirmed duplicate client ids, duplicate agent machine ids, + the server's own conflicted id |
 | `secret.rs` | server secret-key (iroh identity) generation and loading; prints the `EndpointId` |
 | `error.rs` | `ProxyError` (`Network`/`Config`/`Signaling`/`AuthenticationFailed`/`ConnectionLost`) + `is_recoverable()` |
 | `transport/mod.rs` | QUIC transport config (keep-alive, idle timeout, initial MTU) |
@@ -44,7 +44,14 @@ TCP connection.
 | `proxy/signaling.rs` | fixed `ALPN` constant, length-prefixed `Hello`/`HelloResponse`, per-stream `Target` codec, `REP_*` codes |
 | `proxy/socks5.rs` | client-side RFC 1928: method negotiation + `CONNECT` parsing + replies |
 | `proxy/client.rs` | connect + auth + SOCKS5 listener + reconnect loop |
-| `proxy/server.rs` | accept + auth + per-stream DNS/connect/pipe |
+| `proxy/server.rs` | accept + auth + per-stream DNS/connect/pipe; agent registry + reverse routing |
+| `proxy/agent.rs` | reverse-routing exit point: dial + auth (`role=Agent`, machine id) + accept server-opened streams + dial loopback |
+| `proxy/dial.rs` | `Target` → TCP dial + `connect_and_pipe` (the shared server/agent exit-point body) |
+
+The reverse-routing agent ships as a **separate Linux-only binary crate**
+(`flextunnel-agent`, not in the module map above): it reads `/etc/machine-id`,
+holds a single-instance file lock, and drives `proxy::agent::ProxyAgent` over an
+ephemeral `create_client_endpoint`.
 
 ## Connection lifecycle
 
@@ -136,6 +143,20 @@ nonce and is ignored). On confirmation the server tears down the offending
 connections and records the node id in the persisted blocklist (`blocklist.rs`);
 a blocklisted node id is rejected up-front. Because ephemeral ids never recur,
 the persisted client entry is largely an audit record.
+
+**Duplicate agent (server-side).** An agent's iroh id is ephemeral and irrelevant
+to its identity — it is identified by its stable **machine id** (`/etc/machine-id`).
+A single-instance file lock in the `flextunnel-agent` binary already guarantees one
+agent *process* per machine, so the server needs no nonce/liveness machinery: it
+tracks the one active connection per machine id, and a *second concurrent*
+connection presenting the same id is necessarily a **different machine** (e.g. a
+cloned VM image whose `/etc/machine-id` was never regenerated). On that collision
+the server tears both down and records the machine id in the blocklist
+(`blocked_agents`). Because a machine id is stable (unlike an ephemeral client id),
+that block keeps rejecting the id until the operator fixes the duplicate and clears
+the entry. A benign reconnect is not a collision: its prior connection is already
+gone (the reconnect backoff outlasts QUIC dead-connection detection), so it
+registers fresh.
 
 **Duplicate server (self-block).** Server identity is persistent, so two servers
 sharing one secret key is a plausible misconfiguration — but only observable when
@@ -245,6 +266,12 @@ the project `README.md` for the user-facing comparison.
 
 HTTP proxy support is planned; the wire protocol and server are unaffected. See
 [`http-proxy-roadmap.md`](./http-proxy-roadmap.md).
+
+Reverse routing is loopback-only in v1. A follow-up will let one agent (machine
+id) expose several hostnames each mapped to a chosen host/IP on the agent's own
+network (an `agent_ip` target, default `127.0.0.1`); the server already rewrites
+the routed target before opening the agent stream, so this is a server-side
+config + rewrite change with no agent-side protocol change.
 
 Future work on duplicate-id detection — non-ephemeral client ids and their
 pitfalls, the signaling-server path for prompt server-dup detection, and

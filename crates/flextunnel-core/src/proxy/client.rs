@@ -65,7 +65,10 @@ pub struct ClientConfig {
 }
 
 /// Exponential backoff with jitter for the Nth (1-based) reconnect attempt.
-fn calculate_backoff(attempt: u32) -> Duration {
+///
+/// Shared with [`crate::proxy::agent`], whose reconnect policy mirrors the
+/// client's.
+pub(crate) fn calculate_backoff(attempt: u32) -> Duration {
     let shift = attempt.saturating_sub(1).min(6); // cap the doubling at 2^6 = 64
     let secs = (1u64 << shift).min(RECONNECT_BACKOFF_MAX);
     let jitter = rand::rng().random_range(0..=RECONNECT_JITTER_MAX_MS);
@@ -454,7 +457,10 @@ impl ProxyClient {
 /// `Heartbeat` every [`HEARTBEAT_INTERVAL`] and await its `HeartbeatAck` within
 /// [`LIVENESS_WINDOW`]. A missing ack (or stream error) returns
 /// [`ProxyError::ConnectionLost`] (recoverable), which drives the reconnect loop.
-async fn client_heartbeat_loop(
+///
+/// Shared with [`crate::proxy::agent`]: an agent also sends heartbeats over its
+/// retained control stream, so it reuses this loop verbatim.
+pub(crate) async fn client_heartbeat_loop(
     mut send: SendStream,
     mut recv: RecvStream,
 ) -> ProxyResult<()> {

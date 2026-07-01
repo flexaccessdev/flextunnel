@@ -47,6 +47,12 @@ enum Command {
         /// File of accepted client auth tokens (one per line).
         #[arg(long)]
         auth_tokens_file: Option<PathBuf>,
+        /// Accepted agent auth token (repeatable). Separate pool from clients.
+        #[arg(long = "agent-auth-token")]
+        agent_auth_tokens: Vec<String>,
+        /// File of accepted agent auth tokens (one per line).
+        #[arg(long)]
+        agent_auth_tokens_file: Option<PathBuf>,
         /// Custom relay server URL(s) for failover (repeatable).
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
@@ -166,7 +172,7 @@ fn main() -> Result<()> {
         }
         Command::GenerateAuthToken { count } => {
             for _ in 0..count {
-                println!("{}", auth::generate_token());
+                println!("{}", auth::generate_client_token());
             }
             Ok(())
         }
@@ -182,6 +188,8 @@ async fn run_async(command: Command) -> Result<()> {
             secret_file,
             auth_tokens,
             auth_tokens_file,
+            agent_auth_tokens,
+            agent_auth_tokens_file,
             relay_urls,
             dns_server,
             blocklist_file,
@@ -192,6 +200,9 @@ async fn run_async(command: Command) -> Result<()> {
                 secret: None, // no inline-secret CLI flag; config file only
                 auth_tokens: (!auth_tokens.is_empty()).then_some(auth_tokens),
                 auth_tokens_file,
+                agent_auth_tokens: (!agent_auth_tokens.is_empty()).then_some(agent_auth_tokens),
+                agent_auth_tokens_file,
+                agent_routes: None, // config-file only; no CLI flag
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
                 dns_server,
                 host_aliases: None, // config-file only; no CLI flag
@@ -244,17 +255,36 @@ async fn run_async(command: Command) -> Result<()> {
 }
 
 async fn run_server(r: config::ResolvedServer) -> Result<()> {
-    let valid_tokens = auth::load_auth_tokens(&r.auth_tokens, r.auth_tokens_file.as_deref())
-        .context("Failed to load authentication tokens")?;
+    let valid_tokens = auth::load_auth_tokens(
+        &r.auth_tokens,
+        r.auth_tokens_file.as_deref(),
+        auth::CLIENT_TOKEN_PREFIX,
+    )
+    .context("Failed to load client authentication tokens")?;
     if valid_tokens.is_empty() {
         anyhow::bail!(
-            "The server requires at least one authentication token.\n\
+            "The server requires at least one client authentication token.\n\
              Generate one with: flextunnel generate-auth-token\n\
              Then pass --auth-token <TOKEN>, --auth-tokens-file <FILE>, or set \
              auth_tokens/auth_tokens_file in the config."
         );
     }
-    log::info!("Loaded {} authentication token(s)", valid_tokens.len());
+    log::info!("Loaded {} client authentication token(s)", valid_tokens.len());
+
+    // Agent tokens are optional (a server may run no reverse routes). Loaded from
+    // a separate pool with the `fta` prefix so a client token can't act as an agent.
+    let agent_valid_tokens = auth::load_auth_tokens(
+        &r.agent_auth_tokens,
+        r.agent_auth_tokens_file.as_deref(),
+        auth::AGENT_TOKEN_PREFIX,
+    )
+    .context("Failed to load agent authentication tokens")?;
+    if !agent_valid_tokens.is_empty() {
+        log::info!("Loaded {} agent authentication token(s)", agent_valid_tokens.len());
+    }
+    if !r.agent_routes.is_empty() {
+        log::info!("Loaded {} agent route(s)", r.agent_routes.len());
+    }
 
     let secret_key = secret::resolve_secret_key(r.secret.as_deref(), r.secret_file.as_deref())?;
     let own_id = secret_to_endpoint_id(&secret_key);
@@ -308,6 +338,8 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
     let server = ProxyServer::new(
         own_id,
         valid_tokens,
+        agent_valid_tokens,
+        r.agent_routes,
         r.host_aliases,
         routed_set,
         r.routed_domains,
@@ -345,10 +377,10 @@ async fn run_client(r: config::ResolvedClient) -> Result<()> {
         anyhow::bail!("Provide only one of auth_token or auth_token_file, not both");
     }
     let token = if let Some(token) = r.auth_token {
-        auth::validate_token(&token).context("Invalid authentication token")?;
+        auth::validate_client_token(&token).context("Invalid authentication token")?;
         token
     } else if let Some(path) = r.auth_token_file {
-        auth::load_auth_token_from_file(&path)
+        auth::load_auth_token_from_file(&path, auth::CLIENT_TOKEN_PREFIX)
             .context("Failed to load authentication token from file")?
     } else {
         anyhow::bail!(

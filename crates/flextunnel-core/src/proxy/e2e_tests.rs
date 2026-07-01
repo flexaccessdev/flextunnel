@@ -16,8 +16,8 @@
 //!   duplicate client id, exactly as the design intends.
 
 use crate::blocklist::BlockList;
-use crate::proxy::signaling::{self, Hello, HelloResponse};
-use crate::proxy::{ProxyServer, RoutedSet};
+use crate::proxy::signaling::{self, Hello, HelloResponse, Target};
+use crate::proxy::{dial, ProxyServer, RoutedSet};
 use crate::transport::{ALPN, build_quic_transport_config};
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
@@ -25,9 +25,13 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 const TOKEN: &str = "test-token";
+/// A distinct agent-token string (the server checks pool membership, not the
+/// prefix, so any string works as long as the pools differ).
+const AGENT_TOKEN: &str = "test-agent-token";
 
 /// Bind a hermetic loopback endpoint: relay off, no discovery, `127.0.0.1:0`.
 /// Servers get the ALPN so they can accept; clients only dial.
@@ -53,20 +57,42 @@ async fn with_timeout<F: std::future::Future>(f: F) -> F::Output {
         .expect("operation timed out")
 }
 
-/// Spawn a `ProxyServer` on `endpoint` with a single valid token, an empty
-/// routed set, and the given blocklist path. Returns the server's own id.
+/// Spawn a `ProxyServer` on `endpoint` with a single client token, an empty
+/// routed set, no agents, and the given blocklist path. Returns the server's own
+/// id.
 fn spawn_server(endpoint: Endpoint, blocklist_path: std::path::PathBuf) -> iroh::EndpointId {
+    spawn_server_full(
+        endpoint,
+        blocklist_path,
+        HashSet::new(),
+        HashMap::new(),
+        Vec::new(),
+    )
+}
+
+/// Spawn a `ProxyServer` with configurable agent tokens + reverse routes. Client
+/// token is always [`TOKEN`]; `routed_domains` seeds the routed set (empty = deny
+/// all). Returns the server's own id.
+fn spawn_server_full(
+    endpoint: Endpoint,
+    blocklist_path: std::path::PathBuf,
+    agent_valid_tokens: HashSet<String>,
+    agent_routes: HashMap<String, String>,
+    routed_domains: Vec<String>,
+) -> iroh::EndpointId {
     let own_id = endpoint.id();
     let mut tokens = HashSet::new();
     tokens.insert(TOKEN.to_string());
-    let empty: Vec<String> = Vec::new();
+    let no_cidrs: Vec<String> = Vec::new();
     let server = ProxyServer::new(
         own_id,
         tokens,
+        agent_valid_tokens,
+        agent_routes,
         HashMap::new(),
-        RoutedSet::new(&empty, &empty).unwrap(),
-        empty.clone(),
-        empty,
+        RoutedSet::new(&routed_domains, &no_cidrs).unwrap(),
+        routed_domains,
+        no_cidrs,
         BlockList::load(blocklist_path).unwrap(),
     );
     tokio::spawn(async move {
@@ -93,6 +119,31 @@ async fn client_handshake(
     let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
     let mut hello = Hello::new(TOKEN, nonce);
     hello.duplicate_server_observed = duplicate_server_observed;
+    signaling::write_message(&mut send, &signaling::encode_hello(&hello).unwrap())
+        .await
+        .unwrap();
+    send.flush().await.unwrap();
+    let data = with_timeout(signaling::read_message(
+        &mut recv,
+        signaling::MAX_HANDSHAKE_SIZE,
+    ))
+    .await
+    .unwrap();
+    let resp = signaling::decode_hello_response(&data).unwrap();
+    (conn, send, recv, resp)
+}
+
+/// Perform the agent side of the auth handshake (`role = Agent` + machine id)
+/// and return the open control stream + the server's response.
+async fn agent_handshake(
+    ep: &Endpoint,
+    server_addr: EndpointAddr,
+    machine_id: &str,
+    nonce: u128,
+) -> (Connection, SendStream, RecvStream, HelloResponse) {
+    let conn = with_timeout(ep.connect(server_addr, ALPN)).await.unwrap();
+    let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
+    let hello = Hello::new_agent(AGENT_TOKEN, nonce, machine_id);
     signaling::write_message(&mut send, &signaling::encode_hello(&hello).unwrap())
         .await
         .unwrap();
@@ -194,6 +245,130 @@ async fn server_self_blocks_on_duplicate_advisory() {
     // The server recorded its own id as conflicted. Poll rather than assume a
     // fixed delay is enough (avoids flaking under load).
     wait_for_blocklist(&bl_path, |bl| bl.is_server_conflicted(&own_id.to_string())).await;
+
+    let _ = std::fs::remove_file(&bl_path);
+}
+
+/// End-to-end reverse routing: a client requests a hostname reserved in
+/// `[agent_routes]`; the server forwards the stream over the connected agent's
+/// live connection, the agent dials its own loopback, and bytes round-trip.
+#[tokio::test]
+async fn agent_reverse_route_pipes_to_agent_loopback() {
+    // A tiny echo server on the agent's loopback: greets "HELLO", then echoes.
+    let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = echo.accept().await {
+            tokio::spawn(async move {
+                let _ = sock.write_all(b"HELLO").await;
+                let mut buf = [0u8; 256];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let machine_id = "reverse-route-machine-id";
+    let alias = "web.ezvpn";
+    let routes = HashMap::from([(alias.to_string(), machine_id.to_string())]);
+    let agent_tokens = HashSet::from([AGENT_TOKEN.to_string()]);
+
+    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
+    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
+    // "*" routed set so the reserved alias passes the whitelist gate.
+    spawn_server_full(
+        server_ep,
+        temp_blocklist("agentroute"),
+        agent_tokens,
+        routes,
+        vec!["*".to_string()],
+    );
+
+    // Agent connects and serves each server-opened stream by dialing its loopback
+    // (the shared exit-point body, exactly as `proxy::agent` does).
+    let agent_ep = loopback_endpoint(SecretKey::generate(), false).await;
+    let (agent_conn, _asend, _arecv, aresp) =
+        agent_handshake(&agent_ep, server_addr.clone(), machine_id, 1).await;
+    assert!(aresp.accepted, "agent should be accepted");
+    let serve_conn = agent_conn.clone();
+    tokio::spawn(async move {
+        while let Ok((send, mut recv)) = serve_conn.accept_bi().await {
+            tokio::spawn(async move {
+                if let Ok(target) = signaling::read_request(&mut recv).await {
+                    let _ = dial::connect_and_pipe(send, recv, &target).await;
+                }
+            });
+        }
+    });
+
+    // Client requests the reserved alias at the echo port → routed to the agent.
+    let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
+    let (client_conn, _cs, _cr, cresp) =
+        client_handshake(&client_ep, server_addr, 2, false).await;
+    assert!(cresp.accepted, "client should be accepted");
+
+    let (mut send, mut recv) = with_timeout(client_conn.open_bi()).await.unwrap();
+    signaling::write_request(&mut send, &Target::Domain(alias.to_string(), echo_port))
+        .await
+        .unwrap();
+    send.flush().await.unwrap();
+    let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
+    assert_eq!(rep, signaling::REP_SUCCESS, "reverse route should connect");
+
+    // Round-trip through the agent: read the greeting, then our echoed bytes.
+    send.write_all(b"ping").await.unwrap();
+    send.flush().await.unwrap();
+    let mut buf = [0u8; 9]; // "HELLO" + "ping"
+    with_timeout(recv.read_exact(&mut buf)).await.unwrap();
+    assert_eq!(&buf, b"HELLOping");
+
+    // Keep the agent connection alive until the assertions complete.
+    drop(agent_conn);
+}
+
+/// Two agents presenting the *same* machine id concurrently (distinct ephemeral
+/// node ids) are a duplicate: the second is rejected and the machine id is
+/// blocklisted.
+#[tokio::test]
+async fn duplicate_agent_machine_id_is_detected_and_blocklisted() {
+    let bl_path = temp_blocklist("dupagent");
+    let agent_tokens = HashSet::from([AGENT_TOKEN.to_string()]);
+
+    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
+    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
+    spawn_server_full(server_ep, bl_path.clone(), agent_tokens, HashMap::new(), Vec::new());
+
+    let machine_id = "dup-machine-id";
+
+    // First agent authenticates and stays live (held in scope).
+    let ep1 = loopback_endpoint(SecretKey::generate(), false).await;
+    let (_c1, _s1, _r1, resp1) = agent_handshake(&ep1, server_addr.clone(), machine_id, 1).await;
+    assert!(resp1.accepted, "first agent should be accepted");
+
+    // Second agent: a different (ephemeral) node id but the same machine id.
+    let ep2 = loopback_endpoint(SecretKey::generate(), false).await;
+    let (_c2, _s2, _r2, resp2) = agent_handshake(&ep2, server_addr, machine_id, 2).await;
+    assert!(!resp2.accepted, "duplicate agent must be rejected");
+    assert!(
+        resp2
+            .reject_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("duplicate"),
+        "reject reason should mention duplicate: {:?}",
+        resp2.reject_reason
+    );
+
+    // The server persisted the offending machine id to the blocklist.
+    wait_for_blocklist(&bl_path, |bl| bl.is_agent_blocked(machine_id)).await;
 
     let _ = std::fs::remove_file(&bl_path);
 }

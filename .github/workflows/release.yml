@@ -104,11 +104,14 @@ jobs:
 
       - name: Build Release
         run: |
-          cargo build --release -p flextunnel-cli --target ${{ matrix.target }}
+          # flextunnel-agent is Linux-only, so it is built here (not in the macOS/
+          # Windows jobs) alongside the CLI.
+          cargo build --release -p flextunnel-cli -p flextunnel-agent --target ${{ matrix.target }}
 
       - name: Rename Binaries
         run: |
           mv target/${{ matrix.target }}/release/flextunnel target/release/flextunnel-${{ matrix.suffix }}
+          mv target/${{ matrix.target }}/release/flextunnel-agent target/release/flextunnel-agent-${{ matrix.suffix }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -119,6 +122,11 @@ jobs:
         with:
           name: release-${{ matrix.suffix }}
           path: target/release/flextunnel-${{ matrix.suffix }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-agent-${{ matrix.suffix }}
+          path: target/release/flextunnel-agent-${{ matrix.suffix }}
 
   build-macos:
     needs: setup

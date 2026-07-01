@@ -1,0 +1,30 @@
+# flextunnel agent config (TOML). Linux-only.
+#
+# Load with:  flextunnel-agent run -c agent.toml
+#         or: flextunnel-agent run --default-config   (~/.config/flextunnel/agent.toml)
+#
+# An agent is a reverse-routing exit point: it dials the server (like a client)
+# but runs NO local SOCKS5 listener. Instead it accepts the streams the server
+# opens back to it and connects each to `127.0.0.1` on THIS machine. This lets
+# clients reach a service behind NAT that the server cannot dial directly.
+#
+# The agent is identified by its stable machine id (`/etc/machine-id`) — its iroh
+# node id is ephemeral, so there is no key file to manage. Reserve this machine's
+# id in the server's [agent_routes] to make it reachable. Only one agent runs per
+# machine (enforced by a file lock).
+
+# EndpointId of the server to connect to.
+server_node_id = "<server endpoint id>"
+
+# Agent auth token accepted by the server (prefix `fta`). Provide one of:
+# Generate one with:  flextunnel-agent generate-token
+auth_token = "ftaXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+# auth_token_file = "/etc/flextunnel/agent_token.txt"
+
+# Optional iroh tuning.
+# relay_urls = ["https://relay.example"]   # custom relay(s) for failover
+# dns_server = "https://dns.example"        # custom discovery DNS, or "none"
+
+# Reconnect behavior (mirrors the client). Defaults to reconnecting with backoff.
+# auto_reconnect = true
+# max_reconnect_attempts = 10

@@ -151,7 +151,11 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 | `client` | Run the proxy client (local SOCKS5 listener). |
 | `generate-server-key -o <FILE> [--force]` | Generate the server identity key. |
 | `show-server-id --secret-file <FILE>` | Print the EndpointId for a key. |
-| `generate-auth-token [-c N]` | Generate N auth tokens. |
+| `generate-auth-token [-c N]` | Generate N client auth tokens (prefix `ftc`). |
+
+The reverse-routing **agent** is a separate Linux-only binary, `flextunnel-agent`
+(subcommands `run` and `generate-token`) — see
+[Reverse-routing agent](#reverse-routing-agent-linux) below.
 
 ### `server`
 
@@ -161,7 +165,9 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 | `--default-config` | Load `~/.config/flextunnel/server.toml`. |
 | `--secret-file <FILE>` | Server identity key. |
 | `--auth-token <TOKEN>` | Accepted client token (repeatable). |
-| `--auth-tokens-file <FILE>` | File of accepted tokens, one per line. |
+| `--auth-tokens-file <FILE>` | File of accepted client tokens, one per line. |
+| `--agent-auth-token <TOKEN>` | Accepted agent token (repeatable). Separate pool from clients. |
+| `--agent-auth-tokens-file <FILE>` | File of accepted agent tokens, one per line. |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). |
 | `--dns-server <URL>` | Custom discovery DNS server, or `none` to disable. |
 
@@ -230,6 +236,49 @@ This is also the clean way around Firefox refusing to proxy literal
 browse to `http://server.ezvpn:8000/`. Use `socks5h://` (or set Firefox's
 `network.proxy.socks_remote_dns = true`) so the name is resolved by the server,
 not locally.
+
+## Reverse-routing agent (Linux)
+
+Where a `[host_aliases]` entry resolves to a host on the **server's** network, an
+`[agent_routes]` entry resolves to a connected **agent** — a `flextunnel-agent`
+process on some other machine. The agent dials the server (like a client) but runs
+no SOCKS5 listener; instead it accepts the streams the server opens back to it and
+connects each to `127.0.0.1` on its own machine. This lets a client reach a service
+behind NAT that the server cannot dial directly: the agent makes the outbound
+connection, and the server pushes streams back over it. Reverse routing is
+**loopback-only** in v1.
+
+The agent is a **separate, Linux-only binary** (`flextunnel-agent`) and identifies
+itself by its stable **machine id** (`/etc/machine-id`) — its iroh node id is
+ephemeral, so there is no key file to manage. Only one agent runs per machine
+(enforced by a file lock). It authenticates with its **own** token pool (prefix
+`fta`, separate from client `ftc` tokens).
+
+```sh
+# On the server host: generate an agent token and reserve the agent's machine id.
+flextunnel-agent generate-token          # -> fta…   (add to agent_auth_tokens)
+# (get the agent's id from `cat /etc/machine-id` on the agent host)
+```
+
+```toml
+# server.toml
+agent_auth_tokens = ["fta…"]
+routed_domains    = ["web.ezvpn", "*.example.com"]   # the alias must be on the routed set
+
+[agent_routes]
+"web.ezvpn" = { machine_id = "<agent /etc/machine-id>" }
+```
+
+```sh
+# On the agent host (Linux):
+flextunnel-agent run --server-node-id <server id> --auth-token fta…
+# then from a client: curl -x socks5h://127.0.0.1:1080 http://web.ezvpn:8000/
+```
+
+A second agent presenting the **same** machine id (e.g. a cloned VM image whose
+`/etc/machine-id` was never regenerated) is rejected and the machine id is recorded
+in the blocklist — fix the duplicate id and clear the entry to recover. See
+[`agent.toml.example`](agent.toml.example).
 
 ## Routed-set split-tunneling
 
@@ -300,6 +349,11 @@ tunnels those hostnames but direct-connects every bare-IP target, and
   traffic can be preferable to letting it leak out directly; the iOS client keeps
   defaulting to direct-connect. (The server's `0x02` rejection above is a
   separate, server-side control and is unaffected.)
+- **Richer agent routes.** Reverse routing is loopback-only in v1: every
+  `[agent_routes]` entry dials `127.0.0.1` on the agent. A follow-up will let one
+  agent (one machine id) expose several hostnames, each mapped to a chosen host/IP
+  on the agent's own network (an `agent_ip` field, default `127.0.0.1`) — likely
+  either per-domain entries or a grouped `[[agent]]` array-of-tables.
 
 ## Reconnect behavior
 

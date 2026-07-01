@@ -16,6 +16,19 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
+/// One `[agent_routes]` reservation: an alias that resolves, server-side, to a
+/// connected **agent** (by its stable machine id) rather than to a host on the
+/// server's own network. When a client requests the alias, the server forwards
+/// the stream over the agent's live connection and the agent dials
+/// `127.0.0.1:<requested port>` on *its* network. Reverse routing is
+/// **loopback-only** in v1. See `proxy::agent` and `proxy::server`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRoute {
+    /// The agent's stable machine id (`/etc/machine-id`), as a string.
+    pub machine_id: String,
+}
+
 /// Server config file schema. Every field is optional; CLI flags override these.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +41,18 @@ pub struct ServerConfig {
     pub auth_tokens: Option<Vec<String>>,
     /// File of accepted client auth tokens (one per line).
     pub auth_tokens_file: Option<PathBuf>,
+    /// Accepted agent auth tokens (inline list) — a separate pool from
+    /// `auth_tokens`, using the `fta` prefix.
+    pub agent_auth_tokens: Option<Vec<String>>,
+    /// File of accepted agent auth tokens (one per line).
+    pub agent_auth_tokens_file: Option<PathBuf>,
+    /// Reverse-routing reservations: an alias resolved to a connected **agent**
+    /// (by machine id) instead of to a host on the server's own network. A
+    /// requested hostname matching a key is forwarded over the agent's live
+    /// connection; the agent dials `127.0.0.1` on its own network, keeping the
+    /// requested port. Checked *before* `host_aliases`; a name should appear in
+    /// only one. See [`AgentRoute`].
+    pub agent_routes: Option<HashMap<String, AgentRoute>>,
     /// Custom relay URL(s) for failover.
     pub relay_urls: Option<Vec<String>>,
     /// Custom discovery DNS server URL ("none" to disable).
@@ -82,6 +107,11 @@ pub struct ResolvedServer {
     pub secret: Option<String>,
     pub auth_tokens: Vec<String>,
     pub auth_tokens_file: Option<PathBuf>,
+    pub agent_auth_tokens: Vec<String>,
+    pub agent_auth_tokens_file: Option<PathBuf>,
+    /// Reverse-routing reservations, keys lowercased for case-insensitive
+    /// matching, mapping an alias to an agent's machine id. See [`AgentRoute`].
+    pub agent_routes: HashMap<String, String>,
     pub relay_urls: Vec<String>,
     pub dns_server: Option<String>,
     /// Server-side host aliases, keys lowercased for case-insensitive matching.
@@ -196,12 +226,29 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Resolved
     } else {
         (file.auth_tokens, file.auth_tokens_file)
     };
+    let (agent_auth_tokens, agent_auth_tokens_file) =
+        if cli.agent_auth_tokens.is_some() || cli.agent_auth_tokens_file.is_some() {
+            (cli.agent_auth_tokens, cli.agent_auth_tokens_file)
+        } else {
+            (file.agent_auth_tokens, file.agent_auth_tokens_file)
+        };
 
     ResolvedServer {
         secret_file: secret_file.map(|p| expand_tilde(&p)),
         secret,
         auth_tokens: auth_tokens.unwrap_or_default(),
         auth_tokens_file: auth_tokens_file.map(|p| expand_tilde(&p)),
+        agent_auth_tokens: agent_auth_tokens.unwrap_or_default(),
+        agent_auth_tokens_file: agent_auth_tokens_file.map(|p| expand_tilde(&p)),
+        // File-only (no CLI flag). Lowercase keys so matching is case-insensitive
+        // against a lowercased requested host.
+        agent_routes: cli
+            .agent_routes
+            .or(file.agent_routes)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.machine_id))
+            .collect(),
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
         dns_server: cli.dns_server.or(file.dns_server),
         // File-only (no CLI flag). Lowercase keys so matching is case-insensitive
@@ -327,6 +374,24 @@ mod tests {
         assert_eq!(r.host_aliases.get("server.ezvpn").map(String::as_str), Some("127.0.0.1"));
         assert_eq!(r.host_aliases.get("node2.ezvpn").map(String::as_str), Some("192.168.1.50"));
         assert!(!r.host_aliases.contains_key("Server.EzVPN"));
+    }
+
+    #[test]
+    fn agent_routes_parsed_and_lowercased() {
+        let toml = r#"
+            agent_auth_tokens = ["ftaAAA"]
+
+            [agent_routes]
+            "Web.EzVPN" = { machine_id = "abc123def" }
+            "nas.ezvpn" = { machine_id = "999888777" }
+        "#;
+        let file: ServerConfig = toml::from_str(toml).unwrap();
+        let r = resolve_server(ServerConfig::default(), Some(file));
+        // Keys lowercased for case-insensitive matching; values are machine ids.
+        assert_eq!(r.agent_routes.get("web.ezvpn").map(String::as_str), Some("abc123def"));
+        assert_eq!(r.agent_routes.get("nas.ezvpn").map(String::as_str), Some("999888777"));
+        assert!(!r.agent_routes.contains_key("Web.EzVPN"));
+        assert_eq!(r.agent_auth_tokens, vec!["ftaAAA".to_string()]);
     }
 
     #[test]
