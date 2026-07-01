@@ -11,7 +11,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.0.16"
+version = "0.0.17"
 edition = "2024"
 description = "SOCKS5-over-QUIC proxy via iroh P2P"
 

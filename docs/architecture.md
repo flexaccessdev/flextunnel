@@ -57,6 +57,14 @@ holds a single-instance file lock, and drives `proxy::agent::ProxyAgent` over an
 ephemeral `create_client_endpoint`. `flextunnel-agent machine-id` prints the raw
 id and its derived network id locally.
 
+As a machine-global daemon (one per machine), `flextunnel-agent run` uses
+root-owned global paths and must run as root on Unix: config at
+`/etc/flextunnel/agent.toml` and the single-instance lock at
+`/var/run/flextunnel-agent.lock` (Windows uses `%ProgramData%\flextunnel`). This
+contrasts with the per-user server, whose config and lock live under
+`~/.config/flextunnel/`. Root is enforced implicitly — a non-root run fails to
+open the global paths, so there is no separate privilege check.
+
 ## Connection lifecycle
 
 ### 1. ALPN

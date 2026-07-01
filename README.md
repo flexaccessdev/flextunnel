@@ -275,6 +275,14 @@ node id is ephemeral, so there is no key file to manage. Only one agent runs per
 machine (enforced by a file lock). It authenticates with its **own** token pool
 (prefix `fta`, separate from client `ftc` tokens).
 
+Because the agent is a **machine-global daemon** (one per machine, keyed by the
+machine id), `flextunnel-agent run` must run as **root** on Unix: its default
+config lives at `/etc/flextunnel/agent.toml` and its single-instance lock at
+`/var/run/flextunnel-agent.lock` (both root-owned); on Windows it uses
+`%ProgramData%\flextunnel`. There is no privilege check in the code — a non-root
+run simply fails to open those global paths. (`machine-id` and `generate-token`
+touch no global state and run unprivileged.)
+
 ```sh
 # On the agent host: get this agent's network id to reserve on the server.
 flextunnel-agent machine-id              # -> shows the raw id + derived ftm1… id
@@ -292,8 +300,8 @@ routed_domains    = ["web.homelab", "*.example.com"]   # the alias must be on th
 ```
 
 ```sh
-# On the agent host (Linux/macOS/Windows):
-flextunnel-agent run --server-node-id <server id> --auth-token fta…
+# On the agent host (Linux/macOS/Windows). Run as root on Unix (machine-global daemon):
+sudo flextunnel-agent run --server-node-id <server id> --auth-token fta…
 # then from a client: curl -x socks5h://127.0.0.1:1080 http://web.homelab:8000/
 ```
 

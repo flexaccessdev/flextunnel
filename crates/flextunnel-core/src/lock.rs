@@ -7,17 +7,17 @@
 //! never wedges a restart.
 //!
 //! This module owns only the mechanics; each binary chooses the *scope* by
-//! passing the lock path — the agent uses a machine-wide path (one agent per
-//! machine), the server a per-user path (one server per user).
+//! passing the lock path — the agent uses a machine-wide, root-owned path (one
+//! agent per machine), the server a per-user path (one server per user).
 //!
 //! # Alternative mechanisms (if the file lock ever becomes inconvenient)
 //!
 //! A file lock was chosen because it is std-only, portable, and — crucially —
 //! auto-released when the fd closes on exit/crash, so it never leaves stale state
 //! that wedges a restart (a leftover lock *file* is harmless; the lock is the fd,
-//! not the file's existence). Its only wart is filesystem path/permission friction
-//! (see the agent's use of a world-writable `/tmp` path). If that friction ever
-//! outweighs the portability, these are the cleaner OS-native singleton primitives.
+//! not the file's existence). Its only wart is filesystem path/permission friction.
+//! If that friction ever outweighs the portability, these are the cleaner
+//! OS-native singleton primitives.
 //! They are all also auto-released on process death, which is the property that
 //! disqualifies PID files and POSIX/SysV semaphores (both persist and go stale):
 //!
@@ -56,13 +56,10 @@ impl InstanceLock {
     /// operator visibility. Fails if the path can't be opened, or with
     /// `contended_msg` if another process already holds the lock.
     ///
-    /// When `world_writable` is set (Unix only), the lock file is forced to mode
-    /// `0666`. This is for a shared machine-wide lock in a world-writable dir like
-    /// `/tmp`: without it, umask would leave the file `0644` and a *second* user's
-    /// agent could not open the first user's lock file, silently defeating the
-    /// one-agent-per-machine check. It is a no-op on Windows and for per-user locks.
-    #[cfg_attr(not(unix), allow(unused_variables))]
-    pub fn acquire(path: &Path, contended_msg: &str, world_writable: bool) -> Result<Self> {
+    /// Each scope owns its own single-user path (the server's per-user config dir,
+    /// the agent's root-owned `/var/run`), so ordinary umask-created permissions
+    /// suffice — no cross-user sharing is required.
+    pub fn acquire(path: &Path, contended_msg: &str) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("Failed to create the lock directory {}", parent.display())
@@ -72,25 +69,12 @@ impl InstanceLock {
         // only after we hold the lock, so a concurrent holder's PID isn't clobbered.
         let mut opts = OpenOptions::new();
         opts.write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        if world_writable {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o666);
-        }
         let mut file = opts
             .open(path)
             .with_context(|| format!("Failed to open the lock file {}", path.display()))?;
 
         match file.try_lock() {
             Ok(()) => {
-                // Force 0666 even if umask masked the create mode above, so any user
-                // can open the shared lock. Best-effort: only the file's owner can
-                // chmod, but the file is already 0666 for everyone else.
-                #[cfg(unix)]
-                if world_writable {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = file.set_permissions(std::fs::Permissions::from_mode(0o666));
-                }
                 // We hold the lock: record our PID for operator visibility.
                 let _ = file.set_len(0);
                 let _ = file.seek(SeekFrom::Start(0));
@@ -124,15 +108,15 @@ mod tests {
             .unwrap_or(0);
         let path = std::env::temp_dir()
             .join(format!("flextunnel-instance-lock-test-{}-{nanos}.lock", std::process::id()));
-        let first = InstanceLock::acquire(&path, "held", true).expect("first acquire");
+        let first = InstanceLock::acquire(&path, "held").expect("first acquire");
         assert!(
-            InstanceLock::acquire(&path, "held", true).is_err(),
+            InstanceLock::acquire(&path, "held").is_err(),
             "a second acquire must fail while the lock is held"
         );
         drop(first);
         // Released: acquiring again should now succeed.
         assert!(
-            InstanceLock::acquire(&path, "held", true).is_ok(),
+            InstanceLock::acquire(&path, "held").is_ok(),
             "acquire should succeed after the lock is released"
         );
         let _ = std::fs::remove_file(&path);
