@@ -240,8 +240,8 @@ can reach the server's loopback or internal hosts by a real name. Add a
 
 ```toml
 [host_aliases]
-"server.ezvpn" = "127.0.0.1"      # the server's own loopback
-"node2.ezvpn"  = "192.168.1.50"   # another host on the server's network
+"server.homelab" = "127.0.0.1"      # the server's own loopback
+"node2.homelab"  = "192.168.1.50"   # another host on the server's network
 ```
 
 When a requested hostname matches a key (case-insensitive), the server rewrites
@@ -250,8 +250,8 @@ resolves and connects like any other target. Only domain targets are aliased;
 literal IPs pass through unchanged.
 
 This is also the clean way around Firefox refusing to proxy literal
-`localhost` / `127.0.0.1`: alias `server.ezvpn` → `127.0.0.1` on the server and
-browse to `http://server.ezvpn:8000/`. Use `socks5h://` (or set Firefox's
+`localhost` / `127.0.0.1`: alias `server.homelab` → `127.0.0.1` on the server and
+browse to `http://server.homelab:8000/`. Use `socks5h://` (or set Firefox's
 `network.proxy.socks_remote_dns = true`) so the name is resolved by the server,
 not locally.
 
@@ -285,16 +285,16 @@ flextunnel-agent generate-token          # -> fta…
 ```toml
 # server.toml
 agent_auth_tokens = ["fta…"]
-routed_domains    = ["web.ezvpn", "*.example.com"]   # the alias must be on the routed set
+routed_domains    = ["web.homelab", "*.example.com"]   # the alias must be on the routed set
 
 [agent_routes]
-"web.ezvpn" = { machine_id = "ftm1…" }   # from `flextunnel-agent machine-id`
+"web.homelab" = { machine_id = "ftm1…" }   # from `flextunnel-agent machine-id`
 ```
 
 ```sh
 # On the agent host (Linux/macOS/Windows):
 flextunnel-agent run --server-node-id <server id> --auth-token fta…
-# then from a client: curl -x socks5h://127.0.0.1:1080 http://web.ezvpn:8000/
+# then from a client: curl -x socks5h://127.0.0.1:1080 http://web.homelab:8000/
 ```
 
 A second agent presenting the **same** network id (e.g. a cloned VM image whose

@@ -889,26 +889,26 @@ mod tests {
     fn aliases() -> HashMap<String, String> {
         // Keys are lowercased at config-resolution time (see `resolve_server`).
         HashMap::from([
-            ("server.ezvpn".to_string(), "127.0.0.1".to_string()),
-            ("node2.ezvpn".to_string(), "192.168.1.50".to_string()),
+            ("server.homelab".to_string(), "127.0.0.1".to_string()),
+            ("node2.homelab".to_string(), "192.168.1.50".to_string()),
         ])
     }
 
     #[test]
     fn alias_rewrites_host_keeps_port() {
-        let got = apply_alias(Target::Domain("server.ezvpn".into(), 8000), &aliases());
+        let got = apply_alias(Target::Domain("server.homelab".into(), 8000), &aliases());
         assert_eq!(got, Target::Domain("127.0.0.1".into(), 8000));
     }
 
     #[test]
     fn alias_to_internal_host() {
-        let got = apply_alias(Target::Domain("node2.ezvpn".into(), 22), &aliases());
+        let got = apply_alias(Target::Domain("node2.homelab".into(), 22), &aliases());
         assert_eq!(got, Target::Domain("192.168.1.50".into(), 22));
     }
 
     #[test]
     fn alias_match_is_case_insensitive() {
-        let got = apply_alias(Target::Domain("Server.EzVPN".into(), 80), &aliases());
+        let got = apply_alias(Target::Domain("Server.Homelab".into(), 80), &aliases());
         assert_eq!(got, Target::Domain("127.0.0.1".into(), 80));
     }
 
