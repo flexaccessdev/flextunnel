@@ -34,6 +34,18 @@ local app ──SOCKS5──► flextunnel client (127.0.0.1:1080)
 
 ## Security model
 
+flextunnel lets a set of **trusted clients** reach resources on the **server's**
+side of the network. Both ends are run by the same trusted party: whoever runs
+the server decides which clients get tokens. It is **not** a multi-tenant service
+and does not defend the server against the clients it admits — a client with a
+valid token can, by design, reach whatever the server's network can reach
+(including the server's own `localhost`). Distribute tokens accordingly, and
+scope the server's network access if that reach is too broad. The threats it does
+address are on-path attackers (encryption + per-client tokens) and accidental
+misconfiguration (e.g. duplicate-id detection catching two clients or servers
+started with the same identity — an operator guard rail, not an adversary
+defense).
+
 A per-client auth token gates every connection:
 
 - **Auth token** — sent in the connection handshake and checked against the
