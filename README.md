@@ -159,6 +159,11 @@ curl -x socks5h://127.0.0.1:1080 http://127.0.0.1:8000/
 ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 ```
 
+For apps that can't speak SOCKS5 (databases, RDP, most GUIs), put a plain local
+TCP port in front of the proxy — see
+[`docs/port-forwarding.md`](docs/port-forwarding.md) for `socat` and `ssh`
+recipes.
+
 ## Commands
 
 | Command | Description |
@@ -407,6 +412,9 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
   constants.
 - [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) — planned HTTP
   proxy front-end (CONNECT tunneling, then absolute-URI forwarding).
+- [`docs/port-forwarding.md`](docs/port-forwarding.md) — expose a plain local
+  TCP port through the SOCKS5 client (`socat`, `ssh -L`/`-D`) for apps that
+  don't speak SOCKS5.
 
 ## How it relates to ezvpn
 
