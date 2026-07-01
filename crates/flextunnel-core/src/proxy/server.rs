@@ -179,8 +179,18 @@ impl ProxyServer {
     fn self_block(&self, reason: &str) {
         {
             let mut bl = self.blocklist.lock().expect("blocklist lock");
-            if bl.add_conflicted_server(&self.own_id.to_string(), reason) {
-                persist_blocklist(&bl);
+            if bl.add_conflicted_server(&self.own_id.to_string(), reason)
+                && let Err(e) = persist_blocklist(&bl)
+            {
+                // The durable record is what makes the startup guard refuse a
+                // restart; without it a restart of this id will NOT be
+                // auto-refused, so spell out the manual action.
+                log::error!(
+                    "Detected a duplicate server id but could NOT persist the self-block record \
+                     to {}: {e}. A restart of this server id will not be auto-refused — stop the \
+                     duplicate server manually.",
+                    bl.path().display()
+                );
             }
         }
         log::error!("Duplicate server id detected: {reason}");
@@ -190,8 +200,17 @@ impl ProxyServer {
     /// Record a confirmed duplicate client id and persist the blocklist.
     fn block_client(&self, id: &EndpointId, reason: &str) {
         let mut bl = self.blocklist.lock().expect("blocklist lock");
-        if bl.add_blocked_client(&id.to_string(), reason) {
-            persist_blocklist(&bl);
+        if bl.add_blocked_client(&id.to_string(), reason)
+            && let Err(e) = persist_blocklist(&bl)
+        {
+            // Runtime rejection already works from the in-memory block; the disk
+            // write is an audit record (ephemeral client ids never recur), so a
+            // failure here is non-fatal — just surface it.
+            log::error!(
+                "Blocked duplicate client {id} in memory but could not persist the audit record \
+                 to {}: {e}",
+                bl.path().display()
+            );
         }
     }
 
@@ -443,20 +462,15 @@ async fn server_heartbeat_loop(
     }
 }
 
-/// Serialize + atomically persist the blocklist. Call this **while holding the
-/// blocklist lock** so writes are serialized within the process (no reordering
-/// or lost updates between concurrent detections); `write_atomic` additionally
-/// uses a unique temp file so it is safe against a second process writing the
-/// same path.
-fn persist_blocklist(bl: &BlockList) {
-    match bl.to_json() {
-        Ok(json) => {
-            if let Err(e) = blocklist::write_atomic(bl.path(), &json) {
-                log::error!("Failed to persist blocklist to {}: {e}", bl.path().display());
-            }
-        }
-        Err(e) => log::error!("Failed to serialize blocklist: {e}"),
-    }
+/// Serialize + atomically persist the blocklist, returning any failure so the
+/// caller can react with the right consequence (in-memory state is already
+/// updated regardless). Call this **while holding the blocklist lock** so writes
+/// are serialized within the process (no reordering or lost updates between
+/// concurrent detections); `write_atomic` additionally uses a unique temp file
+/// so it is safe against a second process writing the same path.
+fn persist_blocklist(bl: &BlockList) -> io::Result<()> {
+    let json = bl.to_json()?;
+    blocklist::write_atomic(bl.path(), &json)
 }
 
 /// Rewrite a requested target through the server's host-alias map.
