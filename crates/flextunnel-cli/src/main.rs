@@ -283,6 +283,19 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
         log::info!("Loaded {} agent authentication token(s)", agent_valid_tokens.len());
     }
     if !r.agent_routes.is_empty() {
+        // Reverse routes forward to agents, which must authenticate with an agent
+        // token. Routes with no agent token are unusable dead config — fail loudly
+        // rather than start with reverse routes no agent can ever serve.
+        if agent_valid_tokens.is_empty() {
+            anyhow::bail!(
+                "{} agent route(s) are configured but no agent authentication token was \
+                 provided, so no agent can connect to serve them.\n\
+                 Add at least one agent token (--agent-auth-token <TOKEN>, \
+                 --agent-auth-tokens-file <FILE>, or agent_auth_tokens/agent_auth_tokens_file \
+                 in the config), or remove the agent_routes.",
+                r.agent_routes.len()
+            );
+        }
         log::info!("Loaded {} agent route(s)", r.agent_routes.len());
     }
 
