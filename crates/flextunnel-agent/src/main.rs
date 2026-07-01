@@ -29,7 +29,7 @@ use flextunnel_core::transport::endpoint::create_client_endpoint;
 #[derive(Parser)]
 #[command(name = "flextunnel-agent")]
 #[command(version)]
-#[command(about = "flextunnel reverse-routing agent (Linux-only exit point)")]
+#[command(about = "flextunnel reverse-routing agent")]
 struct Args {
     #[command(subcommand)]
     command: Command,
