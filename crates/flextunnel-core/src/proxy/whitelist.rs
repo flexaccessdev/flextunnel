@@ -13,14 +13,18 @@
 //!
 //! * **Domains** — explicit-wildcard matching. A bare `example.com` matches that
 //!   host exactly; a `*.example.com` entry matches any subdomain
-//!   (`api.example.com`, `a.b.example.com`) but **not** the apex `example.com`.
+//!   (`api.example.com`, `a.b.example.com`) but **not** the apex `example.com`; a
+//!   lone `*` matches *every* domain (the full-tunnel catch-all for hostnames).
 //!   Matching is case-insensitive.
 //! * **CIDRs** — an IP target matches if it falls in any configured network. A
-//!   bare IP (`192.168.1.5`) is accepted as a single-host network (`/32`/`/128`).
+//!   bare IP (`192.168.1.5`) is accepted as a single-host network (`/32`/`/128`);
+//!   a default route (`0.0.0.0/0` / `::/0`) matches every IP of its family.
 //!
-//! An empty whitelist is **inactive** ([`Whitelist::is_active`] is `false`),
-//! which preserves the no-whitelist behavior: the client tunnels everything and
-//! the server allows everything.
+//! The whitelist is a VPN-style split-tunnel "included routes" set and is
+//! **required** — an empty whitelist is rejected upstream (server startup /
+//! client handshake), never treated as "tunnel everything". To tunnel *all*
+//! traffic, use the catch-alls: `*` for hostnames and `0.0.0.0/0` (+ `::/0`) for
+//! IPs.
 
 use crate::proxy::signaling::Target;
 use anyhow::{Context, Result, bail};
@@ -37,8 +41,13 @@ pub struct Whitelist {
     /// Suffixes from `*.example.com` entries, stored *with* the leading dot
     /// (`.example.com`) so a suffix match excludes the bare apex.
     domains_suffix: Vec<String>,
-    /// Allowed networks (bare IPs are stored as single-host networks).
+    /// Allowed networks (bare IPs are stored as single-host networks). A default
+    /// route (`0.0.0.0/0` / `::/0`) naturally contains every IP of its family.
     cidrs: Vec<IpNetwork>,
+    /// Set by a lone `*` domain entry — the full-tunnel catch-all for hostnames
+    /// (browser CONNECTs arrive as domains, never CIDRs, so this is what tunnels
+    /// all web traffic).
+    domains_all: bool,
 }
 
 impl Whitelist {
@@ -48,9 +57,13 @@ impl Whitelist {
     pub fn new(domains: &[String], cidrs: &[String]) -> Result<Self> {
         let mut domains_exact = HashSet::new();
         let mut domains_suffix = Vec::new();
+        let mut domains_all = false;
         for raw in domains {
             let entry = raw.trim();
-            if let Some(suffix) = entry.strip_prefix("*.") {
+            if entry == "*" {
+                // Full-tunnel catch-all: match every hostname.
+                domains_all = true;
+            } else if let Some(suffix) = entry.strip_prefix("*.") {
                 // The remainder after `*.` must be a single valid domain: one or
                 // more non-empty, wildcard-free labels. This rejects broken
                 // patterns like `*.*.example.com` or `*..example.com` that would
@@ -80,17 +93,23 @@ impl Whitelist {
             domains_exact,
             domains_suffix,
             cidrs: nets,
+            domains_all,
         })
     }
 
-    /// Whether any rule is configured. An inactive whitelist matches nothing and
-    /// callers treat it as "no filtering" (client tunnels all, server allows all).
-    pub fn is_active(&self) -> bool {
-        !self.domains_exact.is_empty() || !self.domains_suffix.is_empty() || !self.cidrs.is_empty()
+    /// Whether no rule is configured. The whitelist is required (a VPN-style
+    /// tunnel set), so callers reject an empty one upstream rather than treating
+    /// it as "no filtering".
+    pub fn is_empty(&self) -> bool {
+        !self.domains_all
+            && self.domains_exact.is_empty()
+            && self.domains_suffix.is_empty()
+            && self.cidrs.is_empty()
     }
 
     /// Whether `target` is on the whitelist (i.e. should be tunneled / allowed).
-    /// A domain is matched only against domain rules, an IP only against CIDRs.
+    /// A domain is matched only against domain rules (with `*` matching all), an
+    /// IP only against CIDRs (with `0.0.0.0/0` / `::/0` matching all).
     pub fn allows(&self, target: &Target) -> bool {
         match target {
             Target::Domain(host, _) => self.allows_domain(host),
@@ -99,6 +118,9 @@ impl Whitelist {
     }
 
     fn allows_domain(&self, host: &str) -> bool {
+        if self.domains_all {
+            return true;
+        }
         let host = host.to_ascii_lowercase();
         self.domains_exact.contains(&host)
             || self
@@ -127,17 +149,44 @@ mod tests {
     }
 
     #[test]
-    fn empty_is_inactive_and_allows_nothing() {
+    fn empty_is_empty_and_allows_nothing() {
         let w = Whitelist::default();
-        assert!(!w.is_active());
+        assert!(w.is_empty());
         assert!(!w.allows(&domain("example.com")));
         assert!(!w.allows(&ip("1.2.3.4")));
     }
 
     #[test]
+    fn star_domain_matches_all_hosts() {
+        // `*` is the full-tunnel catch-all for hostnames.
+        let w = wl(&["*"], &[]);
+        assert!(!w.is_empty());
+        assert!(w.allows(&domain("anything.example")));
+        assert!(w.allows(&domain("example.com")));
+        // Domains and CIDRs are independent: `*` doesn't imply IP literals.
+        assert!(!w.allows(&ip("8.8.8.8")));
+    }
+
+    #[test]
+    fn default_route_cidr_matches_all_ips() {
+        // `0.0.0.0/0` / `::/0` are the IP-side full-tunnel catch-alls.
+        let v4 = wl(&[], &["0.0.0.0/0"]);
+        assert!(v4.allows(&ip("8.8.8.8")));
+        assert!(v4.allows(&ip("10.0.0.1")));
+        let v6 = wl(&[], &["::/0"]);
+        assert!(v6.allows(&ip("[2606:4700::1]")));
+
+        // Full tunnel for everything: `*` + `0.0.0.0/0` + `::/0`.
+        let full = wl(&["*"], &["0.0.0.0/0", "::/0"]);
+        assert!(full.allows(&domain("anything.example")));
+        assert!(full.allows(&ip("8.8.8.8")));
+        assert!(full.allows(&ip("[2606:4700::1]")));
+    }
+
+    #[test]
     fn exact_domain_matches_only_itself() {
         let w = wl(&["example.com"], &[]);
-        assert!(w.is_active());
+        assert!(!w.is_empty());
         assert!(w.allows(&domain("example.com")));
         assert!(!w.allows(&domain("api.example.com")));
         assert!(!w.allows(&domain("notexample.com")));

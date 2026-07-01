@@ -516,11 +516,11 @@ async fn handle_socks_stream(
 ) -> io::Result<()> {
     let requested = signaling::read_request(&mut recv).await?;
 
-    // Enforce the whitelist on the requested target (before aliasing), as a
-    // defense-in-depth boundary: a well-behaved client only tunnels whitelisted
+    // Enforce the tunnel set on the requested target (before aliasing), as a
+    // defense-in-depth boundary: a well-behaved client only tunnels on-list
     // targets, so a request for anything off-list means a misconfigured or
     // untrusted client. Reject with the SOCKS5 "not allowed by ruleset" code.
-    if whitelist.is_active() && !whitelist.allows(&requested) {
+    if !whitelist.allows(&requested) {
         log::warn!("Tunnel request rejected by whitelist");
         log::debug!("Rejected {requested:?} by whitelist");
         signaling::write_reply(&mut send, signaling::REP_NOT_ALLOWED).await?;

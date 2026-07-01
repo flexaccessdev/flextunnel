@@ -937,7 +937,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "flextunnel-cli"
-version = "0.0.11"
+version = "0.0.12-alpha1"
 dependencies = [
  "anyhow",
  "clap",
@@ -949,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-core"
-version = "0.0.11"
+version = "0.0.12-alpha1"
 dependencies = [
  "anyhow",
  "base64",
@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-ffi"
-version = "0.0.11"
+version = "0.0.12-alpha1"
 dependencies = [
  "env_logger",
  "flextunnel-core",

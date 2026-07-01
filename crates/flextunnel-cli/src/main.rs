@@ -278,6 +278,14 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
     // under panic=abort).
     let whitelist = Whitelist::new(&r.whitelist_domains, &r.whitelist_cidrs)
         .context("Invalid whitelist configuration")?;
+    // The tunnel set is required (VPN-style split tunnel): decide explicitly what
+    // is routed through the tunnel. Use "*" (and 0.0.0.0/0, ::/0) for full tunnel.
+    if whitelist.is_empty() {
+        anyhow::bail!(
+            "a tunnel set is required: configure whitelist_domains / whitelist_cidrs \
+             (use \"*\" plus 0.0.0.0/0 and ::/0 to tunnel all traffic)"
+        );
+    }
 
     let endpoint = create_server_endpoint(&r.relay_urls, secret_key, r.dns_server.as_deref())
         .await
@@ -292,13 +300,11 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
     if !r.host_aliases.is_empty() {
         log::info!("Loaded {} host alias(es)", r.host_aliases.len());
     }
-    if whitelist.is_active() {
-        log::info!(
-            "Whitelist active: {} domain rule(s), {} CIDR(s) — off-list tunnel requests are rejected; pushed to clients on connect",
-            r.whitelist_domains.len(),
-            r.whitelist_cidrs.len()
-        );
-    }
+    log::info!(
+        "Tunnel set: {} domain rule(s), {} CIDR(s) — off-list tunnel requests are rejected; pushed to clients on connect",
+        r.whitelist_domains.len(),
+        r.whitelist_cidrs.len()
+    );
     let server = ProxyServer::new(
         own_id,
         valid_tokens,

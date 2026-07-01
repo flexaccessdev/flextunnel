@@ -24,22 +24,28 @@ auth_tokens = ["vXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"]
 # after resolving the conflict.
 # blocklist_file = "/etc/flextunnel/blocklist.json"
 
-# Optional whitelist (the "tunnel set"). This list is the single source of truth:
-# it is pushed to every client during the handshake (so clients split-tunnel
-# off-list targets directly) AND enforced here as defense-in-depth — the server
-# REJECTS any tunnel request whose target is not on the list (SOCKS5 reply 0x02,
-# "connection not allowed by ruleset"). Both empty (the default) allows every
-# target and tunnels everything. Clients configure no whitelist of their own.
+# Whitelist (the "tunnel set") — REQUIRED. This is a VPN-style split-tunnel
+# "included routes" list and the single source of truth: it is pushed to every
+# client during the handshake (clients tunnel on-list targets and direct-connect
+# off-list ones) AND enforced here as defense-in-depth — the server REJECTS any
+# tunnel request whose target is not on the list (SOCKS5 reply 0x02, "connection
+# not allowed by ruleset"). The server refuses to start with an empty tunnel set.
+# Clients configure no whitelist of their own.
 #
-# Domain entries are exact (`example.com`) or wildcard (`*.example.com`, which
-# matches subdomains only — not the bare apex), case-insensitive. CIDR entries
-# match IP targets and accept a bare IP as a single host. Domains are matched
-# only against `whitelist_domains` and IPs only against `whitelist_cidrs`.
+# Domain entries are exact (`example.com`), wildcard (`*.example.com`, subdomains
+# only — not the bare apex), or `*` to match every host; case-insensitive. CIDR
+# entries match IP targets, accept a bare IP as a single host, and a default
+# route (`0.0.0.0/0` / `::/0`) matches every IP. Domains are matched only against
+# `whitelist_domains` and IPs only against `whitelist_cidrs`.
+#
+# For a FULL tunnel (route all traffic through the tunnel), use the catch-alls:
+#   whitelist_domains = ["*"]
+#   whitelist_cidrs = ["0.0.0.0/0", "::/0"]
 #
 # NOTE: these are top-level keys, so they must appear BEFORE the [host_aliases]
 # table below (in TOML, bare keys after a [table] header belong to that table).
-# whitelist_domains = ["*.example.com", "httpbin.org"]
-# whitelist_cidrs = ["10.0.0.0/8", "192.168.1.5"]
+whitelist_domains = ["*.example.com", "httpbin.org"]
+whitelist_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 
 # Optional host aliases, resolved server-side. A requested hostname matching a
 # key (case-insensitive) is rewritten to its value — an IP or another hostname

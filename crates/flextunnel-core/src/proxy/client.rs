@@ -37,6 +37,14 @@ const TUNNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 /// forever; generous since this is loopback.
 const LOCAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The live QUIC connection shared with the always-on accept loop; `None` while
+/// disconnected (during a drop/backoff), so off-list targets still connect
+/// directly and on-list targets get a clean unreachable reply.
+type SharedConn = Arc<Mutex<Option<Connection>>>;
+/// The last-known tunnel set shared with the accept loop. Retained across drops
+/// so split-tunnel routing keeps working while the connection is down.
+type SharedWhitelist = Arc<Mutex<Arc<Whitelist>>>;
+
 /// Configuration for the proxy client.
 pub struct ClientConfig {
     /// Server's iroh EndpointId (as a string).
@@ -190,13 +198,43 @@ impl ProxyClient {
             listener.local_addr()?
         );
 
+        // Shared state between the always-on accept loop and the connection
+        // manager: the current live connection (None during a drop/backoff) and
+        // the last-known tunnel set. Keeping the accept loop independent of the
+        // connection is what lets off-list targets keep connecting directly while
+        // the tunnel is down — only on-list targets fail until it recovers.
+        let current: SharedConn = Arc::new(Mutex::new(None));
+        let whitelist: SharedWhitelist = Arc::new(Mutex::new(Arc::new(Whitelist::default())));
+
+        // One task, two concurrent futures. When the manager returns (a fatal
+        // first-connect failure or a clean stop) the accept loop is dropped with
+        // it, so `flextunnel_stop`'s `task.abort()` tears everything down — no
+        // orphaned accept task.
+        tokio::select! {
+            r = self.manage_connection(endpoint, &current, &whitelist) => r,
+            r = accept_loop(&listener, &current, &whitelist) => r,
+        }
+    }
+
+    /// Maintain the server connection: (re)establish + authenticate, publish the
+    /// live connection and tunnel set for the accept loop, and reconnect with
+    /// backoff on drops. Reconnect policy is unchanged: the **first** connection
+    /// must succeed (fail fast); once connected, transient drops are retried.
+    async fn manage_connection(
+        &self,
+        endpoint: &Endpoint,
+        current: &SharedConn,
+        whitelist_shared: &SharedWhitelist,
+    ) -> ProxyResult<()> {
         let mut ever_connected = false;
         let mut attempt: u32 = 0;
         loop {
             // Until (re)authenticated, nothing is being forwarded.
             self.set_connected(false);
+            *current.lock().expect("connection lock") = None;
+
             // Establish (connect + auth). The handshake also learns the server's
-            // whitelist (drives split-tunneling) and returns the control-stream
+            // tunnel set (drives split-tunneling) and returns the control-stream
             // halves kept open for heartbeats.
             let (connection, whitelist, ctrl_send, ctrl_recv) = match self.establish(endpoint).await
             {
@@ -214,14 +252,18 @@ impl ProxyClient {
                 },
             };
 
-            // Serve until the connection drops, then reconnect (or exit).
-            let served = self
-                .serve(&connection, &whitelist, &listener, ctrl_send, ctrl_recv)
-                .await;
-            // The connection is no longer live; clear the FFI-visible flag now so
-            // it never lingers as connected through a backoff or a fatal exit.
+            // Publish the live connection + tunnel set so the accept loop routes
+            // against them; the tunnel set is retained on the next drop.
+            *whitelist_shared.lock().expect("whitelist lock") = whitelist;
+            *current.lock().expect("connection lock") = Some(connection.clone());
+
+            // Keep the connection alive until it drops, then reconnect (or exit).
+            let maintained = self.maintain(&connection, ctrl_send, ctrl_recv).await;
+            // The connection is no longer live; clear the FFI-visible flag and the
+            // shared handle so on-list targets fail cleanly during the gap.
             self.set_connected(false);
-            if let Err(e) = served {
+            *current.lock().expect("connection lock") = None;
+            if let Err(e) = maintained {
                 match self.handle_failure(e, ever_connected, &mut attempt) {
                     Ok(backoff) => {
                         tokio::time::sleep(backoff).await;
@@ -284,48 +326,18 @@ impl ProxyClient {
         Ok((connection, Arc::new(whitelist), send, recv))
     }
 
-    /// Accept local SOCKS5 connections and run the heartbeat concurrently, until
-    /// the QUIC connection drops or heartbeat liveness is lost.
-    async fn serve(
+    /// Keep the connection alive: run the heartbeat and watch for the QUIC
+    /// connection closing, whichever ends first. (Accepting local connections is
+    /// handled independently by [`accept_loop`] so it survives a drop.)
+    async fn maintain(
         &self,
         connection: &Connection,
-        whitelist: &Arc<Whitelist>,
-        listener: &TcpListener,
         ctrl_send: SendStream,
         ctrl_recv: RecvStream,
     ) -> ProxyResult<()> {
-        let accept = self.accept_local(connection, whitelist, listener);
-        let heartbeat = client_heartbeat_loop(ctrl_send, ctrl_recv);
         tokio::select! {
-            r = accept => r,
-            r = heartbeat => r,
-        }
-    }
-
-    /// Accept local SOCKS5 connections and tunnel each over its own bi-stream,
-    /// until the QUIC connection drops.
-    async fn accept_local(
-        &self,
-        connection: &Connection,
-        whitelist: &Arc<Whitelist>,
-        listener: &TcpListener,
-    ) -> ProxyResult<()> {
-        loop {
-            let accept = tokio::select! {
-                r = listener.accept() => r,
-                reason = connection.closed() => {
-                    return Err(ProxyError::ConnectionLost(reason.to_string()));
-                }
-            };
-            let (tcp, peer) = accept?;
-            log::debug!("SOCKS5 connection from {peer}");
-            let conn = connection.clone();
-            let whitelist = whitelist.clone();
-            tokio::spawn(async move {
-                if let Err(e) = handle_local_conn(tcp, conn, whitelist).await {
-                    log::debug!("SOCKS5 connection from {peer} ended: {e}");
-                }
-            });
+            r = client_heartbeat_loop(ctrl_send, ctrl_recv) => r,
+            reason = connection.closed() => Err(ProxyError::ConnectionLost(reason.to_string())),
         }
     }
 
@@ -408,15 +420,19 @@ impl ProxyClient {
         // expected; surface it as a signaling error rather than panicking.
         let whitelist = Whitelist::new(&response.whitelist_domains, &response.whitelist_cidrs)
             .map_err(|e| ProxyError::Signaling(format!("server pushed an invalid whitelist: {e}")))?;
-        if whitelist.is_active() {
-            log::info!(
-                "Server whitelist active: {} domain rule(s), {} CIDR(s) — off-list targets connect directly",
-                response.whitelist_domains.len(),
-                response.whitelist_cidrs.len()
-            );
-        } else {
-            log::info!("Server whitelist inactive — tunneling everything");
+        // The tunnel set is required. The server validates this at startup, but
+        // guard here too so a misconfigured/old server surfaces clearly instead of
+        // the client silently direct-connecting everything.
+        if whitelist.is_empty() {
+            return Err(ProxyError::Signaling(
+                "server pushed an empty tunnel set (configure a whitelist, or \"*\" + 0.0.0.0/0 for full tunnel)".into(),
+            ));
         }
+        log::info!(
+            "Server tunnel set: {} domain rule(s), {} CIDR(s) — off-list targets connect directly",
+            response.whitelist_domains.len(),
+            response.whitelist_cidrs.len()
+        );
 
         // Publish the live tunnel set so the FFI/app can show what's forwarded.
         if let Ok(mut routes) = self.routes.lock() {
@@ -469,14 +485,36 @@ async fn client_heartbeat_loop(
     }
 }
 
-/// Handle one local SOCKS5 connection: negotiate, parse CONNECT, then either
-/// tunnel the target to the server or — when a whitelist is active and the
-/// target is not on it — connect to it directly from this device, relaying the
-/// reply and piping bytes either way.
+/// Accept local SOCKS5 connections for the lifetime of the listener, routing each
+/// against the current tunnel set and live connection. Runs independently of the
+/// QUIC connection, so off-list targets keep connecting directly while the tunnel
+/// is down. Returns only on a listener error.
+async fn accept_loop(
+    listener: &TcpListener,
+    current: &SharedConn,
+    whitelist_shared: &SharedWhitelist,
+) -> ProxyResult<()> {
+    loop {
+        let (tcp, peer) = listener.accept().await?;
+        log::debug!("SOCKS5 connection from {peer}");
+        let current = current.clone();
+        let whitelist_shared = whitelist_shared.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_local_conn(tcp, current, whitelist_shared).await {
+                log::debug!("SOCKS5 connection from {peer} ended: {e}");
+            }
+        });
+    }
+}
+
+/// Handle one local SOCKS5 connection: negotiate, parse CONNECT, then route by the
+/// current tunnel set — an on-list target is tunneled to the server (or answered
+/// with a network-unreachable reply if the tunnel is down), an off-list target is
+/// dialed directly from this device.
 async fn handle_local_conn(
     mut tcp: TcpStream,
-    conn: Connection,
-    whitelist: Arc<Whitelist>,
+    current: SharedConn,
+    whitelist_shared: SharedWhitelist,
 ) -> Result<()> {
     // Bound the local SOCKS5 handshake so a peer that connects and sends nothing
     // can't pin this task and its socket indefinitely.
@@ -487,12 +525,23 @@ async fn handle_local_conn(
     .await
     .map_err(|_| anyhow::anyhow!("timed out during local SOCKS5 handshake"))??;
 
-    // Split-tunnel: a target not on an active whitelist bypasses the tunnel and
-    // is dialed directly from this device's own network (its DNS, its IP).
-    if whitelist.is_active() && !whitelist.allows(&target) {
-        log::debug!("Direct (off-whitelist): {target:?}");
+    // Split-tunnel: a target not in the tunnel set is dialed directly from this
+    // device's own network (its DNS, its IP) — works even when the tunnel is down.
+    let whitelist = { whitelist_shared.lock().expect("whitelist lock").clone() };
+    if !whitelist.allows(&target) {
+        log::debug!("Direct (off tunnel set): {target:?}");
         return direct_connect(tcp, &target).await;
     }
+
+    // On-list: needs a live tunnel. If the connection is down (a drop/backoff),
+    // answer with a network-unreachable reply so the app shows a connection error
+    // for this whitelisted target instead of hanging on a dead stream.
+    let conn = { current.lock().expect("connection lock").clone() };
+    let Some(conn) = conn else {
+        log::debug!("Tunnel down; on-list target unreachable: {target:?}");
+        let _ = socks5::write_reply(&mut tcp, signaling::REP_NET_UNREACHABLE).await;
+        return Ok(());
+    };
     log::debug!("Tunneling: {target:?}");
 
     // Open the tunnel stream and read the server's reply. If any step fails the
