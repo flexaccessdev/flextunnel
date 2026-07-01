@@ -17,6 +17,13 @@ auth_tokens = ["vXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"]
 # relay_urls = ["https://relay.example"]   # custom relay(s) for failover
 # dns_server = "https://dns.example"        # custom discovery DNS, or "none"
 
+# Optional duplicate-id blocklist path (JSON). Defaults to
+# ~/.config/flextunnel/blocklist.json. The server records confirmed duplicate
+# client ids here, and its own id if it detects it is a duplicate server; on the
+# next start it refuses to run if its id is listed. Delete the offending entry
+# after resolving the conflict.
+# blocklist_file = "/etc/flextunnel/blocklist.json"
+
 # Optional whitelist (the "tunnel set"). This list is the single source of truth:
 # it is pushed to every client during the handshake (so clients split-tunnel
 # off-list targets directly) AND enforced here as defense-in-depth — the server

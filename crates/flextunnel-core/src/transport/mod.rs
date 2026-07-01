@@ -25,6 +25,20 @@ pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// (`1500 − 40 IPv6 − 8 UDP`) and matches quinn's DPLPMTUD upper-bound default.
 pub const QUIC_INITIAL_MTU: u16 = 1452;
 
+/// App-level heartbeat interval. After the auth handshake the control stream is
+/// kept open and the client sends a `Heartbeat` this often; the server replies
+/// with a `HeartbeatAck`. This is a semantic liveness signal on top of QUIC's
+/// keep-alive: it refreshes the server's per-client connection registry (used
+/// for duplicate-id detection) faster than the 30s QUIC idle timeout would.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Liveness window for the app-level heartbeat. A connection whose control
+/// stream produces no heartbeat traffic for this long is treated as dead (on the
+/// server) or as a lost connection (on the client). Sized at ~3× the interval so
+/// a couple of dropped heartbeats don't trip it, and aligned with the QUIC idle
+/// timeout as the outer bound.
+pub const LIVENESS_WINDOW: Duration = Duration::from_secs(30);
+
 /// QUIC ALPN protocol identifier for flextunnel.
 ///
 /// A plain protocol-negotiation label, sent unencrypted in the TLS/QUIC
