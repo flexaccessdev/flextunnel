@@ -33,7 +33,5 @@ pub fn acquire() -> Result<InstanceLock> {
         &path,
         "Another flextunnel server is already running for this user. \
          Only one server per user is allowed.",
-        // Per-user lock under the user's own config dir — no world-writability needed.
-        false,
     )
 }

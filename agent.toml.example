@@ -1,7 +1,12 @@
 # flextunnel agent config (TOML). Runs on Linux, macOS, and Windows.
 #
-# Load with:  flextunnel-agent run -c agent.toml
-#         or: flextunnel-agent run --default-config   (~/.config/flextunnel/agent.toml)
+# The agent is a machine-global daemon: `flextunnel-agent run` must run as root on
+# Unix (its config and lock live under root-owned global paths).
+#
+# Load with:  sudo flextunnel-agent run -c agent.toml
+#         or: sudo flextunnel-agent run --default-config
+#             (/etc/flextunnel/agent.toml on Unix,
+#              %ProgramData%\flextunnel\agent.toml on Windows)
 #
 # An agent is a reverse-routing exit point: it dials the server (like a client)
 # but runs NO local SOCKS5 listener. Instead it accepts the streams the server
