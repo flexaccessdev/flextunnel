@@ -116,16 +116,19 @@ impl ProxyClient {
     /// Record a server instance nonce observed in a `HelloResponse` and apply the
     /// reappearance rule. Latches [`Self::duplicate_server`] on a confirmed
     /// duplicate; a plain change (restart or first sight of a second instance) is
-    /// only logged.
-    fn observe_server_nonce(&self, nonce: u128) {
+    /// only logged. Returns `true` only when this call *newly* latched the flag,
+    /// so the caller can force an immediate reconnect to get the advisory out.
+    fn observe_server_nonce(&self, nonce: u128) -> bool {
         let mut t = self.nonce_tracker.lock().expect("nonce tracker lock");
+        let mut newly_flagged = false;
         match t.last {
-            Some(last) if last == nonce => return, // same server as last time
+            Some(last) if last == nonce => return false, // same server as last time
             Some(_) => {
                 if t.history.contains(&nonce) {
                     // A previously-seen nonce reappeared after a different one:
                     // two concurrent servers share this identity.
-                    if !self.duplicate_server.swap(true, Ordering::Relaxed) {
+                    newly_flagged = !self.duplicate_server.swap(true, Ordering::Relaxed);
+                    if newly_flagged {
                         log::error!(
                             "Duplicate server id detected: server instance nonce {nonce} \
                              reappeared after a different one — two servers appear to share \
@@ -143,6 +146,7 @@ impl ProxyClient {
             None => t.history.push(nonce), // first observation this process
         }
         t.last = Some(nonce);
+        newly_flagged
     }
 
     /// Shared handle to the live tunnel set, for callers (the FFI) that want to
@@ -380,11 +384,23 @@ impl ProxyClient {
 
         // Record the server's instance nonce (drives duplicate-server detection)
         // before the accept/reject branch so a rejection still updates history.
-        self.observe_server_nonce(response.server_instance_nonce);
+        let newly_flagged_duplicate = self.observe_server_nonce(response.server_instance_nonce);
 
         if !response.accepted {
             let reason = response.reject_reason.unwrap_or_else(|| "unknown".to_string());
             return Err(ProxyError::AuthenticationFailed(reason));
+        }
+
+        // The `Hello` already sent on this handshake could not carry the advisory
+        // (the duplicate was only detected from this very response). Drop the
+        // connection with a recoverable error so we reconnect immediately and the
+        // next `Hello` advises the server to self-block — rather than waiting for a
+        // natural disconnect that may never come while this connection is healthy.
+        if newly_flagged_duplicate {
+            return Err(ProxyError::ConnectionLost(
+                "duplicate server id detected; reconnecting to advise the server to self-block"
+                    .into(),
+            ));
         }
 
         // Build the tunnel set from the server's pushed list. The server
@@ -438,8 +454,18 @@ async fn client_heartbeat_loop(
         .await
         .map_err(|_| ProxyError::ConnectionLost("heartbeat ack timed out".into()))?
         .map_err(|e| ProxyError::ConnectionLost(format!("control stream closed: {e}")))?;
-        // Only acks are expected; anything else is ignored (seq is advisory).
-        let _ = signaling::decode_control(&data)?;
+        // The liveness probe is only satisfied by the ack for *this* heartbeat.
+        // A wrong-seq ack or any other control frame means the channel is out of
+        // sync — treat it as a lost connection so we reconnect rather than count a
+        // stale/unexpected message as liveness.
+        match signaling::decode_control(&data)? {
+            ControlMsg::HeartbeatAck { seq: ack } if ack == seq => {}
+            other => {
+                return Err(ProxyError::ConnectionLost(format!(
+                    "expected HeartbeatAck({seq}), got {other:?}"
+                )));
+            }
+        }
     }
 }
 
@@ -551,8 +577,9 @@ mod tests {
     fn restart_sequence_not_flagged_as_duplicate() {
         let c = test_client();
         // A steady server, then a restart to fresh nonces (never reappearing).
+        // No observation should ever newly-flag a duplicate.
         for n in [10u128, 10, 20, 30, 40] {
-            c.observe_server_nonce(n);
+            assert!(!c.observe_server_nonce(n));
         }
         assert!(!c.duplicate_server.load(Ordering::Relaxed));
     }
@@ -561,10 +588,14 @@ mod tests {
     fn reappearing_nonce_flags_duplicate() {
         let c = test_client();
         // A, B, then A again (flip-flop) → two concurrent servers share the id.
-        c.observe_server_nonce(1);
-        c.observe_server_nonce(2);
+        assert!(!c.observe_server_nonce(1));
+        assert!(!c.observe_server_nonce(2));
         assert!(!c.duplicate_server.load(Ordering::Relaxed));
-        c.observe_server_nonce(1);
+        // The reappearance newly latches the flag → caller must reconnect.
+        assert!(c.observe_server_nonce(1));
         assert!(c.duplicate_server.load(Ordering::Relaxed));
+        // Already latched: a further reappearance is not a *new* flag, so it must
+        // not force another reconnect abort.
+        assert!(!c.observe_server_nonce(2));
     }
 }
