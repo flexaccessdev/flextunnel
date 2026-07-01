@@ -24,7 +24,7 @@ use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 
 const TOKEN: &str = "test-token";
@@ -116,6 +116,27 @@ fn temp_blocklist(tag: &str) -> std::path::PathBuf {
     path
 }
 
+/// Poll the persisted blocklist until `pred` holds, or panic after a timeout.
+/// Replaces a fixed sleep so the persistence check waits for the server's write
+/// instead of assuming a fixed delay is enough (which flakes under load).
+async fn wait_for_blocklist(path: &std::path::Path, pred: impl Fn(&BlockList) -> bool) {
+    let start = Instant::now();
+    let deadline = Duration::from_secs(5);
+    loop {
+        if let Ok(bl) = BlockList::load(path.to_path_buf())
+            && pred(&bl)
+        {
+            return;
+        }
+        assert!(
+            start.elapsed() < deadline,
+            "blocklist at {} did not reach the expected state within {deadline:?}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Two clients sharing one key (same node id) with different instance nonces are
 /// a confirmed duplicate: the id is blocklisted and the second is rejected.
 #[tokio::test]
@@ -149,13 +170,9 @@ async fn duplicate_client_is_detected_and_blocklisted() {
         resp2.reject_reason
     );
 
-    // The server persisted the offending node id to the blocklist.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let reloaded = BlockList::load(bl_path.clone()).unwrap();
-    assert!(
-        reloaded.is_client_blocked(&client_id.to_string()),
-        "client id should be in the persisted blocklist"
-    );
+    // The server persisted the offending node id to the blocklist. Poll rather
+    // than assume a fixed delay is enough (avoids flaking under load).
+    wait_for_blocklist(&bl_path, |bl| bl.is_client_blocked(&client_id.to_string())).await;
 
     let _ = std::fs::remove_file(&bl_path);
 }
@@ -174,13 +191,9 @@ async fn server_self_blocks_on_duplicate_advisory() {
     let (_conn, _s, _r, resp) = client_handshake(&client_ep, server_addr, 9, true).await;
     assert!(!resp.accepted, "self-blocking server should reject the connection");
 
-    // The server recorded its own id as conflicted.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let reloaded = BlockList::load(bl_path.clone()).unwrap();
-    assert!(
-        reloaded.is_server_conflicted(&own_id.to_string()),
-        "server's own id should be recorded as conflicted"
-    );
+    // The server recorded its own id as conflicted. Poll rather than assume a
+    // fixed delay is enough (avoids flaking under load).
+    wait_for_blocklist(&bl_path, |bl| bl.is_server_conflicted(&own_id.to_string())).await;
 
     let _ = std::fs::remove_file(&bl_path);
 }
