@@ -63,7 +63,7 @@ pub struct ServerConfig {
     /// matches a key is rewritten to its value (an IP or another hostname on the
     /// server's network) before connecting. Keeps the requested port. Lets a
     /// client reach the server's loopback or internal hosts via a real name
-    /// (e.g. `server.ezvpn` → `127.0.0.1`), which also dodges Firefox's refusal
+    /// (e.g. `server.homelab` → `127.0.0.1`), which also dodges Firefox's refusal
     /// to proxy literal `localhost`/`127.0.0.1`.
     pub host_aliases: Option<HashMap<String, String>>,
     /// Domains routed through the tunnel (the tunnel set). Exact (`example.com`),
@@ -468,13 +468,13 @@ mod tests {
         let toml = r#"
             [host_aliases]
             "Server.EzVPN" = "127.0.0.1"
-            "node2.ezvpn" = "192.168.1.50"
+            "node2.homelab" = "192.168.1.50"
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let r = resolve_server(ServerConfig::default(), Some(file)).unwrap();
         // Keys are lowercased so matching against a lowercased host works.
-        assert_eq!(r.host_aliases.get("server.ezvpn").map(String::as_str), Some("127.0.0.1"));
-        assert_eq!(r.host_aliases.get("node2.ezvpn").map(String::as_str), Some("192.168.1.50"));
+        assert_eq!(r.host_aliases.get("server.homelab").map(String::as_str), Some("127.0.0.1"));
+        assert_eq!(r.host_aliases.get("node2.homelab").map(String::as_str), Some("192.168.1.50"));
         assert!(!r.host_aliases.contains_key("Server.EzVPN"));
     }
 
@@ -485,13 +485,13 @@ mod tests {
 
             [agent_routes]
             "Web.EzVPN" = { machine_id = "abc123def" }
-            "nas.ezvpn" = { machine_id = "999888777" }
+            "nas.homelab" = { machine_id = "999888777" }
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let r = resolve_server(ServerConfig::default(), Some(file)).unwrap();
         // Keys lowercased for case-insensitive matching; values are machine ids.
-        assert_eq!(r.agent_routes.get("web.ezvpn").map(String::as_str), Some("abc123def"));
-        assert_eq!(r.agent_routes.get("nas.ezvpn").map(String::as_str), Some("999888777"));
+        assert_eq!(r.agent_routes.get("web.homelab").map(String::as_str), Some("abc123def"));
+        assert_eq!(r.agent_routes.get("nas.homelab").map(String::as_str), Some("999888777"));
         assert!(!r.agent_routes.contains_key("Web.EzVPN"));
         assert_eq!(r.agent_auth_tokens, vec!["ftaAAA".to_string()]);
     }
@@ -501,7 +501,7 @@ mod tests {
         let toml = r#"
             [agent_routes]
             "Web.EzVPN" = { machine_id = "abc" }
-            "web.ezvpn" = { machine_id = "def" }
+            "web.homelab" = { machine_id = "def" }
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
@@ -513,7 +513,7 @@ mod tests {
         let toml = r#"
             [host_aliases]
             "Server.EzVPN" = "127.0.0.1"
-            "server.ezvpn" = "192.168.1.50"
+            "server.homelab" = "192.168.1.50"
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
@@ -524,7 +524,7 @@ mod tests {
     fn agent_route_and_host_alias_overlap_is_rejected() {
         let toml = r#"
             [agent_routes]
-            "shared.ezvpn" = { machine_id = "abc" }
+            "shared.homelab" = { machine_id = "abc" }
 
             [host_aliases]
             "Shared.EzVPN" = "127.0.0.1"
