@@ -287,25 +287,10 @@ impl ProxyServer {
         .map_err(|_| ProxyError::Signaling("timed out waiting for client handshake".into()))??;
         let hello = signaling::decode_hello(&data)?;
 
-        // Duplicate-server advisory: a trusted client observed a pattern that
-        // indicates another server shares this identity. It is an observation,
-        // not a command — the server decides, and self-blocks. Honors "at least
-        // one active client with the updated protocol".
-        if hello.duplicate_server_observed {
-            let reason = format!("client {remote_id} reported a duplicate-server pattern");
-            self.self_block(&reason);
-            let resp = HelloResponse::rejected(
-                self.server_instance_nonce,
-                "server is stopping: duplicate server id detected",
-            );
-            let _ = signaling::write_message(&mut send, &signaling::encode_hello_response(&resp)?)
-                .await;
-            let _ = send.finish();
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            connection.close(CLOSE_DUPLICATE.into(), b"duplicate server id");
-            return Ok(());
-        }
-
+        // Authenticate first: only a validated, non-blocklisted peer may influence
+        // server behavior — including the duplicate-server self-block below. The
+        // ALPN is not a credential, so without this gate an unauthenticated peer
+        // could trip self-block + shutdown.
         let token_ok = self.valid_tokens.contains(&hello.auth_token);
         let blocked = self.is_client_blocked(&remote_id);
         if !token_ok || blocked {
@@ -328,6 +313,25 @@ impl ProxyServer {
             return Err(ProxyError::AuthenticationFailed(format!(
                 "client {remote_id} rejected: {reason}"
             )));
+        }
+
+        // Duplicate-server advisory (only reachable once authenticated): a trusted
+        // client observed a pattern indicating another server shares this
+        // identity. It is an observation, not a command — the server decides, and
+        // self-blocks. Honors "at least one active client with the updated protocol".
+        if hello.duplicate_server_observed {
+            let reason = format!("client {remote_id} reported a duplicate-server pattern");
+            self.self_block(&reason);
+            let resp = HelloResponse::rejected(
+                self.server_instance_nonce,
+                "server is stopping: duplicate server id detected",
+            );
+            let _ = signaling::write_message(&mut send, &signaling::encode_hello_response(&resp)?)
+                .await;
+            let _ = send.finish();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            connection.close(CLOSE_DUPLICATE.into(), b"duplicate server id");
+            return Ok(());
         }
 
         // Duplicate-client detection: register this connection, or find a
