@@ -5,7 +5,7 @@
 use crate::blocklist::{self, BlockList};
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::signaling::{self, ControlMsg, HelloResponse, Target};
-use crate::proxy::{dial, Whitelist};
+use crate::proxy::{dial, RoutedSet};
 use crate::transport::LIVENESS_WINDOW;
 use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointId};
@@ -92,14 +92,14 @@ pub struct ProxyServer {
     /// Host aliases (lowercased keys) rewritten before connecting; see
     /// [`apply_alias`].
     host_aliases: HashMap<String, String>,
-    /// Destinations allowed to tunnel. When active, a request for a target not
-    /// on the list is rejected (defense in depth — the client should already
-    /// have split it off; see [`Whitelist`]).
-    whitelist: Whitelist,
-    /// Raw whitelist rules, pushed verbatim to clients in the handshake so they
+    /// Destinations routed through the tunnel. When active, a request for a
+    /// target not on the set is rejected (defense in depth — the client should
+    /// already have split it off; see [`RoutedSet`]).
+    routed_set: RoutedSet,
+    /// Raw routed-set rules, pushed verbatim to clients in the handshake so they
     /// learn the tunnel set from the server (the single source of truth).
-    whitelist_domains: Vec<String>,
-    whitelist_cidrs: Vec<String>,
+    routed_domains: Vec<String>,
+    routed_cidrs: Vec<String>,
     /// Live-connection registry for duplicate-client detection.
     registry: Arc<Mutex<Registry>>,
     /// Persistent duplicate-id blocklist (shared, synced to disk on mutation).
@@ -114,9 +114,9 @@ impl ProxyServer {
         own_id: EndpointId,
         valid_tokens: HashSet<String>,
         host_aliases: HashMap<String, String>,
-        whitelist: Whitelist,
-        whitelist_domains: Vec<String>,
-        whitelist_cidrs: Vec<String>,
+        routed_set: RoutedSet,
+        routed_domains: Vec<String>,
+        routed_cidrs: Vec<String>,
         blocklist: BlockList,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -124,9 +124,9 @@ impl ProxyServer {
             server_instance_nonce: rand::rng().random(),
             valid_tokens,
             host_aliases,
-            whitelist,
-            whitelist_domains,
-            whitelist_cidrs,
+            routed_set,
+            routed_domains,
+            routed_cidrs,
             registry: Arc::new(Mutex::new(Registry::new())),
             blocklist: Arc::new(Mutex::new(blocklist)),
             shutdown: Arc::new(Notify::new()),
@@ -373,12 +373,12 @@ impl ProxyServer {
             }
         };
 
-        // Accept: push the whitelist and our server nonce. The control stream is
+        // Accept: push the routed set and our server nonce. The control stream is
         // NOT finished — it stays open for heartbeats.
         let resp = HelloResponse::accepted(
             self.server_instance_nonce,
-            self.whitelist_domains.clone(),
-            self.whitelist_cidrs.clone(),
+            self.routed_domains.clone(),
+            self.routed_cidrs.clone(),
         );
         signaling::write_message(&mut send, &signaling::encode_hello_response(&resp)?).await?;
         send.flush().await?;
@@ -409,7 +409,7 @@ impl ProxyServer {
                     let server = Arc::clone(self);
                     tokio::spawn(async move {
                         if let Err(e) =
-                            handle_socks_stream(send, recv, &server.host_aliases, &server.whitelist)
+                            handle_socks_stream(send, recv, &server.host_aliases, &server.routed_set)
                                 .await
                         {
                             log::debug!("SOCKS5 stream ended: {e}");
@@ -512,7 +512,7 @@ async fn handle_socks_stream(
     mut send: SendStream,
     mut recv: RecvStream,
     host_aliases: &HashMap<String, String>,
-    whitelist: &Whitelist,
+    routed_set: &RoutedSet,
 ) -> io::Result<()> {
     let requested = signaling::read_request(&mut recv).await?;
 
@@ -520,9 +520,9 @@ async fn handle_socks_stream(
     // defense-in-depth boundary: a well-behaved client only tunnels on-list
     // targets, so a request for anything off-list means a misconfigured or
     // untrusted client. Reject with the SOCKS5 "not allowed by ruleset" code.
-    if !whitelist.allows(&requested) {
-        log::warn!("Tunnel request rejected by whitelist");
-        log::debug!("Rejected {requested:?} by whitelist");
+    if !routed_set.allows(&requested) {
+        log::warn!("Tunnel request rejected: target not in routed set");
+        log::debug!("Rejected {requested:?}: not in routed set");
         signaling::write_reply(&mut send, signaling::REP_NOT_ALLOWED).await?;
         send.flush().await?;
         return Ok(());

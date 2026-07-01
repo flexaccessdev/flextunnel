@@ -13,7 +13,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use flextunnel_core::blocklist::BlockList;
-use flextunnel_core::proxy::{ClientConfig, ProxyClient, ProxyServer, Whitelist};
+use flextunnel_core::proxy::{ClientConfig, ProxyClient, ProxyServer, RoutedSet};
 use flextunnel_core::transport::endpoint::{
     create_client_endpoint, create_server_endpoint, secret_to_endpoint_id,
 };
@@ -195,8 +195,8 @@ async fn run_async(command: Command) -> Result<()> {
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
                 dns_server,
                 host_aliases: None, // config-file only; no CLI flag
-                whitelist_domains: None, // config-file only; no CLI flag
-                whitelist_cidrs: None,   // config-file only; no CLI flag
+                routed_domains: None, // config-file only; no CLI flag
+                routed_cidrs: None,   // config-file only; no CLI flag
                 blocklist_file,
             };
             let file = config::load_server_config(config_path.as_deref(), default_config)?;
@@ -273,16 +273,16 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
         );
     }
 
-    // Parse the whitelist before creating the endpoint: a parse failure here must
+    // Parse the routed set before creating the endpoint: a parse failure here must
     // not bypass the endpoint.close() cleanup below (an ungraceful drop panics
     // under panic=abort).
-    let whitelist = Whitelist::new(&r.whitelist_domains, &r.whitelist_cidrs)
-        .context("Invalid whitelist configuration")?;
+    let routed_set = RoutedSet::new(&r.routed_domains, &r.routed_cidrs)
+        .context("Invalid routed-set configuration")?;
     // The tunnel set is required (VPN-style split tunnel): decide explicitly what
     // is routed through the tunnel. Use "*" (and 0.0.0.0/0, ::/0) for full tunnel.
-    if whitelist.is_empty() {
+    if routed_set.is_empty() {
         anyhow::bail!(
-            "a tunnel set is required: configure whitelist_domains / whitelist_cidrs \
+            "a tunnel set is required: configure routed_domains / routed_cidrs \
              (use \"*\" plus 0.0.0.0/0 and ::/0 to tunnel all traffic)"
         );
     }
@@ -302,16 +302,16 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
     }
     log::info!(
         "Tunnel set: {} domain rule(s), {} CIDR(s) — off-list tunnel requests are rejected; pushed to clients on connect",
-        r.whitelist_domains.len(),
-        r.whitelist_cidrs.len()
+        r.routed_domains.len(),
+        r.routed_cidrs.len()
     );
     let server = ProxyServer::new(
         own_id,
         valid_tokens,
         r.host_aliases,
-        whitelist,
-        r.whitelist_domains,
-        r.whitelist_cidrs,
+        routed_set,
+        r.routed_domains,
+        r.routed_cidrs,
         blocklist,
     );
     let run = async {
@@ -358,7 +358,7 @@ async fn run_client(r: config::ResolvedClient) -> Result<()> {
         );
     };
 
-    // The whitelist (tunnel set) is no longer configured on the client; it is
+    // The routed set (tunnel set) is no longer configured on the client; it is
     // pushed by the server during the handshake (see ProxyClient::handshake).
 
     let endpoint = create_client_endpoint(&r.relay_urls, r.dns_server.as_deref())

@@ -43,12 +43,12 @@ pub struct ServerConfig {
     /// wildcard (`*.example.com`, subdomains only), or `*` to match every host
     /// (full tunnel). The tunnel set is required — a server with an empty set
     /// refuses to start. Off-list targets are rejected server-side and
-    /// direct-connected client-side. Keep in sync with `whitelist_cidrs`.
-    pub whitelist_domains: Option<Vec<String>>,
+    /// direct-connected client-side. Keep in sync with `routed_cidrs`.
+    pub routed_domains: Option<Vec<String>>,
     /// CIDRs / bare IPs routed through the tunnel (matched against IP targets).
     /// A default route (`0.0.0.0/0` / `::/0`) matches every IP. See
-    /// `whitelist_domains`.
-    pub whitelist_cidrs: Option<Vec<String>>,
+    /// `routed_domains`.
+    pub routed_cidrs: Option<Vec<String>>,
     /// Path to the persistent duplicate-id blocklist (JSON). Defaults to
     /// `~/.config/flextunnel/blocklist.json` when unset. See [`crate::blocklist`].
     pub blocklist_file: Option<PathBuf>,
@@ -86,9 +86,9 @@ pub struct ResolvedServer {
     pub dns_server: Option<String>,
     /// Server-side host aliases, keys lowercased for case-insensitive matching.
     pub host_aliases: HashMap<String, String>,
-    /// Raw whitelist entries (parsed into a `Whitelist` at startup).
-    pub whitelist_domains: Vec<String>,
-    pub whitelist_cidrs: Vec<String>,
+    /// Raw routed-set entries (parsed into a `RoutedSet` at startup).
+    pub routed_domains: Vec<String>,
+    pub routed_cidrs: Vec<String>,
     /// Resolved path to the duplicate-id blocklist file (default applied).
     pub blocklist_file: PathBuf,
 }
@@ -213,11 +213,11 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Resolved
             .into_iter()
             .map(|(k, v)| (k.to_ascii_lowercase(), v))
             .collect(),
-        whitelist_domains: cli
-            .whitelist_domains
-            .or(file.whitelist_domains)
+        routed_domains: cli
+            .routed_domains
+            .or(file.routed_domains)
             .unwrap_or_default(),
-        whitelist_cidrs: cli.whitelist_cidrs.or(file.whitelist_cidrs).unwrap_or_default(),
+        routed_cidrs: cli.routed_cidrs.or(file.routed_cidrs).unwrap_or_default(),
         // CLI > file > default (~/.config/flextunnel/blocklist.json). Fall back to
         // a cwd-relative name only if the home dir can't be determined.
         blocklist_file: cli
@@ -330,19 +330,19 @@ mod tests {
     }
 
     #[test]
-    fn whitelist_keys_parsed_and_resolved() {
+    fn routed_keys_parsed_and_resolved() {
         let toml = r#"
-            whitelist_domains = ["*.example.com", "httpbin.org"]
-            whitelist_cidrs = ["10.0.0.0/8"]
+            routed_domains = ["*.example.com", "httpbin.org"]
+            routed_cidrs = ["10.0.0.0/8"]
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let r = resolve_server(ServerConfig::default(), Some(file));
-        assert_eq!(r.whitelist_domains, vec!["*.example.com", "httpbin.org"]);
-        assert_eq!(r.whitelist_cidrs, vec!["10.0.0.0/8"]);
+        assert_eq!(r.routed_domains, vec!["*.example.com", "httpbin.org"]);
+        assert_eq!(r.routed_cidrs, vec!["10.0.0.0/8"]);
         // Defaults to empty (inactive) when unset.
         let empty = resolve_server(ServerConfig::default(), None);
-        assert!(empty.whitelist_domains.is_empty());
-        assert!(empty.whitelist_cidrs.is_empty());
+        assert!(empty.routed_domains.is_empty());
+        assert!(empty.routed_cidrs.is_empty());
     }
 
     #[test]

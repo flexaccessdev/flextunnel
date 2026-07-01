@@ -26,9 +26,9 @@
 //! ## Config JSON (input to `flextunnel_start`)
 //!
 //! `auth_token` and `server_node_id` are required; the rest are optional. The
-//! whitelist (the *tunnel set* that decides split-tunneling) is configured on
+//! routed set (the *tunnel set* that decides split-tunneling) is configured on
 //! the server and pushed to the client during the handshake, so the app sends
-//! no whitelist of its own.
+//! no routed set of its own.
 //!
 //! ```json
 //! {
@@ -276,7 +276,7 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
 /// This is the split-tunnel set the server pushes during the handshake — the
 /// domains/CIDRs routed through the tunnel (off-list targets connect directly).
 /// An empty `domains`+`cidrs` while `connected` is true means the server runs no
-/// whitelist and everything is tunneled. The set becomes available shortly after
+/// routed set and everything is tunneled. The set becomes available shortly after
 /// start, once the handshake completes, so the caller should poll it.
 ///
 /// Returns `1` on success (full JSON written), `0` if `out_buf` was too small

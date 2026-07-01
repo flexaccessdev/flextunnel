@@ -1,10 +1,11 @@
-//! Destination whitelist shared by the client and server.
+//! Destination routed set shared by the client and server.
 //!
-//! A whitelist is the *tunnel set*: the destinations that are allowed to
-//! traverse the QUIC tunnel. The client uses it to decide per-connection
-//! whether to tunnel a target or connect directly from the device
-//! (split-tunneling); the server uses the same rules to reject any tunnel
-//! request for a target that is not on the list (defense in depth). For both
+//! A routed set is the *tunnel set*: the destinations that are routed through
+//! the QUIC tunnel. The client uses it to decide per-connection whether to
+//! tunnel a target or connect directly from the device (split-tunneling);
+//! targets not on the set are **not** rejected client-side, they fall back to a
+//! direct connection. The server uses the same rules to reject any tunnel
+//! request for a target that is not on the set (defense in depth). For both
 //! roles the lists should be kept in sync.
 //!
 //! Two independent lists are matched against the requested [`Target`]. A
@@ -25,8 +26,8 @@
 //!   bare IP (`192.168.1.5`) is accepted as a single-host network (`/32`/`/128`);
 //!   a default route (`0.0.0.0/0` / `::/0`) matches every IP of its family.
 //!
-//! The whitelist is a VPN-style split-tunnel "included routes" set and is
-//! **required** — an empty whitelist is rejected upstream (server startup /
+//! The routed set is a VPN-style split-tunnel "included routes" set and is
+//! **required** — an empty routed set is rejected upstream (server startup /
 //! client handshake), never treated as "tunnel everything". To tunnel *all*
 //! traffic, use the catch-alls: `*` for hostnames and `0.0.0.0/0` (+ `::/0`) for
 //! IPs.
@@ -38,15 +39,15 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use std::str::FromStr;
 
-/// A parsed destination whitelist (the tunnel set). See the module docs.
+/// A parsed destination routed set (the tunnel set). See the module docs.
 #[derive(Debug, Default, Clone)]
-pub struct Whitelist {
+pub struct RoutedSet {
     /// Exact domain names, lowercased.
     domains_exact: HashSet<String>,
     /// Suffixes from `*.example.com` entries, stored *with* the leading dot
     /// (`.example.com`) so a suffix match excludes the bare apex.
     domains_suffix: Vec<String>,
-    /// Allowed networks (bare IPs are stored as single-host networks). A default
+    /// Routed networks (bare IPs are stored as single-host networks). A default
     /// route (`0.0.0.0/0` / `::/0`) naturally contains every IP of its family.
     cidrs: Vec<IpNetwork>,
     /// Set by a lone `*` domain entry — the full-tunnel catch-all for hostnames
@@ -55,8 +56,8 @@ pub struct Whitelist {
     domains_all: bool,
 }
 
-impl Whitelist {
-    /// Build a whitelist from raw config strings. Returns an error (with the
+impl RoutedSet {
+    /// Build a routed set from raw config strings. Returns an error (with the
     /// offending entry) on a malformed domain pattern or CIDR so bad config
     /// fails loudly at startup.
     pub fn new(domains: &[String], cidrs: &[String]) -> Result<Self> {
@@ -74,11 +75,11 @@ impl Whitelist {
                 // patterns like `*.*.example.com` or `*..example.com` that would
                 // otherwise become dead rules matching nothing.
                 if suffix.contains('*') || suffix.split('.').any(str::is_empty) {
-                    bail!("invalid whitelist wildcard pattern: {raw:?}");
+                    bail!("invalid routed-domain wildcard pattern: {raw:?}");
                 }
                 domains_suffix.push(format!(".{}", suffix.to_ascii_lowercase()));
             } else if entry.is_empty() || entry.contains('*') {
-                bail!("invalid whitelist domain pattern: {raw:?}");
+                bail!("invalid routed-domain pattern: {raw:?}");
             } else {
                 domains_exact.insert(entry.to_ascii_lowercase());
             }
@@ -90,7 +91,7 @@ impl Whitelist {
             // Accept both `a.b.c.d/n` and a bare `a.b.c.d` (single host).
             let net = IpNetwork::from_str(entry)
                 .or_else(|_| IpAddr::from_str(entry).map(IpNetwork::from))
-                .with_context(|| format!("invalid whitelist CIDR: {raw:?}"))?;
+                .with_context(|| format!("invalid routed CIDR: {raw:?}"))?;
             nets.push(net);
         }
 
@@ -102,7 +103,7 @@ impl Whitelist {
         })
     }
 
-    /// Whether no rule is configured. The whitelist is required (a VPN-style
+    /// Whether no rule is configured. The routed set is required (a VPN-style
     /// tunnel set), so callers reject an empty one upstream rather than treating
     /// it as "no filtering".
     pub fn is_empty(&self) -> bool {
@@ -112,8 +113,8 @@ impl Whitelist {
             && self.cidrs.is_empty()
     }
 
-    /// Whether `target` is on the whitelist (i.e. should be tunneled / allowed).
-    /// A hostname is matched against the domain rules (with `*` matching every
+    /// Whether `target` is in the routed set (i.e. should be tunneled). A
+    /// hostname is matched against the domain rules (with `*` matching every
     /// hostname); an IP — whether presented as [`Target::Ip`] or as a numeric
     /// [`Target::Domain`] — is matched against the CIDRs (with `0.0.0.0/0` /
     /// `::/0` matching all).
@@ -162,10 +163,10 @@ fn parse_ip_literal(host: &str) -> Option<IpAddr> {
 mod tests {
     use super::*;
 
-    fn wl(domains: &[&str], cidrs: &[&str]) -> Whitelist {
+    fn rs(domains: &[&str], cidrs: &[&str]) -> RoutedSet {
         let d: Vec<String> = domains.iter().map(|s| s.to_string()).collect();
         let c: Vec<String> = cidrs.iter().map(|s| s.to_string()).collect();
-        Whitelist::new(&d, &c).expect("valid whitelist")
+        RoutedSet::new(&d, &c).expect("valid routed set")
     }
 
     fn domain(h: &str) -> Target {
@@ -178,7 +179,7 @@ mod tests {
 
     #[test]
     fn empty_is_empty_and_allows_nothing() {
-        let w = Whitelist::default();
+        let w = RoutedSet::default();
         assert!(w.is_empty());
         assert!(!w.allows(&domain("example.com")));
         assert!(!w.allows(&ip("1.2.3.4")));
@@ -187,7 +188,7 @@ mod tests {
     #[test]
     fn star_domain_matches_all_hosts() {
         // `*` is the full-tunnel catch-all for hostnames.
-        let w = wl(&["*"], &[]);
+        let w = rs(&["*"], &[]);
         assert!(!w.is_empty());
         assert!(w.allows(&domain("anything.example")));
         assert!(w.allows(&domain("example.com")));
@@ -198,14 +199,14 @@ mod tests {
     #[test]
     fn default_route_cidr_matches_all_ips() {
         // `0.0.0.0/0` / `::/0` are the IP-side full-tunnel catch-alls.
-        let v4 = wl(&[], &["0.0.0.0/0"]);
+        let v4 = rs(&[], &["0.0.0.0/0"]);
         assert!(v4.allows(&ip("8.8.8.8")));
         assert!(v4.allows(&ip("10.0.0.1")));
-        let v6 = wl(&[], &["::/0"]);
+        let v6 = rs(&[], &["::/0"]);
         assert!(v6.allows(&ip("[2606:4700::1]")));
 
         // Full tunnel for everything: `*` + `0.0.0.0/0` + `::/0`.
-        let full = wl(&["*"], &["0.0.0.0/0", "::/0"]);
+        let full = rs(&["*"], &["0.0.0.0/0", "::/0"]);
         assert!(full.allows(&domain("anything.example")));
         assert!(full.allows(&ip("8.8.8.8")));
         assert!(full.allows(&ip("[2606:4700::1]")));
@@ -213,7 +214,7 @@ mod tests {
 
     #[test]
     fn exact_domain_matches_only_itself() {
-        let w = wl(&["example.com"], &[]);
+        let w = rs(&["example.com"], &[]);
         assert!(!w.is_empty());
         assert!(w.allows(&domain("example.com")));
         assert!(!w.allows(&domain("api.example.com")));
@@ -222,7 +223,7 @@ mod tests {
 
     #[test]
     fn wildcard_matches_subdomains_not_apex() {
-        let w = wl(&["*.example.com"], &[]);
+        let w = rs(&["*.example.com"], &[]);
         assert!(w.allows(&domain("api.example.com")));
         assert!(w.allows(&domain("a.b.example.com")));
         assert!(!w.allows(&domain("example.com")));
@@ -232,14 +233,14 @@ mod tests {
 
     #[test]
     fn matching_is_case_insensitive() {
-        let w = wl(&["Example.COM", "*.Internal.Corp"], &[]);
+        let w = rs(&["Example.COM", "*.Internal.Corp"], &[]);
         assert!(w.allows(&domain("EXAMPLE.com")));
         assert!(w.allows(&domain("API.Internal.CORP")));
     }
 
     #[test]
     fn cidr_and_bare_ip() {
-        let w = wl(&[], &["10.0.0.0/8", "192.168.1.5"]);
+        let w = rs(&[], &["10.0.0.0/8", "192.168.1.5"]);
         assert!(w.allows(&ip("10.1.2.3")));
         assert!(!w.allows(&ip("11.0.0.1")));
         assert!(w.allows(&ip("192.168.1.5")));
@@ -248,14 +249,14 @@ mod tests {
 
     #[test]
     fn ipv6_cidr() {
-        let w = wl(&[], &["fd00::/8"]);
+        let w = rs(&[], &["fd00::/8"]);
         assert!(w.allows(&ip("[fd00::1]")));
         assert!(!w.allows(&ip("[fe80::1]")));
     }
 
     #[test]
     fn domains_and_ips_match_separate_lists() {
-        let w = wl(&["example.com"], &["10.0.0.0/8"]);
+        let w = rs(&["example.com"], &["10.0.0.0/8"]);
         // A real hostname is matched only against domain rules; a bare IP only
         // against CIDRs. Neither rule set leaks into the other.
         assert!(!w.allows(&domain("other.com")));
@@ -268,30 +269,30 @@ mod tests {
     fn ip_literal_in_domain_form_is_gated_by_cidr() {
         // A numeric host sent as ATYP_DOMAIN is treated as an IP: matched against
         // the CIDRs, never the domain rules — not even the `*` catch-all.
-        let w = wl(&["*"], &["10.0.0.0/8"]);
+        let w = rs(&["*"], &["10.0.0.0/8"]);
         assert!(w.allows(&domain("10.0.0.1"))); // inside the CIDR → allowed
         assert!(!w.allows(&domain("8.8.8.8"))); // `*` does NOT cover IP literals
         assert!(w.allows(&domain("real.hostname"))); // genuine host still matched by `*`
 
         // Bracketed and bare IPv6 literals in domain form are handled too.
-        let w6 = wl(&["*"], &["fd00::/8"]);
+        let w6 = rs(&["*"], &["fd00::/8"]);
         assert!(w6.allows(&domain("[fd00::1]")));
         assert!(w6.allows(&domain("fd00::1")));
         assert!(!w6.allows(&domain("[fe80::1]")));
 
         // With no CIDRs configured, an IP literal in domain form matches nothing
         // even under `*`.
-        let w_dom_only = wl(&["*"], &[]);
+        let w_dom_only = rs(&["*"], &[]);
         assert!(!w_dom_only.allows(&domain("10.0.0.1")));
         assert!(w_dom_only.allows(&domain("real.hostname")));
     }
 
     #[test]
     fn rejects_bad_patterns() {
-        assert!(Whitelist::new(&["*.".to_string()], &[]).is_err());
-        assert!(Whitelist::new(&["a*b.com".to_string()], &[]).is_err());
-        assert!(Whitelist::new(&["*.*.example.com".to_string()], &[]).is_err());
-        assert!(Whitelist::new(&["*..example.com".to_string()], &[]).is_err());
-        assert!(Whitelist::new(&[], &["not-a-cidr".to_string()]).is_err());
+        assert!(RoutedSet::new(&["*.".to_string()], &[]).is_err());
+        assert!(RoutedSet::new(&["a*b.com".to_string()], &[]).is_err());
+        assert!(RoutedSet::new(&["*.*.example.com".to_string()], &[]).is_err());
+        assert!(RoutedSet::new(&["*..example.com".to_string()], &[]).is_err());
+        assert!(RoutedSet::new(&[], &["not-a-cidr".to_string()]).is_err());
     }
 }

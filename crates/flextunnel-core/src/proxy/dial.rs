@@ -1,7 +1,7 @@
 //! Dialing a [`Target`] to an outbound TCP connection.
 //!
 //! Shared by the server (which dials every tunneled target from its own
-//! network) and the client's split-tunnel path (which dials non-whitelisted
+//! network) and the client's split-tunnel path (which dials non-routed
 //! targets directly from the device). Callers wrap these in their own timeouts.
 
 use crate::proxy::signaling::Target;

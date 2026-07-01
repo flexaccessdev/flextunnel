@@ -17,7 +17,7 @@
 
 use crate::blocklist::BlockList;
 use crate::proxy::signaling::{self, Hello, HelloResponse};
-use crate::proxy::{ProxyServer, Whitelist};
+use crate::proxy::{ProxyServer, RoutedSet};
 use crate::transport::{ALPN, build_quic_transport_config};
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
@@ -53,8 +53,8 @@ async fn with_timeout<F: std::future::Future>(f: F) -> F::Output {
         .expect("operation timed out")
 }
 
-/// Spawn a `ProxyServer` on `endpoint` with a single valid token, no whitelist,
-/// and the given blocklist path. Returns the server's own id.
+/// Spawn a `ProxyServer` on `endpoint` with a single valid token, an empty
+/// routed set, and the given blocklist path. Returns the server's own id.
 fn spawn_server(endpoint: Endpoint, blocklist_path: std::path::PathBuf) -> iroh::EndpointId {
     let own_id = endpoint.id();
     let mut tokens = HashSet::new();
@@ -64,7 +64,7 @@ fn spawn_server(endpoint: Endpoint, blocklist_path: std::path::PathBuf) -> iroh:
         own_id,
         tokens,
         HashMap::new(),
-        Whitelist::new(&empty, &empty).unwrap(),
+        RoutedSet::new(&empty, &empty).unwrap(),
         empty.clone(),
         empty,
         BlockList::load(blocklist_path).unwrap(),

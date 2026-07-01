@@ -3,7 +3,7 @@
 
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::signaling::{self, ControlMsg, Hello};
-use crate::proxy::{dial, socks5, Whitelist};
+use crate::proxy::{dial, socks5, RoutedSet};
 use crate::transport::{HEARTBEAT_INTERVAL, LIVENESS_WINDOW};
 use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -46,7 +46,7 @@ type SharedConn = Arc<Mutex<Option<Connection>>>;
 /// across drops so split-tunnel routing keeps working while the connection is
 /// down. While it is `None` the client **fails closed**: no connection is routed
 /// (directly or tunneled) before the policy is known, so nothing leaks out.
-type SharedWhitelist = Arc<Mutex<Option<Arc<Whitelist>>>>;
+type SharedRoutedSet = Arc<Mutex<Option<Arc<RoutedSet>>>>;
 
 /// Configuration for the proxy client.
 pub struct ClientConfig {
@@ -76,7 +76,7 @@ fn calculate_backoff(attempt: u32) -> Duration {
 /// server pushed on the last successful handshake, plus whether a connection is
 /// live right now. Shared with the FFI so the app can display the routed
 /// domains/CIDRs. An empty set while `connected` is true means the server runs
-/// no whitelist and everything is tunneled.
+/// no routed set and everything is tunneled.
 #[derive(Clone, Default)]
 pub struct TunnelRoutes {
     pub connected: bool,
@@ -209,15 +209,15 @@ impl ProxyClient {
         // fail until it recovers. The policy starts None so the client fails closed
         // until it is known.
         let current: SharedConn = Arc::new(Mutex::new(None));
-        let whitelist: SharedWhitelist = Arc::new(Mutex::new(None));
+        let routed_set: SharedRoutedSet = Arc::new(Mutex::new(None));
 
         // One task, two concurrent futures. When the manager returns (a fatal
         // first-connect failure or a clean stop) the accept loop is dropped with
         // it, so `flextunnel_stop`'s `task.abort()` tears everything down — no
         // orphaned accept task.
         tokio::select! {
-            r = self.manage_connection(endpoint, &current, &whitelist) => r,
-            r = accept_loop(&listener, &current, &whitelist) => r,
+            r = self.manage_connection(endpoint, &current, &routed_set) => r,
+            r = accept_loop(&listener, &current, &routed_set) => r,
         }
     }
 
@@ -229,7 +229,7 @@ impl ProxyClient {
         &self,
         endpoint: &Endpoint,
         current: &SharedConn,
-        whitelist_shared: &SharedWhitelist,
+        routed_set_shared: &SharedRoutedSet,
     ) -> ProxyResult<()> {
         let mut ever_connected = false;
         let mut attempt: u32 = 0;
@@ -241,7 +241,7 @@ impl ProxyClient {
             // Establish (connect + auth). The handshake also learns the server's
             // tunnel set (drives split-tunneling) and returns the control-stream
             // halves kept open for heartbeats.
-            let (connection, whitelist, ctrl_send, ctrl_recv) = match self.establish(endpoint).await
+            let (connection, routed_set, ctrl_send, ctrl_recv) = match self.establish(endpoint).await
             {
                 Ok(established) => {
                     ever_connected = true;
@@ -260,7 +260,7 @@ impl ProxyClient {
             // Publish the live connection + route policy so the accept loop routes
             // against them; the policy is retained on the next drop (never reset to
             // None once known, so we only fail closed before the *first* connect).
-            *whitelist_shared.lock().expect("whitelist lock") = Some(whitelist);
+            *routed_set_shared.lock().expect("routed-set lock") = Some(routed_set);
             *current.lock().expect("connection lock") = Some(connection.clone());
 
             // Keep the connection alive until it drops, then reconnect (or exit).
@@ -315,21 +315,21 @@ impl ProxyClient {
     }
 
     /// Connect to the server and complete the auth handshake, returning the
-    /// connection, the whitelist the server pushed, and the control-stream halves
+    /// connection, the routed set the server pushed, and the control-stream halves
     /// (kept open for heartbeats).
     async fn establish(
         &self,
         endpoint: &Endpoint,
-    ) -> ProxyResult<(Connection, Arc<Whitelist>, SendStream, RecvStream)> {
+    ) -> ProxyResult<(Connection, Arc<RoutedSet>, SendStream, RecvStream)> {
         let endpoint_addr = self.resolve_server_addr()?;
         let connection = endpoint
             .connect(endpoint_addr, crate::transport::ALPN)
             .await
             .map_err(|e| ProxyError::Signaling(format!("Failed to connect to server: {e}")))?;
         log::info!("Connected to server, authenticating...");
-        let (whitelist, send, recv) = self.handshake(&connection).await?;
+        let (routed_set, send, recv) = self.handshake(&connection).await?;
         log::info!("Authenticated.");
-        Ok((connection, Arc::new(whitelist), send, recv))
+        Ok((connection, Arc::new(routed_set), send, recv))
     }
 
     /// Keep the connection alive: run the heartbeat and watch for the QUIC
@@ -372,14 +372,14 @@ impl ProxyClient {
     }
 
     /// Perform the connection-level auth handshake on the first bi-stream,
-    /// returning the whitelist (the tunnel set) the server pushed plus the
+    /// returning the routed set (the tunnel set) the server pushed plus the
     /// control-stream halves — the stream is **not** closed; it stays open as the
-    /// heartbeat channel. The client uses the whitelist to split-tunnel; it
+    /// heartbeat channel. The client uses the routed set to split-tunnel; it
     /// configures no list of its own (the server is the single source of truth).
     async fn handshake(
         &self,
         connection: &Connection,
-    ) -> ProxyResult<(Whitelist, SendStream, RecvStream)> {
+    ) -> ProxyResult<(RoutedSet, SendStream, RecvStream)> {
         let (mut send, mut recv) = connection
             .open_bi()
             .await
@@ -424,29 +424,29 @@ impl ProxyClient {
         // Build the tunnel set from the server's pushed list. The server
         // validated these rules at startup, so a parse failure here is not
         // expected; surface it as a signaling error rather than panicking.
-        let whitelist = Whitelist::new(&response.whitelist_domains, &response.whitelist_cidrs)
-            .map_err(|e| ProxyError::Signaling(format!("server pushed an invalid whitelist: {e}")))?;
+        let routed_set = RoutedSet::new(&response.routed_domains, &response.routed_cidrs)
+            .map_err(|e| ProxyError::Signaling(format!("server pushed an invalid routed set: {e}")))?;
         // The tunnel set is required. The server validates this at startup, but
         // guard here too so a misconfigured/old server surfaces clearly instead of
         // the client silently direct-connecting everything.
-        if whitelist.is_empty() {
+        if routed_set.is_empty() {
             return Err(ProxyError::Signaling(
-                "server pushed an empty tunnel set (configure a whitelist, or \"*\" + 0.0.0.0/0 for full tunnel)".into(),
+                "server pushed an empty tunnel set (configure a routed set, or \"*\" + 0.0.0.0/0 for full tunnel)".into(),
             ));
         }
         log::info!(
             "Server tunnel set: {} domain rule(s), {} CIDR(s) — off-list targets connect directly",
-            response.whitelist_domains.len(),
-            response.whitelist_cidrs.len()
+            response.routed_domains.len(),
+            response.routed_cidrs.len()
         );
 
         // Publish the live tunnel set so the FFI/app can show what's forwarded.
         if let Ok(mut routes) = self.routes.lock() {
             routes.connected = true;
-            routes.domains = response.whitelist_domains.clone();
-            routes.cidrs = response.whitelist_cidrs.clone();
+            routes.domains = response.routed_domains.clone();
+            routes.cidrs = response.routed_cidrs.clone();
         }
-        Ok((whitelist, send, recv))
+        Ok((routed_set, send, recv))
     }
 }
 
@@ -499,15 +499,15 @@ async fn client_heartbeat_loop(
 async fn accept_loop(
     listener: &TcpListener,
     current: &SharedConn,
-    whitelist_shared: &SharedWhitelist,
+    routed_set_shared: &SharedRoutedSet,
 ) -> ProxyResult<()> {
     loop {
         let (tcp, peer) = listener.accept().await?;
         log::debug!("SOCKS5 connection from {peer}");
         let current = current.clone();
-        let whitelist_shared = whitelist_shared.clone();
+        let routed_set_shared = routed_set_shared.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_local_conn(tcp, current, whitelist_shared).await {
+            if let Err(e) = handle_local_conn(tcp, current, routed_set_shared).await {
                 log::debug!("SOCKS5 connection from {peer} ended: {e}");
             }
         });
@@ -522,7 +522,7 @@ async fn accept_loop(
 async fn handle_local_conn(
     mut tcp: TcpStream,
     current: SharedConn,
-    whitelist_shared: SharedWhitelist,
+    routed_set_shared: SharedRoutedSet,
 ) -> Result<()> {
     // Bound the local SOCKS5 handshake so a peer that connects and sends nothing
     // can't pin this task and its socket indefinitely.
@@ -537,8 +537,8 @@ async fn handle_local_conn(
     // learns the tunnel set we don't route anything, so no traffic leaks out
     // (directly or tunneled) before we know how it should be routed. Answer with a
     // SOCKS5 general-failure reply rather than leaving the app hanging.
-    let policy = { whitelist_shared.lock().expect("whitelist lock").clone() };
-    let Some(whitelist) = policy else {
+    let policy = { routed_set_shared.lock().expect("routed-set lock").clone() };
+    let Some(routed_set) = policy else {
         log::debug!("Route policy not yet known; refusing: {target:?}");
         let _ = socks5::write_reply(&mut tcp, signaling::REP_GENERAL_FAILURE).await;
         return Ok(());
@@ -546,14 +546,14 @@ async fn handle_local_conn(
 
     // Split-tunnel: a target not in the tunnel set is dialed directly from this
     // device's own network (its DNS, its IP) — works even when the tunnel is down.
-    if !whitelist.allows(&target) {
+    if !routed_set.allows(&target) {
         log::debug!("Direct (off tunnel set): {target:?}");
         return direct_connect(tcp, &target).await;
     }
 
     // On-list: needs a live tunnel. If the connection is down (a drop/backoff),
     // answer with a network-unreachable reply so the app shows a connection error
-    // for this whitelisted target instead of hanging on a dead stream.
+    // for this routed target instead of hanging on a dead stream.
     let conn = { current.lock().expect("connection lock").clone() };
     let Some(conn) = conn else {
         log::debug!("Tunnel down; on-list target unreachable: {target:?}");
@@ -589,7 +589,7 @@ async fn handle_local_conn(
 
 /// Connect to `target` directly from this device (bypassing the tunnel) and pipe
 /// bytes, answering the local app's SOCKS5 request with the matching reply code.
-/// Used for off-whitelist targets in split-tunnel mode. The dial is bounded by
+/// Used for off-routed-set targets in split-tunnel mode. The dial is bounded by
 /// the same deadline as opening a tunnel so a slow target can't pin the task.
 async fn direct_connect(mut tcp: TcpStream, target: &signaling::Target) -> Result<()> {
     let dialed = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, dial::dial_target(target)).await;
