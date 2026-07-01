@@ -65,20 +65,32 @@ Stable releases include `flextunnel` and `flextunnel-agent` for Linux
 amd64/arm64, macOS arm64, and Windows amd64, plus the iOS xcframework asset.
 Automated prereleases currently include Linux amd64/arm64, macOS arm64, and the
 iOS xcframework, but skip Windows. The install scripts download the latest
-`flextunnel` binary, verify its SHA-256 checksum, and install to a per-user
-location (`~/.local/bin` on Linux/macOS,
-`%LOCALAPPDATA%\Programs\flextunnel` on Windows) — **no admin required**.
+binary, verify its SHA-256 checksum, and install to a per-user location
+(`~/.local/bin` on Linux/macOS, `%LOCALAPPDATA%\Programs\flextunnel` on Windows)
+— **no admin required**.
 
-**Linux / macOS:**
+**`flextunnel` (server / client) — Linux / macOS:**
 
 ```sh
 curl -sSL https://andrewtheguy.github.io/flextunnel/install.sh | bash
 ```
 
-**Windows (PowerShell):**
+**`flextunnel` (server / client) — Windows (PowerShell):**
 
 ```powershell
 irm https://andrewtheguy.github.io/flextunnel/install.ps1 | iex
+```
+
+**`flextunnel-agent` (reverse-routing agent) — Linux / macOS:**
+
+```sh
+curl -sSL https://andrewtheguy.github.io/flextunnel/install-agent.sh | bash
+```
+
+**`flextunnel-agent` (reverse-routing agent) — Windows (PowerShell):**
+
+```powershell
+irm https://andrewtheguy.github.io/flextunnel/install-agent.ps1 | iex
 ```
 
 Options: append `-s -- --prerelease` (bash) for the latest prerelease, a release
@@ -91,16 +103,13 @@ published to `ghcr.io/andrewtheguy/flextunnel`.
 
 ```sh
 cargo build --release
-# binary: target/release/flextunnel
-
-cargo build --release -p flextunnel-agent
-# binary: target/release/flextunnel-agent
+# binaries: target/release/flextunnel, target/release/flextunnel-agent
 ```
 
 Requires a recent Rust toolchain (edition 2024). A bare `cargo build --release`
-uses the workspace's default members and builds the main CLI, not the agent or
-iOS static library. To cross-build static Linux binaries for amd64 + arm64 via
-Docker, use `./build-linux.sh`.
+uses the workspace's default members and builds the CLI and the agent, but not
+the iOS static library. To cross-build static Linux binaries for amd64 + arm64
+via Docker, use `./build-linux.sh`.
 
 ## Quick start
 
