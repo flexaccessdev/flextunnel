@@ -36,6 +36,7 @@ TCP connection.
 | `main.rs` | clap CLI, command dispatch, logger/runtime, graceful `endpoint.close()`, shutdown signal |
 | `config.rs` | TOML config files (`-c`/`--default-config`), `deny_unknown_fields`, CLI>file>default merge, `~` expansion |
 | `auth.rs` | auth-token generation/validation/file-loading (CRC16-checksummed Base64URL tokens) |
+| `blocklist.rs` | persisted duplicate-id blocklist (JSON): confirmed duplicate client ids + the server's own conflicted id |
 | `secret.rs` | server secret-key (iroh identity) generation and loading; prints the `EndpointId` |
 | `error.rs` | `ProxyError` (`Network`/`Config`/`Signaling`/`AuthenticationFailed`/`ConnectionLost`) + `is_recoverable()` |
 | `transport/mod.rs` | QUIC transport config (keep-alive, idle timeout, initial MTU) |
@@ -54,13 +55,21 @@ secret: both peers must offer the same ALPN or negotiation fails. Access control
 is enforced by the auth handshake below, not by the ALPN.
 
 ### 2. Auth handshake (control stream)
-On the first bi-stream the client sends `Hello { version, auth_token }` and the
-server replies `HelloResponse { version, accepted, reject_reason }`, both
-length-prefixed JSON via `signaling::write_message` / `read_message` (4-byte
-big-endian length + payload, capped at `MAX_HANDSHAKE_SIZE` = 16 KiB). The server
+The protocol version is `PROTOCOL_VERSION = 3`. On the first bi-stream the client
+sends `Hello { version, auth_token, client_instance_nonce, duplicate_server_observed }`
+and the server replies
+`HelloResponse { version, accepted, reject_reason, server_instance_nonce, whitelist_* }`,
+both length-prefixed JSON via `signaling::write_message` / `read_message` (4-byte
+big-endian length + payload, capped at `MAX_HANDSHAKE_SIZE` = 64 KiB). The server
 checks the token against its accepted set (`auth::load_auth_tokens`). On rejection
 it closes the connection gracefully (with a short drain) carrying the reason.
 `Hello`'s `Debug` impl redacts `auth_token`.
+
+The `*_instance_nonce` fields are random per-process ids (distinct from the iroh
+node id) that drive duplicate-id detection (see below); `duplicate_server_observed`
+is a client advisory. Unlike earlier versions the handshake bi-stream is **not
+closed** after the exchange — it stays open as the control stream carrying
+heartbeats (§6).
 
 The server bounds accepting/reading the client `Hello` with a 10s timeout, and
 the client bounds waiting for the server `HelloResponse` with the same timeout
@@ -98,6 +107,54 @@ Both ends join the iroh `(SendStream, RecvStream)` halves with
 This propagates half-close correctly (EOF on one side → `shutdown`, which quinn
 maps to a stream FIN). Per-stream errors stay per-stream — the shared QUIC
 `Connection` is never closed for a single failed proxied connection.
+
+### 6. Heartbeat & liveness (control stream)
+After the handshake the control bi-stream stays open. The client sends a
+`ControlMsg::Heartbeat { seq }` every `HEARTBEAT_INTERVAL` (10s) and the server
+replies `HeartbeatAck { seq }`, framed with the same length-prefixed helpers
+(capped at `MAX_CONTROL_MSG_SIZE`). This is an app-level liveness signal *on top
+of* QUIC keep-alive: it lets each side notice a dead peer within `LIVENESS_WINDOW`
+(30s) rather than only at the 30s QUIC idle timeout, and — on the server — it
+refreshes the per-client connection registry used for duplicate detection (below).
+A missing heartbeat surfaces as a recoverable `ConnectionLost`, so the client's
+normal reconnect path applies. The heartbeat runs concurrently with the SOCKS5
+stream loop via `tokio::select!` on both sides.
+
+## Duplicate-id detection
+
+A guard rail against *accidental misconfiguration* (not an adversary defense —
+see the security model). Both roles carry a random per-process **instance nonce**
+that is distinct from the iroh node id, exchanged in the handshake.
+
+**Duplicate client (server-side).** Client identity is ephemeral (a fresh key per
+process), so two *different* client processes never share a node id; a node id
+seen on two concurrently-live connections is a rare bug. The server keeps a
+registry keyed by client node id, and within it by connection, refreshed by the
+heartbeat. Two live connections for one node id with **different** instance nonces
+are a confirmed duplicate (a benign same-process reconnect reuses the *same*
+nonce and is ignored). On confirmation the server tears down the offending
+connections and records the node id in the persisted blocklist (`blocklist.rs`);
+a blocklisted node id is rejected up-front. Because ephemeral ids never recur,
+the persisted client entry is largely an audit record.
+
+**Duplicate server (self-block).** Server identity is persistent, so two servers
+sharing one secret key is a plausible misconfiguration — but only observable when
+both are reachable by the *same client over a shared discovery/relay path*
+(same-id servers on isolated networks that no client can reach both of are not a
+conflict). Each server emits a stable `server_instance_nonce`; a restart yields a
+fresh nonce that never reappears, whereas a client bouncing between two concurrent
+same-id servers sees a previously-seen nonce **reappear** after a different one.
+On that reappearance the client latches an advisory (`duplicate_server_observed`)
+into its next `Hello` — a non-privileged observation, not a command. The server,
+on receiving it from any active client, records its **own** `EndpointId` in the
+blocklist and shuts down; on the next start it refuses to run while its id is
+listed. Detection is best-effort and delayed (it needs client churn to observe
+both instances); prompt, robust detection would require a signaling server. See
+[`duplicate-detection-roadmap.md`](./duplicate-detection-roadmap.md).
+
+The blocklist is a JSON file (default `~/.config/flextunnel/blocklist.json`,
+overridable via `blocklist_file`), written atomically (temp + rename) and loaded
+at startup.
 
 ## Concurrency model
 
@@ -139,9 +196,11 @@ clients get tokens. flextunnel is *not* a multi-tenant service and does not defe
 the server against the clients it admits — a client with a valid token is, by
 design, allowed to reach whatever the server's network can reach. The threats it
 does address are **on-path attackers** (defeated by QUIC/TLS 1.3 encryption and
-per-client tokens) and **accidental misconfiguration** (duplicate-id and similar
-error detection catch, e.g., two clients or servers started with the same
-identity — they are guard rails for operators, not adversary defenses).
+per-client tokens) and **accidental misconfiguration** — the duplicate-id
+detection (see "Duplicate-id detection" above) catches, e.g., two clients or two
+servers started with the same identity, blocking the conflicted id and refusing a
+self-blocked server's restart. These are guard rails for operators, not adversary
+defenses.
 
 - **One shared secret:** a per-client auth token (checked in the handshake), a
   CRC16-checksummed Base64URL credential generated by the CLI. The QUIC ALPN
@@ -163,11 +222,15 @@ identity — they are guard rails for operators, not adversary defenses).
 | `QUIC_KEEP_ALIVE_INTERVAL` | 15s | `transport/mod.rs` |
 | `QUIC_IDLE_TIMEOUT` | 30s | `transport/mod.rs` |
 | `QUIC_INITIAL_MTU` | 1452 | `transport/mod.rs` |
+| `HEARTBEAT_INTERVAL` | 10s | `transport/mod.rs` |
+| `LIVENESS_WINDOW` | 30s | `transport/mod.rs` |
 | `RELAY_CONNECT_TIMEOUT` (`endpoint.online()`) | 10s | `transport/endpoint.rs` |
 | `HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs`, `proxy/server.rs` |
 | `CONNECT_TIMEOUT` (server dial) | 10s | `proxy/server.rs` |
 | reconnect backoff | 1s → 60s + ≤500ms jitter | `proxy/client.rs` |
-| `MAX_HANDSHAKE_SIZE` | 16 KiB | `proxy/signaling.rs` |
+| `MAX_HANDSHAKE_SIZE` | 64 KiB | `proxy/signaling.rs` |
+| `MAX_CONTROL_MSG_SIZE` | 1 KiB | `proxy/signaling.rs` |
+| `PROTOCOL_VERSION` | 3 | `proxy/signaling.rs` |
 | auth token length | 47 chars | `auth.rs` |
 | `ALPN` | `flextunnel/1` | `proxy/signaling.rs` |
 
@@ -182,3 +245,8 @@ the project `README.md` for the user-facing comparison.
 
 HTTP proxy support is planned; the wire protocol and server are unaffected. See
 [`http-proxy-roadmap.md`](./http-proxy-roadmap.md).
+
+Future work on duplicate-id detection — non-ephemeral client ids and their
+pitfalls, the signaling-server path for prompt server-dup detection, and
+client-side dup acknowledgement/flagging — is in
+[`duplicate-detection-roadmap.md`](./duplicate-detection-roadmap.md).

@@ -7,6 +7,9 @@ pub mod signaling;
 pub mod socks5;
 pub mod whitelist;
 
+#[cfg(test)]
+mod e2e_tests;
+
 pub use client::{ClientConfig, ProxyClient, TunnelRoutes};
 pub use server::ProxyServer;
 pub use whitelist::Whitelist;

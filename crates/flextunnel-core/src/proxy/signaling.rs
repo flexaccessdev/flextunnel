@@ -15,11 +15,15 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// flextunnel protocol version.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Maximum auth-handshake message size (64 KiB). The server's whitelist rides
 /// the `HelloResponse`, so this is generous enough for a large operator list.
 pub const MAX_HANDSHAKE_SIZE: usize = 64 * 1024;
+
+/// Maximum size of a control-stream frame ([`ControlMsg`]). Heartbeats are tiny
+/// fixed-shape messages, so a small cap is plenty and bounds a misbehaving peer.
+pub const MAX_CONTROL_MSG_SIZE: usize = 1024;
 
 /// Per-stream request/reply header version byte.
 const STREAM_VERSION: u8 = 1;
@@ -49,6 +53,17 @@ pub const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 pub struct Hello {
     pub version: u16,
     pub auth_token: String,
+    /// Random per-process identity of the *client process*, distinct from its
+    /// (ephemeral) iroh node id. Lets the server tell a benign reconnect of one
+    /// client (same nonce) apart from two distinct processes presenting the same
+    /// node id (different nonces → a duplicate-client bug). See `proxy::server`.
+    pub client_instance_nonce: u128,
+    /// Non-privileged advisory: the client has observed a pattern that indicates
+    /// a *duplicate server id* (two servers sharing this identity — see the
+    /// server-nonce reappearance rule in `proxy::client`). It is an observation,
+    /// not a command; the server decides whether to self-block on it.
+    #[serde(default)]
+    pub duplicate_server_observed: bool,
 }
 
 impl std::fmt::Debug for Hello {
@@ -56,6 +71,8 @@ impl std::fmt::Debug for Hello {
         f.debug_struct("Hello")
             .field("version", &self.version)
             .field("auth_token", &"<redacted>")
+            .field("client_instance_nonce", &self.client_instance_nonce)
+            .field("duplicate_server_observed", &self.duplicate_server_observed)
             .finish()
     }
 }
@@ -72,6 +89,13 @@ pub struct HelloResponse {
     pub accepted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reject_reason: Option<String>,
+    /// Random per-process identity of the *server process*, stable for its
+    /// lifetime. A restarting server emits a fresh random nonce each start (never
+    /// reappearing); a client bouncing between two servers that share this
+    /// identity sees nonces flip-flop. That reappearance is how a client detects
+    /// a duplicate server id (see `proxy::client`). Sent on acceptance and
+    /// rejection alike so the client can always record it.
+    pub server_instance_nonce: u128,
     /// Domain rules the client should tunnel (exact or `*.` wildcard).
     #[serde(default)]
     pub whitelist_domains: Vec<String>,
@@ -81,35 +105,70 @@ pub struct HelloResponse {
 }
 
 impl Hello {
-    pub fn new(auth_token: impl Into<String>) -> Self {
+    pub fn new(auth_token: impl Into<String>, client_instance_nonce: u128) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             auth_token: auth_token.into(),
+            client_instance_nonce,
+            duplicate_server_observed: false,
         }
     }
 }
 
 impl HelloResponse {
     /// Accept the client and push the server's whitelist (the *tunnel set*).
-    pub fn accepted(whitelist_domains: Vec<String>, whitelist_cidrs: Vec<String>) -> Self {
+    pub fn accepted(
+        server_instance_nonce: u128,
+        whitelist_domains: Vec<String>,
+        whitelist_cidrs: Vec<String>,
+    ) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             accepted: true,
             reject_reason: None,
+            server_instance_nonce,
             whitelist_domains,
             whitelist_cidrs,
         }
     }
 
-    pub fn rejected(reason: impl Into<String>) -> Self {
+    pub fn rejected(server_instance_nonce: u128, reason: impl Into<String>) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             accepted: false,
             reject_reason: Some(reason.into()),
+            server_instance_nonce,
             whitelist_domains: Vec::new(),
             whitelist_cidrs: Vec::new(),
         }
     }
+}
+
+/// Control-stream frames exchanged after the auth handshake.
+///
+/// The first bi-stream is not closed after `Hello`/`HelloResponse`; it stays
+/// open as a control channel. The client sends [`ControlMsg::Heartbeat`] every
+/// [`HEARTBEAT_INTERVAL`](crate::transport::HEARTBEAT_INTERVAL) and the server
+/// replies [`ControlMsg::HeartbeatAck`]. This is an app-level liveness signal
+/// (on top of QUIC keep-alive) that also drives the server's duplicate-client
+/// registry. Framed with [`write_message`]/[`read_message`], capped at
+/// [`MAX_CONTROL_MSG_SIZE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ControlMsg {
+    /// Client → server liveness ping, carrying a monotonically increasing seq.
+    Heartbeat { seq: u64 },
+    /// Server → client reply echoing the heartbeat's seq.
+    HeartbeatAck { seq: u64 },
+}
+
+/// Encode a [`ControlMsg`] to JSON bytes.
+pub fn encode_control(msg: &ControlMsg) -> io::Result<Vec<u8>> {
+    serde_json::to_vec(msg).map_err(io::Error::other)
+}
+
+/// Decode a [`ControlMsg`] from JSON bytes.
+pub fn decode_control(data: &[u8]) -> io::Result<ControlMsg> {
+    serde_json::from_slice(data).map_err(io::Error::other)
 }
 
 /// A connection target requested over a per-SOCKS5 stream.
@@ -320,31 +379,50 @@ mod tests {
 
     #[test]
     fn hello_roundtrip() {
-        let hello = Hello::new("token");
+        let hello = Hello::new("token", 0x1234_5678_9abc_def0_1122_3344_5566_7788);
         let encoded = encode_hello(&hello).unwrap();
         let decoded = decode_hello(&encoded).unwrap();
         assert_eq!(decoded.auth_token, "token");
         assert_eq!(decoded.version, PROTOCOL_VERSION);
+        assert_eq!(
+            decoded.client_instance_nonce,
+            0x1234_5678_9abc_def0_1122_3344_5566_7788
+        );
+        assert!(!decoded.duplicate_server_observed);
     }
 
     #[test]
     fn hello_response_roundtrip() {
         let resp = HelloResponse::accepted(
+            42,
             vec!["*.example.com".to_string(), "httpbin.org".to_string()],
             vec!["10.0.0.0/8".to_string()],
         );
         let decoded = decode_hello_response(&encode_hello_response(&resp).unwrap()).unwrap();
         assert!(decoded.accepted);
         assert_eq!(decoded.version, PROTOCOL_VERSION);
+        assert_eq!(decoded.server_instance_nonce, 42);
         assert_eq!(decoded.whitelist_domains, vec!["*.example.com", "httpbin.org"]);
         assert_eq!(decoded.whitelist_cidrs, vec!["10.0.0.0/8"]);
 
-        // A rejection carries no whitelist.
-        let rej = HelloResponse::rejected("nope");
+        // A rejection carries no whitelist but still carries the server nonce.
+        let rej = HelloResponse::rejected(7, "nope");
         let decoded = decode_hello_response(&encode_hello_response(&rej).unwrap()).unwrap();
         assert!(!decoded.accepted);
         assert_eq!(decoded.reject_reason.as_deref(), Some("nope"));
+        assert_eq!(decoded.server_instance_nonce, 7);
         assert!(decoded.whitelist_domains.is_empty());
         assert!(decoded.whitelist_cidrs.is_empty());
+    }
+
+    #[test]
+    fn control_msg_roundtrip() {
+        for msg in [
+            ControlMsg::Heartbeat { seq: 1 },
+            ControlMsg::HeartbeatAck { seq: u64::MAX },
+        ] {
+            let decoded = decode_control(&encode_control(&msg).unwrap()).unwrap();
+            assert_eq!(decoded, msg);
+        }
     }
 }

@@ -10,6 +10,7 @@
 //! (`flextunnel-cli`) and by the iOS C FFI staticlib (`flextunnel-ffi`).
 
 pub mod auth;
+pub mod blocklist;
 pub mod config;
 pub mod error;
 pub mod proxy;

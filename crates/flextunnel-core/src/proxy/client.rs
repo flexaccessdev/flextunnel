@@ -2,14 +2,16 @@
 //! a single iroh QUIC connection to the server, one bi-stream per CONNECT.
 
 use crate::error::{ProxyError, ProxyResult};
-use crate::proxy::signaling::{self, Hello};
+use crate::proxy::signaling::{self, ControlMsg, Hello};
 use crate::proxy::{dial, socks5, Whitelist};
+use crate::transport::{HEARTBEAT_INTERVAL, LIVENESS_WINDOW};
 use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
 use rand::Rng;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -71,9 +73,33 @@ pub struct TunnelRoutes {
     pub cidrs: Vec<String>,
 }
 
+/// Client-side history of server instance nonces observed for the configured
+/// server id, used to detect a *duplicate server*.
+///
+/// A single server that merely restarts emits a strictly-growing sequence of
+/// fresh random nonces (a previous one never reappears, 2⁻¹²⁸). A client
+/// bouncing between two servers that share one identity sees a previously-seen
+/// nonce **reappear** after a different one — that flip-flop is the signal.
+#[derive(Default)]
+struct ServerNonceTracker {
+    /// Distinct nonces seen, in first-seen order.
+    history: Vec<u128>,
+    /// The most recently observed nonce.
+    last: Option<u128>,
+}
+
 pub struct ProxyClient {
     config: ClientConfig,
     routes: Arc<Mutex<TunnelRoutes>>,
+    /// Random per-process identity of this client, sent in every `Hello` so the
+    /// server can tell a benign reconnect (same nonce) from two distinct client
+    /// processes sharing a node id (different nonces → a duplicate-client bug).
+    instance_nonce: u128,
+    /// Observed server-nonce history for duplicate-server detection.
+    nonce_tracker: Mutex<ServerNonceTracker>,
+    /// Latches once a duplicate server has been observed; thereafter every
+    /// `Hello` carries the advisory so the server can self-block.
+    duplicate_server: AtomicBool,
 }
 
 impl ProxyClient {
@@ -81,7 +107,46 @@ impl ProxyClient {
         Self {
             config,
             routes: Arc::new(Mutex::new(TunnelRoutes::default())),
+            instance_nonce: rand::rng().random(),
+            nonce_tracker: Mutex::new(ServerNonceTracker::default()),
+            duplicate_server: AtomicBool::new(false),
         }
+    }
+
+    /// Record a server instance nonce observed in a `HelloResponse` and apply the
+    /// reappearance rule. Latches [`Self::duplicate_server`] on a confirmed
+    /// duplicate; a plain change (restart or first sight of a second instance) is
+    /// only logged. Returns `true` only when this call *newly* latched the flag,
+    /// so the caller can force an immediate reconnect to get the advisory out.
+    fn observe_server_nonce(&self, nonce: u128) -> bool {
+        let mut t = self.nonce_tracker.lock().expect("nonce tracker lock");
+        let mut newly_flagged = false;
+        match t.last {
+            Some(last) if last == nonce => return false, // same server as last time
+            Some(_) => {
+                if t.history.contains(&nonce) {
+                    // A previously-seen nonce reappeared after a different one:
+                    // two concurrent servers share this identity.
+                    newly_flagged = !self.duplicate_server.swap(true, Ordering::Relaxed);
+                    if newly_flagged {
+                        log::error!(
+                            "Duplicate server id detected: server instance nonce {nonce} \
+                             reappeared after a different one — two servers appear to share \
+                             this identity. Advising the server to self-block."
+                        );
+                    }
+                } else {
+                    log::warn!(
+                        "Server identity nonce changed ({nonce}) — a restart, or possibly \
+                         a second server sharing this id; watching for a reappearance."
+                    );
+                    t.history.push(nonce);
+                }
+            }
+            None => t.history.push(nonce), // first observation this process
+        }
+        t.last = Some(nonce);
+        newly_flagged
     }
 
     /// Shared handle to the live tunnel set, for callers (the FFI) that want to
@@ -131,8 +196,10 @@ impl ProxyClient {
             // Until (re)authenticated, nothing is being forwarded.
             self.set_connected(false);
             // Establish (connect + auth). The handshake also learns the server's
-            // whitelist, which drives split-tunneling for this connection.
-            let (connection, whitelist) = match self.establish(endpoint).await {
+            // whitelist (drives split-tunneling) and returns the control-stream
+            // halves kept open for heartbeats.
+            let (connection, whitelist, ctrl_send, ctrl_recv) = match self.establish(endpoint).await
+            {
                 Ok(established) => {
                     ever_connected = true;
                     attempt = 0; // reset backoff on a successful connection
@@ -148,7 +215,9 @@ impl ProxyClient {
             };
 
             // Serve until the connection drops, then reconnect (or exit).
-            let served = self.serve(&connection, &whitelist, &listener).await;
+            let served = self
+                .serve(&connection, &whitelist, &listener, ctrl_send, ctrl_recv)
+                .await;
             // The connection is no longer live; clear the FFI-visible flag now so
             // it never lingers as connected through a backoff or a fatal exit.
             self.set_connected(false);
@@ -198,22 +267,44 @@ impl ProxyClient {
     }
 
     /// Connect to the server and complete the auth handshake, returning the
-    /// connection together with the whitelist the server pushed.
-    async fn establish(&self, endpoint: &Endpoint) -> ProxyResult<(Connection, Arc<Whitelist>)> {
+    /// connection, the whitelist the server pushed, and the control-stream halves
+    /// (kept open for heartbeats).
+    async fn establish(
+        &self,
+        endpoint: &Endpoint,
+    ) -> ProxyResult<(Connection, Arc<Whitelist>, SendStream, RecvStream)> {
         let endpoint_addr = self.resolve_server_addr()?;
         let connection = endpoint
             .connect(endpoint_addr, crate::transport::ALPN)
             .await
             .map_err(|e| ProxyError::Signaling(format!("Failed to connect to server: {e}")))?;
         log::info!("Connected to server, authenticating...");
-        let whitelist = self.handshake(&connection).await?;
+        let (whitelist, send, recv) = self.handshake(&connection).await?;
         log::info!("Authenticated.");
-        Ok((connection, Arc::new(whitelist)))
+        Ok((connection, Arc::new(whitelist), send, recv))
+    }
+
+    /// Accept local SOCKS5 connections and run the heartbeat concurrently, until
+    /// the QUIC connection drops or heartbeat liveness is lost.
+    async fn serve(
+        &self,
+        connection: &Connection,
+        whitelist: &Arc<Whitelist>,
+        listener: &TcpListener,
+        ctrl_send: SendStream,
+        ctrl_recv: RecvStream,
+    ) -> ProxyResult<()> {
+        let accept = self.accept_local(connection, whitelist, listener);
+        let heartbeat = client_heartbeat_loop(ctrl_send, ctrl_recv);
+        tokio::select! {
+            r = accept => r,
+            r = heartbeat => r,
+        }
     }
 
     /// Accept local SOCKS5 connections and tunnel each over its own bi-stream,
     /// until the QUIC connection drops.
-    async fn serve(
+    async fn accept_local(
         &self,
         connection: &Connection,
         whitelist: &Arc<Whitelist>,
@@ -263,16 +354,21 @@ impl ProxyClient {
     }
 
     /// Perform the connection-level auth handshake on the first bi-stream,
-    /// returning the whitelist (the tunnel set) the server pushed in its
-    /// response. The client uses it to split-tunnel; it configures no list of
-    /// its own (the server is the single source of truth).
-    async fn handshake(&self, connection: &Connection) -> ProxyResult<Whitelist> {
+    /// returning the whitelist (the tunnel set) the server pushed plus the
+    /// control-stream halves — the stream is **not** closed; it stays open as the
+    /// heartbeat channel. The client uses the whitelist to split-tunnel; it
+    /// configures no list of its own (the server is the single source of truth).
+    async fn handshake(
+        &self,
+        connection: &Connection,
+    ) -> ProxyResult<(Whitelist, SendStream, RecvStream)> {
         let (mut send, mut recv) = connection
             .open_bi()
             .await
             .map_err(|e| ProxyError::Signaling(format!("Failed to open handshake stream: {e}")))?;
 
-        let hello = Hello::new(self.config.auth_token.clone());
+        let mut hello = Hello::new(self.config.auth_token.clone(), self.instance_nonce);
+        hello.duplicate_server_observed = self.duplicate_server.load(Ordering::Relaxed);
         signaling::write_message(&mut send, &signaling::encode_hello(&hello)?).await?;
         send.flush().await?;
 
@@ -285,11 +381,26 @@ impl ProxyClient {
             ProxyError::Signaling("timed out waiting for server handshake response".into())
         })??;
         let response = signaling::decode_hello_response(&data)?;
-        let _ = send.finish();
+
+        // Record the server's instance nonce (drives duplicate-server detection)
+        // before the accept/reject branch so a rejection still updates history.
+        let newly_flagged_duplicate = self.observe_server_nonce(response.server_instance_nonce);
 
         if !response.accepted {
             let reason = response.reject_reason.unwrap_or_else(|| "unknown".to_string());
             return Err(ProxyError::AuthenticationFailed(reason));
+        }
+
+        // The `Hello` already sent on this handshake could not carry the advisory
+        // (the duplicate was only detected from this very response). Drop the
+        // connection with a recoverable error so we reconnect immediately and the
+        // next `Hello` advises the server to self-block — rather than waiting for a
+        // natural disconnect that may never come while this connection is healthy.
+        if newly_flagged_duplicate {
+            return Err(ProxyError::ConnectionLost(
+                "duplicate server id detected; reconnecting to advise the server to self-block"
+                    .into(),
+            ));
         }
 
         // Build the tunnel set from the server's pushed list. The server
@@ -313,7 +424,48 @@ impl ProxyClient {
             routes.domains = response.whitelist_domains.clone();
             routes.cidrs = response.whitelist_cidrs.clone();
         }
-        Ok(whitelist)
+        Ok((whitelist, send, recv))
+    }
+}
+
+/// Client-side heartbeat loop over the retained control stream: send a
+/// `Heartbeat` every [`HEARTBEAT_INTERVAL`] and await its `HeartbeatAck` within
+/// [`LIVENESS_WINDOW`]. A missing ack (or stream error) returns
+/// [`ProxyError::ConnectionLost`] (recoverable), which drives the reconnect loop.
+async fn client_heartbeat_loop(
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> ProxyResult<()> {
+    let mut seq: u64 = 0;
+    loop {
+        tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+        seq = seq.wrapping_add(1);
+        signaling::write_message(
+            &mut send,
+            &signaling::encode_control(&ControlMsg::Heartbeat { seq })?,
+        )
+        .await?;
+        send.flush().await?;
+
+        let data = tokio::time::timeout(
+            LIVENESS_WINDOW,
+            signaling::read_message(&mut recv, signaling::MAX_CONTROL_MSG_SIZE),
+        )
+        .await
+        .map_err(|_| ProxyError::ConnectionLost("heartbeat ack timed out".into()))?
+        .map_err(|e| ProxyError::ConnectionLost(format!("control stream closed: {e}")))?;
+        // The liveness probe is only satisfied by the ack for *this* heartbeat.
+        // A wrong-seq ack or any other control frame means the channel is out of
+        // sync — treat it as a lost connection so we reconnect rather than count a
+        // stale/unexpected message as liveness.
+        match signaling::decode_control(&data)? {
+            ControlMsg::HeartbeatAck { seq: ack } if ack == seq => {}
+            other => {
+                return Err(ProxyError::ConnectionLost(format!(
+                    "expected HeartbeatAck({seq}), got {other:?}"
+                )));
+            }
+        }
     }
 }
 
@@ -404,4 +556,46 @@ async fn open_tunnel(
     send.flush().await?;
     let rep = signaling::read_reply(&mut recv).await?;
     Ok((send, recv, rep))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_client() -> ProxyClient {
+        ProxyClient::new(ClientConfig {
+            server_node_id: "server".to_string(),
+            auth_token: "token".to_string(),
+            socks_listen: "127.0.0.1:0".parse().unwrap(),
+            relay_urls: Vec::new(),
+            auto_reconnect: true,
+            max_reconnect_attempts: None,
+        })
+    }
+
+    #[test]
+    fn restart_sequence_not_flagged_as_duplicate() {
+        let c = test_client();
+        // A steady server, then a restart to fresh nonces (never reappearing).
+        // No observation should ever newly-flag a duplicate.
+        for n in [10u128, 10, 20, 30, 40] {
+            assert!(!c.observe_server_nonce(n));
+        }
+        assert!(!c.duplicate_server.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn reappearing_nonce_flags_duplicate() {
+        let c = test_client();
+        // A, B, then A again (flip-flop) → two concurrent servers share the id.
+        assert!(!c.observe_server_nonce(1));
+        assert!(!c.observe_server_nonce(2));
+        assert!(!c.duplicate_server.load(Ordering::Relaxed));
+        // The reappearance newly latches the flag → caller must reconnect.
+        assert!(c.observe_server_nonce(1));
+        assert!(c.duplicate_server.load(Ordering::Relaxed));
+        // Already latched: a further reappearance is not a *new* flag, so it must
+        // not force another reconnect abort.
+        assert!(!c.observe_server_nonce(2));
+    }
 }

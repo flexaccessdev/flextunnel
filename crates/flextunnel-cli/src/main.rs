@@ -12,8 +12,11 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
+use flextunnel_core::blocklist::BlockList;
 use flextunnel_core::proxy::{ClientConfig, ProxyClient, ProxyServer, Whitelist};
-use flextunnel_core::transport::endpoint::{create_client_endpoint, create_server_endpoint};
+use flextunnel_core::transport::endpoint::{
+    create_client_endpoint, create_server_endpoint, secret_to_endpoint_id,
+};
 use flextunnel_core::{auth, config, secret};
 
 #[derive(Parser)]
@@ -50,6 +53,10 @@ enum Command {
         /// Custom DNS server URL for peer discovery ("none" to disable).
         #[arg(long)]
         dns_server: Option<String>,
+        /// Path to the duplicate-id blocklist file (JSON). Defaults to
+        /// ~/.config/flextunnel/blocklist.json.
+        #[arg(long)]
+        blocklist_file: Option<PathBuf>,
     },
     /// Start the proxy client (local SOCKS5 listener).
     Client {
@@ -177,6 +184,7 @@ async fn run_async(command: Command) -> Result<()> {
             auth_tokens_file,
             relay_urls,
             dns_server,
+            blocklist_file,
         } => {
             log_version();
             let cli = config::ServerConfig {
@@ -189,6 +197,7 @@ async fn run_async(command: Command) -> Result<()> {
                 host_aliases: None, // config-file only; no CLI flag
                 whitelist_domains: None, // config-file only; no CLI flag
                 whitelist_cidrs: None,   // config-file only; no CLI flag
+                blocklist_file,
             };
             let file = config::load_server_config(config_path.as_deref(), default_config)?;
             run_server(config::resolve_server(cli, file)).await
@@ -248,6 +257,21 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
     log::info!("Loaded {} authentication token(s)", valid_tokens.len());
 
     let secret_key = secret::resolve_secret_key(r.secret.as_deref(), r.secret_file.as_deref())?;
+    let own_id = secret_to_endpoint_id(&secret_key);
+
+    // Load the duplicate-id blocklist and refuse to start if this server's own id
+    // is recorded as a conflict (duplicate-server self-block guard). Done before
+    // creating the endpoint so a self-blocked identity never binds.
+    let blocklist = BlockList::load(r.blocklist_file.clone())
+        .with_context(|| format!("Failed to load blocklist {}", r.blocklist_file.display()))?;
+    if blocklist.is_server_conflicted(&own_id.to_string()) {
+        anyhow::bail!(
+            "Refusing to start: server id {own_id} is recorded as a duplicate-id conflict in \
+             {}.\nAnother server was detected sharing this identity. Stop the other server, \
+             then remove the entry from the blocklist to start again.",
+            r.blocklist_file.display()
+        );
+    }
 
     // Parse the whitelist before creating the endpoint: a parse failure here must
     // not bypass the endpoint.close() cleanup below (an ungraceful drop panics
@@ -276,11 +300,13 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
         );
     }
     let server = ProxyServer::new(
+        own_id,
         valid_tokens,
         r.host_aliases,
         whitelist,
         r.whitelist_domains,
         r.whitelist_cidrs,
+        blocklist,
     );
     let run = async {
         server

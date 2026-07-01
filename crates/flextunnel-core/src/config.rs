@@ -48,6 +48,9 @@ pub struct ServerConfig {
     /// CIDRs / bare IPs allowed to tunnel (matched against IP targets). See
     /// `whitelist_domains`.
     pub whitelist_cidrs: Option<Vec<String>>,
+    /// Path to the persistent duplicate-id blocklist (JSON). Defaults to
+    /// `~/.config/flextunnel/blocklist.json` when unset. See [`crate::blocklist`].
+    pub blocklist_file: Option<PathBuf>,
 }
 
 /// Client config file schema. Every field is optional; CLI flags override these.
@@ -85,6 +88,8 @@ pub struct ResolvedServer {
     /// Raw whitelist entries (parsed into a `Whitelist` at startup).
     pub whitelist_domains: Vec<String>,
     pub whitelist_cidrs: Vec<String>,
+    /// Resolved path to the duplicate-id blocklist file (default applied).
+    pub blocklist_file: PathBuf,
 }
 
 /// Fully-resolved client settings (CLI > file > default), paths tilde-expanded.
@@ -212,6 +217,14 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Resolved
             .or(file.whitelist_domains)
             .unwrap_or_default(),
         whitelist_cidrs: cli.whitelist_cidrs.or(file.whitelist_cidrs).unwrap_or_default(),
+        // CLI > file > default (~/.config/flextunnel/blocklist.json). Fall back to
+        // a cwd-relative name only if the home dir can't be determined.
+        blocklist_file: cli
+            .blocklist_file
+            .or(file.blocklist_file)
+            .map(|p| expand_tilde(&p))
+            .or_else(crate::blocklist::default_blocklist_path)
+            .unwrap_or_else(|| PathBuf::from("blocklist.json")),
     }
 }
 
