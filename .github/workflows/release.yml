@@ -153,8 +153,8 @@ jobs:
       - name: Build iOS xcframework + header
         # build-ios.sh installs the iOS Rust targets if missing, builds the
         # device + Simulator slices, and stages the .xcframework and the C header
-        # into dist/ios. The sibling-vendor sync inside the script is a no-op here
-        # (../flextunnel-ios is not checked out).
+        # into dist/ios. That zip becomes the release asset the iOS project's
+        # scripts/fetch-vendor.sh downloads by default.
         run: ./build-ios.sh release
 
       - name: Package xcframework + header

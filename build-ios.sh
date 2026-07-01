@@ -2,8 +2,14 @@
 #
 # Build libflextunnel for iOS — both the device (aarch64-apple-ios) and the
 # Simulator (aarch64-apple-ios-sim) slices — and bundle them into
-# libflextunnel.xcframework, staged with the C header for the separate Xcode
-# project (../flextunnel-ios).
+# libflextunnel.xcframework in dist/ios, staged with the C header. This is the
+# canonical local build output; the CI release workflow zips it into the
+# libflextunnel-ios.xcframework.zip asset. The sibling Xcode project
+# (../flextunnel-ios) links it via its own Swift package
+# (Packages/Flextunnel/Package.swift) — by default a pinned release download, or
+# this dist/ios build (reached through a committed symlink) when
+# FLEXTUNNEL_LOCAL_XCFRAMEWORK is set (FFI dev). This script only produces
+# dist/ios; it does not write into ../flextunnel-ios.
 #
 # An XCFramework is required (not a lipo "fat" .a): the device and Simulator
 # slices are both arm64 on Apple Silicon, and lipo refuses to combine two slices
@@ -59,17 +65,10 @@ xcodebuild -create-xcframework \
 
 echo "Staged: $XCFRAMEWORK"
 echo "        $DIST/flextunnel.h"
-
-# If the sibling Xcode project exists, sync the artifacts into its vendor dir so
-# a rebuild there picks them up with no manual copy.
-SIBLING_VENDOR="$SCRIPT_DIR/../flextunnel-ios/vendor"
-if [ -d "$SIBLING_VENDOR" ]; then
-  rm -rf "$SIBLING_VENDOR/libflextunnel.xcframework"
-  cp -R "$XCFRAMEWORK" "$SIBLING_VENDOR/libflextunnel.xcframework"
-  cp "$DIST/flextunnel.h" "$SIBLING_VENDOR/flextunnel.h"
-  # Drop the obsolete single-arch lib from earlier device-only builds.
-  rm -f "$SIBLING_VENDOR/libflextunnel.a"
-  echo "Synced into:  $SIBLING_VENDOR/"
-fi
-
+echo
+echo "For local iOS FFI dev, build the app against this xcframework with:"
+echo "    cd ../flextunnel-ios"
+echo "    FLEXTUNNEL_LOCAL_XCFRAMEWORK=1 xcodegen generate"
+echo "    FLEXTUNNEL_LOCAL_XCFRAMEWORK=1 xcodebuild -project Flextunnel.xcodeproj \\"
+echo "        -scheme FlextunnelApp -destination 'platform=iOS Simulator,name=iPhone 17,OS=26.2' build"
 echo "Done."
