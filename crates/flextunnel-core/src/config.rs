@@ -214,6 +214,7 @@ fn agent_global_config_path(file_name: &str) -> Option<PathBuf> {
     }
     #[cfg(not(any(unix, target_os = "windows")))]
     {
+        let _ = file_name;
         None
     }
 }
