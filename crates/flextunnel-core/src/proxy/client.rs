@@ -706,7 +706,16 @@ async fn handle_local_conn<P: LocalProto>(
     // — the origin's response, relayed by the splice, is the app's reply.
     match &upstream_preamble {
         None => proto.reply(&mut tcp, rep).await?,
-        Some(head) => send.write_all(head).await?,
+        Some(head) => {
+            // A forward hasn't answered the local app yet (its reply is the
+            // origin's response, relayed by the splice). If writing the head
+            // upstream fails, send a best-effort HTTP failure instead of
+            // dropping the connection silently.
+            if let Err(e) = send.write_all(head).await {
+                let _ = proto.reply(&mut tcp, signaling::REP_GENERAL_FAILURE).await;
+                return Err(e.into());
+            }
+        }
     }
 
     let mut iroh = tokio::io::join(recv, send);
