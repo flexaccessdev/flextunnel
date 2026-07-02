@@ -17,7 +17,9 @@ param(
     [string]$BinaryPath = "$env:ProgramFiles\flextunnel\flextunnel-agent.exe",
     [string]$ConfigPath,
     [string[]]$AgentArgs = @(),
-    [string]$LogLevel = "info",
+    # Matches flextunnel's own built-in default (see app::DEFAULT_LOG_FILTER) —
+    # a bare "info" would override it and flood the log with iroh/tracing spam.
+    [string]$LogLevel = "info,iroh=warn,tracing=warn",
     [string]$DataDir = "$env:ProgramData\flextunnel",
     [switch]$Uninstall
 )
