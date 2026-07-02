@@ -74,6 +74,10 @@ enum Command {
         /// Local address for the SOCKS5 listener (default 127.0.0.1:1080).
         #[arg(long)]
         socks_listen: Option<SocketAddr>,
+        /// Also run an HTTP proxy (CONNECT) listener on this address, e.g.
+        /// 127.0.0.1:8081. Disabled unless set; the SOCKS5 listener stays on.
+        #[arg(long)]
+        http_listen: Option<SocketAddr>,
         /// EndpointId of the server to connect to.
         #[arg(short = 'n', long)]
         server_node_id: Option<String>,
@@ -200,6 +204,7 @@ async fn run_async(command: Command) -> Result<()> {
             config: config_path,
             default_config,
             socks_listen,
+            http_listen,
             server_node_id,
             auth_token,
             auth_token_file,
@@ -223,6 +228,7 @@ async fn run_async(command: Command) -> Result<()> {
             let cli = config::ClientConfig {
                 server_node_id,
                 socks_listen,
+                http_listen,
                 auth_token,
                 auth_token_file,
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
@@ -403,6 +409,7 @@ async fn run_client(r: config::ResolvedClient) -> Result<()> {
         server_node_id,
         auth_token: token,
         socks_listen: r.socks_listen,
+        http_listen: r.http_listen,
         relay_urls: r.relay_urls,
         auto_reconnect: r.auto_reconnect,
         max_reconnect_attempts: r.max_reconnect_attempts,

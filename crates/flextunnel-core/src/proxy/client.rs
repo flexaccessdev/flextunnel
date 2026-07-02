@@ -2,13 +2,15 @@
 //! a single iroh QUIC connection to the server, one bi-stream per CONNECT.
 
 use crate::error::{ProxyError, ProxyResult};
-use crate::proxy::signaling::{self, ControlMsg, Hello};
-use crate::proxy::{dial, socks5, RoutedSet};
+use crate::proxy::signaling::{self, ControlMsg, Hello, Target};
+use crate::proxy::{dial, http, socks5, RoutedSet};
 use crate::transport::{HEARTBEAT_INTERVAL, LIVENESS_WINDOW};
 use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
 use rand::Rng;
+use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,6 +58,9 @@ pub struct ClientConfig {
     pub auth_token: String,
     /// Local address the SOCKS5 listener binds to.
     pub socks_listen: SocketAddr,
+    /// Local address for the optional HTTP proxy (CONNECT) listener. `None`
+    /// leaves the HTTP front-end disabled; the SOCKS5 listener is always on.
+    pub http_listen: Option<SocketAddr>,
     /// Relay URL hints (optional).
     pub relay_urls: Vec<String>,
     /// Reconnect with backoff on a transient failure instead of exiting.
@@ -176,51 +181,83 @@ impl ProxyClient {
         }
     }
 
-    /// Bind the local SOCKS5 listener once, then connect to the server and serve
-    /// it. Reconnect policy (matching ezvpn): the **first** connection must
-    /// succeed — if it fails, exit immediately (a bad node id, wrong relay, or
-    /// down server is not worth retrying blindly). Once connected at least once,
-    /// transient drops are retried with exponential backoff, indefinitely
-    /// (unless `--max-reconnect-attempts` caps it or `--no-auto-reconnect` is
-    /// set). The listener stays bound across reconnects so local apps queue
-    /// rather than see connection-refused during the gap.
+    /// Bind the local SOCKS5 listener (and the optional HTTP listener) once, then
+    /// connect to the server and serve them. Reconnect policy (matching ezvpn):
+    /// the **first** connection must succeed — if it fails, exit immediately (a
+    /// bad node id, wrong relay, or down server is not worth retrying blindly).
+    /// Once connected at least once, transient drops are retried with exponential
+    /// backoff, indefinitely (unless `--max-reconnect-attempts` caps it or
+    /// `--no-auto-reconnect` is set). The listeners stay bound across reconnects
+    /// so local apps queue rather than see connection-refused during the gap.
     pub async fn run(&self, endpoint: &Endpoint) -> ProxyResult<()> {
-        let listener = TcpListener::bind(self.config.socks_listen).await?;
-        self.run_with_listener(endpoint, listener).await
+        let socks = TcpListener::bind(self.config.socks_listen).await?;
+        let http = match self.config.http_listen {
+            Some(addr) => Some(TcpListener::bind(addr).await?),
+            None => None,
+        };
+        self.run_with_listeners(endpoint, socks, http).await
     }
 
-    /// Serve on an already-bound listener (see [`run`](Self::run) for the
+    /// Serve on an already-bound SOCKS5 listener (see [`run`](Self::run) for the
     /// reconnect policy). Callers that need the actual bound address — e.g. the
     /// FFI binding to an ephemeral `127.0.0.1:0` and reporting the chosen port —
     /// bind the [`TcpListener`] themselves, read `local_addr()`, then hand it
     /// here. `run` is the thin convenience wrapper that binds `socks_listen`.
+    /// This path never enables the HTTP front-end.
     pub async fn run_with_listener(
         &self,
         endpoint: &Endpoint,
         listener: TcpListener,
     ) -> ProxyResult<()> {
+        self.run_with_listeners(endpoint, listener, None).await
+    }
+
+    /// Serve the SOCKS5 listener and, when present, the HTTP CONNECT listener,
+    /// both multiplexed over the same reconnecting server connection.
+    async fn run_with_listeners(
+        &self,
+        endpoint: &Endpoint,
+        socks_listener: TcpListener,
+        http_listener: Option<TcpListener>,
+    ) -> ProxyResult<()> {
         log::info!(
             "SOCKS5 proxy listening on {} (TCP CONNECT only)",
-            listener.local_addr()?
+            socks_listener.local_addr()?
         );
+        if let Some(l) = &http_listener {
+            log::info!(
+                "HTTP proxy listening on {} (CONNECT tunneling only)",
+                l.local_addr()?
+            );
+        }
 
-        // Shared state between the always-on accept loop and the connection
+        // Shared state between the always-on accept loops and the connection
         // manager: the current live connection (None during a drop/backoff) and
         // the route policy (None until the first handshake learns it). Keeping the
-        // accept loop independent of the connection is what lets off-list targets
+        // accept loops independent of the connection is what lets off-list targets
         // keep connecting directly while the tunnel is down — only on-list targets
         // fail until it recovers. The policy starts None so the client fails closed
         // until it is known.
         let current: SharedConn = Arc::new(Mutex::new(None));
         let routed_set: SharedRoutedSet = Arc::new(Mutex::new(None));
 
-        // One task, two concurrent futures. When the manager returns (a fatal
-        // first-connect failure or a clean stop) the accept loop is dropped with
+        // The HTTP branch is inert (never resolves) when no HTTP listener is
+        // bound, so the `select!` shape is the same either way.
+        let http_accept = async {
+            match &http_listener {
+                Some(l) => accept_loop(l, &current, &routed_set, HttpProto).await,
+                None => std::future::pending::<ProxyResult<()>>().await,
+            }
+        };
+
+        // One task, N concurrent futures. When the manager returns (a fatal
+        // first-connect failure or a clean stop) the accept loops are dropped with
         // it, so `flextunnel_stop`'s `task.abort()` tears everything down — no
         // orphaned accept task.
         tokio::select! {
             r = self.manage_connection(endpoint, &current, &routed_set) => r,
-            r = accept_loop(&listener, &current, &routed_set) => r,
+            r = accept_loop(&socks_listener, &current, &routed_set, Socks5Proto) => r,
+            r = http_accept => r,
         }
     }
 
@@ -502,19 +539,72 @@ pub(crate) async fn client_heartbeat_loop(
 /// QUIC connection, so off-list targets keep connecting directly while the tunnel
 /// is down. Until the first handshake learns the route policy the client fails
 /// closed and refuses every connection. Returns only on a listener error.
-async fn accept_loop(
+/// A local front-end protocol (SOCKS5 or HTTP CONNECT). The two differ only in
+/// how they parse a local request into a [`Target`] and how they answer with a
+/// server reply code; everything after that — the route policy, split-tunnel
+/// dial, tunnel open, and byte pipe — is shared (see [`handle_local_conn`]).
+///
+/// Methods return `impl Future + Send` (not bare `async fn`) so the futures are
+/// `Send`, which [`accept_loop`] needs to `tokio::spawn` a generic handler.
+trait LocalProto: Copy + Send + Sync + 'static {
+    /// Parse the local handshake into a [`Target`]. Any error the caller can't
+    /// yet answer with a reply code (a bad request, an unsupported method) must
+    /// be written to `tcp` here before returning `Err`, mirroring how
+    /// [`socks5::read_connect_request`] writes its own error replies.
+    fn read_target(&self, tcp: &mut TcpStream) -> impl Future<Output = Result<Target>> + Send;
+
+    /// Answer the local app with the response corresponding to server reply
+    /// code `rep` ([`signaling::REP_SUCCESS`] et al.).
+    fn reply(&self, tcp: &mut TcpStream, rep: u8) -> impl Future<Output = io::Result<()>> + Send;
+}
+
+/// SOCKS5 front-end (RFC 1928): method negotiation + CONNECT parsing, 10-byte
+/// reply frames.
+#[derive(Clone, Copy)]
+struct Socks5Proto;
+
+impl LocalProto for Socks5Proto {
+    async fn read_target(&self, tcp: &mut TcpStream) -> Result<Target> {
+        socks5::negotiate_method(tcp).await?;
+        Ok(socks5::read_connect_request(tcp).await?)
+    }
+
+    async fn reply(&self, tcp: &mut TcpStream, rep: u8) -> io::Result<()> {
+        socks5::write_reply(tcp, rep).await
+    }
+}
+
+/// HTTP proxy front-end: `CONNECT host:port` tunneling, HTTP status-line replies.
+#[derive(Clone, Copy)]
+struct HttpProto;
+
+impl LocalProto for HttpProto {
+    async fn read_target(&self, tcp: &mut TcpStream) -> Result<Target> {
+        Ok(http::read_connect_request(tcp).await?)
+    }
+
+    async fn reply(&self, tcp: &mut TcpStream, rep: u8) -> io::Result<()> {
+        http::write_reply(tcp, rep).await
+    }
+}
+
+/// Accept loop for a local front-end listener. Each accepted connection is
+/// handled by [`handle_local_conn`] parameterized on `proto`. Shared verbatim by
+/// the SOCKS5 and HTTP listeners. Returns only on a listener error.
+async fn accept_loop<P: LocalProto>(
     listener: &TcpListener,
     current: &SharedConn,
     routed_set_shared: &SharedRoutedSet,
+    proto: P,
 ) -> ProxyResult<()> {
     loop {
         let (tcp, peer) = listener.accept().await?;
-        log::debug!("SOCKS5 connection from {peer}");
+        log::debug!("proxy connection from {peer}");
         let current = current.clone();
         let routed_set_shared = routed_set_shared.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_local_conn(tcp, current, routed_set_shared).await {
-                log::debug!("SOCKS5 connection from {peer} ended: {e}");
+            if let Err(e) = handle_local_conn(proto, tcp, current, routed_set_shared).await {
+                log::debug!("proxy connection from {peer} ended: {e}");
             }
         });
     }
@@ -525,28 +615,26 @@ async fn accept_loop(
 /// known (fail closed), otherwise an on-list target is tunneled to the server (or
 /// answered with a network-unreachable reply if the tunnel is down) and an
 /// off-list target is dialed directly from this device.
-async fn handle_local_conn(
+async fn handle_local_conn<P: LocalProto>(
+    proto: P,
     mut tcp: TcpStream,
     current: SharedConn,
     routed_set_shared: SharedRoutedSet,
 ) -> Result<()> {
-    // Bound the local SOCKS5 handshake so a peer that connects and sends nothing
-    // can't pin this task and its socket indefinitely.
-    let target = tokio::time::timeout(LOCAL_HANDSHAKE_TIMEOUT, async {
-        socks5::negotiate_method(&mut tcp).await?;
-        socks5::read_connect_request(&mut tcp).await
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("timed out during local SOCKS5 handshake"))??;
+    // Bound the local handshake so a peer that connects and sends nothing can't
+    // pin this task and its socket indefinitely.
+    let target = tokio::time::timeout(LOCAL_HANDSHAKE_TIMEOUT, proto.read_target(&mut tcp))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out during local proxy handshake"))??;
 
     // Fail closed until the route policy is known: before the first handshake
     // learns the tunnel set we don't route anything, so no traffic leaks out
     // (directly or tunneled) before we know how it should be routed. Answer with a
-    // SOCKS5 general-failure reply rather than leaving the app hanging.
+    // general-failure reply rather than leaving the app hanging.
     let policy = { routed_set_shared.lock().expect("routed-set lock").clone() };
     let Some(routed_set) = policy else {
         log::debug!("Route policy not yet known; refusing: {target:?}");
-        let _ = socks5::write_reply(&mut tcp, signaling::REP_GENERAL_FAILURE).await;
+        let _ = proto.reply(&mut tcp, signaling::REP_GENERAL_FAILURE).await;
         return Ok(());
     };
 
@@ -554,7 +642,7 @@ async fn handle_local_conn(
     // device's own network (its DNS, its IP) — works even when the tunnel is down.
     if !routed_set.allows(&target) {
         log::debug!("Direct (off tunnel set): {target:?}");
-        return direct_connect(tcp, &target).await;
+        return direct_connect(proto, tcp, &target).await;
     }
 
     // On-list: needs a live tunnel. If the connection is down (a drop/backoff),
@@ -563,13 +651,13 @@ async fn handle_local_conn(
     let conn = { current.lock().expect("connection lock").clone() };
     let Some(conn) = conn else {
         log::debug!("Tunnel down; on-list target unreachable: {target:?}");
-        let _ = socks5::write_reply(&mut tcp, signaling::REP_NET_UNREACHABLE).await;
+        let _ = proto.reply(&mut tcp, signaling::REP_NET_UNREACHABLE).await;
         return Ok(());
     };
     log::debug!("Tunneling: {target:?}");
 
     // Open the tunnel stream and read the server's reply. If any step fails the
-    // local app hasn't been answered yet, so send a SOCKS5 general-failure reply
+    // local app hasn't been answered yet, so send a general-failure reply
     // (best effort) instead of dropping the connection with no response.
     let opened = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, open_tunnel(&conn, &target))
         .await
@@ -578,12 +666,12 @@ async fn handle_local_conn(
     let (send, recv, rep) = match opened {
         Ok(v) => v,
         Err(e) => {
-            let _ = socks5::write_reply(&mut tcp, signaling::REP_GENERAL_FAILURE).await;
+            let _ = proto.reply(&mut tcp, signaling::REP_GENERAL_FAILURE).await;
             return Err(e);
         }
     };
 
-    socks5::write_reply(&mut tcp, rep).await?;
+    proto.reply(&mut tcp, rep).await?;
     if rep != signaling::REP_SUCCESS {
         return Ok(());
     }
@@ -594,22 +682,27 @@ async fn handle_local_conn(
 }
 
 /// Connect to `target` directly from this device (bypassing the tunnel) and pipe
-/// bytes, answering the local app's SOCKS5 request with the matching reply code.
-/// Used for off-routed-set targets in split-tunnel mode. The dial is bounded by
-/// the same deadline as opening a tunnel so a slow target can't pin the task.
-async fn direct_connect(mut tcp: TcpStream, target: &signaling::Target) -> Result<()> {
+/// bytes, answering the local app's request with the matching reply code via
+/// `proto`. Used for off-routed-set targets in split-tunnel mode. The dial is
+/// bounded by the same deadline as opening a tunnel so a slow target can't pin
+/// the task.
+async fn direct_connect<P: LocalProto>(
+    proto: P,
+    mut tcp: TcpStream,
+    target: &signaling::Target,
+) -> Result<()> {
     let dialed = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, dial::dial_target(target)).await;
     let mut upstream = match dialed {
         Ok(Ok(s)) => {
-            socks5::write_reply(&mut tcp, signaling::REP_SUCCESS).await?;
+            proto.reply(&mut tcp, signaling::REP_SUCCESS).await?;
             s
         }
         Ok(Err(e)) => {
-            let _ = socks5::write_reply(&mut tcp, signaling::map_io_err(&e)).await;
+            let _ = proto.reply(&mut tcp, signaling::map_io_err(&e)).await;
             return Ok(());
         }
         Err(_) => {
-            let _ = socks5::write_reply(&mut tcp, signaling::REP_HOST_UNREACHABLE).await;
+            let _ = proto.reply(&mut tcp, signaling::REP_HOST_UNREACHABLE).await;
             return Ok(());
         }
     };
@@ -640,6 +733,7 @@ mod tests {
             server_node_id: "server".to_string(),
             auth_token: "token".to_string(),
             socks_listen: "127.0.0.1:0".parse().unwrap(),
+            http_listen: None,
             relay_urls: Vec::new(),
             auto_reconnect: true,
             max_reconnect_attempts: None,

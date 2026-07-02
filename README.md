@@ -164,6 +164,30 @@ tunnel, and putting a plain local TCP port in front of it for apps that can't
 speak SOCKS5 (databases, RDP, most GUIs) — see
 [`docs/socks5-usage.md`](docs/socks5-usage.md).
 
+#### HTTP proxy front-end (optional)
+
+Add `--http-listen <ADDR>` to also run an HTTP proxy (HTTP `CONNECT` tunneling)
+alongside SOCKS5 — useful for the many tools that only speak an HTTP proxy or
+whose SOCKS5 support resolves DNS client-side (`wget`, Docker pulls, npm/yarn,
+JVM/JDBC, .NET). Like SOCKS5, `CONNECT` sends the hostname to the proxy, so DNS
+still happens on the server.
+
+```sh
+flextunnel client \
+    --server-node-id <ENDPOINT_ID> \
+    --auth-token     <AUTH_TOKEN> \
+    --http-listen    127.0.0.1:8081     # SOCKS5 on :1080 stays on
+
+# HTTPS tunnels via CONNECT
+https_proxy=http://127.0.0.1:8081 curl https://example.com
+```
+
+Phase 1 handles `CONNECT` only; plain-HTTP absolute-URI forwarding returns
+`501 Not Implemented`. See
+[`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) for the gap analysis,
+what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`), and the
+planned Phase 2.
+
 ## Commands
 
 | Command | Description |

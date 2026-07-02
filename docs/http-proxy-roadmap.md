@@ -1,8 +1,42 @@
 # Roadmap: HTTP proxy support
 
-Status: **proposed** (not yet implemented). flextunnel today exposes a **SOCKS5**
-listener on the client (`crates/flextunnel-core/src/proxy/socks5.rs`, `crates/flextunnel-core/src/proxy/client.rs`). This
-document plans adding an **HTTP proxy** front-end alongside it.
+Status: **Phase 1 implemented** (HTTP `CONNECT` tunneling). Phases 2–3 remain
+proposed. The client exposes a **SOCKS5** listener
+(`crates/flextunnel-core/src/proxy/socks5.rs`) and, when `--http-listen` is set,
+an **HTTP proxy** front-end (`crates/flextunnel-core/src/proxy/http.rs`) —
+both handled by the shared routing core in
+`crates/flextunnel-core/src/proxy/client.rs` via the `LocalProto` trait.
+
+## Motivation / gap analysis
+
+A SOCKS5-only client leaves a real gap: many common tools either can't speak
+SOCKS5 at all, or only speak it with **client-side DNS** — which is
+fundamentally incompatible with flextunnel's model, where routed names
+(`routed_domains` / `[host_aliases]`, e.g. `networking.internal`) resolve
+**only on the server**. HTTP `CONNECT` always sends the hostname to the proxy,
+so DNS happens server-side — exactly what flextunnel needs. The gap, by tier:
+
+- **No SOCKS5 at all → only reachable via an HTTP proxy:** `wget` (verified:
+  `socks5h://` → `Unsupported scheme`), Docker daemon / `docker build` image
+  pulls (HTTP/HTTPS only), npm / yarn, .NET Framework (pre-.NET-6).
+- **SOCKS5 works only with an extra install:** Python `requests`/`pip`
+  (needs `requests[socks]`/PySocks; HTTP proxy works out of the box); Go
+  `net/http` (honors `socks5://` via `ALL_PROXY` but historically no `socks5h`
+  remote DNS).
+- **SOCKS5 supported but client-side DNS breaks flextunnel:** JVM
+  `socksProxyHost` (Gradle, JDBC drivers), .NET 6+ SOCKS (no `socks5h`). These
+  resolve the hostname locally, so internal names fail even though "SOCKS is
+  supported."
+- **Already fine (no gap):** `apt` (`socks5h://`), curl, ssh, browsers.
+
+### What HTTP proxy does *not* cover
+
+An HTTP proxy only helps clients that speak HTTP (CONNECT or, in Phase 2,
+absolute-URI). **Raw-TCP apps — databases via JDBC/native clients, RDP, SSH —
+do not speak HTTP CONNECT**, so they still need SOCKS5 (with the client-DNS
+caveat) or a `socat` port forward. See
+[`docs/socks5-usage.md`](socks5-usage.md) for those recipes. HTTP proxy
+*complements* the `socat` approach rather than replacing it.
 
 ## Key insight: the wire protocol does not change
 
@@ -32,7 +66,13 @@ migration.
 
 Mode 1 is cheap (reuses everything). Mode 2 needs real HTTP/1.x message parsing.
 
-## Phase 1 — HTTP `CONNECT` tunneling (MVP)
+## Phase 1 — HTTP `CONNECT` tunneling (MVP) — ✅ implemented
+
+Shipped as `--http-listen <ADDR>` (off by default). The SOCKS5 and HTTP
+front-ends share the routing core through a `LocalProto` trait in `client.rs`
+(parse → `Target`, then reply-for-`rep`); `proxy/http.rs` holds the CONNECT
+parser + status-line replies. Non-CONNECT methods get `501`; malformed/oversized
+requests get `400`. The notes below record the original design.
 
 Goal: an HTTP proxy that handles `CONNECT` (covers all HTTPS browsing and most
 `HTTP_PROXY`/`https_proxy` use). Plain-HTTP `GET`/`POST` with absolute URIs is
