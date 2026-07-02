@@ -74,8 +74,8 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 # `localhost`/`127.0.0.1` (use `socks5h://` / remote DNS so the name reaches the
 # server). Only domain targets are aliased; literal IPs pass through unchanged.
 # [host_aliases]
-# "server.homelab" = "127.0.0.1"      # -> the server's own loopback
-# "node2.homelab"  = "192.168.1.50"   # -> another host on the server's network
+# "server.internal" = "127.0.0.1"      # -> the server's own loopback
+# "node2.internal"  = "192.168.1.50"   # -> another host on the server's network
 
 # Optional reverse-routing reservations. Unlike [host_aliases] (which resolve to a
 # host on the SERVER's network), an [agent_routes] alias resolves to a connected
@@ -91,4 +91,4 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 # set is active (it always is), add the alias name to routed_domains above too —
 # filtering happens on the requested hostname first.
 # [agent_routes]
-# "web.homelab" = { machine_id = "ftm1…" }   # from `flextunnel-agent machine-id`
+# "web.internal" = { machine_id = "ftm1…" }   # from `flextunnel-agent machine-id`

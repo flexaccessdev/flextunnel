@@ -17,7 +17,7 @@ This guide covers two mainstream ways to do that:
 
 flextunnel's whole point is that DNS and the outbound connection happen on the
 **server's** network. The server only accepts targets in its `routed_domains`
-set and maps some of them via `[host_aliases]` (e.g. `networking.homelab` →
+set and maps some of them via `[host_aliases]` (e.g. `networking.internal` →
 `127.0.0.1` on the server). Those names usually **do not resolve on the client
 at all**.
 
@@ -38,12 +38,12 @@ Address form:
 SOCKS5-CONNECT:<socks-host>:<socks-port>:<target-host>:<target-port>
 ```
 
-Example — expose the server-side `networking.homelab:80` as a local
+Example — expose the server-side `networking.internal:80` as a local
 `http://localhost:8080/`:
 
 ```sh
 socat TCP-LISTEN:8080,bind=127.0.0.1,reuseaddr,fork \
-      SOCKS5-CONNECT:127.0.0.1:1080:networking.homelab:80
+      SOCKS5-CONNECT:127.0.0.1:1080:networking.internal:80
 ```
 
 Then, with the flextunnel client running:
@@ -57,7 +57,7 @@ Example — expose a server-side Postgres as a local port:
 
 ```sh
 socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork \
-      SOCKS5-CONNECT:127.0.0.1:1080:nas.homelab:5432
+      SOCKS5-CONNECT:127.0.0.1:1080:nas.internal:5432
 # then: psql -h 127.0.0.1 -p 5432 …
 ```
 
@@ -78,18 +78,18 @@ Options that matter:
 ### Caveat: HTTP `Host` header
 
 When you browse to `http://localhost:8080/`, the browser sends
-`Host: localhost:8080`. A server that vhosts on `networking.homelab` may not
+`Host: localhost:8080`. A server that vhosts on `networking.internal` may not
 match. Either send the header explicitly:
 
 ```sh
-curl -H 'Host: networking.homelab' http://localhost:8080/
+curl -H 'Host: networking.internal' http://localhost:8080/
 ```
 
 …or skip the port forward entirely and use the SOCKS5-native path, which
 preserves the real hostname:
 
 ```sh
-curl -x socks5h://127.0.0.1:1080 http://networking.homelab:8080/
+curl -x socks5h://127.0.0.1:1080 http://networking.internal:8080/
 ```
 
 (or point the browser's SOCKS proxy at `127.0.0.1:1080` with remote DNS
@@ -102,17 +102,17 @@ connection *through* the proxy with a `ProxyCommand`. OpenBSD `nc` (`netcat`)
 speaks SOCKS5 with `-X 5 -x`:
 
 ```sh
-ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@workstation.homelab
+ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@workstation.internal
 ```
 
 `%h`/`%p` expand to the target host/port; `nc` sends `%h` as a hostname to the
-proxy, so flextunnel resolves `workstation.homelab` server-side.
+proxy, so flextunnel resolves `workstation.internal` server-side.
 
 Make it permanent in `~/.ssh/config` so plain `ssh workstation` just works:
 
 ```
 Host workstation
-    HostName workstation.homelab
+    HostName workstation.internal
     User user
     ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p
 ```
@@ -123,16 +123,16 @@ Once the SSH session rides the tunnel, you get SSH's forwarding for free — a
 second hop *from the SSH host's* network:
 
 ```sh
-# Local forward: localhost:5432 -> db.internal:5432, as seen from workstation.homelab
+# Local forward: localhost:5432 -> db.internal:5432, as seen from workstation.internal
 ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' \
-    -L 127.0.0.1:5432:db.internal:5432 user@workstation.homelab
+    -L 127.0.0.1:5432:db.internal:5432 user@workstation.internal
 
 # Dynamic (SOCKS) forward: a second SOCKS5 proxy scoped to the SSH host's network
 ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' \
-    -D 127.0.0.1:1081 user@workstation.homelab
+    -D 127.0.0.1:1081 user@workstation.internal
 ```
 
-Here `db.internal` is resolved by `workstation.homelab`, not by flextunnel —
+Here `db.internal` is resolved by `workstation.internal`, not by flextunnel —
 useful for reaching hosts that the flextunnel server itself can't see but the
 SSH box can.
 

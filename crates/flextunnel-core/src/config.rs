@@ -63,7 +63,7 @@ pub struct ServerConfig {
     /// matches a key is rewritten to its value (an IP or another hostname on the
     /// server's network) before connecting. Keeps the requested port. Lets a
     /// client reach the server's loopback or internal hosts via a real name
-    /// (e.g. `server.homelab` → `127.0.0.1`), which also dodges Firefox's refusal
+    /// (e.g. `server.internal` → `127.0.0.1`), which also dodges Firefox's refusal
     /// to proxy literal `localhost`/`127.0.0.1`.
     pub host_aliases: Option<HashMap<String, String>>,
     /// Domains routed through the tunnel (the tunnel set). Exact (`example.com`),
@@ -467,15 +467,15 @@ mod tests {
     fn host_aliases_parsed_and_lowercased() {
         let toml = r#"
             [host_aliases]
-            "Server.Homelab" = "127.0.0.1"
-            "node2.homelab" = "192.168.1.50"
+            "Server.Internal" = "127.0.0.1"
+            "node2.internal" = "192.168.1.50"
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let r = resolve_server(ServerConfig::default(), Some(file)).unwrap();
         // Keys are lowercased so matching against a lowercased host works.
-        assert_eq!(r.host_aliases.get("server.homelab").map(String::as_str), Some("127.0.0.1"));
-        assert_eq!(r.host_aliases.get("node2.homelab").map(String::as_str), Some("192.168.1.50"));
-        assert!(!r.host_aliases.contains_key("Server.Homelab"));
+        assert_eq!(r.host_aliases.get("server.internal").map(String::as_str), Some("127.0.0.1"));
+        assert_eq!(r.host_aliases.get("node2.internal").map(String::as_str), Some("192.168.1.50"));
+        assert!(!r.host_aliases.contains_key("Server.Internal"));
     }
 
     #[test]
@@ -484,15 +484,15 @@ mod tests {
             agent_auth_tokens = ["ftaAAA"]
 
             [agent_routes]
-            "Web.Homelab" = { machine_id = "abc123def" }
-            "nas.homelab" = { machine_id = "999888777" }
+            "Web.Internal" = { machine_id = "abc123def" }
+            "nas.internal" = { machine_id = "999888777" }
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let r = resolve_server(ServerConfig::default(), Some(file)).unwrap();
         // Keys lowercased for case-insensitive matching; values are machine ids.
-        assert_eq!(r.agent_routes.get("web.homelab").map(String::as_str), Some("abc123def"));
-        assert_eq!(r.agent_routes.get("nas.homelab").map(String::as_str), Some("999888777"));
-        assert!(!r.agent_routes.contains_key("Web.Homelab"));
+        assert_eq!(r.agent_routes.get("web.internal").map(String::as_str), Some("abc123def"));
+        assert_eq!(r.agent_routes.get("nas.internal").map(String::as_str), Some("999888777"));
+        assert!(!r.agent_routes.contains_key("Web.Internal"));
         assert_eq!(r.agent_auth_tokens, vec!["ftaAAA".to_string()]);
     }
 
@@ -500,8 +500,8 @@ mod tests {
     fn agent_routes_case_only_duplicate_is_rejected() {
         let toml = r#"
             [agent_routes]
-            "Web.Homelab" = { machine_id = "abc" }
-            "web.homelab" = { machine_id = "def" }
+            "Web.Internal" = { machine_id = "abc" }
+            "web.internal" = { machine_id = "def" }
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
@@ -512,8 +512,8 @@ mod tests {
     fn host_aliases_case_only_duplicate_is_rejected() {
         let toml = r#"
             [host_aliases]
-            "Server.Homelab" = "127.0.0.1"
-            "server.homelab" = "192.168.1.50"
+            "Server.Internal" = "127.0.0.1"
+            "server.internal" = "192.168.1.50"
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
@@ -524,10 +524,10 @@ mod tests {
     fn agent_route_and_host_alias_overlap_is_rejected() {
         let toml = r#"
             [agent_routes]
-            "shared.homelab" = { machine_id = "abc" }
+            "shared.internal" = { machine_id = "abc" }
 
             [host_aliases]
-            "Shared.Homelab" = "127.0.0.1"
+            "Shared.Internal" = "127.0.0.1"
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();

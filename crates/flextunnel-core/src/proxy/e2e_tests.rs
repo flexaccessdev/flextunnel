@@ -277,7 +277,7 @@ async fn agent_reverse_route_pipes_to_agent_loopback() {
     });
 
     let machine_id = "reverse-route-machine-id";
-    let alias = "web.homelab";
+    let alias = "web.internal";
     let routes = HashMap::from([(alias.to_string(), machine_id.to_string())]);
     let agent_tokens = HashSet::from([AGENT_TOKEN.to_string()]);
 
