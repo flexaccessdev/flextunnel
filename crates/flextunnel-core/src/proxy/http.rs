@@ -2,10 +2,13 @@
 //! absolute-URI plain-HTTP forwarding.
 //!
 //! Both modes map the destination to a wire [`Target`] — a hostname becomes
-//! [`Target::Domain`] so DNS happens on the **server** (flextunnel's whole
-//! point), a literal IP becomes [`Target::Ip`] (the client already resolved
-//! it). This mirrors the ATYP DOMAIN vs IP split in
-//! [`crate::proxy::socks5::read_connect_request`].
+//! [`Target::Domain`] (name resolution deferred), a literal IP becomes
+//! [`Target::Ip`] (already an address). Where a domain is ultimately resolved is
+//! decided later by the route policy, not here: a tunneled (on-list) target is
+//! resolved on the **server** (flextunnel's whole point), while an off-list
+//! target is dialed — and so resolved — locally (see
+//! [`crate::proxy::client`]'s `direct_connect`). This mirrors the ATYP DOMAIN vs
+//! IP split in [`crate::proxy::socks5::read_connect_request`].
 //!
 //! `CONNECT host:port` opens an opaque tunnel: answer `200`, then splice.
 //!
@@ -152,7 +155,7 @@ pub async fn read_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             )));
         };
         let target = host_to_target(host, port);
-        log_dns_mode("CONNECT", &target);
+        log_target("CONNECT", &target);
         return Ok(HttpRequest::Connect(target));
     }
 
@@ -161,7 +164,7 @@ pub async fn read_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     let header_block = &head[line_end + 2..head.len() - 2];
     match rewrite_forward(method, request_target, version, header_block) {
         Ok((target, head)) => {
-            log_dns_mode(method, &target);
+            log_target(method, &target);
             Ok(HttpRequest::Forward { target, head })
         }
         Err(reject) => {
@@ -297,8 +300,10 @@ fn strip_scheme<'a>(target: &'a str, scheme: &str) -> Option<&'a str> {
     prefix.eq_ignore_ascii_case(scheme).then_some(rest)
 }
 
-/// A hostname becomes [`Target::Domain`] (resolved on the server), a literal IP
-/// [`Target::Ip`] (the client already resolved it).
+/// A hostname becomes [`Target::Domain`] (name resolution deferred), a literal
+/// IP [`Target::Ip`] (already an address). Whether a domain is later resolved on
+/// the server (tunneled route) or locally (`direct_connect`) is up to the route
+/// policy, decided after parsing.
 fn host_to_target(host: &str, port: u16) -> Target {
     match host.parse::<IpAddr>() {
         Ok(ip) => Target::Ip(SocketAddr::new(ip, port)),
@@ -306,17 +311,19 @@ fn host_to_target(host: &str, port: u16) -> Target {
     }
 }
 
-/// Log the DNS mode at info (server-side vs client-side resolution) and the
-/// specific destination only at debug, matching the SOCKS5 handler so default
-/// logs don't leak user destinations.
-fn log_dns_mode(what: &str, target: &Target) {
+/// Log the parsed target type at info (hostname vs literal IP) and the specific
+/// destination only at debug, matching the SOCKS5 handler so default logs don't
+/// leak user destinations. Where a hostname is ultimately resolved (server for a
+/// tunneled route, locally for a direct one) is decided later by the route
+/// policy, so it's not reported here.
+fn log_target(what: &str, target: &Target) {
     match target {
         Target::Domain(host, port) => {
-            log::info!("HTTP {what} — hostname (remote DNS, resolved on server)");
+            log::info!("HTTP {what} — hostname (name resolution deferred to route)");
             log::debug!("HTTP {what} target {host}:{port}");
         }
         Target::Ip(addr) => {
-            log::info!("HTTP {what} — literal IP (local DNS, client pre-resolved)");
+            log::info!("HTTP {what} — literal IP");
             log::debug!("HTTP {what} target {addr}");
         }
     }
