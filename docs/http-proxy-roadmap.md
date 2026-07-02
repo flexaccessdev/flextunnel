@@ -140,9 +140,9 @@ clients work without TLS.
 
 ## Phase 3 — Hardening & polish
 
-- **Proxy authentication:** optional `Proxy-Authorization` on the HTTP listener
-  (parallels the deliberately no-auth SOCKS5 loopback default; only relevant if
-  binding off-loopback). Return `407 Proxy Authentication Required`.
+- **Proxy authentication:** out of scope. Both listeners are expected to bind
+  loopback only (the SOCKS5 default is deliberately no-auth for the same
+  reason), so there's no untrusted network to authenticate against.
 - **Status-code mapping table:** centralize `rep` → HTTP status and
   `rep` → SOCKS5 reply so both front-ends stay consistent.
 - **Limits:** max header size, request timeout, and a concurrency cap shared with
