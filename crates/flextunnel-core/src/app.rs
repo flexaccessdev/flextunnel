@@ -123,9 +123,14 @@ mod tests {
             rlim_max: 0,
         };
         assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
-        let after_first = lim.rlim_cur;
+        // The kernel must reflect the raise: soft == hard, except on Darwin
+        // where the requestable maximum is capped at OPEN_MAX.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let cap = lim.rlim_max.min(libc::OPEN_MAX as libc::rlim_t);
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        assert_eq!(after_first, lim.rlim_max);
+        let cap = lim.rlim_max;
+        assert_eq!(lim.rlim_cur, cap);
+        let after_first = lim.rlim_cur;
         super::raise_fd_limit();
         assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
         assert_eq!(lim.rlim_cur, after_first);

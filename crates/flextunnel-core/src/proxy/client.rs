@@ -44,6 +44,10 @@ const LOCAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// failed connections make it worse, so back off long enough for in-flight
 /// connections to close and free descriptors instead of exiting the client.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(250);
+/// Warn on the 1st transient accept failure of a burst and then every Nth —
+/// one warn per ~10s at [`ACCEPT_RETRY_DELAY`] pacing — so sustained fd
+/// exhaustion doesn't flood the log; the in-between retries log at debug.
+const ACCEPT_RETRY_WARN_EVERY: u64 = 40;
 
 /// The live QUIC connection shared with the always-on accept loop; `None` while
 /// disconnected (during a drop/backoff), so off-list targets still connect
@@ -659,14 +663,28 @@ async fn accept_loop<P: LocalProto>(
     routed_set_shared: &SharedRoutedSet,
     proto: P,
 ) -> ProxyResult<()> {
+    let mut consecutive_failures: u64 = 0;
     loop {
         let (tcp, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
+            Ok(accepted) => {
+                if consecutive_failures > 0 {
+                    log::info!(
+                        "Local proxy accepting again after {consecutive_failures} failed attempt(s)"
+                    );
+                    consecutive_failures = 0;
+                }
+                accepted
+            }
             Err(e) if is_transient_accept_error(&e) => {
-                log::warn!(
-                    "Local proxy accept failed ({e}); retrying in {}ms",
-                    ACCEPT_RETRY_DELAY.as_millis()
-                );
+                if consecutive_failures.is_multiple_of(ACCEPT_RETRY_WARN_EVERY) {
+                    log::warn!(
+                        "Local proxy accept failed ({e}); retrying every {}ms",
+                        ACCEPT_RETRY_DELAY.as_millis()
+                    );
+                } else {
+                    log::debug!("Local proxy accept failed ({e}); retrying");
+                }
+                consecutive_failures += 1;
                 tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
                 continue;
             }
@@ -850,6 +868,12 @@ mod tests {
                 "os error {code} should be transient"
             );
         }
+        // A kind-only error (no raw OS code) must be classified by the
+        // `ErrorKind` branch alone.
+        assert!(is_transient_accept_error(&io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "peer reset before accept"
+        )));
         assert!(!is_transient_accept_error(&io::Error::from_raw_os_error(
             libc::EBADF
         )));
