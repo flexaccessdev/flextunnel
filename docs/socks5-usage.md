@@ -1,0 +1,243 @@
+# Using the flextunnel SOCKS5 proxy
+
+The flextunnel client exposes a local **SOCKS5** listener (default
+`127.0.0.1:1080`) and tunnels TCP `CONNECT`. Anything that speaks SOCKS5 can be
+pointed straight at it; anything that can't gets a small adapter in front.
+
+This guide covers, in order:
+
+1. **The one rule** — always let the *server* resolve names.
+2. **Programs that speak SOCKS5 natively** — `curl`, `wget`, `git`, `ssh`,
+   browsers, and other common tools.
+3. **`ssh` through the proxy** — reach an internal SSH host, then use SSH's own
+   `-L` / `-D` forwards for a second hop.
+4. **Adapters for programs that don't speak SOCKS5** — put a plain local TCP
+   port in front of the proxy with `socat`.
+
+## The one rule: let the server resolve names
+
+flextunnel's whole point is that DNS and the outbound connection happen on the
+**server's** network. The server only accepts targets in its `routed_domains`
+set and maps some of them via `[host_aliases]` (e.g. `networking.internal` →
+`127.0.0.1` on the server). Those names usually **do not resolve on the client
+at all**.
+
+So whatever you use must send the target **hostname** to the proxy and let
+flextunnel resolve it — the `socks5h` behavior (the `h` means "resolve host at
+the proxy"). Never pre-resolve the name to an IP on the client, and don't attach
+a client-side resolver.
+
+The single most common mistake is using `socks5://` (client-side DNS) where you
+want `socks5h://` (proxy-side DNS). With flextunnel, **you almost always want
+the `h`.**
+
+## 1. Programs that speak SOCKS5 natively
+
+### `curl`
+
+```sh
+# DNS + connection resolved server-side (note socks5h)
+curl -x socks5h://127.0.0.1:1080 https://example.com
+
+# a service on the SERVER's own localhost
+curl -x socks5h://127.0.0.1:1080 http://127.0.0.1:8000/
+
+# a host alias defined on the server
+curl -x socks5h://127.0.0.1:1080 http://networking.internal/
+```
+
+You can also set it for a whole shell session via the standard proxy env vars
+(most tools built on libcurl honor these):
+
+```sh
+export ALL_PROXY=socks5h://127.0.0.1:1080
+curl https://example.com
+```
+
+### `wget`
+
+`wget` reads proxy settings from the environment. It resolves names locally by
+default, so keep it from touching DNS at all — since the connection goes through
+the proxy, `wget` never needs the address:
+
+```sh
+https_proxy=socks5h://127.0.0.1:1080 \
+  wget --no-dns-cache -e use_dns=off https://example.com/file
+```
+
+(If your `wget` build lacks SOCKS support, use `curl` or a `socat` port forward
+instead.)
+
+### `git`
+
+Git honors `ALL_PROXY` for `https://` remotes:
+
+```sh
+ALL_PROXY=socks5h://127.0.0.1:1080 git clone https://internal.git/repo.git
+```
+
+Make it permanent for a host:
+
+```sh
+git config --global http.https://internal.git/.proxy socks5h://127.0.0.1:1080
+```
+
+For SSH remotes (`git@host:…`), configure SSH instead — see section 2.
+
+### Web browsers
+
+Point the browser's SOCKS proxy at `127.0.0.1:1080` **with remote DNS enabled**
+so hostnames resolve on the server:
+
+- **Firefox** — Settings → Network Settings → *Manual proxy configuration* →
+  SOCKS v5 host `127.0.0.1`, port `1080`, and tick **"Proxy DNS when using
+  SOCKS v5"**. This last box is the `socks5h` toggle; without it Firefox
+  resolves names locally and internal hosts fail.
+- **Chrome / Chromium** — Chrome has no remote-DNS checkbox, so launch it with a
+  flag and a fresh profile:
+
+  ```sh
+  chromium \
+    --proxy-server="socks5://127.0.0.1:1080" \
+    --user-data-dir=/tmp/ft-chrome
+  ```
+
+  Chrome sends the hostname to a SOCKS5 proxy by default, so DNS happens
+  server-side.
+
+For per-site control instead of a system-wide switch, a browser extension like
+FoxyProxy lets you route only the internal domains through `127.0.0.1:1080`.
+
+### Other tools worth knowing
+
+- **`nc` (OpenBSD netcat)** — `nc -X 5 -x 127.0.0.1:1080 host port` dials
+  through SOCKS5 (used as the SSH `ProxyCommand` below).
+- **`proxychains-ng`** — wraps programs that have no proxy option of their own:
+  set `socks5 127.0.0.1 1080` and `proxy_dns` in `proxychains.conf`, then run
+  `proxychains4 <program>`. Handy, but it hooks libc and can miss statically
+  linked or Go binaries — a `socat` port forward is more reliable for those.
+- **Package managers / language toolchains** (`pip`, `npm`, `cargo`, `apt` via
+  `Acquire::*::Proxy`) generally honor `ALL_PROXY` / `https_proxy`; prefer the
+  `socks5h://` form.
+
+## 2. `ssh` through the SOCKS5 proxy
+
+To reach an SSH server that only listens on the server's network, run SSH's
+connection *through* the proxy with a `ProxyCommand`. OpenBSD `nc` (`netcat`)
+speaks SOCKS5 with `-X 5 -x`:
+
+```sh
+ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@workstation.internal
+```
+
+`%h`/`%p` expand to the target host/port; `nc` sends `%h` as a hostname to the
+proxy, so flextunnel resolves `workstation.internal` server-side.
+
+Make it permanent in `~/.ssh/config` so plain `ssh workstation` just works (and
+so `git@workstation:…` remotes route through the tunnel too):
+
+```
+Host workstation
+    HostName workstation.internal
+    User user
+    ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p
+```
+
+### Combine with SSH's own forwards
+
+Once the SSH session rides the tunnel, you get SSH's forwarding for free — a
+second hop *from the SSH host's* network:
+
+```sh
+# Local forward: localhost:5432 -> db.internal:5432, as seen from workstation.internal
+ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' \
+    -L 127.0.0.1:5432:db.internal:5432 user@workstation.internal
+
+# Dynamic (SOCKS) forward: a second SOCKS5 proxy scoped to the SSH host's network
+ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' \
+    -D 127.0.0.1:1081 user@workstation.internal
+```
+
+Here `db.internal` is resolved by `workstation.internal`, not by flextunnel —
+useful for reaching hosts that the flextunnel server itself can't see but the
+SSH box can.
+
+## 3. Adapters for programs that don't speak SOCKS5
+
+Database clients, RDP, JDBC drivers, `psql`, and many GUI apps have no SOCKS5
+option. Put `socat` in front of the proxy to present a **plain local TCP port**
+that forwards through it.
+
+`socat`'s `SOCKS5-CONNECT` address dials a target *through* a SOCKS5 proxy and
+sends the target as a **domain name** (it emits SOCKS5 `ATYP=DOMAIN`, so
+flextunnel resolves it server-side).
+
+Address form:
+
+```
+SOCKS5-CONNECT:<socks-host>:<socks-port>:<target-host>:<target-port>
+```
+
+Example — expose the server-side `networking.internal:80` as a local
+`http://localhost:8080/`:
+
+```sh
+socat TCP-LISTEN:8080,bind=127.0.0.1,reuseaddr,fork \
+      SOCKS5-CONNECT:127.0.0.1:1080:networking.internal:80
+```
+
+Then, with the flextunnel client running:
+
+```sh
+curl http://localhost:8080/
+# or open http://localhost:8080/ in a browser
+```
+
+Example — expose a server-side Postgres as a local port:
+
+```sh
+socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork \
+      SOCKS5-CONNECT:127.0.0.1:1080:nas.internal:5432
+# then: psql -h 127.0.0.1 -p 5432 …
+```
+
+Options that matter:
+
+- **`fork`** — serve each incoming connection in its own child. Without it
+  `socat` handles one connection and exits; browsers and most clients open
+  several in parallel, so `fork` is effectively required.
+- **`reuseaddr`** — lets you restart immediately without "address already in
+  use".
+- **`bind=127.0.0.1`** — keep the forward loopback-only. Drop it
+  (`TCP-LISTEN:5432,reuseaddr,fork`) only if you deliberately want other
+  machines on your LAN to reach it.
+- **`SOCKS5`** is just an alias for `SOCKS5-CONNECT`.
+- Add `-d -d` for verbose logs when debugging; `-T5` sets an idle timeout so
+  stuck streams drop.
+
+### Caveat: HTTP `Host` header
+
+When you browse to `http://localhost:8080/`, the browser sends
+`Host: localhost:8080`. A server that vhosts on `networking.internal` may not
+match. Either send the header explicitly:
+
+```sh
+curl -H 'Host: networking.internal' http://localhost:8080/
+```
+
+…or skip the port forward entirely and use the SOCKS5-native path, which
+preserves the real hostname:
+
+```sh
+curl -x socks5h://127.0.0.1:1080 http://networking.internal:8080/
+```
+
+(or point the browser's SOCKS proxy at `127.0.0.1:1080` with remote DNS
+enabled).
+
+### `socat` vs `ssh`
+
+- **`socat`** needs no account on the target — just the flextunnel proxy. Best
+  for exposing a single service port (DB, web, RDP) to a local app.
+- **`ssh`** needs an SSH account on a reachable host, but then gives you a
+  shell plus arbitrary `-L`/`-D` forwards and an extra network hop.
