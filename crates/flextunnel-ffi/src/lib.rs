@@ -178,6 +178,10 @@ pub unsafe extern "C" fn flextunnel_start(
 }
 
 fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
+    // The proxy holds a socket per connection; lift the app process's soft fd
+    // limit (per-process, best-effort) before serving.
+    flextunnel_core::app::raise_fd_limit();
+
     let cfg: FfiConfig =
         serde_json::from_str(json).map_err(|e| format!("invalid config JSON: {e}"))?;
 

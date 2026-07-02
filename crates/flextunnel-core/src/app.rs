@@ -20,6 +20,58 @@ pub fn init_logger(default_filter: &str) {
     .try_init();
 }
 
+/// Raise this process's soft `RLIMIT_NOFILE` to its hard limit (on
+/// macOS/iOS, capped at `OPEN_MAX` as Darwin's `setrlimit` requires).
+///
+/// Strictly per-process: only the calling process's own soft limit moves, and
+/// never above the hard limit the OS already granted it — no other process or
+/// system setting is affected, and no privileges are needed. Matters most on
+/// macOS, whose default soft limit of 256 fds a proxy holding one socket per
+/// connection (two on the direct split-tunnel path) exhausts quickly.
+/// Best-effort: on failure the process just keeps its current limit.
+#[cfg(unix)]
+pub fn raise_fd_limit() {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        log::warn!(
+            "getrlimit(RLIMIT_NOFILE) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    // Darwin rejects a soft limit above OPEN_MAX even when the hard limit
+    // reports RLIM_INFINITY (see `man setrlimit` on macOS).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let target = lim.rlim_max.min(libc::OPEN_MAX as libc::rlim_t);
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let target = lim.rlim_max;
+    if lim.rlim_cur >= target {
+        return; // already at the highest value we may request
+    }
+    let raised = libc::rlimit {
+        rlim_cur: target,
+        rlim_max: lim.rlim_max,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
+        log::warn!(
+            "setrlimit(RLIMIT_NOFILE, {target}) failed: {}; keeping soft limit {}",
+            std::io::Error::last_os_error(),
+            lim.rlim_cur
+        );
+    } else {
+        log::info!("Raised open-file limit: {} -> {target}", lim.rlim_cur);
+    }
+}
+
+/// Raise the open-file limit (non-Unix: nothing to do — Windows has no
+/// `RLIMIT_NOFILE`; socket handles are not constrained by a per-process fd
+/// table the way Unix fds are).
+#[cfg(not(unix))]
+pub fn raise_fd_limit() {}
+
 /// Build the multi-threaded Tokio runtime the entry points block on.
 pub fn build_runtime() -> Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
@@ -56,4 +108,26 @@ pub async fn shutdown_signal() -> Result<()> {
 pub async fn shutdown_signal() -> Result<()> {
     tokio::signal::ctrl_c().await.context("installing Ctrl-C handler")?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    /// Raising the limit must reach the requested cap (the hard limit, off
+    /// Darwin) and be a stable no-op when called again. Only ever raises the
+    /// process's soft limit, so running alongside other tests is harmless.
+    #[test]
+    fn raise_fd_limit_reaches_cap_and_is_idempotent() {
+        super::raise_fd_limit();
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+        let after_first = lim.rlim_cur;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        assert_eq!(after_first, lim.rlim_max);
+        super::raise_fd_limit();
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+        assert_eq!(lim.rlim_cur, after_first);
+    }
 }

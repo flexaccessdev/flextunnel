@@ -103,6 +103,9 @@ fn main() -> Result<()> {
 }
 
 async fn run_async(command: Command) -> Result<()> {
+    // The agent holds a socket per reverse-routed stream; lift the soft fd
+    // limit (per-process, best-effort) so macOS's default 256 doesn't choke it.
+    app::raise_fd_limit();
     match command {
         Command::Run {
             config: config_path,
