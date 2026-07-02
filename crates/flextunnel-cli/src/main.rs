@@ -171,6 +171,10 @@ fn main() -> Result<()> {
 }
 
 async fn run_async(command: Command) -> Result<()> {
+    // Long-running proxy processes hold a socket per connection; lift the soft
+    // fd limit (per-process, best-effort) so macOS's default 256 doesn't choke
+    // a busy client/server.
+    app::raise_fd_limit();
     match command {
         Command::Server {
             config: config_path,

@@ -938,7 +938,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "flextunnel-agent"
-version = "0.0.19"
+version = "0.0.20"
 dependencies = [
  "anyhow",
  "clap",
@@ -950,7 +950,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-cli"
-version = "0.0.19"
+version = "0.0.20"
 dependencies = [
  "anyhow",
  "clap",
@@ -962,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-core"
-version = "0.0.19"
+version = "0.0.20"
 dependencies = [
  "anyhow",
  "base64",
@@ -971,6 +971,7 @@ dependencies = [
  "ipnetwork",
  "iroh",
  "iroh-mdns-address-lookup",
+ "libc",
  "log",
  "rand 0.9.4",
  "rustls",
@@ -986,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-ffi"
-version = "0.0.19"
+version = "0.0.20"
 dependencies = [
  "flextunnel-core",
  "iroh",
