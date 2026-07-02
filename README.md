@@ -65,9 +65,11 @@ Stable releases include `flextunnel` and `flextunnel-agent` for Linux
 amd64/arm64, macOS arm64, and Windows amd64, plus the iOS xcframework asset.
 Automated prereleases currently include Linux amd64/arm64, macOS arm64, and the
 iOS xcframework, but skip Windows. The install scripts download the latest
-binary, verify its SHA-256 checksum, and install to a per-user location
-(`~/.local/bin` on Linux/macOS, `%LOCALAPPDATA%\Programs\flextunnel` on Windows)
-— **no admin required**.
+binary and verify its SHA-256 checksum. On Linux/macOS this installs to a
+per-user location (`~/.local/bin`, no root required). On Windows this installs
+system-wide to `C:\Program Files\flextunnel` and updates the machine PATH,
+which **requires an elevated (Administrator) PowerShell session** — running
+the installed binary afterward does not.
 
 **`flextunnel` (server / client) — Linux / macOS:**
 
@@ -330,6 +332,10 @@ A second agent presenting the **same** network id (e.g. a cloned VM image whose
 machine id was never regenerated) is rejected and the network id is recorded
 in the blocklist — fix the duplicate id and clear the entry to recover. See
 [`agent.toml.example`](agent.toml.example).
+
+To run the agent as a Windows service (starting at boot, before any
+interactive logon — e.g. to keep remote desktop access to the machine
+available), see [`docs/windows-service.md`](docs/windows-service.md).
 
 ## Routed-set split-tunneling
 
