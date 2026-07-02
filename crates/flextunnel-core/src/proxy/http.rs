@@ -120,6 +120,15 @@ pub async fn read_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         }
     };
 
+    // Reject any control byte (a bare CR/LF, NUL, tab, …) in the request line.
+    // The line is split at only the first CRLF, so a smuggled control could
+    // otherwise ride along in the request-target and be reintroduced into the
+    // rewritten upstream head (path / Host header injection).
+    if request_line.bytes().any(|b| b.is_ascii_control()) {
+        write_error(stream, 400, "Bad Request").await?;
+        return Err(io::Error::other("control byte in HTTP request line"));
+    }
+
     // request-line = method SP request-target SP HTTP-version
     let mut parts = request_line.split(' ');
     let (method, request_target, version) = (
@@ -286,10 +295,17 @@ fn split_header_lines(block: &[u8]) -> Result<Vec<HeaderLine<'_>>, Reject> {
         let name = std::str::from_utf8(&line[..colon])
             .map_err(|_| malformed())?
             .trim_ascii_end();
-        out.push(HeaderLine {
-            name,
-            value: &line[colon + 1..],
-        });
+        let value = &line[colon + 1..];
+        // Reject smuggled control bytes: a header name (a token) may contain
+        // none, and a value must not carry CR/LF/NUL — a bare CR/LF would inject
+        // an extra header line into the rewritten upstream head. HTAB and space
+        // stay legal in a value (leading OWS is trimmed on re-emit by the reader).
+        if name.bytes().any(|b| b.is_ascii_control())
+            || value.iter().any(|&b| matches!(b, b'\r' | b'\n' | 0))
+        {
+            return Err(malformed());
+        }
+        out.push(HeaderLine { name, value });
     }
     Ok(out)
 }
@@ -632,6 +648,24 @@ mod tests {
             run_forward(b"GET http://example.com/ HTTP/1.1\r\nX-Test : value\r\n\r\n").await;
         assert!(head.contains("X-Test: value\r\n"), "got: {head:?}");
         assert!(!head.contains("X-Test :"), "got: {head:?}");
+    }
+
+    #[tokio::test]
+    async fn control_byte_in_request_target_is_400() {
+        // A bare LF in the request target must not survive into the rewritten
+        // upstream head (request-line / Host injection).
+        let (target, resp) = run(b"GET http://example.com/a\nfoo HTTP/1.1\r\n\r\n").await;
+        assert!(target.is_err());
+        assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp:?}");
+    }
+
+    #[tokio::test]
+    async fn control_byte_in_header_value_is_400() {
+        // A bare LF in a header value would inject a new header line upstream.
+        let (target, resp) =
+            run(b"GET http://example.com/ HTTP/1.1\r\nX-Foo: bar\nEvil: baz\r\n\r\n").await;
+        assert!(target.is_err());
+        assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp:?}");
     }
 
     #[tokio::test]
