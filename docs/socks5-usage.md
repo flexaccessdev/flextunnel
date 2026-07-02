@@ -95,36 +95,29 @@ For SSH remotes (`git@host:…`), configure SSH instead — see section 2.
 Point the browser's SOCKS proxy at `127.0.0.1:1080` **with remote DNS enabled**
 so hostnames resolve on the server:
 
-- **Firefox** — Settings → Network Settings → *Manual proxy configuration* →
-  SOCKS v5 host `127.0.0.1`, port `1080`, and tick **"Proxy DNS when using
-  SOCKS v5"**. This last box is the `socks5h` toggle; without it Firefox
-  resolves names locally and internal hosts fail.
-- **Chrome / Chromium** — Chrome has no remote-DNS checkbox, so launch it with a
-  flag and a fresh profile:
-
-  ```sh
-  chromium \
-    --proxy-server="socks5://127.0.0.1:1080" \
-    --user-data-dir=/tmp/ft-chrome
-  ```
-
-  Chrome sends the hostname to a SOCKS5 proxy by default, so DNS happens
-  server-side.
+- **Firefox** — set a manual SOCKS v5 proxy of `127.0.0.1:1080` in its network
+  settings, and enable the option to proxy DNS through SOCKS v5 so hostnames
+  resolve on the server rather than locally.
+- **Chrome / Chromium** — configure a SOCKS5 proxy of `127.0.0.1:1080` (Chrome
+  sends the hostname to the proxy, so DNS happens server-side).
 
 For per-site control instead of a system-wide switch, a browser extension like
 FoxyProxy lets you route only the internal domains through `127.0.0.1:1080`.
+
+> These browser paths were not tested here; verify the exact settings in your
+> browser version.
 
 ### Other tools worth knowing
 
 - **`nc` (OpenBSD netcat)** — `nc -X 5 -x 127.0.0.1:1080 host port` dials
   through SOCKS5 (used as the SSH `ProxyCommand` below).
-- **`proxychains-ng`** — wraps programs that have no proxy option of their own:
-  set `socks5 127.0.0.1 1080` and `proxy_dns` in `proxychains.conf`, then run
-  `proxychains4 <program>`. Handy, but it hooks libc and can miss statically
-  linked or Go binaries — a `socat` port forward is more reliable for those.
-- **Package managers / language toolchains** (`pip`, `npm`, `cargo`, `apt` via
-  `Acquire::*::Proxy`) generally honor `ALL_PROXY` / `https_proxy`; prefer the
-  `socks5h://` form.
+- **`proxychains-ng`** — wraps programs that have no proxy option of their own
+  by hooking libc. Point it at `127.0.0.1:1080`. It can miss statically linked
+  or Go binaries, where a `socat` port forward is more reliable. (Not tested
+  here.)
+- **Package managers / language toolchains** (`pip`, `npm`, `cargo`, `apt`)
+  generally honor the `ALL_PROXY` / `https_proxy` environment variables; prefer
+  the `socks5h://` form. (Not tested here — consult each tool's proxy docs.)
 
 ## 2. `ssh` through the SOCKS5 proxy
 
