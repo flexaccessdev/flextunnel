@@ -76,19 +76,42 @@ wget --header 'Host: networking.internal' -O file http://localhost:8080/file
 
 ### `git`
 
-Git honors `ALL_PROXY` for `https://` remotes:
+Git routes differently depending on the remote's transport — this catches
+people out:
+
+| Remote type | How to route through flextunnel |
+|---|---|
+| `http://` / `https://` | `ALL_PROXY` (git's libcurl transport honors it) |
+| `ssh://` / `git@host:…` | SSH `ProxyCommand` — **`ALL_PROXY` is ignored** |
+
+**HTTP(S) remotes** — `ALL_PROXY` works:
 
 ```sh
-ALL_PROXY=socks5h://127.0.0.1:1080 git clone https://internal.git/repo.git
+ALL_PROXY=socks5h://127.0.0.1:1080 git clone https://networking.internal/repo.git
 ```
 
 Make it permanent for a host:
 
 ```sh
-git config --global http.https://internal.git/.proxy socks5h://127.0.0.1:1080
+git config --global http.https://networking.internal/.proxy socks5h://127.0.0.1:1080
 ```
 
-For SSH remotes (`git@host:…`), configure SSH instead — see section 2.
+**SSH remotes** — `ALL_PROXY` does *nothing* here; git shells out to `ssh`,
+which does its own DNS and would fail with `Could not resolve hostname`. Route
+through SSH's `ProxyCommand` instead:
+
+```sh
+GIT_SSH_COMMAND='ssh -o "ProxyCommand=nc -X 5 -x 127.0.0.1:1080 %h %p"' \
+  git clone ssh://networking.internal/repo.git
+```
+
+Or make it permanent in `~/.ssh/config` (see section 2) so plain
+`git clone ssh://networking.internal/repo.git` just works:
+
+```
+Host networking.internal
+    ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p
+```
 
 ### Web browsers
 
