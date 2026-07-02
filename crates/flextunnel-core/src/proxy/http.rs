@@ -132,6 +132,16 @@ pub async fn read_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         )));
     }
 
+    // The listener speaks HTTP/1.x only: a forward is relayed in 1.x framing
+    // end to end, and a CONNECT in this text form is a 1.x request too (a real
+    // h2 CONNECT arrives as binary frames, which never parse this far).
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        write_error(stream, 505, "HTTP Version Not Supported").await?;
+        return Err(io::Error::other(format!(
+            "unsupported HTTP version: {version}"
+        )));
+    }
+
     if method.eq_ignore_ascii_case("CONNECT") {
         // CONNECT request-target is authority-form: host:port (RFC 9110 §9.3.6);
         // the port is mandatory (no default to fall back on).
@@ -169,16 +179,6 @@ fn rewrite_forward(
     version: &str,
     header_block: &[u8],
 ) -> Result<(Target, Vec<u8>), Reject> {
-    // The exchange is relayed verbatim in HTTP/1.x framing end to end, so only
-    // 1.x clients can be served.
-    if version != "HTTP/1.1" && version != "HTTP/1.0" {
-        return Err(Reject {
-            code: 505,
-            reason: "HTTP Version Not Supported",
-            detail: format!("cannot forward a {version} request"),
-        });
-    }
-
     // A proxied plain-HTTP request must be absolute-form (RFC 9112 §3.2.2).
     // `https://` can't appear here — TLS traffic reaches a proxy via CONNECT.
     let Some(rest) = strip_scheme(request_target, "http://") else {
@@ -227,9 +227,11 @@ fn rewrite_forward(
         }
     }
 
-    // Origin-form request line + regenerated Host, then the surviving headers
-    // verbatim, then the forced close so the origin ends the exchange by
-    // closing (one upstream connection per request — no keep-alive reuse).
+    // Origin-form request line + regenerated Host, then the surviving headers —
+    // rebuilt from the parsed name so tolerated-but-invalid whitespace before
+    // the colon is removed (RFC 9112 §5.1) rather than replayed — then the
+    // forced close so the origin ends the exchange by closing (one upstream
+    // connection per request — no keep-alive reuse).
     let mut out = Vec::with_capacity(header_block.len() + 128);
     out.extend_from_slice(format!("{method} {path} {version}\r\nHost: {authority}\r\n").as_bytes());
     for h in &headers {
@@ -237,7 +239,9 @@ fn rewrite_forward(
         if STRIPPED_HEADERS.contains(&lower.as_str()) || connection_options.contains(&lower) {
             continue;
         }
-        out.extend_from_slice(h.line);
+        out.extend_from_slice(h.name.as_bytes());
+        out.push(b':');
+        out.extend_from_slice(h.value);
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"Connection: close\r\n\r\n");
@@ -245,12 +249,12 @@ fn rewrite_forward(
 }
 
 /// One parsed header line: the name (any invalid-but-tolerated whitespace
-/// before the colon removed, as RFC 9112 §5.1 directs a proxy to do), the raw
-/// value bytes, and the full line to forward verbatim.
+/// before the colon removed, as RFC 9112 §5.1 directs a proxy to do) and the
+/// raw value bytes (leading OWS and all, so re-emitting `name:value` restores
+/// the line in canonical form).
 struct HeaderLine<'a> {
     name: &'a str,
     value: &'a [u8],
-    line: &'a [u8],
 }
 
 /// Split a CRLF-terminated header block into [`HeaderLine`]s. Rejects obs-fold
@@ -282,7 +286,6 @@ fn split_header_lines(block: &[u8]) -> Result<Vec<HeaderLine<'_>>, Reject> {
         out.push(HeaderLine {
             name,
             value: &line[colon + 1..],
-            line,
         });
     }
     Ok(out)
@@ -333,6 +336,9 @@ fn split_authority(authority: &str, default_port: Option<u16>) -> Option<(&str, 
         }
     } else {
         match authority.rsplit_once(':') {
+            // A colon still in the host means a raw IPv6 literal (or garbage):
+            // the host/port split is ambiguous, so require brackets.
+            Some((host, _)) if host.contains(':') => return None,
             Some((host, port)) => (host, Some(port)),
             None => (authority, None),
         }
@@ -436,6 +442,19 @@ mod tests {
             target.unwrap(),
             HttpRequest::Connect(Target::Ip("[::1]:80".parse().unwrap()))
         );
+    }
+
+    #[tokio::test]
+    async fn unbracketed_ipv6_authority_is_400() {
+        // "::1:443" is itself a valid IPv6 address — the host/port split is
+        // ambiguous without brackets, so it must be rejected, not guessed.
+        let (target, resp) = run(b"CONNECT ::1:443 HTTP/1.1\r\n\r\n").await;
+        assert!(target.is_err());
+        assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp:?}");
+
+        let (target, resp) = run(b"GET http://foo:bar:80/ HTTP/1.1\r\n\r\n").await;
+        assert!(target.is_err(), "colon-bearing host must not become a Domain");
+        assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp:?}");
     }
 
     #[tokio::test]
@@ -591,6 +610,21 @@ mod tests {
         let (target, resp) = run(b"GET http://example.com/ HTTP/2.0\r\n\r\n").await;
         assert!(target.is_err());
         assert!(resp.starts_with("HTTP/1.1 505"), "got: {resp:?}");
+
+        // CONNECT is gated by the same version check as forwards.
+        let (target, resp) = run(b"CONNECT example.com:443 HTTP/2.0\r\n\r\n").await;
+        assert!(target.is_err());
+        assert!(resp.starts_with("HTTP/1.1 505"), "got: {resp:?}");
+    }
+
+    #[tokio::test]
+    async fn forward_normalizes_whitespace_before_header_colon() {
+        // Whitespace between name and colon is invalid; a proxy removes it
+        // (RFC 9112 §5.1) instead of replaying the raw line.
+        let (_, head) =
+            run_forward(b"GET http://example.com/ HTTP/1.1\r\nX-Test : value\r\n\r\n").await;
+        assert!(head.contains("X-Test: value\r\n"), "got: {head:?}");
+        assert!(!head.contains("X-Test :"), "got: {head:?}");
     }
 
     #[tokio::test]
