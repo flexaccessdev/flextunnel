@@ -1,13 +1,22 @@
-//! Client-side HTTP proxy front-end (Phase 1): HTTP/1.x `CONNECT` tunneling.
+//! Client-side HTTP proxy front-end: HTTP/1.x `CONNECT` tunneling and
+//! absolute-URI plain-HTTP forwarding.
 //!
-//! Handles `CONNECT host:port HTTP/1.1`, mapping the authority to a wire
-//! [`Target`] — a hostname becomes [`Target::Domain`] so DNS happens on the
-//! **server** (flextunnel's whole point), a literal IP becomes [`Target::Ip`]
-//! (the client already resolved it). This mirrors the ATYP DOMAIN vs IP split in
+//! Both modes map the destination to a wire [`Target`] — a hostname becomes
+//! [`Target::Domain`] so DNS happens on the **server** (flextunnel's whole
+//! point), a literal IP becomes [`Target::Ip`] (the client already resolved
+//! it). This mirrors the ATYP DOMAIN vs IP split in
 //! [`crate::proxy::socks5::read_connect_request`].
 //!
-//! Absolute-URI plain-HTTP forwarding (`GET http://host/… HTTP/1.1`) is out of
-//! scope for Phase 1 and is rejected with `501 Not Implemented`.
+//! `CONNECT host:port` opens an opaque tunnel: answer `200`, then splice.
+//!
+//! Plain-HTTP requests arrive in absolute-form (`GET http://host/path
+//! HTTP/1.1`, RFC 9112 §3.2.2). The head is rewritten to origin-form
+//! (`GET /path`) with `Host` regenerated from the URI, hop-by-hop headers
+//! stripped (RFC 9110 §7.6.1), and `Connection: close` appended — one upstream
+//! connection per request; the origin closing it is what ends the exchange.
+//! The request body and the whole response are relayed **verbatim** (their
+//! `Content-Length`/chunked framing untouched), so no body parsing is needed
+//! and the origin's response is the reply the local app sees.
 
 use crate::proxy::signaling::{self, Target};
 use std::io;
@@ -18,18 +27,68 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// like the auth-handshake cap in `signaling` (`MAX_HANDSHAKE_SIZE`).
 const MAX_HTTP_HEADER: usize = 64 * 1024;
 
-/// Read an HTTP proxy request head (request line + headers, up to `\r\n\r\n`) and
-/// parse a `CONNECT` target into a wire [`Target`].
+/// Headers never forwarded: the hop-by-hop set (RFC 9110 §7.6.1), the
+/// pre-standard `Proxy-Connection`, and `Host` (regenerated from the request
+/// URI, RFC 9112 §3.2.2). Headers named by a `Connection` header are stripped
+/// dynamically on top of this list. `Transfer-Encoding`/`Content-Length` stay:
+/// the body is relayed verbatim, so its framing must travel with it.
+const STRIPPED_HEADERS: &[&str] = &[
+    "connection",
+    "proxy-connection",
+    "keep-alive",
+    "te",
+    "upgrade",
+    "proxy-authorization",
+    "proxy-authenticate",
+    "host",
+];
+
+/// A parsed request from the local HTTP proxy listener.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HttpRequest {
+    /// `CONNECT host:port` — open the tunnel, answer `200 Connection
+    /// Established`, then splice raw bytes.
+    Connect(Target),
+    /// Absolute-URI plain-HTTP request — open the tunnel, write the rewritten
+    /// origin-form `head` upstream, then splice raw bytes. The origin's
+    /// response is the local app's reply, so no success response is generated
+    /// locally. Any body bytes were left unread in the local socket and relay
+    /// through the splice.
+    Forward { target: Target, head: Vec<u8> },
+}
+
+/// Why a request can't be served: the HTTP status to answer the local app with
+/// and the detail for the error returned to the caller.
+struct Reject {
+    code: u16,
+    reason: &'static str,
+    detail: String,
+}
+
+impl Reject {
+    fn bad_request(detail: impl Into<String>) -> Self {
+        Self {
+            code: 400,
+            reason: "Bad Request",
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Read an HTTP proxy request head (request line + headers, up to `\r\n\r\n`)
+/// and parse it into an [`HttpRequest`] — a `CONNECT` tunnel or a rewritten
+/// plain-HTTP forward.
 ///
-/// Reads one byte at a time so it never consumes past `\r\n\r\n` — any following
-/// bytes belong to the tunnel and must be left in the socket. On anything that
-/// can't be tunneled (a non-CONNECT method, a malformed request line, or
-/// oversized headers) it writes the matching HTTP error response to the client
-/// before returning an error, mirroring how
-/// [`crate::proxy::socks5::read_connect_request`] writes its own error replies.
-pub async fn read_connect_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+/// Reads one byte at a time so it never consumes past `\r\n\r\n` — any
+/// following bytes (the tunnel, or a forward's body) belong to the splice and
+/// must be left in the socket. On anything that can't be served (a malformed
+/// request line, a non-absolute plain-HTTP target, or oversized headers) it
+/// writes the matching HTTP error response to the client before returning an
+/// error, mirroring how [`crate::proxy::socks5::read_connect_request`] writes
+/// its own error replies.
+pub async fn read_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
-) -> io::Result<Target> {
+) -> io::Result<HttpRequest> {
     // Accumulate the head byte-by-byte until the blank-line terminator. An I/O
     // error or EOF here propagates untouched — there's no complete request to
     // answer with a status line.
@@ -73,60 +132,220 @@ pub async fn read_connect_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         )));
     }
 
-    // Phase 1 handles CONNECT only; plain-HTTP absolute-URI forwarding is Phase 2.
-    if !method.eq_ignore_ascii_case("CONNECT") {
-        write_error(stream, 501, "Not Implemented").await?;
-        return Err(io::Error::other(format!(
-            "HTTP method {method} not supported (CONNECT tunneling only)"
-        )));
+    if method.eq_ignore_ascii_case("CONNECT") {
+        // CONNECT request-target is authority-form: host:port (RFC 9110 §9.3.6);
+        // the port is mandatory (no default to fall back on).
+        let Some((host, port)) = split_authority(request_target, None) else {
+            write_error(stream, 400, "Bad Request").await?;
+            return Err(io::Error::other(format!(
+                "invalid CONNECT authority: {request_target:?}"
+            )));
+        };
+        let target = host_to_target(host, port);
+        log_dns_mode("CONNECT", &target);
+        return Ok(HttpRequest::Connect(target));
     }
 
-    // CONNECT request-target is authority-form: host:port (RFC 9110 §9.3.6).
-    let Some((host, port)) = split_authority(request_target) else {
-        write_error(stream, 400, "Bad Request").await?;
-        return Err(io::Error::other(format!(
-            "invalid CONNECT authority: {request_target:?}"
-        )));
-    };
-
-    let target = match host.parse::<IpAddr>() {
-        Ok(ip) => Target::Ip(SocketAddr::new(ip, port)),
-        Err(_) => Target::Domain(host.to_string(), port),
-    };
-
-    // Log the DNS mode at info (server-side vs client-side resolution) and the
-    // specific destination only at debug, matching the SOCKS5 handler so default
-    // logs don't leak user destinations.
-    match &target {
-        Target::Domain(host, port) => {
-            log::info!("HTTP CONNECT — hostname (remote DNS, resolved on server)");
-            log::debug!("HTTP CONNECT target {host}:{port}");
+    // Any other method is a plain-HTTP forward: rewrite the absolute-form head
+    // to the origin-form head sent upstream.
+    let header_block = &head[line_end + 2..head.len() - 2];
+    match rewrite_forward(method, request_target, version, header_block) {
+        Ok((target, head)) => {
+            log_dns_mode(method, &target);
+            Ok(HttpRequest::Forward { target, head })
         }
-        Target::Ip(addr) => {
-            log::info!("HTTP CONNECT — literal IP (local DNS, client pre-resolved)");
-            log::debug!("HTTP CONNECT target {addr}");
+        Err(reject) => {
+            write_error(stream, reject.code, reject.reason).await?;
+            Err(io::Error::other(reject.detail))
         }
     }
-    Ok(target)
 }
 
-/// Split an authority-form `host:port` into its parts, handling bracketed IPv6
-/// literals (`[::1]:443`). Returns `None` on a missing/empty host, a missing or
-/// non-numeric port, or port 0.
-fn split_authority(authority: &str) -> Option<(&str, u16)> {
+/// Rewrite an absolute-form plain-HTTP request head into the origin-form head
+/// to send upstream, returning it with the derived wire [`Target`].
+fn rewrite_forward(
+    method: &str,
+    request_target: &str,
+    version: &str,
+    header_block: &[u8],
+) -> Result<(Target, Vec<u8>), Reject> {
+    // The exchange is relayed verbatim in HTTP/1.x framing end to end, so only
+    // 1.x clients can be served.
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        return Err(Reject {
+            code: 505,
+            reason: "HTTP Version Not Supported",
+            detail: format!("cannot forward a {version} request"),
+        });
+    }
+
+    // A proxied plain-HTTP request must be absolute-form (RFC 9112 §3.2.2).
+    // `https://` can't appear here — TLS traffic reaches a proxy via CONNECT.
+    let Some(rest) = strip_scheme(request_target, "http://") else {
+        return Err(if strip_scheme(request_target, "https://").is_some() {
+            Reject::bad_request(format!(
+                "https absolute-URI must use CONNECT: {request_target:?}"
+            ))
+        } else {
+            Reject::bad_request(format!(
+                "request target is not an absolute http:// URI: {request_target:?}"
+            ))
+        });
+    };
+    let (authority, path) = match rest.find(['/', '?']) {
+        Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], rest[i..].to_string()),
+        Some(i) => (&rest[..i], format!("/{}", &rest[i..])),
+        None => (rest, "/".to_string()),
+    };
+    if authority.contains('@') {
+        // A client MUST NOT generate userinfo in the target (RFC 9112 §3.2.4);
+        // reject rather than guess at credentials handling.
+        return Err(Reject::bad_request(format!(
+            "userinfo in request target: {request_target:?}"
+        )));
+    }
+    let Some((host, port)) = split_authority(authority, Some(80)) else {
+        return Err(Reject::bad_request(format!(
+            "invalid authority in request target: {request_target:?}"
+        )));
+    };
+    let target = host_to_target(host, port);
+
+    // First pass over the headers: collect the connection options — headers the
+    // client marked hop-by-hop — so the rewrite pass strips them too.
+    let headers = split_header_lines(header_block)?;
+    let mut connection_options: Vec<String> = Vec::new();
+    for h in &headers {
+        if h.name.eq_ignore_ascii_case("connection")
+            || h.name.eq_ignore_ascii_case("proxy-connection")
+        {
+            connection_options.extend(
+                String::from_utf8_lossy(h.value)
+                    .split(',')
+                    .map(|t| t.trim().to_ascii_lowercase()),
+            );
+        }
+    }
+
+    // Origin-form request line + regenerated Host, then the surviving headers
+    // verbatim, then the forced close so the origin ends the exchange by
+    // closing (one upstream connection per request — no keep-alive reuse).
+    let mut out = Vec::with_capacity(header_block.len() + 128);
+    out.extend_from_slice(format!("{method} {path} {version}\r\nHost: {authority}\r\n").as_bytes());
+    for h in &headers {
+        let lower = h.name.to_ascii_lowercase();
+        if STRIPPED_HEADERS.contains(&lower.as_str()) || connection_options.contains(&lower) {
+            continue;
+        }
+        out.extend_from_slice(h.line);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    Ok((target, out))
+}
+
+/// One parsed header line: the name (any invalid-but-tolerated whitespace
+/// before the colon removed, as RFC 9112 §5.1 directs a proxy to do), the raw
+/// value bytes, and the full line to forward verbatim.
+struct HeaderLine<'a> {
+    name: &'a str,
+    value: &'a [u8],
+    line: &'a [u8],
+}
+
+/// Split a CRLF-terminated header block into [`HeaderLine`]s. Rejects obs-fold
+/// continuation lines (a proxy may answer those with `400`, RFC 9112 §5.2) and
+/// lines without a colon.
+fn split_header_lines(block: &[u8]) -> Result<Vec<HeaderLine<'_>>, Reject> {
+    let mut out = Vec::new();
+    let mut rest = block;
+    while !rest.is_empty() {
+        // The block is CRLF-terminated by construction (it ends right before the
+        // head's final CRLF), so a missing CRLF can't happen; be defensive anyway.
+        let end = rest
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .unwrap_or(rest.len());
+        let line = &rest[..end];
+        rest = &rest[(end + 2).min(rest.len())..];
+        if line.first().is_some_and(|b| *b == b' ' || *b == b'\t') {
+            return Err(Reject::bad_request(
+                "obsolete header line folding is not supported".to_string(),
+            ));
+        }
+        let malformed =
+            || Reject::bad_request(format!("malformed header line: {:?}", line.escape_ascii()));
+        let colon = line.iter().position(|&b| b == b':').ok_or_else(malformed)?;
+        let name = std::str::from_utf8(&line[..colon])
+            .map_err(|_| malformed())?
+            .trim_ascii_end();
+        out.push(HeaderLine {
+            name,
+            value: &line[colon + 1..],
+            line,
+        });
+    }
+    Ok(out)
+}
+
+/// Case-insensitively strip a `scheme` prefix (e.g. `"http://"`).
+fn strip_scheme<'a>(target: &'a str, scheme: &str) -> Option<&'a str> {
+    let (prefix, rest) = target.split_at_checked(scheme.len())?;
+    prefix.eq_ignore_ascii_case(scheme).then_some(rest)
+}
+
+/// A hostname becomes [`Target::Domain`] (resolved on the server), a literal IP
+/// [`Target::Ip`] (the client already resolved it).
+fn host_to_target(host: &str, port: u16) -> Target {
+    match host.parse::<IpAddr>() {
+        Ok(ip) => Target::Ip(SocketAddr::new(ip, port)),
+        Err(_) => Target::Domain(host.to_string(), port),
+    }
+}
+
+/// Log the DNS mode at info (server-side vs client-side resolution) and the
+/// specific destination only at debug, matching the SOCKS5 handler so default
+/// logs don't leak user destinations.
+fn log_dns_mode(what: &str, target: &Target) {
+    match target {
+        Target::Domain(host, port) => {
+            log::info!("HTTP {what} — hostname (remote DNS, resolved on server)");
+            log::debug!("HTTP {what} target {host}:{port}");
+        }
+        Target::Ip(addr) => {
+            log::info!("HTTP {what} — literal IP (local DNS, client pre-resolved)");
+            log::debug!("HTTP {what} target {addr}");
+        }
+    }
+}
+
+/// Split an authority `host[:port]` into its parts, handling bracketed IPv6
+/// literals (`[::1]:443`). A missing port falls back to `default_port`; `None`
+/// (CONNECT, where the port is mandatory) makes it an error. Returns `None` on
+/// a missing/empty host, a malformed or non-numeric port, or port 0.
+fn split_authority(authority: &str, default_port: Option<u16>) -> Option<(&str, u16)> {
     let (host, port_str) = if let Some(rest) = authority.strip_prefix('[') {
-        // IPv6 literal: [addr]:port — host is the address without the brackets.
+        // IPv6 literal: [addr][:port] — host is the address without the brackets.
         let (addr, after) = rest.split_once(']')?;
-        (addr, after.strip_prefix(':')?)
+        match after {
+            "" => (addr, None),
+            _ => (addr, Some(after.strip_prefix(':')?)),
+        }
     } else {
-        authority.rsplit_once(':')?
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
     };
     if host.is_empty() {
         return None;
     }
-    match port_str.parse::<u16>() {
-        Ok(0) | Err(_) => None,
-        Ok(port) => Some((host, port)),
+    match port_str {
+        Some(p) => match p.parse::<u16>() {
+            Ok(0) | Err(_) => None,
+            Ok(port) => Some((host, port)),
+        },
+        None => Some((host, default_port?)),
     }
 }
 
@@ -134,6 +353,8 @@ fn split_authority(authority: &str) -> Option<(&str, u16)> {
 ///
 /// [`signaling::REP_SUCCESS`] becomes `200 Connection Established` (after which
 /// the socket is an opaque tunnel); other codes map to an HTTP error status.
+/// Only the tunnel (CONNECT) path sends the success response — a forward's
+/// success reply is the origin's own response.
 pub async fn write_reply<S: AsyncWriteExt + Unpin>(stream: &mut S, rep: u8) -> io::Result<()> {
     if rep == signaling::REP_SUCCESS {
         return stream
@@ -143,7 +364,7 @@ pub async fn write_reply<S: AsyncWriteExt + Unpin>(stream: &mut S, rep: u8) -> i
     let (code, reason) = match rep {
         signaling::REP_NOT_ALLOWED => (403, "Forbidden"),
         // Timeouts, refusals, unreachable, and general failures all surface as a
-        // bad-gateway to the local app in Phase 1.
+        // bad-gateway to the local app.
         _ => (502, "Bad Gateway"),
     };
     write_error(stream, code, reason).await
@@ -164,23 +385,39 @@ async fn write_error<S: AsyncWriteExt + Unpin>(
 mod tests {
     use super::*;
 
-    /// Drive `read_connect_request` with `request`, returning its result and any
-    /// bytes it wrote back to the client (the error response, if any).
-    async fn run(request: &[u8]) -> (io::Result<Target>, String) {
+    /// Drive `read_request` with `request`, returning its result and any bytes
+    /// it wrote back to the client (the error response, if any).
+    async fn run(request: &[u8]) -> (io::Result<HttpRequest>, String) {
         let (mut client, mut server) = tokio::io::duplex(4096);
         client.write_all(request).await.unwrap();
-        let result = read_connect_request(&mut server).await;
+        let result = read_request(&mut server).await;
         drop(server);
         let mut resp = Vec::new();
         let _ = client.read_to_end(&mut resp).await;
         (result, String::from_utf8_lossy(&resp).into_owned())
     }
 
+    /// `run` for requests expected to parse into a forward; returns the target
+    /// and the rewritten head as a string.
+    async fn run_forward(request: &[u8]) -> (Target, String) {
+        let (result, resp) = run(request).await;
+        match result.unwrap() {
+            HttpRequest::Forward { target, head } => {
+                assert!(resp.is_empty(), "no local response expected, got: {resp:?}");
+                (target, String::from_utf8(head).unwrap())
+            }
+            other => panic!("expected a forward, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn connect_domain_is_server_resolved() {
         let (target, _) =
             run(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n").await;
-        assert_eq!(target.unwrap(), Target::Domain("example.com".to_string(), 443));
+        assert_eq!(
+            target.unwrap(),
+            HttpRequest::Connect(Target::Domain("example.com".to_string(), 443))
+        );
     }
 
     #[tokio::test]
@@ -188,21 +425,17 @@ mod tests {
         let (target, _) = run(b"CONNECT 93.184.216.34:443 HTTP/1.1\r\n\r\n").await;
         assert_eq!(
             target.unwrap(),
-            Target::Ip("93.184.216.34:443".parse().unwrap())
+            HttpRequest::Connect(Target::Ip("93.184.216.34:443".parse().unwrap()))
         );
     }
 
     #[tokio::test]
     async fn connect_ipv6_literal_is_ip() {
         let (target, _) = run(b"CONNECT [::1]:80 HTTP/1.1\r\n\r\n").await;
-        assert_eq!(target.unwrap(), Target::Ip("[::1]:80".parse().unwrap()));
-    }
-
-    #[tokio::test]
-    async fn non_connect_method_is_501() {
-        let (target, resp) = run(b"GET http://example.com/ HTTP/1.1\r\nHost: x\r\n\r\n").await;
-        assert!(target.is_err());
-        assert!(resp.starts_with("HTTP/1.1 501"), "got: {resp:?}");
+        assert_eq!(
+            target.unwrap(),
+            HttpRequest::Connect(Target::Ip("[::1]:80".parse().unwrap()))
+        );
     }
 
     #[tokio::test]
@@ -236,8 +469,138 @@ mod tests {
             let _ = client.write_all(&vec![b'a'; MAX_HTTP_HEADER + 16]).await;
             std::future::pending::<()>().await;
         });
-        let err = read_connect_request(&mut server).await.unwrap_err();
+        let err = read_request(&mut server).await.unwrap_err();
         assert!(err.to_string().contains("size cap"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn absolute_uri_get_is_rewritten_to_origin_form() {
+        let (target, head) = run_forward(
+            b"GET http://example.com/path?q=1 HTTP/1.1\r\n\
+              Host: stale.example\r\n\
+              Accept: */*\r\n\
+              Proxy-Connection: keep-alive\r\n\r\n",
+        )
+        .await;
+        assert_eq!(target, Target::Domain("example.com".to_string(), 80));
+        assert_eq!(
+            head,
+            "GET /path?q=1 HTTP/1.1\r\n\
+             Host: example.com\r\n\
+             Accept: */*\r\n\
+             Connection: close\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_explicit_port_and_bare_authority() {
+        // No path → "/", and the URI's explicit port survives in Host + target.
+        let (target, head) = run_forward(b"GET http://example.com:8080 HTTP/1.1\r\n\r\n").await;
+        assert_eq!(target, Target::Domain("example.com".to_string(), 8080));
+        assert!(
+            head.starts_with("GET / HTTP/1.1\r\nHost: example.com:8080\r\n"),
+            "got: {head:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_query_without_path_gets_slash() {
+        let (_, head) = run_forward(b"GET http://example.com?q=1 HTTP/1.1\r\n\r\n").await;
+        assert!(head.starts_with("GET /?q=1 HTTP/1.1\r\n"), "got: {head:?}");
+    }
+
+    #[tokio::test]
+    async fn forward_ip_literals() {
+        let (target, _) = run_forward(b"GET http://127.0.0.1:8080/x HTTP/1.1\r\n\r\n").await;
+        assert_eq!(target, Target::Ip("127.0.0.1:8080".parse().unwrap()));
+
+        let (target, head) = run_forward(b"GET http://[::1]/x HTTP/1.1\r\n\r\n").await;
+        assert_eq!(target, Target::Ip("[::1]:80".parse().unwrap()));
+        assert!(head.contains("Host: [::1]\r\n"), "got: {head:?}");
+    }
+
+    #[tokio::test]
+    async fn forward_strips_connection_named_headers() {
+        // "Connection: keep-alive, x-hop" marks X-Hop hop-by-hop; body framing
+        // headers survive because the body is relayed verbatim.
+        let (_, head) = run_forward(
+            b"POST http://example.com/upload HTTP/1.1\r\n\
+              Connection: keep-alive, x-hop\r\n\
+              X-Hop: secret\r\n\
+              Keep-Alive: timeout=5\r\n\
+              Proxy-Authorization: Basic Zm9v\r\n\
+              Transfer-Encoding: chunked\r\n\
+              User-Agent: test\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            head,
+            "POST /upload HTTP/1.1\r\n\
+             Host: example.com\r\n\
+             Transfer-Encoding: chunked\r\n\
+             User-Agent: test\r\n\
+             Connection: close\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_leaves_body_bytes_in_the_stream() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client
+            .write_all(
+                b"POST http://example.com/ HTTP/1.1\r\nContent-Length: 4\r\n\r\nBODY",
+            )
+            .await
+            .unwrap();
+        let req = read_request(&mut server).await.unwrap();
+        assert!(matches!(req, HttpRequest::Forward { .. }));
+        let mut body = [0u8; 4];
+        server.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"BODY");
+    }
+
+    #[tokio::test]
+    async fn forward_http10_version_is_echoed() {
+        let (_, head) = run_forward(b"GET http://example.com/ HTTP/1.0\r\n\r\n").await;
+        assert!(head.starts_with("GET / HTTP/1.0\r\n"), "got: {head:?}");
+    }
+
+    #[tokio::test]
+    async fn https_absolute_uri_is_400() {
+        let (target, resp) = run(b"GET https://example.com/ HTTP/1.1\r\n\r\n").await;
+        assert!(target.is_err());
+        assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp:?}");
+    }
+
+    #[tokio::test]
+    async fn origin_form_target_is_400() {
+        let (target, resp) = run(b"GET /path HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
+        assert!(target.is_err());
+        assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp:?}");
+    }
+
+    #[tokio::test]
+    async fn userinfo_in_target_is_400() {
+        let (target, resp) = run(b"GET http://user:pw@example.com/ HTTP/1.1\r\n\r\n").await;
+        assert!(target.is_err());
+        assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp:?}");
+    }
+
+    #[tokio::test]
+    async fn non_http1x_version_is_505() {
+        let (target, resp) = run(b"GET http://example.com/ HTTP/2.0\r\n\r\n").await;
+        assert!(target.is_err());
+        assert!(resp.starts_with("HTTP/1.1 505"), "got: {resp:?}");
+    }
+
+    #[tokio::test]
+    async fn obs_fold_header_is_400() {
+        let (target, resp) = run(
+            b"GET http://example.com/ HTTP/1.1\r\nX-Long: a\r\n b\r\n\r\n",
+        )
+        .await;
+        assert!(target.is_err());
+        assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp:?}");
     }
 
     #[tokio::test]

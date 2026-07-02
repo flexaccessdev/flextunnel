@@ -86,8 +86,9 @@ pub struct ClientConfig {
     pub server_node_id: Option<String>,
     /// Local address for the SOCKS5 listener.
     pub socks_listen: Option<SocketAddr>,
-    /// Local address for the optional HTTP proxy (CONNECT) listener. Unset =
-    /// HTTP front-end disabled; the SOCKS5 listener is always on.
+    /// Local address for the optional HTTP proxy listener (CONNECT tunneling +
+    /// absolute-URI plain-HTTP forwarding). Unset = HTTP front-end disabled;
+    /// the SOCKS5 listener is always on.
     pub http_listen: Option<SocketAddr>,
     /// Auth token to send to the server.
     pub auth_token: Option<String>,

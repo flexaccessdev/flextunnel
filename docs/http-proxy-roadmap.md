@@ -1,7 +1,8 @@
 # Roadmap: HTTP proxy support
 
-Status: **Phase 1 implemented** (HTTP `CONNECT` tunneling). Phases 2–3 remain
-proposed. The client exposes a **SOCKS5** listener
+Status: **Phases 1–2 implemented** (HTTP `CONNECT` tunneling + absolute-URI
+plain-HTTP forwarding). Phase 3 remains proposed. The client exposes a
+**SOCKS5** listener
 (`crates/flextunnel-core/src/proxy/socks5.rs`) and, when `--http-listen` is set,
 an **HTTP proxy** front-end (`crates/flextunnel-core/src/proxy/http.rs`) —
 both handled by the shared routing core in
@@ -31,8 +32,8 @@ so DNS happens server-side — exactly what flextunnel needs. The gap, by tier:
 
 ### What HTTP proxy does *not* cover
 
-An HTTP proxy only helps clients that speak HTTP (CONNECT or, in Phase 2,
-absolute-URI). **Raw-TCP apps — databases via JDBC/native clients, RDP, SSH —
+An HTTP proxy only helps clients that speak HTTP (CONNECT or absolute-URI).
+**Raw-TCP apps — databases via JDBC/native clients, RDP, SSH —
 do not speak HTTP CONNECT**, so they still need SOCKS5 (with the client-DNS
 caveat) or a `socat` port forward. See
 [`docs/socks5-usage.md`](socks5-usage.md) for those recipes. HTTP proxy
@@ -118,25 +119,37 @@ explicitly rejected with `501 Not Implemented` until Phase 2.
 - E2E (extend `scratchpad` harness): `curl -p -x http://127.0.0.1:8081 https://example.com`
   (curl `-p` forces CONNECT) and the server-localhost reachability case.
 
-## Phase 2 — Absolute-URI plain HTTP forwarding
+## Phase 2 — Absolute-URI plain HTTP forwarding — ✅ implemented
 
 Goal: handle `GET http://host/path HTTP/1.1` (and other methods) so plain-HTTP
 clients work without TLS.
 
-- Parse the absolute-form request target; derive `Target::Domain(host, 80)` (or
-  the URI's explicit port).
-- Rewrite the request line to origin-form and ensure a correct `Host` header;
-  strip hop-by-hop headers (`Proxy-Connection`, `Connection`, `Keep-Alive`,
-  `Proxy-Authorization`, etc.) per RFC 7230 §6.1.
-- Stream the request body (honor `Content-Length` / `Transfer-Encoding: chunked`)
-  to the tunnel, then relay the response.
-- **Decision needed:** adopt a vetted HTTP/1.x parser (e.g. `httparse`) rather
-  than hand-rolling header/chunk parsing. Add it as a dependency gated to this
-  feature. (Phase 1 needs only request-line + headers, which is small enough to
-  hand-parse; Phase 2's body framing is where a real parser earns its keep.)
-- Connection reuse / keep-alive across requests on one client↔proxy socket is a
-  sub-goal; the simplest correct first cut is one tunnel bi-stream per request
-  with `Connection: close`.
+Shipped in `proxy/http.rs` as a second arm of the same request parser
+(`read_request -> HttpRequest::{Connect, Forward}`); the shared routing core
+gained an optional *upstream preamble* (the rewritten head, written upstream
+instead of a local success reply) so the tunnel and direct split-tunnel paths
+both forward unchanged. As designed:
+
+- The absolute-form request target derives `Target::Domain(host, 80)` (or the
+  URI's explicit port); literal IPs become `Target::Ip`, as with CONNECT.
+- The request line is rewritten to origin-form with `Host` regenerated from the
+  URI; hop-by-hop headers (`Proxy-Connection`, `Connection` and any header it
+  names, `Keep-Alive`, `Proxy-Authorization`, etc.) are stripped per RFC 9110
+  §7.6.1.
+- One tunnel bi-stream per request with a forced `Connection: close`: after the
+  rewritten head is written upstream, the body and the whole response relay
+  **verbatim** (the same byte splice as CONNECT), and the origin closing the
+  connection ends the exchange. Keep-alive reuse remains future work (Phase 3
+  territory) — a client that tries to reuse the socket sees a clean close and
+  retries on a fresh connection.
+- **Decision (parser):** no `httparse` dependency. The verbatim relay means
+  body framing (`Content-Length`/chunked) is never interpreted, so the existing
+  hand-parsed request-line + header-line reader — where a real parser would
+  have earned its keep — covers everything Phase 2 needs.
+- Rejections: non-absolute (origin-form) targets, `https://` absolute URIs
+  (must use CONNECT), userinfo in the target, and obs-fold headers get `400`;
+  non-HTTP/1.x versions get `505`. The former blanket `501` for non-CONNECT
+  methods is gone.
 
 ## Phase 3 — Hardening & polish
 
@@ -147,7 +160,10 @@ clients work without TLS.
   `rep` → SOCKS5 reply so both front-ends stay consistent.
 - **Limits:** max header size, request timeout, and a concurrency cap shared with
   the SOCKS5 path.
-- **Docs:** add an HTTP-proxy section to `README.md` with `https_proxy=` usage.
+- **Keep-alive forwarding:** reuse one client↔proxy socket for multiple
+  forwarded requests (today each request forces `Connection: close`).
+- **Docs:** add an HTTP-proxy section to `README.md` with `https_proxy=` usage
+  (done alongside Phases 1–2).
 
 ## Non-goals (for now)
 

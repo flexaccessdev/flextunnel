@@ -58,8 +58,9 @@ pub struct ClientConfig {
     pub auth_token: String,
     /// Local address the SOCKS5 listener binds to.
     pub socks_listen: SocketAddr,
-    /// Local address for the optional HTTP proxy (CONNECT) listener. `None`
-    /// leaves the HTTP front-end disabled; the SOCKS5 listener is always on.
+    /// Local address for the optional HTTP proxy listener (CONNECT tunneling +
+    /// absolute-URI plain-HTTP forwarding). `None` leaves the HTTP front-end
+    /// disabled; the SOCKS5 listener is always on.
     pub http_listen: Option<SocketAddr>,
     /// Relay URL hints (optional).
     pub relay_urls: Vec<String>,
@@ -226,7 +227,7 @@ impl ProxyClient {
         );
         if let Some(l) = &http_listener {
             log::info!(
-                "HTTP proxy listening on {} (CONNECT tunneling only)",
+                "HTTP proxy listening on {} (CONNECT tunneling + plain-HTTP forwarding)",
                 l.local_addr()?
             );
         }
@@ -534,24 +535,32 @@ pub(crate) async fn client_heartbeat_loop(
     }
 }
 
-/// Accept local SOCKS5 connections for the lifetime of the listener, routing each
-/// against the current route policy and live connection. Runs independently of the
-/// QUIC connection, so off-list targets keep connecting directly while the tunnel
-/// is down. Until the first handshake learns the route policy the client fails
-/// closed and refuses every connection. Returns only on a listener error.
-/// A local front-end protocol (SOCKS5 or HTTP CONNECT). The two differ only in
-/// how they parse a local request into a [`Target`] and how they answer with a
-/// server reply code; everything after that — the route policy, split-tunnel
-/// dial, tunnel open, and byte pipe — is shared (see [`handle_local_conn`]).
+/// A local front-end request resolved to a wire [`Target`], plus how to begin
+/// the upstream exchange once connected.
+struct LocalRequest {
+    target: Target,
+    /// Bytes to write upstream before splicing: the rewritten request head of
+    /// an HTTP plain-forward, whose reply is the origin's own response. `None`
+    /// for pure tunnels (SOCKS5, HTTP CONNECT), which instead answer the local
+    /// app with a success reply.
+    upstream_preamble: Option<Vec<u8>>,
+}
+
+/// A local front-end protocol (SOCKS5 or HTTP). The protocols differ only in
+/// how they parse a local request into a [`LocalRequest`] and how they answer
+/// with a server reply code; everything after that — the route policy,
+/// split-tunnel dial, tunnel open, and byte pipe — is shared (see
+/// [`handle_local_conn`]).
 ///
 /// Methods return `impl Future + Send` (not bare `async fn`) so the futures are
 /// `Send`, which [`accept_loop`] needs to `tokio::spawn` a generic handler.
 trait LocalProto: Copy + Send + Sync + 'static {
-    /// Parse the local handshake into a [`Target`]. Any error the caller can't
-    /// yet answer with a reply code (a bad request, an unsupported method) must
-    /// be written to `tcp` here before returning `Err`, mirroring how
-    /// [`socks5::read_connect_request`] writes its own error replies.
-    fn read_target(&self, tcp: &mut TcpStream) -> impl Future<Output = Result<Target>> + Send;
+    /// Parse the local handshake into a [`LocalRequest`]. Any error the caller
+    /// can't yet answer with a reply code (a bad request, an unsupported
+    /// method) must be written to `tcp` here before returning `Err`, mirroring
+    /// how [`socks5::read_connect_request`] writes its own error replies.
+    fn read_request(&self, tcp: &mut TcpStream)
+    -> impl Future<Output = Result<LocalRequest>> + Send;
 
     /// Answer the local app with the response corresponding to server reply
     /// code `rep` ([`signaling::REP_SUCCESS`] et al.).
@@ -564,9 +573,12 @@ trait LocalProto: Copy + Send + Sync + 'static {
 struct Socks5Proto;
 
 impl LocalProto for Socks5Proto {
-    async fn read_target(&self, tcp: &mut TcpStream) -> Result<Target> {
+    async fn read_request(&self, tcp: &mut TcpStream) -> Result<LocalRequest> {
         socks5::negotiate_method(tcp).await?;
-        Ok(socks5::read_connect_request(tcp).await?)
+        Ok(LocalRequest {
+            target: socks5::read_connect_request(tcp).await?,
+            upstream_preamble: None,
+        })
     }
 
     async fn reply(&self, tcp: &mut TcpStream, rep: u8) -> io::Result<()> {
@@ -574,13 +586,23 @@ impl LocalProto for Socks5Proto {
     }
 }
 
-/// HTTP proxy front-end: `CONNECT host:port` tunneling, HTTP status-line replies.
+/// HTTP proxy front-end: `CONNECT host:port` tunneling and absolute-URI
+/// plain-HTTP forwarding, HTTP status-line replies.
 #[derive(Clone, Copy)]
 struct HttpProto;
 
 impl LocalProto for HttpProto {
-    async fn read_target(&self, tcp: &mut TcpStream) -> Result<Target> {
-        Ok(http::read_connect_request(tcp).await?)
+    async fn read_request(&self, tcp: &mut TcpStream) -> Result<LocalRequest> {
+        Ok(match http::read_request(tcp).await? {
+            http::HttpRequest::Connect(target) => LocalRequest {
+                target,
+                upstream_preamble: None,
+            },
+            http::HttpRequest::Forward { target, head } => LocalRequest {
+                target,
+                upstream_preamble: Some(head),
+            },
+        })
     }
 
     async fn reply(&self, tcp: &mut TcpStream, rep: u8) -> io::Result<()> {
@@ -610,11 +632,11 @@ async fn accept_loop<P: LocalProto>(
     }
 }
 
-/// Handle one local SOCKS5 connection: negotiate, parse CONNECT, then route by the
-/// current route policy — refused with a general-failure reply until the policy is
-/// known (fail closed), otherwise an on-list target is tunneled to the server (or
-/// answered with a network-unreachable reply if the tunnel is down) and an
-/// off-list target is dialed directly from this device.
+/// Handle one local proxy connection: parse the front-end request, then route by
+/// the current route policy — refused with a general-failure reply until the
+/// policy is known (fail closed), otherwise an on-list target is tunneled to the
+/// server (or answered with a network-unreachable reply if the tunnel is down)
+/// and an off-list target is dialed directly from this device.
 async fn handle_local_conn<P: LocalProto>(
     proto: P,
     mut tcp: TcpStream,
@@ -623,7 +645,10 @@ async fn handle_local_conn<P: LocalProto>(
 ) -> Result<()> {
     // Bound the local handshake so a peer that connects and sends nothing can't
     // pin this task and its socket indefinitely.
-    let target = tokio::time::timeout(LOCAL_HANDSHAKE_TIMEOUT, proto.read_target(&mut tcp))
+    let LocalRequest {
+        target,
+        upstream_preamble,
+    } = tokio::time::timeout(LOCAL_HANDSHAKE_TIMEOUT, proto.read_request(&mut tcp))
         .await
         .map_err(|_| anyhow::anyhow!("timed out during local proxy handshake"))??;
 
@@ -642,7 +667,7 @@ async fn handle_local_conn<P: LocalProto>(
     // device's own network (its DNS, its IP) — works even when the tunnel is down.
     if !routed_set.allows(&target) {
         log::debug!("Direct (off tunnel set): {target:?}");
-        return direct_connect(proto, tcp, &target).await;
+        return direct_connect(proto, tcp, &target, upstream_preamble).await;
     }
 
     // On-list: needs a live tunnel. If the connection is down (a drop/backoff),
@@ -663,7 +688,7 @@ async fn handle_local_conn<P: LocalProto>(
         .await
         .map_err(|_| anyhow::anyhow!("timed out opening tunnel / awaiting server reply"))
         .and_then(|r| r);
-    let (send, recv, rep) = match opened {
+    let (mut send, recv, rep) = match opened {
         Ok(v) => v,
         Err(e) => {
             let _ = proto.reply(&mut tcp, signaling::REP_GENERAL_FAILURE).await;
@@ -671,9 +696,17 @@ async fn handle_local_conn<P: LocalProto>(
         }
     };
 
-    proto.reply(&mut tcp, rep).await?;
     if rep != signaling::REP_SUCCESS {
+        proto.reply(&mut tcp, rep).await?;
         return Ok(());
+    }
+
+    // Begin the exchange: a tunnel answers the local app with a success reply
+    // and splices; a forward instead writes the rewritten request head upstream
+    // — the origin's response, relayed by the splice, is the app's reply.
+    match &upstream_preamble {
+        None => proto.reply(&mut tcp, rep).await?,
+        Some(head) => send.write_all(head).await?,
     }
 
     let mut iroh = tokio::io::join(recv, send);
@@ -683,18 +716,23 @@ async fn handle_local_conn<P: LocalProto>(
 
 /// Connect to `target` directly from this device (bypassing the tunnel) and pipe
 /// bytes, answering the local app's request with the matching reply code via
-/// `proto`. Used for off-routed-set targets in split-tunnel mode. The dial is
-/// bounded by the same deadline as opening a tunnel so a slow target can't pin
-/// the task.
+/// `proto` (or, for an HTTP forward, writing its rewritten head upstream instead
+/// of a success reply). Used for off-routed-set targets in split-tunnel mode.
+/// The dial is bounded by the same deadline as opening a tunnel so a slow target
+/// can't pin the task.
 async fn direct_connect<P: LocalProto>(
     proto: P,
     mut tcp: TcpStream,
     target: &signaling::Target,
+    upstream_preamble: Option<Vec<u8>>,
 ) -> Result<()> {
     let dialed = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, dial::dial_target(target)).await;
     let mut upstream = match dialed {
-        Ok(Ok(s)) => {
-            proto.reply(&mut tcp, signaling::REP_SUCCESS).await?;
+        Ok(Ok(mut s)) => {
+            match &upstream_preamble {
+                None => proto.reply(&mut tcp, signaling::REP_SUCCESS).await?,
+                Some(head) => s.write_all(head).await?,
+            }
             s
         }
         Ok(Err(e)) => {
@@ -727,6 +765,7 @@ async fn open_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     fn test_client() -> ProxyClient {
         ProxyClient::new(ClientConfig {
@@ -764,5 +803,74 @@ mod tests {
         // Already latched: a further reappearance is not a *new* flag, so it must
         // not force another reconnect abort.
         assert!(!c.observe_server_nonce(2));
+    }
+
+    /// End-to-end plain-HTTP forwarding through the split-tunnel *direct* path:
+    /// the HTTP front-end rewrites the absolute-URI request to origin-form, the
+    /// off-list target is dialed directly, the rewritten head is written
+    /// upstream (no local success reply), and the origin's response streams
+    /// back verbatim.
+    #[tokio::test]
+    async fn http_forward_direct_path_relays_origin_response() {
+        // The origin: assert the head arrived rewritten, answer, and close —
+        // the close is what ends the exchange (Connection: close semantics).
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = origin.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.unwrap();
+                head.extend_from_slice(&buf[..n]);
+            }
+            let head = String::from_utf8(head).unwrap();
+            assert!(
+                head.starts_with("GET /hello HTTP/1.1\r\n"),
+                "origin-form request line expected, got: {head:?}"
+            );
+            assert!(head.contains(&format!("Host: 127.0.0.1:{origin_port}\r\n")));
+            assert!(head.contains("Connection: close\r\n"));
+            assert!(!head.contains("Proxy-Connection"));
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi")
+                .await
+                .unwrap();
+        });
+
+        // The proxy: one accepted socket handled with a policy that leaves
+        // 127.0.0.1 off-list, so the request takes the direct path.
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let routed = RoutedSet::new(
+            &["nothing.internal".to_string()],
+            &["10.0.0.0/8".to_string()],
+        )
+        .unwrap();
+        let current: SharedConn = Arc::new(Mutex::new(None));
+        let policy: SharedRoutedSet = Arc::new(Mutex::new(Some(Arc::new(routed))));
+        tokio::spawn(async move {
+            let (tcp, _) = proxy.accept().await.unwrap();
+            handle_local_conn(HttpProto, tcp, current, policy).await.unwrap();
+        });
+
+        let mut app = TcpStream::connect(proxy_addr).await.unwrap();
+        app.write_all(
+            format!(
+                "GET http://127.0.0.1:{origin_port}/hello HTTP/1.1\r\n\
+                 Host: 127.0.0.1:{origin_port}\r\n\
+                 Proxy-Connection: keep-alive\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut resp = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), app.read_to_end(&mut resp))
+            .await
+            .expect("proxied response timed out")
+            .unwrap();
+        let resp = String::from_utf8(resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "got: {resp:?}");
+        assert!(resp.ends_with("hi"), "got: {resp:?}");
     }
 }
