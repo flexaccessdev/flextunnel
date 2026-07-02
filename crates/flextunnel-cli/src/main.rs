@@ -74,8 +74,9 @@ enum Command {
         /// Local address for the SOCKS5 listener (default 127.0.0.1:1080).
         #[arg(long)]
         socks_listen: Option<SocketAddr>,
-        /// Also run an HTTP proxy (CONNECT) listener on this address, e.g.
-        /// 127.0.0.1:8081. Disabled unless set; the SOCKS5 listener stays on.
+        /// Also run an HTTP proxy listener (CONNECT + plain-HTTP forwarding) on
+        /// this address, e.g. 127.0.0.1:8081. Disabled unless set; the SOCKS5
+        /// listener stays on.
         #[arg(long)]
         http_listen: Option<SocketAddr>,
         /// EndpointId of the server to connect to.

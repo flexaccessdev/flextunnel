@@ -166,10 +166,11 @@ speak SOCKS5 (databases, RDP, most GUIs) — see
 
 #### HTTP proxy front-end (optional)
 
-Add `--http-listen <ADDR>` to also run an HTTP proxy (HTTP `CONNECT` tunneling)
-alongside SOCKS5 — useful for the many tools that only speak an HTTP proxy or
-whose SOCKS5 support resolves DNS client-side (`wget`, Docker pulls, npm/yarn,
-JVM/JDBC, .NET). Like SOCKS5, `CONNECT` sends the hostname to the proxy, so DNS
+Add `--http-listen <ADDR>` to also run an HTTP proxy alongside SOCKS5 — useful
+for the many tools that only speak an HTTP proxy or whose SOCKS5 support
+resolves DNS client-side (`wget`, Docker pulls, npm/yarn, JVM/JDBC, .NET). It
+handles HTTPS (and any TCP) via `CONNECT` tunneling and plain-HTTP via
+absolute-URI forwarding; either way the hostname goes to the proxy, so DNS
 still happens on the server.
 
 ```sh
@@ -178,15 +179,13 @@ flextunnel client \
     --auth-token     <AUTH_TOKEN> \
     --http-listen    127.0.0.1:8081     # SOCKS5 on :1080 stays on
 
-# HTTPS tunnels via CONNECT
+# HTTPS tunnels via CONNECT; plain HTTP is forwarded
 https_proxy=http://127.0.0.1:8081 curl https://example.com
+http_proxy=http://127.0.0.1:8081  curl http://example.com
 ```
 
-Phase 1 handles `CONNECT` only; plain-HTTP absolute-URI forwarding returns
-`501 Not Implemented`. See
-[`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) for the gap analysis,
-what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`), and the
-planned Phase 2.
+See [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) for the gap
+analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 
 ## Commands
 
@@ -434,8 +433,9 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
   lifecycle (fixed ALPN, auth handshake, per-stream protocol), module map,
   concurrency model, reconnect policy, security boundaries, and reference
   constants.
-- [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) — planned HTTP
-  proxy front-end (CONNECT tunneling, then absolute-URI forwarding).
+- [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) — the HTTP proxy
+  front-end (CONNECT tunneling + absolute-URI forwarding): motivation, design,
+  and remaining hardening work.
 - [`docs/socks5-usage.md`](docs/socks5-usage.md) — using the SOCKS5 proxy:
   native clients (`curl`, `git`, browsers), `ssh` through the tunnel, and
   `socat`/`ssh -L`/`-D` port forwards for apps that don't speak SOCKS5.

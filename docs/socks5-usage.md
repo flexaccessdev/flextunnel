@@ -7,11 +7,10 @@ pointed straight at it; anything that can't gets a small adapter in front.
 > If a tool only speaks an **HTTP proxy** (or its SOCKS5 support resolves DNS
 > client-side, which breaks routed internal names), run the client with
 > `--http-listen 127.0.0.1:8081` and point the tool at `http://127.0.0.1:8081`
-> — e.g. `https_proxy=http://127.0.0.1:8081`. Note this front-end currently
-> tunnels **HTTPS (and other `CONNECT`) traffic only**; plain-HTTP requests are
-> answered `501 Not Implemented`, so setting `http_proxy` won't help yet — use
-> `socks5h://` (or a `socat` forward) for plain HTTP. See
-> [`http-proxy-roadmap.md`](http-proxy-roadmap.md).
+> — e.g. `https_proxy=http://127.0.0.1:8081 http_proxy=http://127.0.0.1:8081`.
+> The front-end handles both HTTPS (`CONNECT` tunneling) and plain-HTTP
+> (absolute-URI forwarding). Raw-TCP apps (databases, RDP) still need SOCKS5 or
+> a `socat` forward. See [`http-proxy-roadmap.md`](http-proxy-roadmap.md).
 
 This guide covers, in order:
 
