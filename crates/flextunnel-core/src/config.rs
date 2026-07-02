@@ -86,6 +86,10 @@ pub struct ClientConfig {
     pub server_node_id: Option<String>,
     /// Local address for the SOCKS5 listener.
     pub socks_listen: Option<SocketAddr>,
+    /// Local address for the optional HTTP proxy listener (CONNECT tunneling +
+    /// absolute-URI plain-HTTP forwarding). Unset = HTTP front-end disabled;
+    /// the SOCKS5 listener is always on.
+    pub http_listen: Option<SocketAddr>,
     /// Auth token to send to the server.
     pub auth_token: Option<String>,
     /// File containing the auth token.
@@ -152,6 +156,7 @@ pub struct ResolvedServer {
 pub struct ResolvedClient {
     pub server_node_id: Option<String>,
     pub socks_listen: SocketAddr,
+    pub http_listen: Option<SocketAddr>,
     pub auth_token: Option<String>,
     pub auth_token_file: Option<PathBuf>,
     pub relay_urls: Vec<String>,
@@ -373,6 +378,8 @@ pub fn resolve_client(cli: ClientConfig, file: Option<ClientConfig>) -> Resolved
             .socks_listen
             .or(file.socks_listen)
             .unwrap_or_else(|| DEFAULT_SOCKS_LISTEN.parse().expect("valid default addr")),
+        // No default: the HTTP front-end is off unless explicitly configured.
+        http_listen: cli.http_listen.or(file.http_listen),
         auth_token,
         auth_token_file: auth_token_file.map(|p| expand_tilde(&p)),
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),

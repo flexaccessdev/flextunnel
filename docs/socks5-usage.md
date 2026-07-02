@@ -4,6 +4,14 @@ The flextunnel client exposes a local **SOCKS5** listener (default
 `127.0.0.1:1080`) and tunnels TCP `CONNECT`. Anything that speaks SOCKS5 can be
 pointed straight at it; anything that can't gets a small adapter in front.
 
+> If a tool only speaks an **HTTP proxy** (or its SOCKS5 support resolves DNS
+> client-side, which breaks routed internal names), run the client with
+> `--http-listen 127.0.0.1:8081` and point the tool at `http://127.0.0.1:8081`
+> — e.g. `https_proxy=http://127.0.0.1:8081 http_proxy=http://127.0.0.1:8081`.
+> The front-end handles both HTTPS (`CONNECT` tunneling) and plain-HTTP
+> (absolute-URI forwarding). Raw-TCP apps (databases, RDP) still need SOCKS5 or
+> a `socat` forward. See [`http-proxy-roadmap.md`](http-proxy-roadmap.md).
+
 This guide covers, in order:
 
 1. **The one rule** — always let the *server* resolve names.

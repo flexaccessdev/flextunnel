@@ -202,6 +202,8 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
         auth_token: cfg.auth_token,
         // Unused: the listener is already bound above and passed in directly.
         socks_listen: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        // iOS uses run_with_listener (SOCKS5 only); no HTTP front-end exposed.
+        http_listen: None,
         relay_urls: cfg.relay_urls,
         auto_reconnect: true,
         max_reconnect_attempts: None,

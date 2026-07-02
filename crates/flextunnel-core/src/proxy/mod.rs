@@ -1,8 +1,10 @@
-//! The SOCKS5-over-QUIC proxy: signaling, SOCKS5, client, server, and agent.
+//! The proxy over QUIC: signaling, SOCKS5 and HTTP front-ends, client, server,
+//! and agent.
 
 pub mod agent;
 pub mod client;
 pub mod dial;
+pub mod http;
 pub mod server;
 pub mod routed_set;
 pub mod signaling;
