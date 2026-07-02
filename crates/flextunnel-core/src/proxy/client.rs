@@ -822,6 +822,7 @@ mod tests {
             let mut buf = [0u8; 1024];
             while !head.windows(4).any(|w| w == b"\r\n\r\n") {
                 let n = sock.read(&mut buf).await.unwrap();
+                assert!(n > 0, "EOF before a complete request head");
                 head.extend_from_slice(&buf[..n]);
             }
             let head = String::from_utf8(head).unwrap();
