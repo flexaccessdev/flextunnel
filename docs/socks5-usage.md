@@ -54,19 +54,25 @@ export ALL_PROXY=socks5h://127.0.0.1:1080
 curl https://example.com
 ```
 
-### `wget`
+### `wget` — no SOCKS support
 
-`wget` reads proxy settings from the environment. It resolves names locally by
-default, so keep it from touching DNS at all — since the connection goes through
-the proxy, `wget` never needs the address:
+GNU `wget` (tested with 1.25.0) **cannot use a SOCKS5 proxy**. Its `*_proxy`
+environment variables only accept HTTP/HTTPS proxies — pointing them at the
+SOCKS listener fails immediately:
 
 ```sh
-https_proxy=socks5h://127.0.0.1:1080 \
-  wget --no-dns-cache -e use_dns=off https://example.com/file
+$ https_proxy=socks5h://127.0.0.1:1080 wget http://networking.internal/
+Error parsing proxy URL socks5h://127.0.0.1:1080: Unsupported scheme.
 ```
 
-(If your `wget` build lacks SOCKS support, use `curl` or a `socat` port forward
-instead.)
+Use `curl -x socks5h://…` for one-off downloads, or a `socat` port forward
+(section 3) if you specifically need `wget`:
+
+```sh
+socat TCP-LISTEN:8080,bind=127.0.0.1,reuseaddr,fork \
+      SOCKS5-CONNECT:127.0.0.1:1080:networking.internal:80 &
+wget --header 'Host: networking.internal' -O file http://localhost:8080/file
+```
 
 ### `git`
 
