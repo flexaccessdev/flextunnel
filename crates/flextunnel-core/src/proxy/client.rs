@@ -38,6 +38,12 @@ const TUNNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 /// listener but sends nothing would otherwise pin the spawned task and socket
 /// forever; generous since this is loopback.
 const LOCAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Pause before retrying `accept()` after a transient failure. Matters most
+/// for fd exhaustion (EMFILE/ENFILE — easy to hit under macOS's default
+/// 256-fd soft limit): the listener is still healthy, and apps retrying their
+/// failed connections make it worse, so back off long enough for in-flight
+/// connections to close and free descriptors instead of exiting the client.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// The live QUIC connection shared with the always-on accept loop; `None` while
 /// disconnected (during a drop/backoff), so off-list targets still connect
@@ -610,9 +616,43 @@ impl LocalProto for HttpProto {
     }
 }
 
+/// Whether an `accept()` error is transient — the listener itself is fine and
+/// accepting will work again once conditions change — as opposed to a broken
+/// listener that should end the loop (and with it the client).
+///
+/// Transient: fd exhaustion (EMFILE per-process / ENFILE system-wide; no
+/// stable `io::ErrorKind` exists for these, so match the raw OS codes) and
+/// per-connection races where the peer aborted between the kernel queuing the
+/// connection and us accepting it.
+fn is_transient_accept_error(e: &io::Error) -> bool {
+    if matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
+    }
+    #[cfg(windows)]
+    {
+        const WSAEMFILE: i32 = 10024;
+        e.raw_os_error() == Some(WSAEMFILE)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
 /// Accept loop for a local front-end listener. Each accepted connection is
 /// handled by [`handle_local_conn`] parameterized on `proto`. Shared verbatim by
-/// the SOCKS5 and HTTP listeners. Returns only on a listener error.
+/// the SOCKS5 and HTTP listeners. Transient accept errors (fd exhaustion,
+/// peer-aborted races) are retried after [`ACCEPT_RETRY_DELAY`]; returns only on
+/// a fatal listener error.
 async fn accept_loop<P: LocalProto>(
     listener: &TcpListener,
     current: &SharedConn,
@@ -620,7 +660,18 @@ async fn accept_loop<P: LocalProto>(
     proto: P,
 ) -> ProxyResult<()> {
     loop {
-        let (tcp, peer) = listener.accept().await?;
+        let (tcp, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) if is_transient_accept_error(&e) => {
+                log::warn!(
+                    "Local proxy accept failed ({e}); retrying in {}ms",
+                    ACCEPT_RETRY_DELAY.as_millis()
+                );
+                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         log::debug!("proxy connection from {peer}");
         let current = current.clone();
         let routed_set_shared = routed_set_shared.clone();
@@ -786,6 +837,25 @@ mod tests {
             auto_reconnect: true,
             max_reconnect_attempts: None,
         })
+    }
+
+    /// fd exhaustion and peer-aborted races must be retried, not kill the
+    /// client; a genuinely broken listener (e.g. bad fd) must still be fatal.
+    #[cfg(unix)]
+    #[test]
+    fn accept_error_transience_classification() {
+        for code in [libc::EMFILE, libc::ENFILE, libc::ECONNABORTED, libc::EINTR] {
+            assert!(
+                is_transient_accept_error(&io::Error::from_raw_os_error(code)),
+                "os error {code} should be transient"
+            );
+        }
+        assert!(!is_transient_accept_error(&io::Error::from_raw_os_error(
+            libc::EBADF
+        )));
+        assert!(!is_transient_accept_error(&io::Error::from_raw_os_error(
+            libc::EINVAL
+        )));
     }
 
     #[test]
