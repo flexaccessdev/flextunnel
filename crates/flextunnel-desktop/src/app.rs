@@ -104,6 +104,50 @@ fn parse_port(input: &str, what: &str) -> Result<u16, String> {
         .ok_or_else(|| format!("{what} must be 1-65535"))
 }
 
+/// Validate a forward's remote host — an IP literal (IPv4, IPv6, `[IPv6]`) or
+/// a hostname — returning the normalized form to store (brackets stripped so
+/// the wire sees a bare address). Hostname rules are deliberately permissive
+/// (underscores allowed for internal names) but catch real typos: empty
+/// labels (`a..b`, leading/trailing dots), bad characters, oversized labels.
+fn validate_remote_host(input: &str) -> Result<String, String> {
+    let host = input.trim();
+    if host.is_empty() {
+        return Err("Remote host is required".into());
+    }
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if bare.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(bare.to_string());
+    }
+    // SOCKS5 ATYP_DOMAIN caps the name at 255 bytes; DNS at 253.
+    if host.len() > 253 {
+        return Err("Remote host is too long (253 characters max)".into());
+    }
+    for label in host.split('.') {
+        if label.is_empty() {
+            return Err("Remote host has an empty label — check the dots".into());
+        }
+        if label.len() > 63 {
+            return Err("Remote host has a label longer than 63 characters".into());
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err("Remote host labels can't start or end with a hyphen".into());
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(
+                "Remote host may only contain letters, digits, dots, hyphens and underscores"
+                    .into(),
+            );
+        }
+    }
+    Ok(host.to_string())
+}
+
 /// Editable add/edit buffers for one port forward, mirroring the iOS sheet.
 /// `editing_id` is `None` when adding.
 struct ForwardForm {
@@ -144,11 +188,12 @@ impl ForwardForm {
         socks_port: u16,
         http_port: Option<u16>,
     ) -> Result<PortForward, String> {
-        let local_port = parse_port(&self.local_port, "Local port")?;
-        let remote_host = self.remote_host.trim();
-        if remote_host.is_empty() {
-            return Err("Remote host is required".into());
+        let label = self.label.trim();
+        if label.len() > 64 {
+            return Err("Label must be 64 characters or fewer".into());
         }
+        let local_port = parse_port(&self.local_port, "Local port")?;
+        let remote_host = validate_remote_host(&self.remote_host)?;
         let remote_port = parse_port(&self.remote_port, "Remote port")?;
         if local_port == socks_port {
             return Err(format!("Port {local_port} is the SOCKS5 proxy port"));
@@ -167,9 +212,9 @@ impl ForwardForm {
                 .editing_id
                 .clone()
                 .unwrap_or_else(PortForward::new_id),
-            label: self.label.trim().to_string(),
+            label: label.to_string(),
             local_port,
-            remote_host: remote_host.into(),
+            remote_host,
             remote_port,
             enabled: self.enabled,
         })
@@ -1027,6 +1072,32 @@ mod tests {
     }
 
     #[test]
+    fn remote_host_validation() {
+        // Valid hostnames and IP literals, normalized where relevant.
+        assert_eq!(validate_remote_host(" db.internal "), Ok("db.internal".into()));
+        assert_eq!(
+            validate_remote_host("net_dev-1.example.com"),
+            Ok("net_dev-1.example.com".into())
+        );
+        assert_eq!(validate_remote_host("10.0.0.7"), Ok("10.0.0.7".into()));
+        assert_eq!(validate_remote_host("::1"), Ok("::1".into()));
+        assert_eq!(validate_remote_host("[2001:db8::1]"), Ok("2001:db8::1".into()));
+
+        // The typo class that motivated this: empty labels.
+        assert!(validate_remote_host("networking..internal").is_err());
+        assert!(validate_remote_host(".internal").is_err());
+        assert!(validate_remote_host("internal.").is_err());
+
+        assert!(validate_remote_host("").is_err());
+        assert!(validate_remote_host("has space.com").is_err());
+        assert!(validate_remote_host("bad!char.com").is_err());
+        assert!(validate_remote_host("-leading.com").is_err());
+        assert!(validate_remote_host("trailing-.com").is_err());
+        assert!(validate_remote_host(&"a".repeat(64)).is_err());
+        assert!(validate_remote_host(&format!("{}.com", "a.".repeat(130))).is_err());
+    }
+
+    #[test]
     fn forward_form_rejects_bad_input() {
         let mut form = valid_forward_form();
         form.local_port = "0".into();
@@ -1034,6 +1105,14 @@ mod tests {
 
         let mut form = valid_forward_form();
         form.remote_host = "  ".into();
+        assert!(form.validate(&[], 1080, None).is_err());
+
+        let mut form = valid_forward_form();
+        form.remote_host = "networking..internal".into();
+        assert!(form.validate(&[], 1080, None).is_err());
+
+        let mut form = valid_forward_form();
+        form.label = "x".repeat(65);
         assert!(form.validate(&[], 1080, None).is_err());
 
         let mut form = valid_forward_form();
