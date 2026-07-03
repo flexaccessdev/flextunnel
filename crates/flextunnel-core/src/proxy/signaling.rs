@@ -475,6 +475,7 @@ mod tests {
         assert_eq!(decoded.server_instance_nonce, 7);
         assert!(decoded.routed_domains.is_empty());
         assert!(decoded.routed_cidrs.is_empty());
+        assert!(decoded.host_aliases.is_empty());
     }
 
     #[test]
