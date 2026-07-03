@@ -1,0 +1,14 @@
+name: Test (Manual)
+
+# Placeholder so this workflow is dispatchable: workflow_dispatch only works
+# for workflows that exist on the default branch. Run against a branch with
+# `gh workflow run test.yml --ref <branch>` — that executes the branch's
+# version of this file, not this placeholder.
+on:
+  workflow_dispatch:
+
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "placeholder — replaced by the real test matrix on feature branches"
