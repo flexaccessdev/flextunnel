@@ -9,6 +9,7 @@
 
 use askama::Template;
 use iroh::endpoint::SendStream;
+use serde::Serialize;
 use std::io;
 use tokio::io::AsyncWriteExt;
 
@@ -16,17 +17,22 @@ use crate::proxy::signaling;
 
 /// Plain-text status endpoint under `flextunnel.internal`.
 pub const STATUS_TEXT_PATH: &str = "/status.txt";
+/// JSON status endpoint under `flextunnel.internal`.
+pub const STATUS_JSON_PATH: &str = "/status.json";
 
 const CONTENT_TYPE_HTML: &str = "text/html; charset=utf-8";
 const CONTENT_TYPE_TEXT: &str = "text/plain; charset=utf-8";
+const CONTENT_TYPE_JSON: &str = "application/json; charset=utf-8";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatusFormat {
     Html,
     Text,
+    Json,
 }
 
 /// One configured reverse route plus whether its agent is currently registered.
+#[derive(Serialize)]
 pub struct AgentRouteStatus {
     pub name: String,
     pub machine_id: String,
@@ -63,11 +69,37 @@ struct ServerStatusTextTemplate<'a> {
     tpl: &'a ServerStatusTemplate,
 }
 
+#[derive(Serialize)]
+struct ServerStatusJson<'a> {
+    version: &'static str,
+    server_node_id: &'a str,
+    routed_domains: &'a [String],
+    routed_cidrs: &'a [String],
+    host_aliases: Vec<HostAliasJson<'a>>,
+    agent_routes: &'a [AgentRouteStatus],
+    duplicate_id_blocklist: DuplicateIdBlocklistJson<'a>,
+}
+
+#[derive(Serialize)]
+struct HostAliasJson<'a> {
+    name: &'a str,
+    target: &'a str,
+}
+
+#[derive(Serialize)]
+struct DuplicateIdBlocklistJson<'a> {
+    file: &'a str,
+    blocked_clients: usize,
+    blocked_agents: usize,
+    conflicted_servers: usize,
+}
+
 /// Fallback body used if a template fails to render (should not happen with
 /// compiled templates, but we never drop the stream uncleanly over it).
 const FALLBACK_BODY: &str =
     "<!DOCTYPE html><title>flextunnel</title><p>status page unavailable</p>";
 const FALLBACK_TEXT_BODY: &str = "flextunnel server status unavailable\n";
+const FALLBACK_JSON_BODY: &str = "{\"error\":\"flextunnel server status unavailable\"}\n";
 
 /// Render the status page, falling back to a 500 on the (unexpected) render
 /// error. Returns `(http_status_line, content_type, body)`.
@@ -98,11 +130,48 @@ pub fn render_status(
                 )
             }
         },
+        StatusFormat::Json => match render_status_json(tpl) {
+            Ok(body) => ("200 OK", CONTENT_TYPE_JSON, body),
+            Err(e) => {
+                log::warn!("Failed to render status JSON page: {e}");
+                (
+                    "500 Internal Server Error",
+                    CONTENT_TYPE_JSON,
+                    FALLBACK_JSON_BODY.to_string(),
+                )
+            }
+        },
     }
 }
 
 fn render_status_text(tpl: &ServerStatusTemplate) -> Result<String, askama::Error> {
     ServerStatusTextTemplate { tpl }.render()
+}
+
+fn render_status_json(tpl: &ServerStatusTemplate) -> Result<String, serde_json::Error> {
+    let host_aliases = tpl
+        .host_aliases
+        .iter()
+        .map(|(name, target)| HostAliasJson { name, target })
+        .collect();
+    let payload = ServerStatusJson {
+        version: tpl.version,
+        server_node_id: &tpl.node_id,
+        routed_domains: &tpl.routed_domains,
+        routed_cidrs: &tpl.routed_cidrs,
+        host_aliases,
+        agent_routes: &tpl.agent_routes,
+        duplicate_id_blocklist: DuplicateIdBlocklistJson {
+            file: &tpl.blocklist_path,
+            blocked_clients: tpl.blocked_client_count,
+            blocked_agents: tpl.blocked_agent_count,
+            conflicted_servers: tpl.conflicted_server_count,
+        },
+    };
+    serde_json::to_string_pretty(&payload).map(|mut body| {
+        body.push('\n');
+        body
+    })
 }
 
 /// Render the reserved-subdomain 404 page.

@@ -137,6 +137,11 @@ pub struct HelloResponse {
     /// same list); alias resolution itself stays server-side.
     #[serde(default)]
     pub host_aliases: Vec<(String, String)>,
+    /// Reverse-routing (agent) aliases, sorted. Names only: the agents' machine
+    /// ids and live connected-state are server-side bookkeeping and would go
+    /// stale after this one-shot handshake, so they are not pushed.
+    #[serde(default)]
+    pub agent_aliases: Vec<String>,
 }
 
 impl Hello {
@@ -170,12 +175,13 @@ impl Hello {
 
 impl HelloResponse {
     /// Accept the client and push the server's routed set (the *tunnel set*)
-    /// plus the informational host-alias list.
+    /// plus the informational host-alias and agent-alias lists.
     pub fn accepted(
         server_instance_nonce: u128,
         routed_domains: Vec<String>,
         routed_cidrs: Vec<String>,
         host_aliases: Vec<(String, String)>,
+        agent_aliases: Vec<String>,
     ) -> Self {
         Self {
             version: PROTOCOL_VERSION,
@@ -185,6 +191,7 @@ impl HelloResponse {
             routed_domains,
             routed_cidrs,
             host_aliases,
+            agent_aliases,
         }
     }
 
@@ -197,6 +204,7 @@ impl HelloResponse {
             routed_domains: Vec::new(),
             routed_cidrs: Vec::new(),
             host_aliases: Vec::new(),
+            agent_aliases: Vec::new(),
         }
     }
 }
@@ -455,6 +463,7 @@ mod tests {
             vec!["*.example.com".to_string(), "httpbin.org".to_string()],
             vec!["10.0.0.0/8".to_string()],
             vec![("nas.internal".to_string(), "192.168.1.9".to_string())],
+            vec!["workstation.internal".to_string()],
         );
         let decoded = decode_hello_response(&encode_hello_response(&resp).unwrap()).unwrap();
         assert!(decoded.accepted);
@@ -466,6 +475,7 @@ mod tests {
             decoded.host_aliases,
             vec![("nas.internal".to_string(), "192.168.1.9".to_string())]
         );
+        assert_eq!(decoded.agent_aliases, vec!["workstation.internal"]);
 
         // A rejection carries no routed set but still carries the server nonce.
         let rej = HelloResponse::rejected(7, "nope");
@@ -476,6 +486,7 @@ mod tests {
         assert!(decoded.routed_domains.is_empty());
         assert!(decoded.routed_cidrs.is_empty());
         assert!(decoded.host_aliases.is_empty());
+        assert!(decoded.agent_aliases.is_empty());
     }
 
     #[test]

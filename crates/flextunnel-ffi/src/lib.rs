@@ -273,7 +273,8 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
 ///
 /// ```json
 /// { "connected": true, "domains": ["*.example.com"], "cidrs": ["10.0.0.0/8"],
-///   "host_aliases": [["nas.internal", "192.168.1.9"]] }
+///   "host_aliases": [["nas.internal", "192.168.1.9"]],
+///   "agent_aliases": ["workstation.internal"] }
 /// ```
 ///
 /// This is the required split-tunnel set the server pushes during the handshake
@@ -284,9 +285,9 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
 /// the lists are empty. The set becomes available shortly after start, once the
 /// handshake completes, so the caller should poll it.
 ///
-/// `host_aliases` is the server's informational `[alias, target]` list, for
-/// display in status UIs only — the server resolves aliases itself, so there is
-/// nothing to enforce caller-side.
+/// `host_aliases` (`[alias, target]` pairs) and `agent_aliases` (reverse-routing
+/// alias names) are informational, for display in status UIs only — the server
+/// resolves both itself, so there is nothing to enforce caller-side.
 ///
 /// Returns `1` on success (full JSON written), `0` if `out_buf` was too small
 /// (the JSON is truncated; retry with a larger buffer), and `-1` for a null
@@ -315,6 +316,7 @@ pub unsafe extern "C" fn flextunnel_routes(
             "domains": routes.domains,
             "cidrs": routes.cidrs,
             "host_aliases": routes.host_aliases,
+            "agent_aliases": routes.agent_aliases,
         })
         .to_string(),
         Err(_) => {
