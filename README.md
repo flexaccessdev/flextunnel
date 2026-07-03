@@ -161,6 +161,20 @@ curl -x socks5h://127.0.0.1:1080 http://127.0.0.1:8000/
 ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 ```
 
+#### Server status page
+
+From a connected client, `flextunnel.internal` is reserved by flextunnel and is
+always tunneled to the server, regardless of the routed set. The browser view is
+HTML; `/status.txt` is plain text for scripts:
+
+```sh
+# plain-text status through the default SOCKS5 listener
+curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.txt
+
+# same endpoint through the optional HTTP proxy listener
+curl -sS -x http://127.0.0.1:8081 http://flextunnel.internal/status.txt
+```
+
 For more ways to use the proxy — `curl`/`git`/browser recipes, `ssh` through the
 tunnel, and putting a plain local TCP port in front of it for apps that can't
 speak SOCKS5 (databases, RDP, most GUIs) — see

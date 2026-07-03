@@ -386,6 +386,21 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
         "status page should show the connected agent state"
     );
 
+    let body = fetch_reserved_path(&client_conn, "flextunnel.internal", "/status.txt").await;
+    assert!(body.starts_with("HTTP/1.1 200"), "text status should be 200: {body:.40}");
+    assert!(
+        body.contains("Content-Type: text/plain; charset=utf-8"),
+        "text status should use text/plain"
+    );
+    assert!(
+        body.contains("flextunnel server status"),
+        "text status should include a plain heading"
+    );
+    assert!(
+        body.contains("  - agent-status.internal -> status-machine-id (connected)"),
+        "text status should show the connected agent route"
+    );
+
     // A reserved subdomain: expect an HTTP 404 "reserved" page.
     let body = fetch_reserved(&client_conn, "sub.flextunnel.internal").await;
     assert!(body.starts_with("HTTP/1.1 404"), "reserved subdomain should be 404: {body:.40}");
@@ -395,10 +410,12 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
 }
 
 /// Open a tunnel stream for `host:80`, send a minimal HTTP request, and return
-/// the full response (after consuming the per-stream success reply byte). The
-/// server responds without requiring the request, then drains it — so we write
-/// the request best-effort (the drain may race the close) and read the response.
+/// the full response after consuming the per-stream success reply byte.
 async fn fetch_reserved(conn: &Connection, host: &str) -> String {
+    fetch_reserved_path(conn, host, "/").await
+}
+
+async fn fetch_reserved_path(conn: &Connection, host: &str, path: &str) -> String {
     let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
     signaling::write_request(&mut send, &Target::Domain(host.to_string(), 80))
         .await
@@ -407,7 +424,7 @@ async fn fetch_reserved(conn: &Connection, host: &str) -> String {
     let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
     assert_eq!(rep, signaling::REP_SUCCESS, "reserved host should reply success");
     let _ = send
-        .write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
         .await;
     let _ = send.finish();
     let bytes = with_timeout(recv.read_to_end(64 * 1024)).await.unwrap();

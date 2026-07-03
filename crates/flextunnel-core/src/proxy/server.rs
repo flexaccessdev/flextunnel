@@ -35,6 +35,8 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 /// avoid a STOP_SENDING that could truncate the relayed response; a peer that
 /// then neither sends nor closes must not pin the task, so cap the wait.
 const RESERVED_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cap on the HTTP request head read from a reserved-namespace stream.
+const RESERVED_REQUEST_HEAD_LIMIT: usize = 64 * 1024;
 
 /// QUIC close code used when the server tears a connection down for a
 /// duplicate-id conflict (distinct from the auth-failure code `1`).
@@ -908,15 +910,96 @@ async fn serve_reserved(
     server: &Arc<ProxyServer>,
     is_status: bool,
 ) -> io::Result<()> {
-    let (status_line, body) = if is_status {
+    if is_status {
         log::debug!("Serving flextunnel.internal status page");
-        status_page::render_status(&server.build_status_template())
+        status_page::write_tunnel_success(&mut send).await?;
+        let request_head = read_reserved_request_head(&mut recv).await;
+        let format = status_format_for_reserved_request(&request_head);
+        let (status_line, content_type, body) =
+            status_page::render_status(&server.build_status_template(), format);
+        status_page::write_http_payload(&mut send, status_line, content_type, &body).await?;
     } else {
         log::debug!("Serving reserved flextunnel.internal subdomain 404");
-        status_page::render_reserved_404()
-    };
-    status_page::write_http_response(&mut send, status_line, &body).await?;
+        let (status_line, content_type, body) = status_page::render_reserved_404();
+        status_page::write_http_response(&mut send, status_line, content_type, &body).await?;
+    }
 
+    drain_reserved_request(&mut recv).await;
+    Ok(())
+}
+
+async fn read_reserved_request_head(recv: &mut RecvStream) -> Vec<u8> {
+    let mut head = Vec::with_capacity(512);
+    let mut buf = [0u8; 1024];
+    while head.len() < RESERVED_REQUEST_HEAD_LIMIT {
+        let read_len = buf.len().min(RESERVED_REQUEST_HEAD_LIMIT - head.len());
+        match tokio::time::timeout(RESERVED_DRAIN_TIMEOUT, recv.read(&mut buf[..read_len])).await {
+            Ok(Ok(Some(n))) => {
+                head.extend_from_slice(&buf[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    head
+}
+
+fn status_format_for_reserved_request(head: &[u8]) -> status_page::StatusFormat {
+    let Ok(head) = std::str::from_utf8(head) else {
+        return status_page::StatusFormat::Html;
+    };
+    let mut lines = head.split("\r\n");
+    if let Some(request_line) = lines.next() {
+        let mut parts = request_line.split_ascii_whitespace();
+        let _method = parts.next();
+        if let Some(target) = parts.next()
+            && request_target_wants_text(target)
+        {
+            return status_page::StatusFormat::Text;
+        }
+    }
+
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("accept")
+            && value.split(',').any(|part| {
+                part.trim()
+                    .split(';')
+                    .next()
+                    .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/plain"))
+            })
+        {
+            return status_page::StatusFormat::Text;
+        }
+    }
+
+    status_page::StatusFormat::Html
+}
+
+fn request_target_wants_text(target: &str) -> bool {
+    let path = if let Some(rest) = strip_http_scheme(target) {
+        match rest.find(['/', '?']) {
+            Some(i) if rest.as_bytes()[i] == b'/' => &rest[i..],
+            Some(i) => &rest[i..],
+            None => "/",
+        }
+    } else {
+        target
+    };
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
+    path == status_page::STATUS_TEXT_PATH
+}
+
+fn strip_http_scheme(target: &str) -> Option<&str> {
+    let (prefix, rest) = target.split_at_checked("http://".len())?;
+    prefix.eq_ignore_ascii_case("http://").then_some(rest)
+}
+
+async fn drain_reserved_request(recv: &mut RecvStream) {
     // Drain the peer's HTTP request instead of dropping `recv` immediately: an
     // abrupt drop sends STOP_SENDING, which can truncate the response as the
     // client relays it. We sent `Connection: close`, so the peer closes after
@@ -931,7 +1014,6 @@ async fn serve_reserved(
             Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
         }
     }
-    Ok(())
 }
 
 /// Route a client stream to a reserved agent: find the agent's live connection,
