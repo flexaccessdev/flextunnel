@@ -3,11 +3,14 @@
 //! ellipses, and an outer circle, white on a blue gradient. macOS renders the
 //! bare glyph as a template image — the OS adapts it to light/dark menu bars,
 //! matching the iOS "tinted" appearance — with the connection state shown by
-//! opacity. Windows renders the full-color badge, grayscale while disconnected.
+//! opacity plus a corner status dot when connected. The dot stays monochrome on
+//! macOS so the icon remains a crisp template (a colored icon renders as a
+//! blurry non-template image in the menu bar); on Windows it is green on the
+//! full-color badge (grayscale while disconnected).
 
 use tiny_skia::{
-    Color, FillRule, GradientStop, LineCap, LinearGradient, Paint, PathBuilder, Pixmap, Point,
-    PremultipliedColorU8, Rect, SpreadMode, Stroke, Transform,
+    BlendMode, Color, FillRule, GradientStop, LineCap, LinearGradient, Paint, PathBuilder, Pixmap,
+    Point, PremultipliedColorU8, Rect, SpreadMode, Stroke, Transform,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,6 +93,43 @@ fn draw_glyph(pixmap: &mut Pixmap, paint: &Paint, fill: f32) {
     pb.push_circle(c, c, m.scale(R_OUTER));
     if let Some(path) = pb.finish() {
         pixmap.stroke_path(&path, paint, &round_stroke(m.scale(STROKE_OUTER)), id, None);
+    }
+}
+
+/// Overlay a "connected" status badge: a filled dot in the bottom-right,
+/// separated from the glyph behind it by a ring. `ring` is the ring's fill
+/// color, or `None` to punch a transparent gap (used by the macOS template,
+/// where only alpha matters). Drawn last, so it sits on top.
+fn draw_status_dot(pixmap: &mut Pixmap, dot: Color, ring: Option<Color>) {
+    let s = pixmap.width() as f32;
+    let (cx, cy) = (s * 0.70, s * 0.70);
+    let dot_r = s * 0.24;
+    let ring_r = dot_r + s * 0.09;
+    let id = Transform::identity();
+
+    let mut ring_paint = Paint {
+        anti_alias: true,
+        ..Paint::default()
+    };
+    match ring {
+        Some(color) => ring_paint.set_color(color),
+        None => ring_paint.blend_mode = BlendMode::Clear,
+    }
+    let mut pb = PathBuilder::new();
+    pb.push_circle(cx, cy, ring_r);
+    if let Some(path) = pb.finish() {
+        pixmap.fill_path(&path, &ring_paint, FillRule::Winding, id, None);
+    }
+
+    let mut dot_paint = Paint {
+        anti_alias: true,
+        ..Paint::default()
+    };
+    dot_paint.set_color(dot);
+    let mut pb = PathBuilder::new();
+    pb.push_circle(cx, cy, dot_r);
+    if let Some(path) = pb.finish() {
+        pixmap.fill_path(&path, &dot_paint, FillRule::Winding, id, None);
     }
 }
 
@@ -198,7 +238,13 @@ pub fn tray_rgba(state: TrayState) -> (Vec<u8>, u32, u32) {
             TrayState::Connecting | TrayState::Reconnecting => 0.6,
             TrayState::Idle | TrayState::Failed => 0.35,
         };
-        (to_rgba(glyph_only(44, alpha)), 44, 44)
+        let mut pixmap = glyph_only(44, alpha);
+        if state == TrayState::Connected {
+            // Monochrome so the icon stays a crisp template; the transparent
+            // ring reads as a gap once the OS tints the mask.
+            draw_status_dot(&mut pixmap, Color::from_rgba8(0, 0, 0, 255), None);
+        }
+        (to_rgba(pixmap), 44, 44)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -207,7 +253,16 @@ pub fn tray_rgba(state: TrayState) -> (Vec<u8>, u32, u32) {
             TrayState::Connecting | TrayState::Reconnecting => (true, 0.6),
             TrayState::Idle | TrayState::Failed => (false, 1.0),
         };
-        (to_rgba(badge(32, blue, alpha)), 32, 32)
+        let mut pixmap = badge(32, blue, alpha);
+        if state == TrayState::Connected {
+            // Green dot with a white ring to stand out against the blue badge.
+            draw_status_dot(
+                &mut pixmap,
+                Color::from_rgba8(52, 199, 89, 255),
+                Some(Color::from_rgba8(255, 255, 255, 255)),
+            );
+        }
+        (to_rgba(pixmap), 32, 32)
     }
 }
 

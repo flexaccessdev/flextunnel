@@ -520,6 +520,12 @@ impl App {
         egui::ScrollArea::both()
             .stick_to_bottom(true)
             .auto_shrink([false, false])
+            // `show_rows` measures content width from only the visible rows, so
+            // as lines of differing widths scroll past the bottom the horizontal
+            // bar would flicker on/off, stealing vertical space and making the
+            // stuck-to-bottom view jump. Always reserving both bars keeps the
+            // viewport height stable.
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .show_rows(ui, row_height, self.log_lines.len(), |ui, range| {
                 for line in &self.log_lines[range] {
                     ui.label(RichText::new(line).monospace());
