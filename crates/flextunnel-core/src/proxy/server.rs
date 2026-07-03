@@ -983,7 +983,6 @@ fn status_format_for_reserved_request(head: &[u8]) -> status_page::StatusFormat 
 fn request_target_wants_text(target: &str) -> bool {
     let path = if let Some(rest) = strip_http_scheme(target) {
         match rest.find(['/', '?']) {
-            Some(i) if rest.as_bytes()[i] == b'/' => &rest[i..],
             Some(i) => &rest[i..],
             None => "/",
         }
@@ -1007,7 +1006,7 @@ async fn drain_reserved_request(recv: &mut RecvStream) {
     // per-read timeout so a peer that never sends nor closes can't pin the task.
     let mut buf = [0u8; 4096];
     let mut drained = 0usize;
-    while drained < 64 * 1024 {
+    while drained < RESERVED_REQUEST_HEAD_LIMIT {
         match tokio::time::timeout(RESERVED_DRAIN_TIMEOUT, recv.read(&mut buf)).await {
             Ok(Ok(Some(n))) => drained += n,
             // EOF, read error, or drain timeout: stop draining.
