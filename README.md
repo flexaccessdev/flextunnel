@@ -193,15 +193,24 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 
 From a connected client, `flextunnel.internal` is reserved by flextunnel and is
 always tunneled to the server, regardless of the routed set. The browser view is
-HTML; `/status.txt` is plain text for scripts:
+HTML; `/status.txt` is plain text and `/status.json` is structured JSON for
+scripts:
 
 ```sh
 # plain-text status through the default SOCKS5 listener
 curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.txt
 
+# JSON status through the default SOCKS5 listener
+curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.json
+
 # same endpoint through the optional HTTP proxy listener
 curl -sS -x http://127.0.0.1:8081 http://flextunnel.internal/status.txt
+curl -sS -x http://127.0.0.1:8081 http://flextunnel.internal/status.json
 ```
+
+The JSON response includes `version`, `server_node_id`, `routed_domains`,
+`routed_cidrs`, `host_aliases`, `agent_routes`, and duplicate-id blocklist
+counts under `duplicate_id_blocklist`.
 
 For more ways to use the proxy — `curl`/`git`/browser recipes, `ssh` through the
 tunnel, and putting a plain local TCP port in front of it for apps that can't

@@ -55,6 +55,9 @@ curl -x socks5h://127.0.0.1:1080 http://networking.internal/
 
 # flextunnel server status, as plain text
 curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.txt
+
+# flextunnel server status, as JSON
+curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.json
 ```
 
 You can also set it for a whole shell session via the standard proxy env vars
@@ -66,12 +69,17 @@ curl https://example.com
 ```
 
 `http://flextunnel.internal/` is the HTML status page; `/status.txt` is the
-script-friendly text form. These names are reserved by flextunnel and are always
-tunneled, even when they are not in the server's routed set. If the client is
-also running the optional HTTP proxy front-end, query the same text endpoint with:
+script-friendly text form; `/status.json` is the structured JSON form. The JSON
+response includes `version`, `server_node_id`, `routed_domains`,
+`routed_cidrs`, `host_aliases`, `agent_routes`, and duplicate-id blocklist
+counts under `duplicate_id_blocklist`. These names are reserved by flextunnel
+and are always tunneled, even when they are not in the server's routed set. If
+the client is also running the optional HTTP proxy front-end, query the same
+endpoints with:
 
 ```sh
 curl -sS -x http://127.0.0.1:8081 http://flextunnel.internal/status.txt
+curl -sS -x http://127.0.0.1:8081 http://flextunnel.internal/status.json
 ```
 
 ### `wget` — no SOCKS support
