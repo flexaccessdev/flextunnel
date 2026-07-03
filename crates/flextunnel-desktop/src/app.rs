@@ -5,20 +5,28 @@
 //! so a tray click wakes the loop immediately even while the window is hidden.
 
 use crate::config::{self, AppConfig};
+use crate::forward::{self, ForwardState, ForwardStatus, PortForward};
 use crate::icon;
 use crate::logging;
 use crate::tray::{self, Tray};
 use crate::tunnel::{Controller, Phase, Snapshot};
 use eframe::egui::{self, Color32, RichText, TextEdit, TextStyle, ViewportCommand};
+use flextunnel_core::proxy::signaling::Target;
+use flextunnel_core::proxy::{reserved, RoutedSet, TunnelRoutes};
 use std::net::SocketAddr;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 use tray_icon::menu::MenuEvent;
 use tray_icon::TrayIconEvent;
 
+const GREEN: Color32 = Color32::from_rgb(60, 180, 90);
+const AMBER: Color32 = Color32::from_rgb(230, 160, 30);
+const RED: Color32 = Color32::from_rgb(220, 70, 70);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Status,
+    Forwards,
     Settings,
     Logs,
 }
@@ -96,12 +104,178 @@ fn parse_port(input: &str, what: &str) -> Result<u16, String> {
         .ok_or_else(|| format!("{what} must be 1-65535"))
 }
 
+/// Validate a forward's remote host — an IP literal (IPv4, IPv6, `[IPv6]`) or
+/// a hostname — returning the normalized form to store (brackets stripped so
+/// the wire sees a bare address). Hostname rules are deliberately permissive
+/// (underscores allowed for internal names) but catch real typos: empty
+/// labels (`a..b`, leading/trailing dots), bad characters, oversized labels.
+fn validate_remote_host(input: &str) -> Result<String, String> {
+    let host = input.trim();
+    if host.is_empty() {
+        return Err("Remote host is required".into());
+    }
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if bare.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(bare.to_string());
+    }
+    // SOCKS5 ATYP_DOMAIN caps the name at 255 bytes; DNS at 253.
+    if host.len() > 253 {
+        return Err("Remote host is too long (253 characters max)".into());
+    }
+    for label in host.split('.') {
+        if label.is_empty() {
+            return Err("Remote host has an empty label — check the dots".into());
+        }
+        if label.len() > 63 {
+            return Err("Remote host has a label longer than 63 characters".into());
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err("Remote host labels can't start or end with a hyphen".into());
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(
+                "Remote host may only contain letters, digits, dots, hyphens and underscores"
+                    .into(),
+            );
+        }
+    }
+    Ok(host.to_string())
+}
+
+/// Editable add/edit buffers for one port forward, mirroring the iOS sheet.
+/// `editing_id` is `None` when adding.
+struct ForwardForm {
+    editing_id: Option<String>,
+    label: String,
+    local_port: String,
+    remote_host: String,
+    remote_port: String,
+    enabled: bool,
+}
+
+impl ForwardForm {
+    fn add() -> Self {
+        Self {
+            editing_id: None,
+            label: String::new(),
+            local_port: String::new(),
+            remote_host: String::new(),
+            remote_port: String::new(),
+            enabled: true,
+        }
+    }
+
+    fn edit(forward: &PortForward) -> Self {
+        Self {
+            editing_id: Some(forward.id.clone()),
+            label: forward.label.clone(),
+            local_port: forward.local_port.to_string(),
+            remote_host: forward.remote_host.clone(),
+            remote_port: forward.remote_port.to_string(),
+            enabled: forward.enabled,
+        }
+    }
+
+    fn validate(
+        &self,
+        existing: &[PortForward],
+        socks_port: u16,
+        http_port: Option<u16>,
+    ) -> Result<PortForward, String> {
+        let label = self.label.trim();
+        if label.len() > 64 {
+            return Err("Label must be 64 characters or fewer".into());
+        }
+        let local_port = parse_port(&self.local_port, "Local port")?;
+        let remote_host = validate_remote_host(&self.remote_host)?;
+        let remote_port = parse_port(&self.remote_port, "Remote port")?;
+        if local_port == socks_port {
+            return Err(format!("Port {local_port} is the SOCKS5 proxy port"));
+        }
+        if Some(local_port) == http_port {
+            return Err(format!("Port {local_port} is the HTTP proxy port"));
+        }
+        if existing
+            .iter()
+            .any(|f| f.local_port == local_port && Some(&f.id) != self.editing_id.as_ref())
+        {
+            return Err(format!("Another forward already uses local port {local_port}"));
+        }
+        Ok(PortForward {
+            id: self
+                .editing_id
+                .clone()
+                .unwrap_or_else(PortForward::new_id),
+            label: label.to_string(),
+            local_port,
+            remote_host,
+            remote_port,
+            enabled: self.enabled,
+        })
+    }
+}
+
 /// Everything is tunneled when the server pushes no routed set at all, a
 /// wildcard domain, or an all-covering CIDR (mirrors the iOS derivation).
-fn is_full_tunnel(routes: &flextunnel_core::proxy::TunnelRoutes) -> bool {
+fn is_full_tunnel(routes: &TunnelRoutes) -> bool {
     (routes.domains.is_empty() && routes.cidrs.is_empty())
         || routes.domains.iter().any(|d| d == "*")
         || routes.cidrs.iter().any(|c| c == "0.0.0.0/0" || c == "::/0")
+}
+
+/// Advisory tunneled/direct badge for a forward (`None` = hidden). Mirrors the
+/// core's routing decision — reserved hosts always tunnel, everything else per
+/// the routed set — but never gates traffic; the core decides for real per
+/// connection (like the iOS badge).
+fn forward_badge(
+    phase: Phase,
+    routes: &TunnelRoutes,
+    routed_set: Option<&RoutedSet>,
+    forward: &PortForward,
+) -> Option<bool> {
+    if phase != Phase::Connected {
+        return None;
+    }
+    if is_full_tunnel(routes) || reserved::is_reserved_host(&forward.remote_host) {
+        return Some(true);
+    }
+    let set = routed_set?;
+    Some(set.allows(&Target::Domain(
+        forward.remote_host.clone(),
+        forward.remote_port,
+    )))
+}
+
+/// One-line live status for a forward row (text, color), mirroring the iOS
+/// row: gray "off"/"stopped", green "listening (· N active)", red failure.
+fn forward_status_line(
+    forward: &PortForward,
+    status: Option<&ForwardStatus>,
+    phase: Phase,
+) -> (String, Color32) {
+    if !forward.enabled {
+        return ("off".into(), Color32::GRAY);
+    }
+    match status {
+        Some(status) => match &status.state {
+            ForwardState::Listening if status.active > 0 => {
+                (format!("listening · {} active", status.active), GREEN)
+            }
+            ForwardState::Listening => ("listening".into(), GREEN),
+            ForwardState::Failed(reason) => (reason.clone(), RED),
+        },
+        // No status = no running session for this forward.
+        None => match phase {
+            Phase::Idle | Phase::Failed => ("stopped — connect to start".into(), Color32::GRAY),
+            _ => ("stopped".into(), Color32::GRAY),
+        },
+    }
 }
 
 fn format_duration(d: Duration) -> String {
@@ -140,6 +314,12 @@ pub struct App {
     form: SettingsForm,
     saved: Option<AppConfig>,
     settings_notice: Option<String>,
+    forwards: Vec<PortForward>,
+    forward_form: Option<ForwardForm>,
+    forwards_notice: Option<String>,
+    /// Advisory-badge cache: the `RoutedSet` rebuilt only when the pushed
+    /// domains/CIDRs change (`None` inside means the set failed to parse).
+    routed_cache: Option<(Vec<String>, Vec<String>, Option<RoutedSet>)>,
     log_revision: u64,
     log_lines: Vec<String>,
     window_visible: bool,
@@ -192,6 +372,11 @@ impl App {
             Tab::Settings
         };
 
+        // Push the persisted forwards to the tunnel thread up front so they
+        // start with the first session.
+        let forwards = forward::load();
+        controller.set_forwards(forwards.clone());
+
         Self {
             controller,
             tray,
@@ -201,6 +386,10 @@ impl App {
             form,
             saved,
             settings_notice: None,
+            forwards,
+            forward_form: None,
+            forwards_notice: None,
+            routed_cache: None,
             log_revision: 0,
             log_lines: Vec::new(),
             window_visible: true,
@@ -272,10 +461,10 @@ impl App {
     fn status_tab(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
         let (color, heading) = match snapshot.phase {
             Phase::Idle => (Color32::GRAY, "Disconnected"),
-            Phase::Connecting => (Color32::from_rgb(230, 160, 30), "Connecting…"),
-            Phase::Connected => (Color32::from_rgb(60, 180, 90), "Connected"),
-            Phase::Reconnecting => (Color32::from_rgb(230, 160, 30), "Reconnecting…"),
-            Phase::Failed => (Color32::from_rgb(220, 70, 70), "Connection failed"),
+            Phase::Connecting => (AMBER, "Connecting…"),
+            Phase::Connected => (GREEN, "Connected"),
+            Phase::Reconnecting => (AMBER, "Reconnecting…"),
+            Phase::Failed => (RED, "Connection failed"),
         };
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -287,7 +476,7 @@ impl App {
             ui.label(format!("for {}", format_duration(since.elapsed())));
         }
         if let Some(error) = &snapshot.last_error {
-            ui.colored_label(Color32::from_rgb(220, 70, 70), error);
+            ui.colored_label(RED, error);
         }
 
         ui.add_space(8.0);
@@ -412,6 +601,212 @@ impl App {
         }
     }
 
+    /// Persist the forward list and push it to the tunnel thread (live apply).
+    fn commit_forwards(&mut self) {
+        match forward::save(&self.forwards) {
+            Ok(()) => self.forwards_notice = None,
+            Err(e) => {
+                log::error!("Failed to save forwards: {e:#}");
+                self.forwards_notice = Some(format!("Failed to save forwards: {e:#}"));
+            }
+        }
+        self.controller.set_forwards(self.forwards.clone());
+    }
+
+    /// Rebuild the advisory-badge `RoutedSet` only when the pushed routes change.
+    fn refresh_routed_cache(&mut self, routes: &TunnelRoutes) {
+        let fresh = matches!(&self.routed_cache,
+            Some((domains, cidrs, _)) if *domains == routes.domains && *cidrs == routes.cidrs);
+        if !fresh {
+            let set = RoutedSet::new(&routes.domains, &routes.cidrs)
+                .inspect_err(|e| log::debug!("Routed set unusable for the badge: {e:#}"))
+                .ok();
+            self.routed_cache = Some((routes.domains.clone(), routes.cidrs.clone(), set));
+        }
+    }
+
+    fn forwards_tab(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        self.refresh_routed_cache(&snapshot.routes);
+
+        ui.horizontal(|ui| {
+            if ui.button("Add forward").clicked() {
+                self.forward_form = Some(ForwardForm::add());
+            }
+            if let Some(notice) = &self.forwards_notice {
+                ui.colored_label(AMBER, notice.clone());
+            }
+        });
+
+        // Inline add/edit form — one at a time; an inline group fits the small
+        // window better than a floating window.
+        let mut save: Option<PortForward> = None;
+        let mut close_form = false;
+        if let Some(form) = &mut self.forward_form {
+            let (socks_port, http_port) = {
+                let default = AppConfig::default();
+                let config = self.saved.as_ref().unwrap_or(&default);
+                (config.socks_port, config.http_port)
+            };
+            ui.add_space(6.0);
+            ui.group(|ui| {
+                egui::Grid::new("forward-form")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Label");
+                        ui.add(
+                            TextEdit::singleline(&mut form.label)
+                                .hint_text("optional")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.end_row();
+
+                        ui.label("Local port");
+                        ui.add(TextEdit::singleline(&mut form.local_port).desired_width(80.0));
+                        ui.end_row();
+
+                        ui.label("Remote host");
+                        ui.add(
+                            TextEdit::singleline(&mut form.remote_host)
+                                .hint_text("host or IP — resolved server-side")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.end_row();
+
+                        ui.label("Remote port");
+                        ui.add(TextEdit::singleline(&mut form.remote_port).desired_width(80.0));
+                        ui.end_row();
+
+                        ui.label("Enabled");
+                        ui.checkbox(&mut form.enabled, "");
+                        ui.end_row();
+                    });
+                let validated = form.validate(&self.forwards, socks_port, http_port);
+                if let Err(message) = &validated {
+                    ui.colored_label(AMBER, message);
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(validated.is_ok(), egui::Button::new("Save"))
+                        .clicked()
+                    {
+                        save = validated.ok();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close_form = true;
+                    }
+                });
+            });
+        }
+        if let Some(saved) = save {
+            match self.forwards.iter_mut().find(|f| f.id == saved.id) {
+                Some(slot) => *slot = saved,
+                None => self.forwards.push(saved),
+            }
+            self.commit_forwards();
+            close_form = true;
+        }
+        if close_form {
+            self.forward_form = None;
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+
+        if self.forwards.is_empty() {
+            ui.label(
+                RichText::new(
+                    "No port forwards. Add one to expose a remote service on localhost.",
+                )
+                .weak(),
+            );
+            return;
+        }
+
+        enum RowAction {
+            Toggle(usize, bool),
+            Edit(usize),
+            Delete(usize),
+        }
+        let mut action: Option<RowAction> = None;
+        let routed_set = self.routed_cache.as_ref().and_then(|(_, _, set)| set.as_ref());
+
+        egui::ScrollArea::vertical()
+            .id_salt("forwards")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (i, forward) in self.forwards.iter().enumerate() {
+                    let status = snapshot.forwards.iter().find(|s| s.id == forward.id);
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            let mut enabled = forward.enabled;
+                            if ui.checkbox(&mut enabled, "").changed() {
+                                action = Some(RowAction::Toggle(i, enabled));
+                            }
+                            ui.label(RichText::new(forward.display_name()).strong());
+                            if let Some(tunneled) = forward_badge(
+                                snapshot.phase,
+                                &snapshot.routes,
+                                routed_set,
+                                forward,
+                            ) {
+                                let (text, color) = if tunneled {
+                                    ("tunneled", GREEN)
+                                } else {
+                                    ("direct", AMBER)
+                                };
+                                ui.label(RichText::new(text).small().color(color));
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("delete").clicked() {
+                                        action = Some(RowAction::Delete(i));
+                                    }
+                                    if ui.small_button("edit").clicked() {
+                                        action = Some(RowAction::Edit(i));
+                                    }
+                                },
+                            );
+                        });
+                        ui.monospace(forward.route_description());
+                        let (text, color) = forward_status_line(forward, status, snapshot.phase);
+                        ui.label(RichText::new(text).small().color(color));
+                        if forward.enabled
+                            && let Some(error) = status.and_then(|s| s.last_conn_error.as_deref())
+                        {
+                            ui.label(RichText::new(error).small().color(AMBER));
+                        }
+                    });
+                }
+            });
+
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "Forwards listen on localhost only (127.0.0.1 and ::1) and relay through \
+                 this app's SOCKS5 proxy while connected.",
+            )
+            .small()
+            .weak(),
+        );
+
+        match action {
+            Some(RowAction::Toggle(i, enabled)) => {
+                self.forwards[i].enabled = enabled;
+                self.commit_forwards();
+            }
+            Some(RowAction::Edit(i)) => {
+                self.forward_form = Some(ForwardForm::edit(&self.forwards[i]));
+            }
+            Some(RowAction::Delete(i)) => {
+                self.forwards.remove(i);
+                self.commit_forwards();
+            }
+            None => {}
+        }
+    }
+
     fn settings_tab(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
         egui::Grid::new("settings-grid")
             .num_columns(2)
@@ -465,7 +860,7 @@ impl App {
             (Err(_), _) => false,
         };
         if let Err(message) = &validated {
-            ui.colored_label(Color32::from_rgb(230, 160, 30), message);
+            ui.colored_label(AMBER, message);
         }
         ui.horizontal(|ui| {
             if ui
@@ -475,12 +870,26 @@ impl App {
                 let config = validated.as_ref().expect("validated").clone();
                 match config::save(&config) {
                     Ok(()) => {
-                        self.saved = Some(config);
-                        self.settings_notice = Some(if snapshot.phase == Phase::Idle {
-                            "Saved.".into()
+                        let mut notice = if snapshot.phase == Phase::Idle {
+                            "Saved.".to_string()
                         } else {
-                            "Saved — reconnect to apply.".into()
-                        });
+                            "Saved — reconnect to apply.".to_string()
+                        };
+                        // Soft warning only — the hard guard is the forward's
+                        // bind failing visibly ("port N is in use").
+                        if let Some(forward) = self.forwards.iter().find(|f| {
+                            f.enabled
+                                && (f.local_port == config.socks_port
+                                    || Some(f.local_port) == config.http_port)
+                        }) {
+                            notice.push_str(&format!(
+                                " Forward \"{}\" uses port {} and will fail to bind.",
+                                forward.display_name(),
+                                forward.local_port
+                            ));
+                        }
+                        self.saved = Some(config);
+                        self.settings_notice = Some(notice);
                     }
                     Err(e) => {
                         log::error!("{e:#}");
@@ -584,6 +993,7 @@ impl eframe::App for App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Status, "Status");
+                ui.selectable_value(&mut self.tab, Tab::Forwards, "Forwards");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
                 ui.selectable_value(&mut self.tab, Tab::Logs, "Logs");
             });
@@ -591,6 +1001,7 @@ impl eframe::App for App {
         });
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Status => self.status_tab(ui, &snapshot),
+            Tab::Forwards => self.forwards_tab(ui, &snapshot),
             Tab::Settings => self.settings_tab(ui, &snapshot),
             Tab::Logs => self.logs_tab(ui),
         });
@@ -623,8 +1034,108 @@ mod tests {
             http_enabled: false,
             http_port: "8080".into(),
             relay_urls: " https://a.example ,, https://b.example ".into(),
-            ..Default::default()
         }
+    }
+
+    fn valid_forward_form() -> ForwardForm {
+        ForwardForm {
+            editing_id: None,
+            label: "  db  ".into(),
+            local_port: "5432".into(),
+            remote_host: " db.internal ".into(),
+            remote_port: "5432".into(),
+            enabled: true,
+        }
+    }
+
+    fn existing_forward(id: &str, local_port: u16) -> PortForward {
+        PortForward {
+            id: id.into(),
+            label: String::new(),
+            local_port,
+            remote_host: "other.internal".into(),
+            remote_port: 80,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn forward_form_trims_and_builds() {
+        let forward = valid_forward_form()
+            .validate(&[], 1080, None)
+            .expect("valid");
+        assert_eq!(forward.label, "db");
+        assert_eq!(forward.local_port, 5432);
+        assert_eq!(forward.remote_host, "db.internal");
+        assert_eq!(forward.remote_port, 5432);
+        assert!(forward.enabled);
+        assert!(!forward.id.is_empty());
+    }
+
+    #[test]
+    fn remote_host_validation() {
+        // Valid hostnames and IP literals, normalized where relevant.
+        assert_eq!(validate_remote_host(" db.internal "), Ok("db.internal".into()));
+        assert_eq!(
+            validate_remote_host("net_dev-1.example.com"),
+            Ok("net_dev-1.example.com".into())
+        );
+        assert_eq!(validate_remote_host("10.0.0.7"), Ok("10.0.0.7".into()));
+        assert_eq!(validate_remote_host("::1"), Ok("::1".into()));
+        assert_eq!(validate_remote_host("[2001:db8::1]"), Ok("2001:db8::1".into()));
+
+        // The typo class that motivated this: empty labels.
+        assert!(validate_remote_host("networking..internal").is_err());
+        assert!(validate_remote_host(".internal").is_err());
+        assert!(validate_remote_host("internal.").is_err());
+
+        assert!(validate_remote_host("").is_err());
+        assert!(validate_remote_host("has space.com").is_err());
+        assert!(validate_remote_host("bad!char.com").is_err());
+        assert!(validate_remote_host("-leading.com").is_err());
+        assert!(validate_remote_host("trailing-.com").is_err());
+        assert!(validate_remote_host(&"a".repeat(64)).is_err());
+        assert!(validate_remote_host(&format!("{}.com", "a.".repeat(130))).is_err());
+    }
+
+    #[test]
+    fn forward_form_rejects_bad_input() {
+        let mut form = valid_forward_form();
+        form.local_port = "0".into();
+        assert!(form.validate(&[], 1080, None).is_err());
+
+        let mut form = valid_forward_form();
+        form.remote_host = "  ".into();
+        assert!(form.validate(&[], 1080, None).is_err());
+
+        let mut form = valid_forward_form();
+        form.remote_host = "networking..internal".into();
+        assert!(form.validate(&[], 1080, None).is_err());
+
+        let mut form = valid_forward_form();
+        form.label = "x".repeat(65);
+        assert!(form.validate(&[], 1080, None).is_err());
+
+        let mut form = valid_forward_form();
+        form.remote_port = "70000".into();
+        assert!(form.validate(&[], 1080, None).is_err());
+
+        // Collisions with the proxy ports.
+        let form = valid_forward_form();
+        assert!(form.validate(&[], 5432, None).is_err());
+        assert!(form.validate(&[], 1080, Some(5432)).is_err());
+
+        // Duplicate local port among existing forwards…
+        let taken = existing_forward("aaaa", 5432);
+        assert!(form.validate(std::slice::from_ref(&taken), 1080, None).is_err());
+
+        // …unless it is the forward being edited (id reused).
+        let mut form = valid_forward_form();
+        form.editing_id = Some("aaaa".into());
+        let edited = form
+            .validate(std::slice::from_ref(&taken), 1080, None)
+            .expect("editing the same forward");
+        assert_eq!(edited.id, "aaaa");
     }
 
     #[test]

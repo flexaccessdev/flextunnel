@@ -5,6 +5,7 @@
 //! manager together, followed by a graceful endpoint close.
 
 use crate::config::AppConfig;
+use crate::forward::{ForwardManager, ForwardStatus, PortForward};
 use flextunnel_core::proxy::{ClientConfig, ProxyClient, TunnelRoutes};
 use flextunnel_core::transport::endpoint::create_client_endpoint;
 use std::net::SocketAddr;
@@ -29,6 +30,9 @@ pub struct Snapshot {
     pub http_addr: Option<SocketAddr>,
     pub routes: TunnelRoutes,
     pub last_error: Option<String>,
+    /// Live status per running forward; empty while no session runs, which the
+    /// UI renders as "stopped".
+    pub forwards: Vec<ForwardStatus>,
 }
 
 impl Default for Snapshot {
@@ -40,6 +44,7 @@ impl Default for Snapshot {
             http_addr: None,
             routes: TunnelRoutes::default(),
             last_error: None,
+            forwards: Vec::new(),
         }
     }
 }
@@ -47,6 +52,9 @@ impl Default for Snapshot {
 enum Command {
     Connect(AppConfig),
     Disconnect,
+    /// Replace the desired forward list (the UI sends the full list at startup
+    /// and after every add/edit/delete/toggle); applied live mid-session.
+    SetForwards(Vec<PortForward>),
     Shutdown,
 }
 
@@ -96,6 +104,10 @@ impl Controller {
         let _ = self.tx.blocking_send(Command::Disconnect);
     }
 
+    pub fn set_forwards(&self, forwards: Vec<PortForward>) {
+        let _ = self.tx.blocking_send(Command::SetForwards(forwards));
+    }
+
     /// Stop any session and join the worker thread (blocks briefly for the
     /// graceful endpoint close).
     pub fn shutdown(&mut self) {
@@ -114,15 +126,25 @@ fn update<F: FnOnce(&mut Snapshot)>(shared: &Arc<Mutex<Snapshot>>, f: F) {
     f(&mut s);
 }
 
+/// Publish the manager's current per-forward statuses to the snapshot.
+fn refresh_forward_statuses(shared: &Arc<Mutex<Snapshot>>, fwd_mgr: &ForwardManager) {
+    let statuses = fwd_mgr.statuses();
+    update(shared, |s| s.forwards = statuses);
+}
+
 async fn run_loop(mut rx: mpsc::Receiver<Command>, shared: Arc<Mutex<Snapshot>>) {
+    let mut forwards: Vec<PortForward> = Vec::new();
     while let Some(cmd) = rx.recv().await {
         match cmd {
             Command::Connect(config) => {
-                if run_session(config, &mut rx, &shared).await == SessionExit::Shutdown {
+                if run_session(config, &mut forwards, &mut rx, &shared).await
+                    == SessionExit::Shutdown
+                {
                     return;
                 }
             }
             Command::Disconnect => {}
+            Command::SetForwards(f) => forwards = f,
             Command::Shutdown => return,
         }
     }
@@ -136,6 +158,7 @@ enum SessionExit {
 
 async fn run_session(
     config: AppConfig,
+    forwards: &mut Vec<PortForward>,
     rx: &mut mpsc::Receiver<Command>,
     shared: &Arc<Mutex<Snapshot>>,
 ) -> SessionExit {
@@ -190,6 +213,7 @@ async fn run_session(
                     });
                     return SessionExit::Ended;
                 }
+                Some(Command::SetForwards(f)) => *forwards = f,
                 Some(Command::Shutdown) | None => {
                     // Bounded grace so quitting stays responsive: close
                     // cleanly when creation finishes quickly, otherwise just
@@ -217,6 +241,13 @@ async fn run_session(
         max_reconnect_attempts: None,
     });
     let routes = client.routes();
+
+    // Forwards run for the whole session (including reconnect gaps — the SOCKS
+    // listener stays bound); they die with the manager when the session ends.
+    // The SOCKS listener binds when `run` is first polled below, so an early
+    // relay sees at most one connection-refused, surfaced per-forward.
+    let mut fwd_mgr =
+        ForwardManager::new(config.socks_port, client.socks_auth_password().into(), forwards);
 
     let run = client.run(&endpoint);
     tokio::pin!(run);
@@ -260,6 +291,7 @@ async fn run_session(
                     }
                     s.routes = routes;
                 });
+                refresh_forward_statuses(shared, &fwd_mgr);
             }
             cmd = rx.recv() => match cmd {
                 Some(Command::Disconnect) => {
@@ -270,18 +302,27 @@ async fn run_session(
                 Some(Command::Connect(_)) => {
                     log::warn!("Already running a session; disconnect first");
                 }
+                Some(Command::SetForwards(f)) => {
+                    *forwards = f;
+                    fwd_mgr.apply(forwards);
+                    refresh_forward_statuses(shared, &fwd_mgr);
+                }
                 Some(Command::Shutdown) | None => break SessionExit::Shutdown,
             }
         }
     };
 
     // The select loop is done with `run`; dropping it cancels the client.
-    // Close the endpoint gracefully before it is dropped (see the CLI's
-    // run_client for why an ungraceful drop is fatal under panic=abort).
+    // Tear the forward listeners down with the session so their rows read
+    // "stopped" immediately, then close the endpoint gracefully before it is
+    // dropped (see the CLI's run_client for why an ungraceful drop is fatal
+    // under panic=abort).
+    drop(fwd_mgr);
     endpoint.close().await;
     update(shared, |s| {
         s.routes.connected = false;
         s.connected_since = None;
+        s.forwards.clear();
     });
     exit
 }
