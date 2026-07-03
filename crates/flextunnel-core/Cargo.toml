@@ -18,6 +18,7 @@ ipnetwork.workspace = true
 iroh.workspace = true
 iroh-mdns-address-lookup.workspace = true
 log.workspace = true
+n0-future.workspace = true
 rand.workspace = true
 rustls.workspace = true
 serde.workspace = true

@@ -1036,6 +1036,7 @@ dependencies = [
  "iroh-mdns-address-lookup",
  "libc",
  "log",
+ "n0-future",
  "rand 0.9.4",
  "rustls",
  "serde",
