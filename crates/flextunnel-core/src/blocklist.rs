@@ -103,6 +103,22 @@ impl BlockList {
         &self.path
     }
 
+    /// Number of blocked client ids (for the status page — entries are not
+    /// exposed).
+    pub fn blocked_client_count(&self) -> usize {
+        self.data.blocked_clients.len()
+    }
+
+    /// Number of blocked agent ids.
+    pub fn blocked_agent_count(&self) -> usize {
+        self.data.blocked_agents.len()
+    }
+
+    /// Number of recorded conflicted (self-blocked) server ids.
+    pub fn conflicted_server_count(&self) -> usize {
+        self.data.conflicted_server_ids.len()
+    }
+
     /// Whether a client node id is blocked.
     pub fn is_client_blocked(&self, id: &str) -> bool {
         self.data.blocked_clients.iter().any(|e| e.id == id)

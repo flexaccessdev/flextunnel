@@ -308,6 +308,16 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
             );
         }
     }
+    // The `flextunnel.internal` namespace is reserved by flextunnel itself (the
+    // server serves a status page there); it can't be used as an alias name.
+    for key in agent_routes.keys().chain(host_aliases.keys()) {
+        if crate::proxy::reserved::is_reserved_host(key) {
+            anyhow::bail!(
+                "alias '{key}' uses the reserved flextunnel.internal namespace and \
+                 cannot be used as a [host_aliases] or [agent_routes] name"
+            );
+        }
+    }
 
     // Fixed at the default (~/.config/flextunnel/blocklist.json) and NOT
     // overridable via CLI or config: the blocklist is a security guard rail, and
@@ -525,6 +535,21 @@ mod tests {
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
         assert!(err.to_string().contains("host_aliases"), "{err}");
+    }
+
+    #[test]
+    fn reserved_namespace_alias_is_rejected() {
+        // The exact reserved host and any subdomain are refused as alias names.
+        for name in ["flextunnel.internal", "status.flextunnel.internal"] {
+            let toml = format!("[host_aliases]\n\"{name}\" = \"127.0.0.1\"\n");
+            let file: ServerConfig = toml::from_str(&toml).unwrap();
+            let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
+            assert!(err.to_string().contains("reserved"), "{err}");
+        }
+        let toml = "[agent_routes]\n\"flextunnel.internal\" = { machine_id = \"abc\" }\n";
+        let file: ServerConfig = toml::from_str(toml).unwrap();
+        let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
+        assert!(err.to_string().contains("reserved"), "{err}");
     }
 
     #[test]

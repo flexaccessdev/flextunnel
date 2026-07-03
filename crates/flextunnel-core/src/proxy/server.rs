@@ -5,7 +5,8 @@
 use crate::blocklist::{self, BlockList};
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::signaling::{self, ControlMsg, Hello, HelloResponse, PeerRole, Target};
-use crate::proxy::{dial, RoutedSet};
+use crate::proxy::status_page::{self, ServerStatusTemplate};
+use crate::proxy::{dial, reserved, RoutedSet};
 use crate::transport::LIVENESS_WINDOW;
 use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointId};
@@ -28,6 +29,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// SOCKS5 streams are separately bounded by the QUIC transport's bidi-stream
 /// limit, so this single cap is enough to bound overall task growth.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
+
+/// Deadline for draining a reserved-namespace request after the server has
+/// already written its HTTP response. We drain (rather than drop `recv`) only to
+/// avoid a STOP_SENDING that could truncate the relayed response; a peer that
+/// then neither sends nor closes must not pin the task, so cap the wait.
+const RESERVED_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// QUIC close code used when the server tears a connection down for a
 /// duplicate-id conflict (distinct from the auth-failure code `1`).
@@ -207,6 +214,37 @@ impl ProxyServer {
             blocklist: Arc::new(Mutex::new(blocklist)),
             shutdown: Arc::new(Notify::new()),
         })
+    }
+
+    /// Snapshot the live routing config into the status-page template. Secrets
+    /// are never included; the blocklist is exposed as counts only.
+    fn build_status_template(&self) -> ServerStatusTemplate {
+        let mut host_aliases: Vec<(String, String)> = self
+            .host_aliases
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        host_aliases.sort();
+        let mut agent_routes: Vec<(String, String)> = self
+            .agent_routes
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        agent_routes.sort();
+
+        let bl = self.blocklist.lock().expect("blocklist lock");
+        ServerStatusTemplate {
+            version: env!("CARGO_PKG_VERSION"),
+            node_id: self.own_id.to_string(),
+            routed_domains: self.routed_domains.clone(),
+            routed_cidrs: self.routed_cidrs.clone(),
+            host_aliases,
+            agent_routes,
+            blocklist_path: bl.path().display().to_string(),
+            blocked_client_count: bl.blocked_client_count(),
+            blocked_agent_count: bl.blocked_agent_count(),
+            conflicted_server_count: bl.conflicted_server_count(),
+        }
     }
 
     /// Accept connections until the endpoint closes or the server self-blocks.
@@ -808,6 +846,16 @@ async fn handle_socks_stream(
 ) -> io::Result<()> {
     let requested = signaling::read_request(&mut recv).await?;
 
+    // Reserved `flextunnel.internal` namespace: handled by the server itself
+    // (a status page / reserved 404), bypassing the routed-set whitelist,
+    // agent routes and host aliases. The client always tunnels these names, so
+    // no operator config is needed to reach them.
+    if let Target::Domain(host, _) = &requested
+        && reserved::is_reserved_host(host)
+    {
+        return serve_reserved(send, recv, server, reserved::is_status_host(host)).await;
+    }
+
     // Enforce the routed set as a whitelist on the requested target (before
     // aliasing/routing), as a defense-in-depth boundary: a well-behaved client
     // only tunnels on-list targets, so a request for anything off-list means a
@@ -833,6 +881,41 @@ async fn handle_socks_stream(
     let target = apply_alias(requested, &server.host_aliases);
     log::debug!("Stream target: {target:?}");
     dial::connect_and_pipe(send, recv, &target).await
+}
+
+/// Serve a reserved `flextunnel.internal` request: the status page for the exact
+/// host, or a "reserved for future use" 404 for a `*.flextunnel.internal`
+/// subdomain. Both are HTTP responses written over the tunnel stream.
+async fn serve_reserved(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    server: &Arc<ProxyServer>,
+    is_status: bool,
+) -> io::Result<()> {
+    let (status_line, body) = if is_status {
+        log::debug!("Serving flextunnel.internal status page");
+        status_page::render_status(&server.build_status_template())
+    } else {
+        log::debug!("Serving reserved flextunnel.internal subdomain 404");
+        status_page::render_reserved_404()
+    };
+    status_page::write_http_response(&mut send, status_line, &body).await?;
+
+    // Drain the peer's HTTP request instead of dropping `recv` immediately: an
+    // abrupt drop sends STOP_SENDING, which can truncate the response as the
+    // client relays it. We sent `Connection: close`, so the peer closes after
+    // reading the response, giving us EOF. Bounded by both a byte cap and a
+    // per-read timeout so a peer that never sends nor closes can't pin the task.
+    let mut buf = [0u8; 4096];
+    let mut drained = 0usize;
+    while drained < 64 * 1024 {
+        match tokio::time::timeout(RESERVED_DRAIN_TIMEOUT, recv.read(&mut buf)).await {
+            Ok(Ok(Some(n))) => drained += n,
+            // EOF, read error, or drain timeout: stop draining.
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    Ok(())
 }
 
 /// Route a client stream to a reserved agent: find the agent's live connection,
