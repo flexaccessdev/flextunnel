@@ -34,6 +34,7 @@ struct Args {
 #[derive(Subcommand)]
 enum Command {
     /// Start the proxy server.
+    #[command(arg_required_else_help = true)]
     Server {
         /// Config file path (TOML). CLI flags override file values.
         #[arg(short = 'c', long)]
@@ -64,6 +65,7 @@ enum Command {
         dns_server: Option<String>,
     },
     /// Start the proxy client (local SOCKS5 listener).
+    #[command(arg_required_else_help = true)]
     Client {
         /// Config file path (TOML). CLI flags override file values.
         #[arg(short = 'c', long)]
@@ -114,6 +116,7 @@ enum Command {
         force: bool,
     },
     /// Show the server's public EndpointId derived from a private key.
+    #[command(arg_required_else_help = true)]
     ShowServerId {
         /// Config file path (TOML). CLI flags override file values.
         #[arg(short = 'c', long)]

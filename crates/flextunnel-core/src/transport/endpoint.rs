@@ -4,15 +4,17 @@ use crate::transport::{ALPN, build_quic_transport_config};
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use iroh::{
-    Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
+    Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
     address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver},
-    endpoint::{Builder as EndpointBuilder, presets},
+    endpoint::{Builder as EndpointBuilder, Connection, PathList, presets},
 };
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use log::info;
+use n0_future::StreamExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use url::Url;
 
 pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -179,4 +181,72 @@ pub async fn create_client_endpoint(
 
     wait_online(&endpoint).await?;
     Ok(endpoint)
+}
+
+/// Format the currently-selected path(s) of a connection for logging, e.g.
+/// `Direct [2607:…]:52186 (rtt 1ms)` or `Relay https://… (rtt 42ms)`.
+fn format_paths(paths: &PathList<'_>) -> String {
+    if paths.is_empty() {
+        return "establishing...".to_string();
+    }
+    let parts: Vec<String> = paths
+        .iter()
+        .filter(|p| p.is_selected())
+        .map(|path| {
+            let rtt = path.rtt();
+            match path.remote_addr() {
+                TransportAddr::Ip(addr) => format!("Direct {addr} (rtt {rtt:.0?})"),
+                TransportAddr::Relay(url) => format!("Relay {url} (rtt {rtt:.0?})"),
+                other => format!("{other:?} (rtt {rtt:.0?})"),
+            }
+        })
+        .collect();
+    if parts.is_empty() {
+        "no selected path".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Key identifying the selected-path topology, excluding the volatile RTT, so
+/// we only log when the path actually changes (not on every RTT update).
+fn paths_key(paths: &PathList<'_>) -> (bool, Vec<String>) {
+    let selected = paths
+        .iter()
+        .filter(|p| p.is_selected())
+        .map(|p| format!("{:?}", p.remote_addr()))
+        .collect();
+    (paths.is_empty(), selected)
+}
+
+/// RAII guard that aborts the background path-watcher task on drop.
+pub struct PathWatcherGuard(JoinHandle<()>);
+
+impl Drop for PathWatcherGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Log the connection's selected path and spawn a background task that logs
+/// updates whenever the active path changes (e.g. relay -> direct).
+///
+/// The returned [`PathWatcherGuard`] aborts the background task when dropped;
+/// callers must keep it alive for the duration of the connection.
+pub fn watch_connection_paths(conn: &Connection) -> PathWatcherGuard {
+    let conn = conn.clone();
+    PathWatcherGuard(tokio::spawn(async move {
+        // The stream yields the current snapshot on the first poll, then a
+        // fresh snapshot whenever the open or selected paths change; it ends
+        // when the connection closes.
+        let mut stream = conn.paths_stream();
+        let mut last_key = None;
+        while let Some(paths) = stream.next().await {
+            let key = paths_key(&paths);
+            if last_key.as_ref() != Some(&key) {
+                info!("Connection: {}", format_paths(&paths));
+                last_key = Some(key);
+            }
+        }
+    }))
 }

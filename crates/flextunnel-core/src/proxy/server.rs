@@ -465,6 +465,11 @@ impl ProxyServer {
         let conn_seq = NEXT_CONN_SEQ.fetch_add(1, Ordering::Relaxed);
         log::info!("New connection from {remote_id}");
 
+        // Log the selected path (relay/direct) and any later switch, for the
+        // lifetime of this connection. Guard is dropped when `handle_connection`
+        // returns (it outlives the awaited agent path too).
+        let _path_watcher = crate::transport::endpoint::watch_connection_paths(&connection);
+
         // Control stream: read Hello. Kept open afterwards for heartbeats, so the
         // send/recv halves flow through to the heartbeat loop. Bounded so a peer
         // that opens the connection but never sends the handshake can't hang us.
