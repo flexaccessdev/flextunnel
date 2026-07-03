@@ -59,13 +59,14 @@ impl Tray {
         let open = MenuItem::with_id(MENU_OPEN, "Open flextunnel…", true, None);
         let quit = MenuItem::with_id(MENU_QUIT, "Quit flextunnel", true, None);
         let menu = Menu::with_items(&[
+            &open,
+            &PredefinedMenuItem::separator(),
             &status,
             &PredefinedMenuItem::separator(),
             &connect,
             &disconnect,
             &copy_socks,
             &PredefinedMenuItem::separator(),
-            &open,
             &quit,
         ])?;
 
