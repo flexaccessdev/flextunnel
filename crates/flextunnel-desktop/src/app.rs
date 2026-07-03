@@ -371,26 +371,36 @@ impl App {
         if snapshot.phase == Phase::Connected {
             ui.add_space(8.0);
             ui.separator();
-            if is_full_tunnel(&snapshot.routes) {
-                ui.label("Routing: everything through the tunnel");
-            } else {
-                ui.label(format!(
-                    "Split tunnel — {} domain(s), {} CIDR(s) routed through the server:",
-                    snapshot.routes.domains.len(),
-                    snapshot.routes.cidrs.len()
-                ));
-                egui::ScrollArea::vertical()
-                    .id_salt("routes")
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("routes")
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    if is_full_tunnel(&snapshot.routes) {
+                        ui.label("Routing: everything through the tunnel");
+                    } else {
+                        ui.label(format!(
+                            "Split tunnel — {} domain(s), {} CIDR(s) routed through the server:",
+                            snapshot.routes.domains.len(),
+                            snapshot.routes.cidrs.len()
+                        ));
                         for domain in &snapshot.routes.domains {
                             ui.monospace(domain);
                         }
                         for cidr in &snapshot.routes.cidrs {
                             ui.monospace(cidr);
                         }
-                    });
-            }
+                    }
+                    if !snapshot.routes.host_aliases.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(format!(
+                            "Host aliases — {} resolved server-side:",
+                            snapshot.routes.host_aliases.len()
+                        ));
+                        for (alias, target) in &snapshot.routes.host_aliases {
+                            ui.monospace(format!("{alias} → {target}"));
+                        }
+                    }
+                });
         }
     }
 
