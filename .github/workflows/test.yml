@@ -49,7 +49,7 @@ jobs:
       - name: Package desktop app (.app, unsigned)
         if: runner.os == 'macOS'
         run: |
-          cargo binstall -y cargo-packager@0.11.8
+          cargo binstall -y --force cargo-packager@0.11.8
           cargo build --release -p flextunnel-desktop --target ${{ matrix.target }}
           cargo packager --release -p flextunnel-desktop --formats app --target ${{ matrix.target }}
           ditto -c -k --keepParent target/${{ matrix.target }}/release/flextunnel.app flextunnel-desktop-macos-arm64.app.zip
@@ -57,7 +57,7 @@ jobs:
       - name: Package desktop installer (.msi, unsigned)
         if: runner.os == 'Windows'
         run: |
-          cargo binstall -y cargo-packager@0.11.8
+          cargo binstall -y --force cargo-packager@0.11.8
           cargo build --release -p flextunnel-desktop --target ${{ matrix.target }}
           cargo packager --release -p flextunnel-desktop --formats wix --target ${{ matrix.target }}
           Move-Item target/${{ matrix.target }}/release/*.msi flextunnel-desktop-windows-amd64.msi
