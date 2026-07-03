@@ -39,6 +39,7 @@ struct Args {
 #[derive(Subcommand)]
 enum Command {
     /// Run the agent: connect to the server and serve reverse-routed streams.
+    #[command(arg_required_else_help = true)]
     Run {
         /// Config file path (TOML). CLI flags override file values.
         #[arg(short = 'c', long)]
