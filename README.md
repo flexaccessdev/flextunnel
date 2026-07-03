@@ -105,7 +105,16 @@ published to `ghcr.io/andrewtheguy/flextunnel`.
 
 Stable releases also include the desktop client
 (`flextunnel-desktop-macos-arm64.app.zip` and
-`flextunnel-desktop-windows-amd64.msi`). The installers are **unsigned**:
+`flextunnel-desktop-windows-amd64.msi`). The installers are **unsigned** — if
+you'd rather not apply the workarounds below, build it yourself instead:
+
+```sh
+cargo build --release -p flextunnel-desktop
+# binary: target/release/flextunnel-desktop — locally built binaries are not
+# quarantined, so no workaround is needed
+```
+
+Otherwise:
 
 **macOS:** because the app is not notarized, Gatekeeper quarantines the
 download and shows *"flextunnel" is damaged and can't be opened*. Remove the
