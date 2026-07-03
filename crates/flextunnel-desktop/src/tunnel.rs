@@ -126,6 +126,12 @@ fn update<F: FnOnce(&mut Snapshot)>(shared: &Arc<Mutex<Snapshot>>, f: F) {
     f(&mut s);
 }
 
+/// Publish the manager's current per-forward statuses to the snapshot.
+fn refresh_forward_statuses(shared: &Arc<Mutex<Snapshot>>, fwd_mgr: &ForwardManager) {
+    let statuses = fwd_mgr.statuses();
+    update(shared, |s| s.forwards = statuses);
+}
+
 async fn run_loop(mut rx: mpsc::Receiver<Command>, shared: Arc<Mutex<Snapshot>>) {
     let mut forwards: Vec<PortForward> = Vec::new();
     while let Some(cmd) = rx.recv().await {
@@ -269,7 +275,6 @@ async fn run_session(
                     .map(|r| r.clone())
                     .unwrap_or_default();
                 ever_connected |= routes.connected;
-                let forward_statuses = fwd_mgr.statuses();
                 update(shared, |s| {
                     if routes.connected {
                         if s.phase != Phase::Connected {
@@ -285,8 +290,8 @@ async fn run_session(
                         };
                     }
                     s.routes = routes;
-                    s.forwards = forward_statuses;
                 });
+                refresh_forward_statuses(shared, &fwd_mgr);
             }
             cmd = rx.recv() => match cmd {
                 Some(Command::Disconnect) => {
@@ -300,8 +305,7 @@ async fn run_session(
                 Some(Command::SetForwards(f)) => {
                     *forwards = f;
                     fwd_mgr.apply(forwards);
-                    let forward_statuses = fwd_mgr.statuses();
-                    update(shared, |s| s.forwards = forward_statuses);
+                    refresh_forward_statuses(shared, &fwd_mgr);
                 }
                 Some(Command::Shutdown) | None => break SessionExit::Shutdown,
             }
