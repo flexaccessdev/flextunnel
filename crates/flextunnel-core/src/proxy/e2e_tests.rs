@@ -334,6 +334,64 @@ async fn agent_reverse_route_pipes_to_agent_loopback() {
     drop(agent_conn);
 }
 
+/// End-to-end reserved namespace: a request for `flextunnel.internal` is served
+/// by the server itself as an HTTP status page (bypassing the routed-set
+/// whitelist — note the routed set here does NOT contain it), and a
+/// `*.flextunnel.internal` subdomain returns an HTTP 404.
+#[tokio::test]
+async fn reserved_internal_serves_status_page_and_subdomain_404() {
+    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
+    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
+    // A distinctive routed domain we expect to see rendered on the status page.
+    // `flextunnel.internal` is deliberately NOT on the routed set.
+    spawn_server_full(
+        server_ep,
+        temp_blocklist("reserved"),
+        HashSet::new(),
+        HashMap::new(),
+        vec!["marker.example.com".to_string()],
+    );
+
+    let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
+    let (client_conn, _cs, _cr, cresp) =
+        client_handshake(&client_ep, server_addr, 1, false).await;
+    assert!(cresp.accepted, "client should be accepted");
+
+    // The status host: expect an HTTP 200 whose body contains the routed domain.
+    let body = fetch_reserved(&client_conn, "flextunnel.internal").await;
+    assert!(body.starts_with("HTTP/1.1 200"), "status page should be 200: {body:.40}");
+    assert!(
+        body.contains("marker.example.com"),
+        "status page should list the configured routed domain"
+    );
+
+    // A reserved subdomain: expect an HTTP 404 "reserved" page.
+    let body = fetch_reserved(&client_conn, "sub.flextunnel.internal").await;
+    assert!(body.starts_with("HTTP/1.1 404"), "reserved subdomain should be 404: {body:.40}");
+
+    drop(client_conn);
+}
+
+/// Open a tunnel stream for `host:80`, send a minimal HTTP request, and return
+/// the full response (after consuming the per-stream success reply byte). The
+/// server responds without requiring the request, then drains it — so we write
+/// the request best-effort (the drain may race the close) and read the response.
+async fn fetch_reserved(conn: &Connection, host: &str) -> String {
+    let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
+    signaling::write_request(&mut send, &Target::Domain(host.to_string(), 80))
+        .await
+        .unwrap();
+    send.flush().await.unwrap();
+    let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
+    assert_eq!(rep, signaling::REP_SUCCESS, "reserved host should reply success");
+    let _ = send
+        .write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await;
+    let _ = send.finish();
+    let bytes = with_timeout(recv.read_to_end(64 * 1024)).await.unwrap();
+    String::from_utf8(bytes).unwrap()
+}
+
 /// Two agents presenting the *same* machine id concurrently (distinct ephemeral
 /// node ids) are a duplicate: the second is rejected and the machine id is
 /// blocklisted.

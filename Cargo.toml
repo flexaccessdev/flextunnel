@@ -11,12 +11,13 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.0.20"
+version = "0.0.21"
 edition = "2024"
 description = "SOCKS5-over-QUIC proxy via iroh P2P"
 
 [workspace.dependencies]
 anyhow = "1"
+askama = "0.16.0"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"

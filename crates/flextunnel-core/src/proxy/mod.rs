@@ -5,10 +5,12 @@ pub mod agent;
 pub mod client;
 pub mod dial;
 pub mod http;
+pub mod reserved;
 pub mod server;
 pub mod routed_set;
 pub mod signaling;
 pub mod socks5;
+pub mod status_page;
 
 #[cfg(test)]
 mod e2e_tests;

@@ -3,7 +3,7 @@
 
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::signaling::{self, ControlMsg, Hello, Target};
-use crate::proxy::{dial, http, socks5, RoutedSet};
+use crate::proxy::{dial, http, reserved, socks5, RoutedSet};
 use crate::transport::{HEARTBEAT_INTERVAL, LIVENESS_WINDOW};
 use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -732,9 +732,15 @@ async fn handle_local_conn<P: LocalProto>(
         return Ok(());
     };
 
+    // The reserved `flextunnel.internal` namespace is always tunneled to the
+    // server (which serves it itself), regardless of the pushed routed set — a
+    // direct connection would just fail on a name that resolves nowhere.
+    let reserved_target = matches!(&target, signaling::Target::Domain(host, _)
+        if reserved::is_reserved_host(host));
+
     // Split-tunnel: a target not in the tunnel set is dialed directly from this
     // device's own network (its DNS, its IP) — works even when the tunnel is down.
-    if !routed_set.allows(&target) {
+    if !reserved_target && !routed_set.allows(&target) {
         log::debug!("Direct (off tunnel set): {target:?}");
         return direct_connect(proto, tcp, &target, upstream_preamble).await;
     }
