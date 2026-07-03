@@ -30,3 +30,15 @@ egui-winit = { version = "0.35", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-native-keyring-store = "1"
+
+# Installer packaging (`cargo packager`): .app on macOS, .msi (WiX) on Windows.
+# Icons are pre-generated from the iOS icon.svg glyph (see src/icon.rs, which
+# renders the same geometry at runtime for the tray).
+[package.metadata.packager]
+product-name = "flextunnel"
+identifier = "com.flextunnel.desktop"
+icons = ["icons/icon.icns", "icons/icon.ico", "icons/icon.png"]
+
+[package.metadata.packager.macos]
+# Menu-bar app: sets LSUIElement so there is no Dock icon or launch bounce.
+background-app = true

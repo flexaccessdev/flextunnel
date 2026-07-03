@@ -157,6 +157,17 @@ jobs:
           mv target/aarch64-apple-darwin/release/flextunnel target/release/flextunnel-macos-arm64
           mv target/aarch64-apple-darwin/release/flextunnel-agent target/release/flextunnel-agent-macos-arm64
 
+      - uses: cargo-bins/cargo-binstall@main
+
+      - name: Package desktop app (.app, unsigned)
+        # Unsigned: downloads get the quarantine attribute; the README documents
+        # the standard `xattr` workaround.
+        run: |
+          cargo binstall -y cargo-packager@0.11.8
+          cargo build --release -p flextunnel-desktop --target aarch64-apple-darwin
+          cargo packager --release -p flextunnel-desktop --formats app --target aarch64-apple-darwin
+          ditto -c -k --keepParent target/aarch64-apple-darwin/release/flextunnel.app target/release/flextunnel-desktop-macos-arm64.app.zip
+
       - uses: actions/upload-artifact@v4
         with:
           name: release-macos-arm64
@@ -166,6 +177,11 @@ jobs:
         with:
           name: release-agent-macos-arm64
           path: target/release/flextunnel-agent-macos-arm64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-desktop-macos-arm64
+          path: target/release/flextunnel-desktop-macos-arm64.app.zip
 
   build-ios:
     needs: setup
@@ -220,6 +236,17 @@ jobs:
           move target\x86_64-pc-windows-msvc\release\flextunnel.exe target\release\flextunnel-windows-amd64.exe
           move target\x86_64-pc-windows-msvc\release\flextunnel-agent.exe target\release\flextunnel-agent-windows-amd64.exe
 
+      - uses: cargo-bins/cargo-binstall@main
+
+      - name: Package desktop installer (.msi, unsigned)
+        # cargo-packager downloads the WiX toolset itself. Unsigned: users see
+        # the SmartScreen "unknown publisher" prompt.
+        run: |
+          cargo binstall -y cargo-packager@0.11.8
+          cargo build --release -p flextunnel-desktop --target x86_64-pc-windows-msvc
+          cargo packager --release -p flextunnel-desktop --formats wix --target x86_64-pc-windows-msvc
+          Move-Item target/x86_64-pc-windows-msvc/release/*.msi target/release/flextunnel-desktop-windows-amd64.msi
+
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows-amd64
@@ -229,6 +256,11 @@ jobs:
         with:
           name: release-agent-windows-amd64
           path: target/release/flextunnel-agent-windows-amd64.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-desktop-windows-amd64
+          path: target/release/flextunnel-desktop-windows-amd64.msi
 
   publish-release:
     needs: [setup, build-linux, build-macos, build-ios, build-windows]
