@@ -980,9 +980,9 @@ fn status_format_for_reserved_request(head: &[u8]) -> status_page::StatusFormat 
         let mut parts = request_line.split_ascii_whitespace();
         let _method = parts.next();
         if let Some(target) = parts.next()
-            && request_target_wants_text(target)
+            && let Some(format) = request_target_status_format(target)
         {
-            return status_page::StatusFormat::Text;
+            return format;
         }
     }
 
@@ -991,21 +991,16 @@ fn status_format_for_reserved_request(head: &[u8]) -> status_page::StatusFormat 
             continue;
         };
         if name.eq_ignore_ascii_case("accept")
-            && value.split(',').any(|part| {
-                part.trim()
-                    .split(';')
-                    .next()
-                    .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/plain"))
-            })
+            && let Some(format) = status_format_for_accept(value)
         {
-            return status_page::StatusFormat::Text;
+            return format;
         }
     }
 
     status_page::StatusFormat::Html
 }
 
-fn request_target_wants_text(target: &str) -> bool {
+fn request_target_status_format(target: &str) -> Option<status_page::StatusFormat> {
     let path = if let Some(rest) = strip_http_scheme(target) {
         match rest.find(['/', '?']) {
             Some(i) => &rest[i..],
@@ -1015,7 +1010,24 @@ fn request_target_wants_text(target: &str) -> bool {
         target
     };
     let path = path.split_once('?').map_or(path, |(path, _)| path);
-    path == status_page::STATUS_TEXT_PATH
+    match path {
+        status_page::STATUS_TEXT_PATH => Some(status_page::StatusFormat::Text),
+        status_page::STATUS_JSON_PATH => Some(status_page::StatusFormat::Json),
+        _ => None,
+    }
+}
+
+fn status_format_for_accept(value: &str) -> Option<status_page::StatusFormat> {
+    value.split(',').find_map(|part| {
+        let media_type = part.trim().split(';').next()?.trim();
+        if media_type.eq_ignore_ascii_case("application/json") {
+            Some(status_page::StatusFormat::Json)
+        } else if media_type.eq_ignore_ascii_case("text/plain") {
+            Some(status_page::StatusFormat::Text)
+        } else {
+            None
+        }
+    })
 }
 
 fn strip_http_scheme(target: &str) -> Option<&str> {

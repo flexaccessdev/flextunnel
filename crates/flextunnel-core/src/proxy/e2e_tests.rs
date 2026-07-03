@@ -421,6 +421,34 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
         "text status should show the configured host alias"
     );
 
+    let body = fetch_reserved_path(&client_conn, "flextunnel.internal", "/status.json").await;
+    assert!(body.starts_with("HTTP/1.1 200"), "json status should be 200: {body:.40}");
+    assert!(
+        body.contains("Content-Type: application/json; charset=utf-8"),
+        "json status should use application/json"
+    );
+    let json_body = body
+        .split_once("\r\n\r\n")
+        .expect("json status response should include headers")
+        .1;
+    let status: serde_json::Value =
+        serde_json::from_str(json_body).expect("json status body should parse");
+    assert_eq!(
+        status["routed_domains"],
+        serde_json::json!(["marker.example.com"]),
+        "json status should list the configured routed domain"
+    );
+    assert_eq!(
+        status["host_aliases"],
+        serde_json::json!([{"name": "nas.internal", "target": "192.168.1.9"}]),
+        "json status should list the configured host alias"
+    );
+    assert_eq!(
+        status["agent_routes"],
+        serde_json::json!([{"name": agent_alias, "machine_id": machine_id, "connected": true}]),
+        "json status should show the connected agent route"
+    );
+
     // Accept-header negotiation: a `/` request with `Accept: text/plain` should
     // also return the plain-text status response (not the HTML page).
     let body = fetch_reserved_accept(&client_conn, "flextunnel.internal", "/", "text/plain").await;
