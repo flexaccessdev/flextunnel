@@ -1,14 +1,41 @@
 name: Test (Manual)
 
-# Placeholder so this workflow is dispatchable: workflow_dispatch only works
-# for workflows that exist on the default branch. Run against a branch with
-# `gh workflow run test.yml --ref <branch>` — that executes the branch's
-# version of this file, not this placeholder.
+# Standalone version of the release workflow's test steps. Shares the release
+# jobs' Rust caches (same rust-cache shared-key per target), so it can verify
+# platforms without cutting a release — notably flextunnel-desktop on Windows,
+# which release only builds for stable releases and never tests on its own.
 on:
   workflow_dispatch:
 
 jobs:
-  placeholder:
-    runs-on: ubuntu-latest
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            # flextunnel-desktop is macOS/Windows only (tray + keychain backends).
+            packages: -p flextunnel-cli -p flextunnel-agent
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            packages: -p flextunnel-cli -p flextunnel-agent
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            packages: -p flextunnel-cli -p flextunnel-agent -p flextunnel-desktop
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            packages: -p flextunnel-cli -p flextunnel-agent -p flextunnel-desktop
+    runs-on: ${{ matrix.os }}
+
     steps:
-      - run: echo "placeholder — replaced by the real test matrix on feature branches"
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Must stay in sync with the release workflow's build jobs so both
+          # workflows restore/populate the same cache.
+          shared-key: release-${{ matrix.target }}
+
+      - name: Test Release
+        run: |
+          cargo test --release ${{ matrix.packages }} --target ${{ matrix.target }}

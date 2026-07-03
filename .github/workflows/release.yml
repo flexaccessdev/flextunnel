@@ -101,6 +101,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Shared with the standalone test workflow (test.yml).
+          shared-key: release-${{ matrix.target }}
 
       - name: Build Release
         run: |
@@ -137,6 +140,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Shared with the standalone test workflow (test.yml).
+          shared-key: release-aarch64-apple-darwin
 
       - name: Build Release
         run: |
@@ -197,6 +203,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Shared with the standalone test workflow (test.yml).
+          shared-key: release-x86_64-pc-windows-msvc
 
       - name: Build Release
         run: |
