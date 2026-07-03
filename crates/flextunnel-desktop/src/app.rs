@@ -878,8 +878,9 @@ impl App {
                         // Soft warning only — the hard guard is the forward's
                         // bind failing visibly ("port N is in use").
                         if let Some(forward) = self.forwards.iter().find(|f| {
-                            f.local_port == config.socks_port
-                                || Some(f.local_port) == config.http_port
+                            f.enabled
+                                && (f.local_port == config.socks_port
+                                    || Some(f.local_port) == config.http_port)
                         }) {
                             notice.push_str(&format!(
                                 " Forward \"{}\" uses port {} and will fail to bind.",

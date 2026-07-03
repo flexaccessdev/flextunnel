@@ -65,6 +65,15 @@ impl PortForward {
             self.local_port, self.remote_host, self.remote_port
         )
     }
+
+    /// Whether two configs relay identically. Display-only fields (the label)
+    /// don't count, so editing them must not drop live connections.
+    fn same_relay(&self, other: &Self) -> bool {
+        self.local_port == other.local_port
+            && self.remote_host == other.remote_host
+            && self.remote_port == other.remote_port
+            && self.enabled == other.enabled
+    }
 }
 
 /// Forwards live in a plain JSON file, not the keychain config blob — they are
@@ -174,18 +183,23 @@ impl ForwardManager {
     }
 
     /// Reconcile the running tasks with the desired list: removed, disabled, or
-    /// edited forwards are aborted (dropping their live relays); new or edited
-    /// enabled forwards are spawned. Untouched forwards keep their listeners
-    /// and open connections.
+    /// relay-edited forwards are aborted (dropping their live relays); new or
+    /// edited enabled forwards are spawned. Forwards whose relay config is
+    /// unchanged — including label-only edits — keep their listeners and open
+    /// connections.
     pub fn apply(&mut self, forwards: &[PortForward]) {
         let desired: HashMap<&str, &PortForward> =
             forwards.iter().map(|f| (f.id.as_str(), f)).collect();
-        self.tasks.retain(|id, task| {
-            let keep = desired.get(id.as_str()) == Some(&&task.forward);
-            if !keep {
-                task.handle.abort();
+        self.tasks.retain(|id, task| match desired.get(id.as_str()) {
+            Some(f) if f.same_relay(&task.forward) => {
+                // Refresh display-only fields so the stored copy stays current.
+                task.forward = (*f).clone();
+                true
             }
-            keep
+            _ => {
+                task.handle.abort();
+                false
+            }
         });
         for forward in forwards {
             if forward.enabled && !self.tasks.contains_key(&forward.id) {
@@ -521,6 +535,26 @@ mod tests {
         let status = status_of(&manager, &id).await;
         let error = status.last_conn_error.expect("error recorded");
         assert!(error.contains("rejected"), "got: {error}");
+    }
+
+    #[tokio::test]
+    async fn apply_keeps_task_on_label_only_edit() {
+        let socks_port = spawn_mini_socks(PASSWORD).await;
+        let mut f = forward(free_port().await);
+        let mut manager =
+            ForwardManager::new(socks_port, PASSWORD.into(), std::slice::from_ref(&f));
+        let shared_before = Arc::as_ptr(&manager.tasks[&f.id].shared);
+
+        // Label-only edit: same task (same shared cells), refreshed metadata.
+        f.label = "renamed".into();
+        manager.apply(std::slice::from_ref(&f));
+        assert_eq!(Arc::as_ptr(&manager.tasks[&f.id].shared), shared_before);
+        assert_eq!(manager.tasks[&f.id].forward.label, "renamed");
+
+        // Relay edit: task restarted (fresh shared cells).
+        f.remote_port += 1;
+        manager.apply(std::slice::from_ref(&f));
+        assert_ne!(Arc::as_ptr(&manager.tasks[&f.id].shared), shared_before);
     }
 
     #[tokio::test]
