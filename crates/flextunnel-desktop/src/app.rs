@@ -996,6 +996,13 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.tab, Tab::Forwards, "Forwards");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
                 ui.selectable_value(&mut self.tab, Tab::Logs, "Logs");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                            .small()
+                            .weak(),
+                    );
+                });
             });
             ui.add_space(2.0);
         });
