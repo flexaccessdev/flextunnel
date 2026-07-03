@@ -5,7 +5,7 @@
 use crate::blocklist::{self, BlockList};
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::signaling::{self, ControlMsg, Hello, HelloResponse, PeerRole, Target};
-use crate::proxy::status_page::{self, ServerStatusTemplate};
+use crate::proxy::status_page::{self, AgentRouteStatus, ServerStatusTemplate};
 use crate::proxy::{dial, reserved, RoutedSet};
 use crate::transport::LIVENESS_WINDOW;
 use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
@@ -225,12 +225,23 @@ impl ProxyServer {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         host_aliases.sort();
-        let mut agent_routes: Vec<(String, String)> = self
+        let connected_agents: HashSet<String> = self
+            .agent_registry
+            .lock()
+            .expect("agent registry lock")
+            .keys()
+            .cloned()
+            .collect();
+        let mut agent_routes: Vec<AgentRouteStatus> = self
             .agent_routes
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(name, machine_id)| AgentRouteStatus {
+                name: name.clone(),
+                machine_id: machine_id.clone(),
+                connected: connected_agents.contains(machine_id),
+            })
             .collect();
-        agent_routes.sort();
+        agent_routes.sort_by(|a, b| a.name.cmp(&b.name));
 
         let bl = self.blocklist.lock().expect("blocklist lock");
         ServerStatusTemplate {

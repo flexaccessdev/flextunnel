@@ -14,6 +14,13 @@ use tokio::io::AsyncWriteExt;
 
 use crate::proxy::signaling;
 
+/// One configured reverse route plus whether its agent is currently registered.
+pub struct AgentRouteStatus {
+    pub name: String,
+    pub machine_id: String,
+    pub connected: bool,
+}
+
 /// The server status page. Fields are populated from the live `ProxyServer`
 /// state; secrets are never included and the blocklist is shown as counts only.
 #[derive(Template)]
@@ -25,8 +32,8 @@ pub struct ServerStatusTemplate {
     pub routed_cidrs: Vec<String>,
     /// `(alias, target)` pairs, sorted for stable output.
     pub host_aliases: Vec<(String, String)>,
-    /// `(alias, machine_id)` pairs, sorted for stable output.
-    pub agent_routes: Vec<(String, String)>,
+    /// Configured agent routes, sorted by alias for stable output.
+    pub agent_routes: Vec<AgentRouteStatus>,
     pub blocklist_path: String,
     pub blocked_client_count: usize,
     pub blocked_agent_count: usize,
