@@ -70,9 +70,11 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 # subdomain are reserved by flextunnel and cannot be used as [host_aliases] or
 # [agent_routes] names (the server rejects such configs at startup). Clients
 # always tunnel these names regardless of the routed set. Browse to
-# `http://flextunnel.internal` through the tunnel for a read-only server status
-# page (routing config, node id, blocklist counts); HTTP-only. Other
-# `*.flextunnel.internal` names are reserved for future use and return a 404.
+# `http://flextunnel.internal/` through the tunnel for the HTML server status
+# page, or query the plain-text form from a client with:
+#   curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.txt
+# HTTP-only. Other `*.flextunnel.internal` names are reserved for future use and
+# return a 404.
 
 # Optional host aliases, resolved server-side. A requested hostname matching a
 # key (case-insensitive) is rewritten to its value — an IP or another hostname

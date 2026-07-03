@@ -29,6 +29,8 @@
   ul { margin: 0; padding-left: 1.25rem; }
   li { margin: 0.15rem 0; }
   .empty { color: #6a737d; font-style: italic; }
+  .ok { color: #1a7f37; font-weight: 600; }
+  .warn { color: #9a6700; font-weight: 600; }
   table { width: 100%; border-collapse: collapse; }
   td { padding: 0.2rem 0.5rem 0.2rem 0; vertical-align: top; }
   td:first-child { white-space: nowrap; color: #444d56; }
@@ -95,8 +97,12 @@
       <p class="empty">none configured</p>
     {% else %}
       <table>
-      {% for (name, machine_id) in agent_routes %}
-        <tr><td class="mono">{{ name }}</td><td class="mono">&rarr; {{ machine_id }}</td></tr>
+      {% for route in agent_routes %}
+        <tr>
+          <td class="mono">{{ route.name }}</td>
+          <td class="mono">&rarr; {{ route.machine_id }}</td>
+          <td>{% if route.connected %}<span class="ok">connected</span>{% else %}<span class="warn">disconnected</span>{% endif %}</td>
+        </tr>
       {% endfor %}
       </table>
     {% endif %}

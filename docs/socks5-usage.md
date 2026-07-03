@@ -52,6 +52,9 @@ curl -x socks5h://127.0.0.1:1080 http://127.0.0.1:8000/
 
 # a host alias defined on the server
 curl -x socks5h://127.0.0.1:1080 http://networking.internal/
+
+# flextunnel server status, as plain text
+curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.txt
 ```
 
 You can also set it for a whole shell session via the standard proxy env vars
@@ -60,6 +63,15 @@ You can also set it for a whole shell session via the standard proxy env vars
 ```sh
 export ALL_PROXY=socks5h://127.0.0.1:1080
 curl https://example.com
+```
+
+`http://flextunnel.internal/` is the HTML status page; `/status.txt` is the
+script-friendly text form. These names are reserved by flextunnel and are always
+tunneled, even when they are not in the server's routed set. If the client is
+also running the optional HTTP proxy front-end, query the same text endpoint with:
+
+```sh
+curl -sS -x http://127.0.0.1:8081 http://flextunnel.internal/status.txt
 ```
 
 ### `wget` — no SOCKS support

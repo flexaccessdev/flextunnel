@@ -342,15 +342,24 @@ async fn agent_reverse_route_pipes_to_agent_loopback() {
 async fn reserved_internal_serves_status_page_and_subdomain_404() {
     let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
     let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
-    // A distinctive routed domain we expect to see rendered on the status page.
-    // `flextunnel.internal` is deliberately NOT on the routed set.
+    // A distinctive routed domain and agent route we expect to see rendered on
+    // the status page. `flextunnel.internal` is deliberately NOT on the routed set.
+    let machine_id = "status-machine-id";
+    let agent_alias = "agent-status.internal";
+    let agent_tokens = HashSet::from([AGENT_TOKEN.to_string()]);
+    let agent_routes = HashMap::from([(agent_alias.to_string(), machine_id.to_string())]);
     spawn_server_full(
         server_ep,
         temp_blocklist("reserved"),
-        HashSet::new(),
-        HashMap::new(),
+        agent_tokens,
+        agent_routes,
         vec!["marker.example.com".to_string()],
     );
+
+    let agent_ep = loopback_endpoint(SecretKey::generate(), false).await;
+    let (agent_conn, _as, _ar, aresp) =
+        agent_handshake(&agent_ep, server_addr.clone(), machine_id, 7).await;
+    assert!(aresp.accepted, "agent should be accepted");
 
     let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
     let (client_conn, _cs, _cr, cresp) =
@@ -364,19 +373,78 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
         body.contains("marker.example.com"),
         "status page should list the configured routed domain"
     );
+    assert!(
+        body.contains(agent_alias),
+        "status page should list the configured agent route"
+    );
+    assert!(
+        body.contains(machine_id),
+        "status page should list the configured agent machine id"
+    );
+    assert!(
+        body.contains(r#"class="ok">connected"#),
+        "status page should show the connected agent state"
+    );
+
+    let body = fetch_reserved_path(&client_conn, "flextunnel.internal", "/status.txt").await;
+    assert!(body.starts_with("HTTP/1.1 200"), "text status should be 200: {body:.40}");
+    assert!(
+        body.contains("Content-Type: text/plain; charset=utf-8"),
+        "text status should use text/plain"
+    );
+    assert!(
+        body.contains("flextunnel server status"),
+        "text status should include a plain heading"
+    );
+    assert!(
+        body.contains("  - agent-status.internal -> status-machine-id (connected)"),
+        "text status should show the connected agent route"
+    );
+
+    // Accept-header negotiation: a `/` request with `Accept: text/plain` should
+    // also return the plain-text status response (not the HTML page).
+    let body = fetch_reserved_accept(&client_conn, "flextunnel.internal", "/", "text/plain").await;
+    assert!(body.starts_with("HTTP/1.1 200"), "accept-text status should be 200: {body:.40}");
+    assert!(
+        body.contains("Content-Type: text/plain; charset=utf-8"),
+        "accept-text status should use text/plain"
+    );
+    assert!(
+        body.contains("flextunnel server status"),
+        "accept-text status should include a plain heading"
+    );
 
     // A reserved subdomain: expect an HTTP 404 "reserved" page.
     let body = fetch_reserved(&client_conn, "sub.flextunnel.internal").await;
     assert!(body.starts_with("HTTP/1.1 404"), "reserved subdomain should be 404: {body:.40}");
 
     drop(client_conn);
+    drop(agent_conn);
 }
 
 /// Open a tunnel stream for `host:80`, send a minimal HTTP request, and return
-/// the full response (after consuming the per-stream success reply byte). The
-/// server responds without requiring the request, then drains it — so we write
-/// the request best-effort (the drain may race the close) and read the response.
+/// the full response after consuming the per-stream success reply byte.
 async fn fetch_reserved(conn: &Connection, host: &str) -> String {
+    fetch_reserved_path(conn, host, "/").await
+}
+
+async fn fetch_reserved_path(conn: &Connection, host: &str, path: &str) -> String {
+    fetch_reserved_request(conn, host, path, None).await
+}
+
+/// Like [`fetch_reserved_path`] but with an optional `Accept` header, so the
+/// Accept-based text negotiation path can be exercised (a `/` request with
+/// `Accept: text/plain` should return the plain-text status response).
+async fn fetch_reserved_accept(conn: &Connection, host: &str, path: &str, accept: &str) -> String {
+    fetch_reserved_request(conn, host, path, Some(accept)).await
+}
+
+async fn fetch_reserved_request(
+    conn: &Connection,
+    host: &str,
+    path: &str,
+    accept: Option<&str>,
+) -> String {
     let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
     signaling::write_request(&mut send, &Target::Domain(host.to_string(), 80))
         .await
@@ -384,8 +452,11 @@ async fn fetch_reserved(conn: &Connection, host: &str) -> String {
     send.flush().await.unwrap();
     let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
     assert_eq!(rep, signaling::REP_SUCCESS, "reserved host should reply success");
+    let accept_header = accept.map(|a| format!("Accept: {a}\r\n")).unwrap_or_default();
     let _ = send
-        .write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{accept_header}\r\n").as_bytes(),
+        )
         .await;
     let _ = send.finish();
     let bytes = with_timeout(recv.read_to_end(64 * 1024)).await.unwrap();
