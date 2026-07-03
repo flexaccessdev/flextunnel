@@ -163,7 +163,7 @@ jobs:
         # Unsigned: downloads get the quarantine attribute; the README documents
         # the standard `xattr` workaround.
         run: |
-          cargo binstall -y cargo-packager@0.11.8
+          cargo binstall -y --force cargo-packager@0.11.8
           cargo build --release -p flextunnel-desktop --target aarch64-apple-darwin
           cargo packager --release -p flextunnel-desktop --formats app --target aarch64-apple-darwin
           ditto -c -k --keepParent target/aarch64-apple-darwin/release/flextunnel.app target/release/flextunnel-desktop-macos-arm64.app.zip
@@ -242,7 +242,7 @@ jobs:
         # cargo-packager downloads the WiX toolset itself. Unsigned: users see
         # the SmartScreen "unknown publisher" prompt.
         run: |
-          cargo binstall -y cargo-packager@0.11.8
+          cargo binstall -y --force cargo-packager@0.11.8
           cargo build --release -p flextunnel-desktop --target x86_64-pc-windows-msvc
           cargo packager --release -p flextunnel-desktop --formats wix --target x86_64-pc-windows-msvc
           Move-Item target/x86_64-pc-windows-msvc/release/*.msi target/release/flextunnel-desktop-windows-amd64.msi

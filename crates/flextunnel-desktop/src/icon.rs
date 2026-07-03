@@ -94,6 +94,7 @@ fn draw_glyph(pixmap: &mut Pixmap, paint: &Paint, fill: f32) {
 }
 
 /// The bare glyph in black at the given opacity — a macOS template image.
+#[cfg(target_os = "macos")]
 fn glyph_only(size: u32, alpha: f32) -> Pixmap {
     let mut pixmap = Pixmap::new(size, size).expect("pixmap");
     let mut paint = Paint {
