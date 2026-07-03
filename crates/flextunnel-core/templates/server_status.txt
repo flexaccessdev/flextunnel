@@ -1,0 +1,25 @@
+flextunnel server status
+version: {{ tpl.version }}
+server_node_id: {{ tpl.node_id }}
+
+routed_domains:
+{% if tpl.routed_domains.is_empty() %}  none
+{% else %}{% for value in tpl.routed_domains %}  - {{ value }}
+{% endfor %}{% endif %}
+routed_cidrs:
+{% if tpl.routed_cidrs.is_empty() %}  none
+{% else %}{% for value in tpl.routed_cidrs %}  - {{ value }}
+{% endfor %}{% endif %}
+host_aliases:
+{% if tpl.host_aliases.is_empty() %}  none configured
+{% else %}{% for (name, target) in tpl.host_aliases %}  - {{ name }} -> {{ target }}
+{% endfor %}{% endif %}
+agent_routes:
+{% if tpl.agent_routes.is_empty() %}  none configured
+{% else %}{% for route in tpl.agent_routes %}  - {{ route.name }} -> {{ route.machine_id }} ({% if route.connected %}connected{% else %}disconnected{% endif %})
+{% endfor %}{% endif %}
+duplicate_id_blocklist:
+  file: {{ tpl.blocklist_path }}
+  blocked_clients: {{ tpl.blocked_client_count }}
+  blocked_agents: {{ tpl.blocked_agent_count }}
+  conflicted_servers: {{ tpl.conflicted_server_count }}{{ "\n" }}

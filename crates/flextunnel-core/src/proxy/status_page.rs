@@ -9,7 +9,6 @@
 
 use askama::Template;
 use iroh::endpoint::SendStream;
-use std::fmt::Write as _;
 use std::io;
 use tokio::io::AsyncWriteExt;
 
@@ -58,10 +57,17 @@ pub struct ServerStatusTemplate {
 #[template(path = "reserved_404.html")]
 pub struct ReservedNotFoundTemplate;
 
+#[derive(Template)]
+#[template(path = "server_status.txt")]
+struct ServerStatusTextTemplate<'a> {
+    tpl: &'a ServerStatusTemplate,
+}
+
 /// Fallback body used if a template fails to render (should not happen with
 /// compiled templates, but we never drop the stream uncleanly over it).
 const FALLBACK_BODY: &str =
     "<!DOCTYPE html><title>flextunnel</title><p>status page unavailable</p>";
+const FALLBACK_TEXT_BODY: &str = "flextunnel server status unavailable\n";
 
 /// Render the status page, falling back to a 500 on the (unexpected) render
 /// error. Returns `(http_status_line, content_type, body)`.
@@ -81,83 +87,22 @@ pub fn render_status(
                 )
             }
         },
-        StatusFormat::Text => ("200 OK", CONTENT_TYPE_TEXT, render_status_text(tpl)),
+        StatusFormat::Text => match render_status_text(tpl) {
+            Ok(body) => ("200 OK", CONTENT_TYPE_TEXT, body),
+            Err(e) => {
+                log::warn!("Failed to render status text page: {e}");
+                (
+                    "500 Internal Server Error",
+                    CONTENT_TYPE_TEXT,
+                    FALLBACK_TEXT_BODY.to_string(),
+                )
+            }
+        },
     }
 }
 
-fn render_status_text(tpl: &ServerStatusTemplate) -> String {
-    let mut out = String::new();
-    writeln!(&mut out, "flextunnel server status").expect("write to String");
-    writeln!(&mut out, "version: {}", tpl.version).expect("write to String");
-    writeln!(&mut out, "server_node_id: {}", tpl.node_id).expect("write to String");
-    writeln!(&mut out).expect("write to String");
-
-    write_string_list(&mut out, "routed_domains", &tpl.routed_domains);
-    write_string_list(&mut out, "routed_cidrs", &tpl.routed_cidrs);
-    write_pair_list(&mut out, "host_aliases", &tpl.host_aliases);
-
-    writeln!(&mut out, "agent_routes:").expect("write to String");
-    if tpl.agent_routes.is_empty() {
-        writeln!(&mut out, "  none configured").expect("write to String");
-    } else {
-        for route in &tpl.agent_routes {
-            let status = if route.connected {
-                "connected"
-            } else {
-                "disconnected"
-            };
-            writeln!(
-                &mut out,
-                "  - {} -> {} ({status})",
-                route.name, route.machine_id
-            )
-            .expect("write to String");
-        }
-    }
-    writeln!(&mut out).expect("write to String");
-
-    writeln!(&mut out, "duplicate_id_blocklist:").expect("write to String");
-    writeln!(&mut out, "  file: {}", tpl.blocklist_path).expect("write to String");
-    writeln!(
-        &mut out,
-        "  blocked_clients: {}",
-        tpl.blocked_client_count
-    )
-    .expect("write to String");
-    writeln!(&mut out, "  blocked_agents: {}", tpl.blocked_agent_count)
-        .expect("write to String");
-    writeln!(
-        &mut out,
-        "  conflicted_servers: {}",
-        tpl.conflicted_server_count
-    )
-    .expect("write to String");
-
-    out
-}
-
-fn write_string_list(out: &mut String, title: &str, values: &[String]) {
-    writeln!(out, "{title}:").expect("write to String");
-    if values.is_empty() {
-        writeln!(out, "  none").expect("write to String");
-    } else {
-        for value in values {
-            writeln!(out, "  - {value}").expect("write to String");
-        }
-    }
-    writeln!(out).expect("write to String");
-}
-
-fn write_pair_list(out: &mut String, title: &str, values: &[(String, String)]) {
-    writeln!(out, "{title}:").expect("write to String");
-    if values.is_empty() {
-        writeln!(out, "  none configured").expect("write to String");
-    } else {
-        for (name, target) in values {
-            writeln!(out, "  - {name} -> {target}").expect("write to String");
-        }
-    }
-    writeln!(out).expect("write to String");
+fn render_status_text(tpl: &ServerStatusTemplate) -> Result<String, askama::Error> {
+    ServerStatusTextTemplate { tpl }.render()
 }
 
 /// Render the reserved-subdomain 404 page.
