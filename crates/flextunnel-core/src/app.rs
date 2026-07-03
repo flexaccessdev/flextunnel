@@ -21,7 +21,8 @@ pub fn init_logger(default_filter: &str) {
 }
 
 /// Raise this process's soft `RLIMIT_NOFILE` to its hard limit (on
-/// macOS/iOS, capped at `OPEN_MAX` as Darwin's `setrlimit` requires).
+/// macOS/iOS, capped at `kern.maxfilesperproc` as Darwin's `setrlimit`
+/// requires).
 ///
 /// Strictly per-process: only the calling process's own soft limit moves, and
 /// never above the hard limit the OS already granted it — no other process or
@@ -42,10 +43,14 @@ pub fn raise_fd_limit() {
         );
         return;
     }
-    // Darwin rejects a soft limit above OPEN_MAX even when the hard limit
-    // reports RLIM_INFINITY (see `man setrlimit` on macOS).
+    // Darwin rejects a soft limit above `kern.maxfilesperproc` even when the
+    // hard limit reports RLIM_INFINITY (`libc` exposes no `OPEN_MAX` on
+    // Darwin, and the sysctl is the value the kernel actually enforces).
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    let target = lim.rlim_max.min(libc::OPEN_MAX as libc::rlim_t);
+    let target = match darwin_maxfilesperproc() {
+        Some(max) => lim.rlim_max.min(max),
+        None => return, // can't learn the cap; leave the soft limit untouched
+    };
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     let target = lim.rlim_max;
     if lim.rlim_cur >= target {
@@ -64,6 +69,34 @@ pub fn raise_fd_limit() {
     } else {
         log::info!("Raised open-file limit: {} -> {target}", lim.rlim_cur);
     }
+}
+
+/// Read `kern.maxfilesperproc`, the ceiling Darwin's `setrlimit` enforces on
+/// the `RLIMIT_NOFILE` soft limit. Returns `None` if the sysctl fails or
+/// reports a non-positive value.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn darwin_maxfilesperproc() -> Option<libc::rlim_t> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_MAXFILESPERPROC];
+    let mut maxfiles: libc::c_int = 0;
+    let mut size = std::mem::size_of_val(&maxfiles);
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            &mut maxfiles as *mut _ as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        log::warn!(
+            "sysctl(kern.maxfilesperproc) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return None;
+    }
+    (maxfiles > 0).then_some(maxfiles as libc::rlim_t)
 }
 
 /// Raise the open-file limit (non-Unix: nothing to do — Windows has no
@@ -112,9 +145,12 @@ pub async fn shutdown_signal() -> Result<()> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    /// Raising the limit must reach the requested cap (the hard limit, off
-    /// Darwin) and be a stable no-op when called again. Only ever raises the
-    /// process's soft limit, so running alongside other tests is harmless.
+    /// Raising the limit must bring the soft limit to at least the target we
+    /// request (the hard limit off Darwin, `kern.maxfilesperproc` on it) and
+    /// be a stable no-op when called again. `raise_fd_limit` only ever raises,
+    /// so an ambient soft limit already above the target is left in place —
+    /// hence `>=`, not `==`. Only touches the process's own soft limit, so
+    /// running alongside other tests is harmless.
     #[test]
     fn raise_fd_limit_reaches_cap_and_is_idempotent() {
         super::raise_fd_limit();
@@ -123,13 +159,17 @@ mod tests {
             rlim_max: 0,
         };
         assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
-        // The kernel must reflect the raise: soft == hard, except on Darwin
-        // where the requestable maximum is capped at OPEN_MAX.
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        let cap = lim.rlim_max.min(libc::OPEN_MAX as libc::rlim_t);
+        let target = lim
+            .rlim_max
+            .min(super::darwin_maxfilesperproc().expect("kern.maxfilesperproc must be readable"));
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        let cap = lim.rlim_max;
-        assert_eq!(lim.rlim_cur, cap);
+        let target = lim.rlim_max;
+        assert!(
+            lim.rlim_cur >= target,
+            "soft limit {} below target {target}",
+            lim.rlim_cur
+        );
         let after_first = lim.rlim_cur;
         super::raise_fd_limit();
         assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);

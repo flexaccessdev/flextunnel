@@ -2,16 +2,15 @@
 
 # flextunnel-agent installer for Windows
 # Downloads latest binary from: https://github.com/andrewtheguy/flextunnel/releases
+# Installs system-wide to C:\Program Files\flextunnel — requires an elevated
+# (Administrator) PowerShell session.
 #
-# Usage: .\install-agent.ps1 [RELEASE_TAG] [-Admin] [-PreRelease]
+# Usage: .\install-agent.ps1 [RELEASE_TAG] [-PreRelease]
 # Or set $env:RELEASE_TAG environment variable
 
 param(
     [Parameter(Position = 0)]
     [string]$ReleaseTag,
-
-    [Parameter()]
-    [switch]$Admin,
 
     [Parameter()]
     [switch]$PreRelease,
@@ -272,7 +271,7 @@ function Install-Binary {
     $url = "$BaseUrl/$BinaryName"
     $tempDir = Join-Path $env:TEMP "flextunnel-install-$(Get-Random)"
     $tempBinary = Join-Path $tempDir $BinaryName
-    $installDir = Join-Path $env:LOCALAPPDATA "Programs\flextunnel"
+    $installDir = Join-Path $env:ProgramFiles "flextunnel"
     $finalPath = Join-Path $installDir "flextunnel-agent.exe"
 
     try {
@@ -312,15 +311,16 @@ function Install-Binary {
 
         Print-Info "Binary installed successfully to $finalPath"
 
-        # Add to PATH if not already there
-        $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
-        if ($userPath -notlike "*$installDir*") {
-            Print-Warn "$installDir is not in your PATH"
-            Print-Warn "Adding to user PATH..."
+        # Add to the machine-wide PATH if not already there (system-wide install,
+        # so this must go in Machine scope, not User).
+        $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+        if ($machinePath -notlike "*$installDir*") {
+            Print-Warn "$installDir is not in the system PATH"
+            Print-Warn "Adding to machine PATH..."
 
             try {
-                $newPath = if ($userPath) { "$userPath;$installDir" } else { $installDir }
-                [System.Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+                $newPath = if ($machinePath) { "$machinePath;$installDir" } else { $installDir }
+                [System.Environment]::SetEnvironmentVariable("Path", $newPath, "Machine")
                 Print-Info "Added to PATH. You may need to restart your terminal for changes to take effect."
             }
             catch {
@@ -329,7 +329,7 @@ function Install-Binary {
             }
         }
         else {
-            Print-Info "$installDir is already in your PATH"
+            Print-Info "$installDir is already in the system PATH"
         }
     }
     finally {
@@ -345,12 +345,11 @@ function Show-Usage {
     Write-Host @"
 Usage: .\install-agent.ps1 [OPTIONS] [RELEASE_TAG]
 
-Download and install the flextunnel-agent binary
+Download and install the flextunnel-agent binary system-wide (C:\Program Files\flextunnel)
 
 Options:
   -DownloadOnly  Download binary to current directory without installing
   -PreRelease    Use latest prerelease if it includes a Windows asset
-  -Admin         Allow installation with administrator privileges (not recommended)
   -h, --help     Show this help message
 
 Arguments:
@@ -365,37 +364,23 @@ Examples:
   .\install-agent.ps1 -PreRelease                  # Install latest prerelease
   .\install-agent.ps1 -DownloadOnly                # Download latest to current directory
   .\install-agent.ps1 -DownloadOnly 20251210172710 # Download specific release
-  .\install-agent.ps1 -Admin                       # Allow admin installation (not recommended)
   `$env:RELEASE_TAG='latest'; .\install-agent.ps1  # Use environment variable
 
 Supported platforms: Windows (amd64)
 
-Note: Installation as administrator is not recommended. Use -Admin flag to override.
+Note: Installing (not -DownloadOnly) requires an elevated (Administrator) PowerShell session.
 "@
 }
 
-# Check if running with administrator privileges
+# Check for administrator privileges, required for a system-wide install.
 function Test-AdminPrivileges {
-    param([bool]$AllowAdmin)
-
     $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     $isAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
-    if ($isAdmin) {
-        if (-not $AllowAdmin) {
-            Print-Error "Installation as administrator is not allowed without explicit override."
-            Print-Error "Running as administrator can cause permission issues and is not recommended."
-            Print-Error ""
-            Print-Error "To proceed anyway, run with the -Admin flag:"
-            Print-Error "  .\install-agent.ps1 -Admin"
-            Print-Error ""
-            Print-Error "Recommended: Run this installer as a regular user instead."
-            exit 1
-        }
-        else {
-            Print-Warn "Running as administrator with explicit override (-Admin flag)."
-            Print-Warn "This is not recommended and may cause permission issues."
-        }
+    if (-not $isAdmin) {
+        Print-Error "Installing to C:\Program Files\flextunnel requires an elevated (Administrator) PowerShell session."
+        Print-Error "Re-run this script from an Administrator PowerShell, or use -DownloadOnly to skip installation."
+        exit 1
     }
 }
 
@@ -484,7 +469,7 @@ function Main {
     }
 
     if (-not $DownloadOnly) {
-        Test-AdminPrivileges -AllowAdmin:$Admin
+        Test-AdminPrivileges
     }
 
     Start-Installation -Tag $tag -DownloadOnly:$DownloadOnly
