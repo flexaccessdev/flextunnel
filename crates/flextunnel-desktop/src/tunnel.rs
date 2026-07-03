@@ -150,15 +150,59 @@ async fn run_session(
         };
     });
 
-    let endpoint = match create_client_endpoint(&config.relay_urls, None).await {
-        Ok(endpoint) => endpoint,
-        Err(e) => {
-            log::error!("Failed to create the iroh endpoint: {e:#}");
-            update(shared, |s| {
-                s.phase = Phase::Failed;
-                s.last_error = Some(format!("{e:#}"));
-            });
-            return SessionExit::Ended;
+    // Endpoint creation can block for up to ~10s (the relay online-wait), so
+    // it races the command channel — otherwise a Disconnect or app quit issued
+    // during it would stall until it finished. It runs as a spawned task
+    // rather than a raced future because cancelling it by drop could drop a
+    // bound endpoint without `close()`, which is fatal under panic=abort (see
+    // the CLI's run_client); on a stop the task finishes on its own and the
+    // endpoint is closed gracefully.
+    let mut create = tokio::spawn({
+        let relay_urls = config.relay_urls.clone();
+        async move { create_client_endpoint(&relay_urls, None).await }
+    });
+    let endpoint = loop {
+        tokio::select! {
+            created = &mut create => match created.map_err(anyhow::Error::from) {
+                Ok(Ok(endpoint)) => break endpoint,
+                Ok(Err(e)) | Err(e) => {
+                    log::error!("Failed to create the iroh endpoint: {e:#}");
+                    update(shared, |s| {
+                        s.phase = Phase::Failed;
+                        s.last_error = Some(format!("{e:#}"));
+                    });
+                    return SessionExit::Ended;
+                }
+            },
+            cmd = rx.recv() => match cmd {
+                Some(Command::Connect(_)) => {
+                    log::warn!("Already running a session; disconnect first");
+                }
+                Some(Command::Disconnect) => {
+                    log::info!("Disconnecting");
+                    update(shared, |s| s.phase = Phase::Idle);
+                    // Close the endpoint gracefully once creation finishes,
+                    // without holding up the disconnect.
+                    tokio::spawn(async move {
+                        if let Ok(Ok(endpoint)) = create.await {
+                            endpoint.close().await;
+                        }
+                    });
+                    return SessionExit::Ended;
+                }
+                Some(Command::Shutdown) | None => {
+                    // Bounded grace so quitting stays responsive: close
+                    // cleanly when creation finishes quickly, otherwise just
+                    // exit — the process is going away anyway.
+                    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                        if let Ok(Ok(endpoint)) = create.await {
+                            endpoint.close().await;
+                        }
+                    })
+                    .await;
+                    return SessionExit::Shutdown;
+                }
+            }
         }
     };
     log::info!("flextunnel client node id: {}", endpoint.id());
