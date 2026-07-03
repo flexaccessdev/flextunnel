@@ -30,6 +30,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// limit, so this single cap is enough to bound overall task growth.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
+/// Deadline for draining a reserved-namespace request after the server has
+/// already written its HTTP response. We drain (rather than drop `recv`) only to
+/// avoid a STOP_SENDING that could truncate the relayed response; a peer that
+/// then neither sends nor closes must not pin the task, so cap the wait.
+const RESERVED_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// QUIC close code used when the server tears a connection down for a
 /// duplicate-id conflict (distinct from the auth-failure code `1`).
 const CLOSE_DUPLICATE: u32 = 2;
@@ -898,14 +904,15 @@ async fn serve_reserved(
     // Drain the peer's HTTP request instead of dropping `recv` immediately: an
     // abrupt drop sends STOP_SENDING, which can truncate the response as the
     // client relays it. We sent `Connection: close`, so the peer closes after
-    // reading the response, giving us EOF. Bounded so a peer that never closes
-    // can't pin the task.
+    // reading the response, giving us EOF. Bounded by both a byte cap and a
+    // per-read timeout so a peer that never sends nor closes can't pin the task.
     let mut buf = [0u8; 4096];
     let mut drained = 0usize;
     while drained < 64 * 1024 {
-        match recv.read(&mut buf).await {
-            Ok(Some(n)) => drained += n,
-            Ok(None) | Err(_) => break,
+        match tokio::time::timeout(RESERVED_DRAIN_TIMEOUT, recv.read(&mut buf)).await {
+            Ok(Ok(Some(n))) => drained += n,
+            // EOF, read error, or drain timeout: stop draining.
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
         }
     }
     Ok(())
