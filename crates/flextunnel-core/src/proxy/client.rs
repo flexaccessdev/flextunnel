@@ -105,6 +105,8 @@ pub struct TunnelRoutes {
     /// server resolves them; shown in client status UIs like the server status
     /// page shows them.
     pub host_aliases: Vec<(String, String)>,
+    /// Reverse-routing (agent) alias names, informational only.
+    pub agent_aliases: Vec<String>,
 }
 
 /// Client-side history of server instance nonces observed for the configured
@@ -504,6 +506,7 @@ impl ProxyClient {
             routes.domains = response.routed_domains.clone();
             routes.cidrs = response.routed_cidrs.clone();
             routes.host_aliases = response.host_aliases.clone();
+            routes.agent_aliases = response.agent_aliases.clone();
         }
         Ok((routed_set, send, recv))
     }

@@ -231,6 +231,15 @@ impl ProxyServer {
         host_aliases
     }
 
+    /// The configured reverse-routing alias names, sorted. Pushed to clients in
+    /// the `HelloResponse` for their status UIs (names only — machine ids and
+    /// live agent state stay server-side; the status page shows those).
+    fn sorted_agent_aliases(&self) -> Vec<String> {
+        let mut agent_aliases: Vec<String> = self.agent_routes.keys().cloned().collect();
+        agent_aliases.sort();
+        agent_aliases
+    }
+
     /// Snapshot the live routing config into the status-page template. Secrets
     /// are never included; the blocklist is exposed as counts only.
     fn build_status_template(&self) -> ServerStatusTemplate {
@@ -607,6 +616,7 @@ impl ProxyServer {
             self.routed_domains.clone(),
             self.routed_cidrs.clone(),
             self.sorted_host_aliases(),
+            self.sorted_agent_aliases(),
         );
         signaling::write_message(&mut send, &signaling::encode_hello_response(&resp)?).await?;
         send.flush().await?;
@@ -727,6 +737,7 @@ impl ProxyServer {
         // control stream stays open for heartbeats.
         let resp = HelloResponse::accepted(
             self.server_instance_nonce,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),

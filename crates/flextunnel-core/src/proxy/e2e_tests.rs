@@ -376,6 +376,11 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
         vec![("nas.internal".to_string(), "192.168.1.9".to_string())],
         "handshake should push the configured host aliases for client status UIs"
     );
+    assert_eq!(
+        cresp.agent_aliases,
+        vec![agent_alias.to_string()],
+        "handshake should push the configured agent-route aliases for client status UIs"
+    );
 
     // The status host: expect an HTTP 200 whose body contains the routed domain.
     let body = fetch_reserved(&client_conn, "flextunnel.internal").await;

@@ -400,6 +400,16 @@ impl App {
                             ui.monospace(format!("{alias} → {target}"));
                         }
                     }
+                    if !snapshot.routes.agent_aliases.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(format!(
+                            "Agent routes — {} via connected agents:",
+                            snapshot.routes.agent_aliases.len()
+                        ));
+                        for alias in &snapshot.routes.agent_aliases {
+                            ui.monospace(alias);
+                        }
+                    }
                 });
         }
     }
