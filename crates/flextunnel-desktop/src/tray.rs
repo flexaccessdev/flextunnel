@@ -113,7 +113,12 @@ impl Tray {
 
         if icon_changed {
             if let Ok(icon) = make_icon(state) {
-                let _ = self.tray.set_icon(Some(icon));
+                // `set_icon` alone re-sets the macOS image as non-template
+                // (rendering it solid black instead of adapting to the menu
+                // bar), so pass the template flag through explicitly.
+                let _ = self
+                    .tray
+                    .set_icon_with_as_template(Some(icon), icon::is_template());
             }
             let _ = self
                 .tray
