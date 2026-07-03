@@ -15,6 +15,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 dirs = { workspace = true }
+rand = { workspace = true }
 eframe = "0.35"
 tray-icon = "0.24"
 keyring-core = "1"
@@ -30,6 +31,9 @@ egui-winit = { version = "0.35", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-native-keyring-store = "1"
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 # Installer packaging (`cargo packager`): .app on macOS, .msi (WiX) on Windows.
 # Icons are pre-generated from the iOS icon.svg glyph (see src/icon.rs, which

@@ -136,6 +136,11 @@ pub struct ProxyClient {
     /// Latches once a duplicate server has been observed; thereafter every
     /// `Hello` carries the advisory so the server can self-block.
     duplicate_server: AtomicBool,
+    /// Random per-instance password for the SOCKS5 username/password method —
+    /// the port forwarder's instance handshake (see [`socks5`] module docs).
+    /// Distinct from [`Self::instance_nonce`], which is sent to the server for
+    /// duplicate-client detection; this one never leaves the local machine.
+    socks_auth_password: Arc<str>,
 }
 
 impl ProxyClient {
@@ -146,7 +151,14 @@ impl ProxyClient {
             instance_nonce: rand::rng().random(),
             nonce_tracker: Mutex::new(ServerNonceTracker::default()),
             duplicate_server: AtomicBool::new(false),
+            socks_auth_password: format!("{:032x}", rand::rng().random::<u128>()).into(),
         }
+    }
+
+    /// The per-instance SOCKS5 password a port forwarder must present (with
+    /// [`socks5::AUTH_USERNAME`]) to verify it reached this instance's listener.
+    pub fn socks_auth_password(&self) -> &str {
+        &self.socks_auth_password
     }
 
     /// Record a server instance nonce observed in a `HelloResponse` and apply the
@@ -271,9 +283,12 @@ impl ProxyClient {
         // first-connect failure or a clean stop) the accept loops are dropped with
         // it, so `flextunnel_stop`'s `task.abort()` tears everything down — no
         // orphaned accept task.
+        let socks_proto = Socks5Proto {
+            auth_password: self.socks_auth_password.clone(),
+        };
         tokio::select! {
             r = self.manage_connection(endpoint, &current, &routed_set) => r,
-            r = accept_loop(&socks_listener, &current, &routed_set, Socks5Proto) => r,
+            r = accept_loop(&socks_listener, &current, &routed_set, socks_proto) => r,
             r = http_accept => r,
         }
     }
@@ -575,7 +590,7 @@ struct LocalRequest {
 ///
 /// Methods return `impl Future + Send` (not bare `async fn`) so the futures are
 /// `Send`, which [`accept_loop`] needs to `tokio::spawn` a generic handler.
-trait LocalProto: Copy + Send + Sync + 'static {
+trait LocalProto: Clone + Send + Sync + 'static {
     /// Parse the local handshake into a [`LocalRequest`]. Any error the caller
     /// can't yet answer with a reply code (a bad request, an unsupported
     /// method) must be written to `tcp` here before returning `Err`, mirroring
@@ -589,13 +604,16 @@ trait LocalProto: Copy + Send + Sync + 'static {
 }
 
 /// SOCKS5 front-end (RFC 1928): method negotiation + CONNECT parsing, 10-byte
-/// reply frames.
-#[derive(Clone, Copy)]
-struct Socks5Proto;
+/// reply frames. Carries the instance-handshake password the negotiation
+/// verifies when a client offers the username/password method.
+#[derive(Clone)]
+struct Socks5Proto {
+    auth_password: Arc<str>,
+}
 
 impl LocalProto for Socks5Proto {
     async fn read_request(&self, tcp: &mut TcpStream) -> Result<LocalRequest> {
-        socks5::negotiate_method(tcp).await?;
+        socks5::negotiate_method(tcp, &self.auth_password).await?;
         Ok(LocalRequest {
             target: socks5::read_connect_request(tcp).await?,
             upstream_preamble: None,
@@ -609,7 +627,7 @@ impl LocalProto for Socks5Proto {
 
 /// HTTP proxy front-end: `CONNECT host:port` tunneling and absolute-URI
 /// plain-HTTP forwarding, HTTP status-line replies.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct HttpProto;
 
 impl LocalProto for HttpProto {
@@ -704,6 +722,7 @@ async fn accept_loop<P: LocalProto>(
         log::debug!("proxy connection from {peer}");
         let current = current.clone();
         let routed_set_shared = routed_set_shared.clone();
+        let proto = proto.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_local_conn(proto, tcp, current, routed_set_shared).await {
                 log::debug!("proxy connection from {peer} ended: {e}");
