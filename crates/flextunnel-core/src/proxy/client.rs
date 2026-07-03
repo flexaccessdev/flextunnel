@@ -101,6 +101,10 @@ pub struct TunnelRoutes {
     pub connected: bool,
     pub domains: Vec<String>,
     pub cidrs: Vec<String>,
+    /// Server-side host aliases (`alias -> target`), informational only — the
+    /// server resolves them; shown in client status UIs like the server status
+    /// page shows them.
+    pub host_aliases: Vec<(String, String)>,
 }
 
 /// Client-side history of server instance nonces observed for the configured
@@ -499,6 +503,7 @@ impl ProxyClient {
             routes.connected = true;
             routes.domains = response.routed_domains.clone();
             routes.cidrs = response.routed_cidrs.clone();
+            routes.host_aliases = response.host_aliases.clone();
         }
         Ok((routed_set, send, recv))
     }

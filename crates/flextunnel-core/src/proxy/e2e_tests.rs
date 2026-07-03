@@ -66,6 +66,7 @@ fn spawn_server(endpoint: Endpoint, blocklist_path: std::path::PathBuf) -> iroh:
         blocklist_path,
         HashSet::new(),
         HashMap::new(),
+        HashMap::new(),
         Vec::new(),
     )
 }
@@ -78,6 +79,7 @@ fn spawn_server_full(
     blocklist_path: std::path::PathBuf,
     agent_valid_tokens: HashSet<String>,
     agent_routes: HashMap<String, String>,
+    host_aliases: HashMap<String, String>,
     routed_domains: Vec<String>,
 ) -> iroh::EndpointId {
     let own_id = endpoint.id();
@@ -89,7 +91,7 @@ fn spawn_server_full(
         tokens,
         agent_valid_tokens,
         agent_routes,
-        HashMap::new(),
+        host_aliases,
         RoutedSet::new(&routed_domains, &no_cidrs).unwrap(),
         routed_domains,
         no_cidrs,
@@ -289,6 +291,7 @@ async fn agent_reverse_route_pipes_to_agent_loopback() {
         temp_blocklist("agentroute"),
         agent_tokens,
         routes,
+        HashMap::new(),
         vec!["*".to_string()],
     );
 
@@ -348,11 +351,14 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
     let agent_alias = "agent-status.internal";
     let agent_tokens = HashSet::from([AGENT_TOKEN.to_string()]);
     let agent_routes = HashMap::from([(agent_alias.to_string(), machine_id.to_string())]);
+    let host_aliases =
+        HashMap::from([("nas.internal".to_string(), "192.168.1.9".to_string())]);
     spawn_server_full(
         server_ep,
         temp_blocklist("reserved"),
         agent_tokens,
         agent_routes,
+        host_aliases,
         vec!["marker.example.com".to_string()],
     );
 
@@ -365,6 +371,11 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
     let (client_conn, _cs, _cr, cresp) =
         client_handshake(&client_ep, server_addr, 1, false).await;
     assert!(cresp.accepted, "client should be accepted");
+    assert_eq!(
+        cresp.host_aliases,
+        vec![("nas.internal".to_string(), "192.168.1.9".to_string())],
+        "handshake should push the configured host aliases for client status UIs"
+    );
 
     // The status host: expect an HTTP 200 whose body contains the routed domain.
     let body = fetch_reserved(&client_conn, "flextunnel.internal").await;
@@ -399,6 +410,10 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
     assert!(
         body.contains("  - agent-status.internal -> status-machine-id (connected)"),
         "text status should show the connected agent route"
+    );
+    assert!(
+        body.contains("  - nas.internal -> 192.168.1.9"),
+        "text status should show the configured host alias"
     );
 
     // Accept-header negotiation: a `/` request with `Accept: text/plain` should
@@ -473,7 +488,14 @@ async fn duplicate_agent_machine_id_is_detected_and_blocklisted() {
 
     let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
     let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
-    spawn_server_full(server_ep, bl_path.clone(), agent_tokens, HashMap::new(), Vec::new());
+    spawn_server_full(
+        server_ep,
+        bl_path.clone(),
+        agent_tokens,
+        HashMap::new(),
+        HashMap::new(),
+        Vec::new(),
+    );
 
     let machine_id = "dup-machine-id";
 
@@ -512,7 +534,14 @@ async fn agent_reconnect_same_nonce_is_not_blocklisted() {
 
     let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
     let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
-    spawn_server_full(server_ep, bl_path.clone(), agent_tokens, HashMap::new(), Vec::new());
+    spawn_server_full(
+        server_ep,
+        bl_path.clone(),
+        agent_tokens,
+        HashMap::new(),
+        HashMap::new(),
+        Vec::new(),
+    );
 
     let machine_id = "reconnect-machine-id";
     let nonce = 42u128;

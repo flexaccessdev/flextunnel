@@ -101,6 +101,34 @@ without installing. `-PreRelease` is also accepted by the Windows installer when
 the selected prerelease includes a Windows asset. A container image is also
 published to `ghcr.io/andrewtheguy/flextunnel`.
 
+### Desktop app (tray GUI, client mode)
+
+Stable releases also include the desktop client
+(`flextunnel-desktop-macos-arm64.app.zip` and
+`flextunnel-desktop-windows-amd64.msi`). The installers are **unsigned** — if
+you'd rather not apply the workarounds below, build it yourself instead:
+
+```sh
+cargo build --release -p flextunnel-desktop
+# binary: target/release/flextunnel-desktop — locally built binaries are not
+# quarantined, so no workaround is needed
+```
+
+Otherwise:
+
+**macOS:** because the app is not notarized, Gatekeeper quarantines the
+download and shows *"flextunnel" is damaged and can't be opened*. Remove the
+quarantine attribute after unzipping (e.g. into `/Applications`):
+
+```sh
+xattr -cr /Applications/flextunnel.app
+```
+
+Alternatively, right-click the app and choose **Open** the first time.
+
+**Windows:** SmartScreen shows an "unknown publisher" warning — click
+**More info → Run anyway**.
+
 ## Build from source
 
 ```sh

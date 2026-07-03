@@ -132,6 +132,11 @@ pub struct HelloResponse {
     /// CIDR / bare-IP rules the client should tunnel.
     #[serde(default)]
     pub routed_cidrs: Vec<String>,
+    /// Server-side host aliases as `(alias, target)` pairs, sorted by alias.
+    /// Purely informational for client UIs (the server status page shows the
+    /// same list); alias resolution itself stays server-side.
+    #[serde(default)]
+    pub host_aliases: Vec<(String, String)>,
 }
 
 impl Hello {
@@ -164,11 +169,13 @@ impl Hello {
 }
 
 impl HelloResponse {
-    /// Accept the client and push the server's routed set (the *tunnel set*).
+    /// Accept the client and push the server's routed set (the *tunnel set*)
+    /// plus the informational host-alias list.
     pub fn accepted(
         server_instance_nonce: u128,
         routed_domains: Vec<String>,
         routed_cidrs: Vec<String>,
+        host_aliases: Vec<(String, String)>,
     ) -> Self {
         Self {
             version: PROTOCOL_VERSION,
@@ -177,6 +184,7 @@ impl HelloResponse {
             server_instance_nonce,
             routed_domains,
             routed_cidrs,
+            host_aliases,
         }
     }
 
@@ -188,6 +196,7 @@ impl HelloResponse {
             server_instance_nonce,
             routed_domains: Vec::new(),
             routed_cidrs: Vec::new(),
+            host_aliases: Vec::new(),
         }
     }
 }
@@ -445,6 +454,7 @@ mod tests {
             42,
             vec!["*.example.com".to_string(), "httpbin.org".to_string()],
             vec!["10.0.0.0/8".to_string()],
+            vec![("nas.internal".to_string(), "192.168.1.9".to_string())],
         );
         let decoded = decode_hello_response(&encode_hello_response(&resp).unwrap()).unwrap();
         assert!(decoded.accepted);
@@ -452,6 +462,10 @@ mod tests {
         assert_eq!(decoded.server_instance_nonce, 42);
         assert_eq!(decoded.routed_domains, vec!["*.example.com", "httpbin.org"]);
         assert_eq!(decoded.routed_cidrs, vec!["10.0.0.0/8"]);
+        assert_eq!(
+            decoded.host_aliases,
+            vec![("nas.internal".to_string(), "192.168.1.9".to_string())]
+        );
 
         // A rejection carries no routed set but still carries the server nonce.
         let rej = HelloResponse::rejected(7, "nope");
@@ -461,6 +475,7 @@ mod tests {
         assert_eq!(decoded.server_instance_nonce, 7);
         assert!(decoded.routed_domains.is_empty());
         assert!(decoded.routed_cidrs.is_empty());
+        assert!(decoded.host_aliases.is_empty());
     }
 
     #[test]

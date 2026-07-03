@@ -1,0 +1,44 @@
+# Tray GUI for the flextunnel client. macOS and Windows only (keychain +
+# tray backends); not in the workspace default-members so server-side
+# `cargo build` on Linux stays unaffected — build with `-p flextunnel-desktop`.
+[package]
+name = "flextunnel-desktop"
+version.workspace = true
+edition.workspace = true
+description = "Tray GUI for the flextunnel client (macOS and Windows)"
+
+[dependencies]
+flextunnel-core = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+dirs = { workspace = true }
+eframe = "0.35"
+tray-icon = "0.24"
+keyring-core = "1"
+arboard = "3"
+env_filter = "2"
+tiny-skia = "0.11"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+# Only for the re-exported winit (activation policy); version must track eframe.
+egui-winit = { version = "0.35", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = "1"
+
+# Installer packaging (`cargo packager`): .app on macOS, .msi (WiX) on Windows.
+# Icons are pre-generated from the iOS icon.svg glyph (see src/icon.rs, which
+# renders the same geometry at runtime for the tray).
+[package.metadata.packager]
+product-name = "flextunnel"
+identifier = "com.flextunnel.desktop"
+icons = ["icons/icon.icns", "icons/icon.ico", "icons/icon.png"]
+
+[package.metadata.packager.macos]
+# Menu-bar app: sets LSUIElement so there is no Dock icon or launch bounce.
+background-app = true
