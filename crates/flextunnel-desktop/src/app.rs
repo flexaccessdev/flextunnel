@@ -28,7 +28,6 @@ enum Tab {
 struct SettingsForm {
     server_node_id: String,
     auth_token: String,
-    show_token: bool,
     socks_port: String,
     http_enabled: bool,
     http_port: String,
@@ -40,7 +39,6 @@ impl SettingsForm {
         Self {
             server_node_id: config.server_node_id.clone(),
             auth_token: config.auth_token.clone(),
-            show_token: false,
             socks_port: config.socks_port.to_string(),
             http_enabled: config.http_port.is_some(),
             http_port: config
@@ -427,14 +425,11 @@ impl App {
                 ui.end_row();
 
                 ui.label("Auth token");
-                ui.horizontal(|ui| {
-                    ui.add(
-                        TextEdit::singleline(&mut self.form.auth_token)
-                            .password(!self.form.show_token)
-                            .desired_width(240.0),
-                    );
-                    ui.checkbox(&mut self.form.show_token, "show");
-                });
+                ui.add(
+                    TextEdit::singleline(&mut self.form.auth_token)
+                        .password(true)
+                        .desired_width(240.0),
+                );
                 ui.end_row();
 
                 ui.label("SOCKS5 port");
@@ -525,6 +520,12 @@ impl App {
         egui::ScrollArea::both()
             .stick_to_bottom(true)
             .auto_shrink([false, false])
+            // `show_rows` measures content width from only the visible rows, so
+            // as lines of differing widths scroll past the bottom the horizontal
+            // bar would flicker on/off, stealing vertical space and making the
+            // stuck-to-bottom view jump. Always reserving both bars keeps the
+            // viewport height stable.
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .show_rows(ui, row_height, self.log_lines.len(), |ui, range| {
                 for line in &self.log_lines[range] {
                     ui.label(RichText::new(line).monospace());

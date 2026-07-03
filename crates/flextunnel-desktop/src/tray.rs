@@ -59,13 +59,14 @@ impl Tray {
         let open = MenuItem::with_id(MENU_OPEN, "Open flextunnel…", true, None);
         let quit = MenuItem::with_id(MENU_QUIT, "Quit flextunnel", true, None);
         let menu = Menu::with_items(&[
+            &open,
+            &PredefinedMenuItem::separator(),
             &status,
             &PredefinedMenuItem::separator(),
             &connect,
             &disconnect,
             &copy_socks,
             &PredefinedMenuItem::separator(),
-            &open,
             &quit,
         ])?;
 
@@ -113,7 +114,12 @@ impl Tray {
 
         if icon_changed {
             if let Ok(icon) = make_icon(state) {
-                let _ = self.tray.set_icon(Some(icon));
+                // `set_icon` alone re-sets the macOS image as non-template
+                // (rendering it solid black instead of adapting to the menu
+                // bar), so pass the template flag through explicitly.
+                let _ = self
+                    .tray
+                    .set_icon_with_as_template(Some(icon), icon::is_template());
             }
             let _ = self
                 .tray
