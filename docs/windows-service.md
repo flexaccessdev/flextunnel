@@ -53,6 +53,31 @@ lives in `C:\Program Files\flextunnel` (read-only program files); config and
 logs live in `C:\ProgramData\flextunnel` (mutable machine-wide state) —
 the standard Windows split.
 
+## Updating to a new release
+
+The running service holds a lock on `flextunnel-agent.exe`, so you must stop
+it before overwriting the binary — otherwise `install-agent.ps1` fails to
+replace the file. From an **elevated** PowerShell session:
+
+```powershell
+# 1. Stop the service so the binary is no longer locked.
+nssm stop flextunnel-agent
+
+# 2. Install the new binary (checksum-verified) over the old one. Pass the
+#    release tag explicitly, or omit it to take the latest release.
+.\install-agent.ps1 v0.0.31
+
+# 3. Reinstall and start the service. This removes the stopped service and
+#    recreates it with the same config — pass the same -ConfigPath (and any
+#    -AgentArgs) you used originally.
+.\install-agent-service.ps1 -ConfigPath C:\ProgramData\flextunnel\agent.toml
+```
+
+`install-agent-service.ps1` removes any existing service before recreating it,
+so step 3 both applies the new binary and restarts cleanly. Confirm the
+upgrade with `flextunnel-agent --version` and by checking the log for the
+`flextunnel-agent v<version>` and `Authenticated.` lines.
+
 To remove the service:
 
 ```powershell
