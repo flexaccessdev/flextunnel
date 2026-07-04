@@ -12,10 +12,10 @@ use crate::tray::{self, Tray};
 use crate::tunnel::{Controller, Phase, Snapshot};
 use eframe::egui::{self, Color32, RichText, TextEdit, TextStyle, ViewportCommand};
 use flextunnel_core::proxy::signaling::Target;
-use flextunnel_core::proxy::{reserved, RoutedSet, TunnelRoutes};
+use flextunnel_core::proxy::{reserved, AgentConnState, RoutedSet, TunnelRoutes};
 use std::net::SocketAddr;
 use std::sync::mpsc::{Receiver, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tray_icon::menu::MenuEvent;
 use tray_icon::TrayIconEvent;
 
@@ -590,11 +590,23 @@ impl App {
                     if !snapshot.routes.agent_aliases.is_empty() {
                         ui.add_space(8.0);
                         ui.label(format!(
-                            "Agent routes — {} via connected agents:",
+                            "Agent routes — {} via agents:",
                             snapshot.routes.agent_aliases.len()
                         ));
-                        for alias in &snapshot.routes.agent_aliases {
-                            ui.monospace(alias);
+                        for (alias, state) in snapshot.routes.agent_states(Instant::now()) {
+                            let (label, color) = match state {
+                                AgentConnState::Connected => {
+                                    ("connected", egui::Color32::from_rgb(0x2e, 0xa0, 0x43))
+                                }
+                                AgentConnState::Disconnected => {
+                                    ("disconnected", egui::Color32::from_rgb(0xc0, 0x39, 0x2b))
+                                }
+                                AgentConnState::Unknown => ("unknown", egui::Color32::GRAY),
+                            };
+                            ui.horizontal(|ui| {
+                                ui.monospace(&alias);
+                                ui.colored_label(color, label);
+                            });
                         }
                     }
                 });
