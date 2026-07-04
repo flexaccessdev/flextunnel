@@ -240,19 +240,26 @@ impl ProxyServer {
         agent_aliases
     }
 
+    /// The machine ids of all agents connected right now. A passive read of the
+    /// agent registry (membership == connected) — no probing. The single
+    /// definition of "connected", shared by every caller that filters
+    /// `agent_routes` on live state, so it can't drift.
+    fn connected_agent_ids(&self) -> HashSet<String> {
+        self.agent_registry
+            .lock()
+            .expect("agent registry lock")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     /// The subset of the configured agent aliases whose backing agent is
     /// connected right now, sorted. This is a passive read of the agent
     /// registry (membership == connected) — no probing of agents. Pushed to
     /// clients at handshake and refreshed on every heartbeat ack so their status
     /// UIs can show a live connected/disconnected badge per agent route.
     fn connected_agent_aliases(&self) -> Vec<String> {
-        let connected_ids: HashSet<String> = self
-            .agent_registry
-            .lock()
-            .expect("agent registry lock")
-            .keys()
-            .cloned()
-            .collect();
+        let connected_ids = self.connected_agent_ids();
         let mut aliases: Vec<String> = self
             .agent_routes
             .iter()
@@ -267,13 +274,7 @@ impl ProxyServer {
     /// are never included; the blocklist is exposed as counts only.
     fn build_status_template(&self) -> ServerStatusTemplate {
         let host_aliases = self.sorted_host_aliases();
-        let connected_agents: HashSet<String> = self
-            .agent_registry
-            .lock()
-            .expect("agent registry lock")
-            .keys()
-            .cloned()
-            .collect();
+        let connected_agents = self.connected_agent_ids();
         let mut agent_routes: Vec<AgentRouteStatus> = self
             .agent_routes
             .iter()
