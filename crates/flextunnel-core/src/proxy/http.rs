@@ -335,7 +335,7 @@ fn host_to_target(host: &str, port: u16) -> Target {
 fn log_target(what: &str, target: &Target) {
     match target {
         Target::Domain(host, port) => {
-            log::info!("HTTP {what} — hostname (name resolution deferred to route)");
+            log::debug!("HTTP {what} — hostname (name resolution deferred to route)");
             log::debug!("HTTP {what} target {host}:{port}");
         }
         Target::Ip(addr) => {
