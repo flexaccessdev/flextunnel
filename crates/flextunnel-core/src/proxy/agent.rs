@@ -11,7 +11,7 @@
 //! that data streams flow the other way (server-opened, agent-accepted).
 
 use crate::error::{ProxyError, ProxyResult};
-use crate::proxy::client::{calculate_backoff, client_heartbeat_loop};
+use crate::proxy::client::{calculate_backoff, client_heartbeat_loop, connect_with_timeout};
 use crate::proxy::signaling::{self, Hello, Target};
 use crate::proxy::dial;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -126,10 +126,7 @@ impl ProxyAgent {
         endpoint: &Endpoint,
     ) -> ProxyResult<(Connection, SendStream, RecvStream)> {
         let addr = self.resolve_server_addr()?;
-        let connection = endpoint
-            .connect(addr, crate::transport::ALPN)
-            .await
-            .map_err(|e| ProxyError::Signaling(format!("Failed to connect to server: {e}")))?;
+        let connection = connect_with_timeout(endpoint, addr).await?;
         log::info!("Connected to server, authenticating as agent...");
         let (send, recv) = self.handshake(&connection).await?;
         log::info!("Authenticated.");
