@@ -83,9 +83,16 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 # hosts via a real name, which also avoids Firefox's refusal to proxy literal
 # `localhost`/`127.0.0.1` (use `socks5h://` / remote DNS so the name reaches the
 # server). Only domain targets are aliased; literal IPs pass through unchanged.
+#
+# For an IPv6 value, write the address BARE — no brackets, no port. Brackets
+# (`[::1]`) are only for embedding a port in one string; here the requested port
+# is kept separately, so `[::1]` would fail to parse. A link-local address needs
+# a zone id (`fe80::1%eth0`).
 # [host_aliases]
-# "server.internal" = "127.0.0.1"      # -> the server's own loopback
+# "server.internal" = "127.0.0.1"      # -> the server's own loopback (IPv4)
 # "node2.internal"  = "192.168.1.50"   # -> another host on the server's network
+# "server6.internal" = "::1"           # -> the server's own loopback (IPv6, bare)
+# "node6.internal"   = "2001:db8::50"  # -> another host, global IPv6 (bare)
 
 # Optional reverse-routing reservations. Unlike [host_aliases] (which resolve to a
 # host on the SERVER's network), an [agent_routes] alias resolves to a connected
