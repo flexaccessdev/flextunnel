@@ -27,6 +27,13 @@ const RECONNECT_JITTER_MAX_MS: u64 = 500;
 /// connection from idling out, so without this a server that accepts the
 /// connection but never replies on the stream would hang the client forever.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for `Endpoint::connect` (address discovery + QUIC handshake). The
+/// discovery phase awaits DNS/pkarr/mDNS lookups with no deadline of its own,
+/// and on a wedged endpoint (seen on iOS after the OS suspends the process and
+/// invalidates the socket state underneath it) that future can pend forever —
+/// which would stall the reconnect loop permanently instead of retrying.
+/// Generous: a healthy connect through discovery + relay completes well within.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Deadline for opening a tunnel stream and receiving the server's CONNECT
 /// reply. Must exceed the server's own connect timeout (it replies only after
 /// dialing the target, up to ~10s), so a legitimately slow target isn't cut
@@ -469,10 +476,18 @@ impl ProxyClient {
         endpoint: &Endpoint,
     ) -> ProxyResult<(Connection, Arc<RoutedSet>, SendStream, RecvStream)> {
         let endpoint_addr = self.resolve_server_addr()?;
-        let connection = endpoint
-            .connect(endpoint_addr, crate::transport::ALPN)
-            .await
-            .map_err(|e| ProxyError::Signaling(format!("Failed to connect to server: {e}")))?;
+        let connection = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            endpoint.connect(endpoint_addr, crate::transport::ALPN),
+        )
+        .await
+        .map_err(|_| {
+            ProxyError::Signaling(format!(
+                "timed out connecting to server after {}s",
+                CONNECT_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|e| ProxyError::Signaling(format!("Failed to connect to server: {e}")))?;
         log::info!("Connected to server, authenticating...");
         let (routed_set, send, recv) = self.handshake(&connection).await?;
         log::info!("Authenticated.");
