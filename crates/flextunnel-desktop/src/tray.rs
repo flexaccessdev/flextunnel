@@ -57,6 +57,12 @@ impl Tray {
         let disconnect = MenuItem::with_id(MENU_DISCONNECT, "Disconnect", false, None);
         let copy_socks = MenuItem::with_id(MENU_COPY_SOCKS, "Copy SOCKS5 Address", false, None);
         let open = MenuItem::with_id(MENU_OPEN, "Open flextunnel…", true, None);
+        let version = MenuItem::with_id(
+            "version",
+            concat!("flextunnel v", env!("CARGO_PKG_VERSION")),
+            false,
+            None,
+        );
         let quit = MenuItem::with_id(MENU_QUIT, "Quit flextunnel", true, None);
         let menu = Menu::with_items(&[
             &open,
@@ -67,6 +73,7 @@ impl Tray {
             &disconnect,
             &copy_socks,
             &PredefinedMenuItem::separator(),
+            &version,
             &quit,
         ])?;
 
