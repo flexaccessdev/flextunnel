@@ -327,7 +327,7 @@ fn host_to_target(host: &str, port: u16) -> Target {
     }
 }
 
-/// Log the parsed target type at info (hostname vs literal IP) and the specific
+/// Log the parsed target type (hostname vs literal IP) and the specific
 /// destination only at debug, matching the SOCKS5 handler so default logs don't
 /// leak user destinations. Where a hostname is ultimately resolved (server for a
 /// tunneled route, locally for a direct one) is decided later by the route
@@ -339,7 +339,7 @@ fn log_target(what: &str, target: &Target) {
             log::debug!("HTTP {what} target {host}:{port}");
         }
         Target::Ip(addr) => {
-            log::info!("HTTP {what} — literal IP");
+            log::debug!("HTTP {what} — literal IP");
             log::debug!("HTTP {what} target {addr}");
         }
     }
