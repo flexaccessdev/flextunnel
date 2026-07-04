@@ -74,14 +74,17 @@ int flextunnel_health(const FlextunnelHandle *handle);
  * Snapshot the tunnel's current forwarding set as JSON into out_buf:
  *   {"connected":true,"domains":["*.example.com"],"cidrs":["10.0.0.0/8"],
  *    "host_aliases":[["nas.internal","192.168.1.9"]],
- *    "agent_aliases":["workstation.internal"]}
+ *    "agent_aliases":[{"name":"workstation.internal","status":"connected"}]}
  * This is the required split-tunnel set the server pushes during the handshake
  * — the domains/CIDRs routed through the tunnel (off-list targets connect
  * directly). Before the first successful handshake, connected is false and the
  * lists are empty. The set becomes available shortly after start once the
  * handshake completes, so poll it. host_aliases ([alias, target] pairs) and
- * agent_aliases (reverse-routing alias names) are informational, for display
- * only — the server resolves both itself.
+ * agent_aliases are informational, for display only — the server resolves both
+ * itself. Each agent_aliases entry is {"name","status"} where status is
+ * "connected", "disconnected", or "unknown"; it rides the heartbeat control
+ * stream (refreshed every ~10s) and reads "unknown" before the first update,
+ * while the tunnel is down, or when the view has gone stale.
  *
  * Returns 1 on success (full JSON written), 0 if out_buf was too small (the JSON
  * is truncated; retry larger), and -1 for a NULL handle or if the route snapshot

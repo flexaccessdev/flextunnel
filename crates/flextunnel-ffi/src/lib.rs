@@ -52,6 +52,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use serde::Deserialize;
 use tokio::net::TcpListener;
@@ -274,7 +275,7 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
 /// ```json
 /// { "connected": true, "domains": ["*.example.com"], "cidrs": ["10.0.0.0/8"],
 ///   "host_aliases": [["nas.internal", "192.168.1.9"]],
-///   "agent_aliases": ["workstation.internal"] }
+///   "agent_aliases": [{"name": "workstation.internal", "status": "connected"}] }
 /// ```
 ///
 /// This is the required split-tunnel set the server pushes during the handshake
@@ -285,9 +286,13 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
 /// the lists are empty. The set becomes available shortly after start, once the
 /// handshake completes, so the caller should poll it.
 ///
-/// `host_aliases` (`[alias, target]` pairs) and `agent_aliases` (reverse-routing
-/// alias names) are informational, for display in status UIs only — the server
-/// resolves both itself, so there is nothing to enforce caller-side.
+/// `host_aliases` (`[alias, target]` pairs) and `agent_aliases` are
+/// informational, for display in status UIs only — the server resolves both
+/// itself, so there is nothing to enforce caller-side. Each `agent_aliases`
+/// entry is `{"name", "status"}` where `status` is `"connected"`,
+/// `"disconnected"`, or `"unknown"`. The status rides the heartbeat control
+/// stream (refreshed every ~10s); it reads `"unknown"` before the first update,
+/// while the tunnel is down, or when that view has gone stale.
 ///
 /// Returns `1` on success (full JSON written), `0` if `out_buf` was too small
 /// (the JSON is truncated; retry with a larger buffer), and `-1` for a null
@@ -311,14 +316,25 @@ pub unsafe extern "C" fn flextunnel_routes(
     }
     let handle = unsafe { &*handle };
     let json = match handle.routes.lock() {
-        Ok(routes) => serde_json::json!({
-            "connected": routes.connected,
-            "domains": routes.domains,
-            "cidrs": routes.cidrs,
-            "host_aliases": routes.host_aliases,
-            "agent_aliases": routes.agent_aliases,
-        })
-        .to_string(),
+        Ok(routes) => {
+            // Resolve each agent route to connected/disconnected/unknown as of
+            // now; a stale view (no recent heartbeat) reports "unknown".
+            let agent_aliases: Vec<_> = routes
+                .agent_states(Instant::now())
+                .into_iter()
+                .map(|(name, state)| {
+                    serde_json::json!({ "name": name, "status": state.as_str() })
+                })
+                .collect();
+            serde_json::json!({
+                "connected": routes.connected,
+                "domains": routes.domains,
+                "cidrs": routes.cidrs,
+                "host_aliases": routes.host_aliases,
+                "agent_aliases": agent_aliases,
+            })
+            .to_string()
+        }
         Err(_) => {
             write_cstr(out_buf, out_len, "");
             return -1;

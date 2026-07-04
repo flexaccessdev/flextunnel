@@ -232,12 +232,35 @@ impl ProxyServer {
     }
 
     /// The configured reverse-routing alias names, sorted. Pushed to clients in
-    /// the `HelloResponse` for their status UIs (names only — machine ids and
-    /// live agent state stay server-side; the status page shows those).
+    /// the `HelloResponse` for their status UIs (names only — machine ids stay
+    /// server-side). Live connected-state rides `connected_agent_aliases`.
     fn sorted_agent_aliases(&self) -> Vec<String> {
         let mut agent_aliases: Vec<String> = self.agent_routes.keys().cloned().collect();
         agent_aliases.sort();
         agent_aliases
+    }
+
+    /// The subset of the configured agent aliases whose backing agent is
+    /// connected right now, sorted. This is a passive read of the agent
+    /// registry (membership == connected) — no probing of agents. Pushed to
+    /// clients at handshake and refreshed on every heartbeat ack so their status
+    /// UIs can show a live connected/disconnected badge per agent route.
+    fn connected_agent_aliases(&self) -> Vec<String> {
+        let connected_ids: HashSet<String> = self
+            .agent_registry
+            .lock()
+            .expect("agent registry lock")
+            .keys()
+            .cloned()
+            .collect();
+        let mut aliases: Vec<String> = self
+            .agent_routes
+            .iter()
+            .filter(|(_, machine_id)| connected_ids.contains(*machine_id))
+            .map(|(name, _)| name.clone())
+            .collect();
+        aliases.sort();
+        aliases
     }
 
     /// Snapshot the live routing config into the status-page template. Secrets
@@ -617,6 +640,7 @@ impl ProxyServer {
             self.routed_cidrs.clone(),
             self.sorted_host_aliases(),
             self.sorted_agent_aliases(),
+            self.connected_agent_aliases(),
         );
         signaling::write_message(&mut send, &signaling::encode_hello_response(&resp)?).await?;
         send.flush().await?;
@@ -624,12 +648,14 @@ impl ProxyServer {
 
         // Serve SOCKS5 streams and the heartbeat concurrently until either ends
         // (connection closed, or heartbeat liveness lost). `_guard` cleans the
-        // registry on return via Drop.
+        // registry on return via Drop. The heartbeat also ships the live
+        // connected-agent list back to this client (`Some(self)`).
         let socks = self.serve_socks(&connection, remote_id);
         let heartbeat = server_heartbeat_loop(
             send,
             recv,
             Some((self.registry.clone(), remote_id, conn_seq)),
+            Some(self.clone()),
         );
         tokio::select! {
             r = socks => r,
@@ -733,10 +759,12 @@ impl ProxyServer {
             );
         }
 
-        // Accept: agents get no routed set (the server decides their targets). The
-        // control stream stays open for heartbeats.
+        // Accept: agents get no routed set (the server decides their targets) and
+        // no connected-agent list (only clients display it). The control stream
+        // stays open for heartbeats.
         let resp = HelloResponse::accepted(
             self.server_instance_nonce,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -747,9 +775,10 @@ impl ProxyServer {
         log::info!("Agent {machine_id} authenticated");
 
         // Keep the connection alive (and detect its death) via the heartbeat; no
-        // registry-liveness refresh — the agent registry carries no last_seen.
+        // registry-liveness refresh — the agent registry carries no last_seen —
+        // and no connected-agent list (`None`), which agents don't display.
         // `_guard` removes the registry entry on return via Drop.
-        server_heartbeat_loop(send, recv, None).await
+        server_heartbeat_loop(send, recv, None, None).await
     }
 
     /// Reject an agent handshake: write a rejection response, close gracefully,
@@ -803,10 +832,16 @@ impl ProxyServer {
 /// duplicate-detection registry carries a `last_seen`) and `None` for an agent
 /// (its registry has no liveness field — the connection lifecycle alone keeps it
 /// accurate).
+///
+/// `server` is `Some` for a client connection — each ack then carries the live
+/// connected-agent alias list (a passive registry read; no agent probing) so the
+/// client's status UI can show a live badge — and `None` for an agent, which
+/// doesn't display it.
 async fn server_heartbeat_loop(
     mut send: SendStream,
     mut recv: RecvStream,
     client_entry: Option<(Arc<Mutex<Registry>>, EndpointId, u64)>,
+    server: Option<Arc<ProxyServer>>,
 ) -> ProxyResult<()> {
     loop {
         let data = match tokio::time::timeout(
@@ -835,7 +870,14 @@ async fn server_heartbeat_loop(
                 {
                     entry.last_seen = Instant::now();
                 }
-                let ack = ControlMsg::HeartbeatAck { seq };
+                let connected_agents = server
+                    .as_ref()
+                    .map(|s| s.connected_agent_aliases())
+                    .unwrap_or_default();
+                let ack = ControlMsg::HeartbeatAck {
+                    seq,
+                    connected_agents,
+                };
                 signaling::write_message(&mut send, &signaling::encode_control(&ack)?).await?;
                 send.flush().await?;
             }

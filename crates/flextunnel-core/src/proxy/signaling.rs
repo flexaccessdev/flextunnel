@@ -15,15 +15,16 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// flextunnel protocol version.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// Maximum auth-handshake message size (64 KiB). The server's routed set rides
 /// the `HelloResponse`, so this is generous enough for a large operator list.
 pub const MAX_HANDSHAKE_SIZE: usize = 64 * 1024;
 
-/// Maximum size of a control-stream frame ([`ControlMsg`]). Heartbeats are tiny
-/// fixed-shape messages, so a small cap is plenty and bounds a misbehaving peer.
-pub const MAX_CONTROL_MSG_SIZE: usize = 1024;
+/// Maximum size of a control-stream frame ([`ControlMsg`]). A `HeartbeatAck`
+/// carries the server's live connected-agent alias list, so the cap is generous
+/// enough for a large operator list while still bounding a misbehaving peer.
+pub const MAX_CONTROL_MSG_SIZE: usize = 16 * 1024;
 
 /// Per-stream request/reply header version byte.
 const STREAM_VERSION: u8 = 1;
@@ -137,11 +138,19 @@ pub struct HelloResponse {
     /// same list); alias resolution itself stays server-side.
     #[serde(default)]
     pub host_aliases: Vec<(String, String)>,
-    /// Reverse-routing (agent) aliases, sorted. Names only: the agents' machine
-    /// ids and live connected-state are server-side bookkeeping and would go
-    /// stale after this one-shot handshake, so they are not pushed.
+    /// Reverse-routing (agent) alias names, sorted — the full configured set,
+    /// whether or not each agent is currently connected. The agents' machine ids
+    /// stay server-side (never pushed). Live connected-state is not derivable
+    /// from this list alone; it rides [`Self::connected_agents`] here (the
+    /// initial seed) and is then refreshed by every
+    /// [`ControlMsg::HeartbeatAck`].
     #[serde(default)]
     pub agent_aliases: Vec<String>,
+    /// The subset of [`Self::agent_aliases`] whose backing agent is connected
+    /// *right now*, sorted. Seeds the client's status UI at handshake so it isn't
+    /// blank until the first heartbeat; the heartbeat ack then keeps it fresh.
+    #[serde(default)]
+    pub connected_agents: Vec<String>,
 }
 
 impl Hello {
@@ -182,6 +191,7 @@ impl HelloResponse {
         routed_cidrs: Vec<String>,
         host_aliases: Vec<(String, String)>,
         agent_aliases: Vec<String>,
+        connected_agents: Vec<String>,
     ) -> Self {
         Self {
             version: PROTOCOL_VERSION,
@@ -192,6 +202,7 @@ impl HelloResponse {
             routed_cidrs,
             host_aliases,
             agent_aliases,
+            connected_agents,
         }
     }
 
@@ -205,6 +216,7 @@ impl HelloResponse {
             routed_cidrs: Vec::new(),
             host_aliases: Vec::new(),
             agent_aliases: Vec::new(),
+            connected_agents: Vec::new(),
         }
     }
 }
@@ -216,14 +228,23 @@ impl HelloResponse {
 /// [`HEARTBEAT_INTERVAL`](crate::transport::HEARTBEAT_INTERVAL) and the server
 /// replies [`ControlMsg::HeartbeatAck`]. This is an app-level liveness signal
 /// (on top of QUIC keep-alive) that also drives the server's duplicate-client
-/// registry. Framed with [`write_message`]/[`read_message`], capped at
+/// registry and piggybacks the server's live connected-agent list back to the
+/// client. Framed with [`write_message`]/[`read_message`], capped at
 /// [`MAX_CONTROL_MSG_SIZE`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMsg {
     /// Client → server liveness ping, carrying a monotonically increasing seq.
     Heartbeat { seq: u64 },
-    /// Server → client reply echoing the heartbeat's seq.
-    HeartbeatAck { seq: u64 },
+    /// Server → client reply echoing the heartbeat's seq. `connected_agents` is
+    /// the subset of the client's `agent_aliases` whose backing agent is
+    /// connected right now (sorted) — the server already knows this passively
+    /// from its agent registry, so shipping it on the ack costs no extra probing.
+    /// Empty for agent connections, which don't display it.
+    HeartbeatAck {
+        seq: u64,
+        #[serde(default)]
+        connected_agents: Vec<String>,
+    },
 }
 
 /// Encode a [`ControlMsg`] to JSON bytes.
@@ -463,6 +484,7 @@ mod tests {
             vec!["*.example.com".to_string(), "httpbin.org".to_string()],
             vec!["10.0.0.0/8".to_string()],
             vec![("nas.internal".to_string(), "192.168.1.9".to_string())],
+            vec!["elitedesk.internal".to_string(), "workstation.internal".to_string()],
             vec!["workstation.internal".to_string()],
         );
         let decoded = decode_hello_response(&encode_hello_response(&resp).unwrap()).unwrap();
@@ -475,7 +497,11 @@ mod tests {
             decoded.host_aliases,
             vec![("nas.internal".to_string(), "192.168.1.9".to_string())]
         );
-        assert_eq!(decoded.agent_aliases, vec!["workstation.internal"]);
+        assert_eq!(
+            decoded.agent_aliases,
+            vec!["elitedesk.internal", "workstation.internal"]
+        );
+        assert_eq!(decoded.connected_agents, vec!["workstation.internal"]);
 
         // A rejection carries no routed set but still carries the server nonce.
         let rej = HelloResponse::rejected(7, "nope");
@@ -487,13 +513,21 @@ mod tests {
         assert!(decoded.routed_cidrs.is_empty());
         assert!(decoded.host_aliases.is_empty());
         assert!(decoded.agent_aliases.is_empty());
+        assert!(decoded.connected_agents.is_empty());
     }
 
     #[test]
     fn control_msg_roundtrip() {
         for msg in [
             ControlMsg::Heartbeat { seq: 1 },
-            ControlMsg::HeartbeatAck { seq: u64::MAX },
+            ControlMsg::HeartbeatAck {
+                seq: u64::MAX,
+                connected_agents: Vec::new(),
+            },
+            ControlMsg::HeartbeatAck {
+                seq: 7,
+                connected_agents: vec!["workstation.internal".to_string()],
+            },
         ] {
             let decoded = decode_control(&encode_control(&msg).unwrap()).unwrap();
             assert_eq!(decoded, msg);

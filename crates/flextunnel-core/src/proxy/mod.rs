@@ -16,6 +16,6 @@ pub mod status_page;
 mod e2e_tests;
 
 pub use agent::{AgentConfig, ProxyAgent};
-pub use client::{ClientConfig, ProxyClient, TunnelRoutes};
+pub use client::{AgentAlias, AgentConnState, ClientConfig, ProxyClient, TunnelRoutes};
 pub use routed_set::RoutedSet;
 pub use server::ProxyServer;

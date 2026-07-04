@@ -185,7 +185,8 @@ impl ProxyAgent {
         // lifetime of this connection. Guard is dropped when `serve` returns.
         let _path_watcher = crate::transport::endpoint::watch_connection_paths(connection);
         let accept = accept_server_streams(connection);
-        let heartbeat = client_heartbeat_loop(ctrl_send, ctrl_recv);
+        // Agents have no routes UI to update, so pass `None`.
+        let heartbeat = client_heartbeat_loop(ctrl_send, ctrl_recv, None);
         tokio::select! {
             r = accept => r,
             r = heartbeat => r,

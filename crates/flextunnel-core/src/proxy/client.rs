@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -105,8 +105,83 @@ pub struct TunnelRoutes {
     /// server resolves them; shown in client status UIs like the server status
     /// page shows them.
     pub host_aliases: Vec<(String, String)>,
-    /// Reverse-routing (agent) alias names, informational only.
-    pub agent_aliases: Vec<String>,
+    /// Reverse-routing (agent) routes, informational only. Each carries a live
+    /// `connected` flag: seeded from the handshake and refreshed on every
+    /// heartbeat ack (see [`client_heartbeat_loop`]). Consumers should render
+    /// state via [`TunnelRoutes::agent_states`], which downgrades a stale view to
+    /// [`AgentConnState::Unknown`] rather than trusting the raw flag.
+    pub agent_aliases: Vec<AgentAlias>,
+    /// When the agent connected-state was last refreshed by a heartbeat ack (or
+    /// seeded at handshake). `None` before the first refresh. Used to detect a
+    /// stale view — see [`TunnelRoutes::agent_states`].
+    pub agent_status_updated: Option<Instant>,
+}
+
+/// How long the client's connected-agent view stays trustworthy after the last
+/// heartbeat ack refreshed it. Past this, [`TunnelRoutes::agent_states`] reports
+/// [`AgentConnState::Unknown`] instead of a stale connected/disconnected. Set to
+/// 3× the heartbeat interval so a single late/dropped ack doesn't flip the UI to
+/// unknown, while still surfacing a genuinely lagging view before the connection
+/// itself is declared lost (`LIVENESS_WINDOW`).
+pub const AGENT_STATUS_STALE_AFTER: Duration =
+    Duration::from_secs(HEARTBEAT_INTERVAL.as_secs() * 3);
+
+/// A reverse-routing (agent) alias plus whether its backing agent is connected
+/// to the server right now. The connected flag tracks the server's passive
+/// agent-registry view, delivered over the heartbeat control stream.
+#[derive(Clone, Default)]
+pub struct AgentAlias {
+    pub name: String,
+    pub connected: bool,
+}
+
+/// Display-resolved connection state of an agent route, accounting for view
+/// staleness — see [`TunnelRoutes::agent_states`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentConnState {
+    /// The backing agent was connected as of the last fresh update.
+    Connected,
+    /// The backing agent was disconnected as of the last fresh update.
+    Disconnected,
+    /// The view is stale (or the tunnel is down): the true state is unknown.
+    Unknown,
+}
+
+impl AgentConnState {
+    /// Lowercase wire/JSON token, for status UIs (FFI, iOS).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentConnState::Connected => "connected",
+            AgentConnState::Disconnected => "disconnected",
+            AgentConnState::Unknown => "unknown",
+        }
+    }
+}
+
+impl TunnelRoutes {
+    /// Resolve each agent route to a display state as of `now`. The state is
+    /// [`AgentConnState::Unknown`] when the tunnel is down or the last heartbeat
+    /// refresh is older than [`AGENT_STATUS_STALE_AFTER`]; otherwise it reflects
+    /// the last-known connected flag. Pass `Instant::now()`.
+    pub fn agent_states(&self, now: Instant) -> Vec<(String, AgentConnState)> {
+        let fresh = self.connected
+            && self
+                .agent_status_updated
+                .is_some_and(|t| now.saturating_duration_since(t) <= AGENT_STATUS_STALE_AFTER);
+        self.agent_aliases
+            .iter()
+            .map(|a| {
+                let state = if !fresh {
+                    AgentConnState::Unknown
+                } else if a.connected {
+                    AgentConnState::Connected
+                } else {
+                    AgentConnState::Disconnected
+                };
+                (a.name.clone(), state)
+            })
+            .collect()
+    }
 }
 
 /// Client-side history of server instance nonces observed for the configured
@@ -417,7 +492,7 @@ impl ProxyClient {
         // lifetime of this connection. Guard is dropped when `maintain` returns.
         let _path_watcher = crate::transport::endpoint::watch_connection_paths(connection);
         tokio::select! {
-            r = client_heartbeat_loop(ctrl_send, ctrl_recv) => r,
+            r = client_heartbeat_loop(ctrl_send, ctrl_recv, Some(self.routes.clone())) => r,
             reason = connection.closed() => Err(ProxyError::ConnectionLost(reason.to_string())),
         }
     }
@@ -516,12 +591,22 @@ impl ProxyClient {
         );
 
         // Publish the live tunnel set so the FFI/app can show what's forwarded.
+        // Agent routes carry a connected flag seeded from the handshake's
+        // `connected_agents` subset; the heartbeat loop keeps it fresh.
         if let Ok(mut routes) = self.routes.lock() {
             routes.connected = true;
             routes.domains = response.routed_domains.clone();
             routes.cidrs = response.routed_cidrs.clone();
             routes.host_aliases = response.host_aliases.clone();
-            routes.agent_aliases = response.agent_aliases.clone();
+            routes.agent_aliases = response
+                .agent_aliases
+                .iter()
+                .map(|name| AgentAlias {
+                    connected: response.connected_agents.contains(name),
+                    name: name.clone(),
+                })
+                .collect();
+            routes.agent_status_updated = Some(Instant::now());
         }
         Ok((routed_set, send, recv))
     }
@@ -532,11 +617,16 @@ impl ProxyClient {
 /// [`LIVENESS_WINDOW`]. A missing ack (or stream error) returns
 /// [`ProxyError::ConnectionLost`] (recoverable), which drives the reconnect loop.
 ///
+/// Each ack also carries the server's live connected-agent alias list; when
+/// `routes` is `Some`, the matching entries' `connected` flags are refreshed so
+/// the status UI stays current. Agents pass `None` (they don't display it).
+///
 /// Shared with [`crate::proxy::agent`]: an agent also sends heartbeats over its
-/// retained control stream, so it reuses this loop verbatim.
+/// retained control stream, so it reuses this loop (passing `None` for `routes`).
 pub(crate) async fn client_heartbeat_loop(
     mut send: SendStream,
     mut recv: RecvStream,
+    routes: Option<Arc<Mutex<TunnelRoutes>>>,
 ) -> ProxyResult<()> {
     let mut seq: u64 = 0;
     loop {
@@ -561,7 +651,19 @@ pub(crate) async fn client_heartbeat_loop(
         // sync — treat it as a lost connection so we reconnect rather than count a
         // stale/unexpected message as liveness.
         match signaling::decode_control(&data)? {
-            ControlMsg::HeartbeatAck { seq: ack } if ack == seq => {}
+            ControlMsg::HeartbeatAck {
+                seq: ack,
+                connected_agents,
+            } if ack == seq => {
+                if let Some(routes) = &routes
+                    && let Ok(mut routes) = routes.lock()
+                {
+                    for alias in &mut routes.agent_aliases {
+                        alias.connected = connected_agents.contains(&alias.name);
+                    }
+                    routes.agent_status_updated = Some(Instant::now());
+                }
+            }
             other => {
                 return Err(ProxyError::ConnectionLost(format!(
                     "expected HeartbeatAck({seq}), got {other:?}"
@@ -942,6 +1044,47 @@ mod tests {
         // Already latched: a further reappearance is not a *new* flag, so it must
         // not force another reconnect abort.
         assert!(!c.observe_server_nonce(2));
+    }
+
+    /// `agent_states` reflects the last-known flag while fresh, but degrades to
+    /// `Unknown` when the tunnel is down, the view was never updated, or the last
+    /// update is older than `AGENT_STATUS_STALE_AFTER`.
+    #[test]
+    fn agent_states_degrade_to_unknown_when_stale() {
+        let now = Instant::now();
+        let mut routes = TunnelRoutes {
+            connected: true,
+            agent_aliases: vec![
+                AgentAlias { name: "up.internal".into(), connected: true },
+                AgentAlias { name: "down.internal".into(), connected: false },
+            ],
+            agent_status_updated: Some(now),
+            ..TunnelRoutes::default()
+        };
+
+        // Fresh view: flags map straight through.
+        let states = routes.agent_states(now);
+        assert_eq!(states[0], ("up.internal".into(), AgentConnState::Connected));
+        assert_eq!(states[1], ("down.internal".into(), AgentConnState::Disconnected));
+
+        // Just past the staleness window: every route reads Unknown.
+        let later = now + AGENT_STATUS_STALE_AFTER + Duration::from_secs(1);
+        for (_, state) in routes.agent_states(later) {
+            assert_eq!(state, AgentConnState::Unknown);
+        }
+
+        // Tunnel down: Unknown regardless of a recent update.
+        routes.connected = false;
+        for (_, state) in routes.agent_states(now) {
+            assert_eq!(state, AgentConnState::Unknown);
+        }
+
+        // Never updated: Unknown even while connected.
+        routes.connected = true;
+        routes.agent_status_updated = None;
+        for (_, state) in routes.agent_states(now) {
+            assert_eq!(state, AgentConnState::Unknown);
+        }
     }
 
     /// End-to-end plain-HTTP forwarding through the split-tunnel *direct* path:
