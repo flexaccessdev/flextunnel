@@ -247,7 +247,7 @@ async fn run_session(
     // The SOCKS listener binds when `run` is first polled below, so an early
     // relay sees at most one connection-refused, surfaced per-forward.
     let mut fwd_mgr =
-        ForwardManager::new(config.socks_port, client.socks_auth_password().into(), forwards);
+        ForwardManager::new(config.socks_port, config.server_node_id.as_str().into(), forwards);
 
     let run = client.run(&endpoint);
     tokio::pin!(run);
