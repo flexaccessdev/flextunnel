@@ -331,7 +331,13 @@ impl ProxyClient {
 
     /// Serve the SOCKS5 listener and, when present, the HTTP CONNECT listener,
     /// both multiplexed over the same reconnecting server connection.
-    async fn run_with_listeners(
+    ///
+    /// Public for callers that must own the local ports before starting work
+    /// that depends on them — the desktop binds both itself so its port
+    /// forwarders only ever come up once the SOCKS port is held by this
+    /// process (their first line of defense against relaying into some other
+    /// server squatting the port).
+    pub async fn run_with_listeners(
         &self,
         endpoint: &Endpoint,
         socks_listener: TcpListener,
