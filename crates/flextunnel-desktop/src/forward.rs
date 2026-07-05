@@ -46,6 +46,9 @@ pub struct PortForward {
     pub local_port: u16,
     pub remote_host: String,
     pub remote_port: u16,
+    /// Runtime-only session state (the enable/disable switch): never written
+    /// to disk, so every launch starts with all forwards disabled.
+    #[serde(skip)]
     pub enabled: bool,
 }
 
@@ -509,8 +512,13 @@ mod tests {
 
         assert_eq!(load_from(&path), Vec::new());
 
-        let forwards = vec![forward(18081), forward(18082)];
+        let mut forwards = vec![forward(18081), forward(18082)];
+        forwards[1].enabled = false;
         save_to(&path, &forwards).expect("save");
+        // `enabled` is runtime-only: not written, and off after a reload.
+        let raw = std::fs::read_to_string(&path).expect("read raw");
+        assert!(!raw.contains("enabled"), "enabled leaked into the file: {raw}");
+        forwards[0].enabled = false;
         assert_eq!(load_from(&path), forwards);
 
         std::fs::write(&path, b"not json").expect("write");
