@@ -118,6 +118,18 @@ impl Controller {
     }
 }
 
+/// Bind a local listener, mapping the common taken-port case to a clear
+/// session error.
+async fn bind_local(addr: SocketAddr, label: &str) -> Result<tokio::net::TcpListener, String> {
+    tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            format!("{label} port {} is already in use — another flextunnel?", addr.port())
+        } else {
+            format!("Failed to bind the {label} listener on {addr}: {e}")
+        }
+    })
+}
+
 fn update<F: FnOnce(&mut Snapshot)>(shared: &Arc<Mutex<Snapshot>>, f: F) {
     let mut s = match shared.lock() {
         Ok(guard) => guard,
@@ -242,14 +254,39 @@ async fn run_session(
     });
     let routes = client.routes();
 
-    // Forwards run for the whole session (including reconnect gaps — the SOCKS
-    // listener stays bound); they die with the manager when the session ends.
-    // The SOCKS listener binds when `run` is first polled below, so an early
-    // relay sees at most one connection-refused, surfaced per-forward.
-    let mut fwd_mgr =
-        ForwardManager::new(config.socks_port, client.socks_auth_password().into(), forwards);
+    // Bind the local listeners before any forward listener exists: holding the
+    // SOCKS port in this process is the forwarders' first line of defense
+    // against relaying into some other server squatting the port (the
+    // flextunnel.internal probe is only the secondary check). A taken port
+    // fails the session here, before a single forward comes up.
+    let listeners = async {
+        let socks = bind_local(socks_addr, "SOCKS").await?;
+        let http = match http_addr {
+            Some(addr) => Some(bind_local(addr, "HTTP").await?),
+            None => None,
+        };
+        Ok::<_, String>((socks, http))
+    };
+    let (socks_listener, http_listener) = match listeners.await {
+        Ok(listeners) => listeners,
+        Err(reason) => {
+            log::error!("{reason}");
+            update(shared, |s| {
+                s.phase = Phase::Failed;
+                s.last_error = Some(reason);
+            });
+            endpoint.close().await;
+            return SessionExit::Ended;
+        }
+    };
 
-    let run = client.run(&endpoint);
+    // Forwards run for the whole session (including reconnect gaps — the SOCKS
+    // listener above stays bound); they die with the manager when the session
+    // ends.
+    let mut fwd_mgr =
+        ForwardManager::new(config.socks_port, config.server_node_id.as_str().into(), forwards);
+
+    let run = client.run_with_listeners(&endpoint, socks_listener, http_listener);
     tokio::pin!(run);
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     let mut ever_connected = false;

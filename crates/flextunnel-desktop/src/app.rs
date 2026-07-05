@@ -13,6 +13,7 @@ use crate::tunnel::{Controller, Phase, Snapshot};
 use eframe::egui::{self, Color32, RichText, TextEdit, TextStyle, ViewportCommand};
 use flextunnel_core::proxy::signaling::Target;
 use flextunnel_core::proxy::{reserved, AgentConnState, RoutedSet, TunnelRoutes};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
@@ -252,6 +253,30 @@ fn forward_badge(
     )))
 }
 
+/// Start/stop semantics for the per-forward toggle: a forward whose initial
+/// setup failed (its listener could not bind — e.g. the local port is in use)
+/// is flipped back off instead of sitting enabled-but-failed. `Failed` is only
+/// ever set at bind time (see `forward::run_forward`), so every failed status
+/// is a setup failure. Returns the `(id, reason)` pairs of the forwards
+/// disabled, for display next to their rows.
+fn disable_failed_forwards(
+    forwards: &mut [PortForward],
+    statuses: &[ForwardStatus],
+) -> Vec<(String, String)> {
+    let mut disabled = Vec::new();
+    for status in statuses {
+        if let ForwardState::Failed(reason) = &status.state
+            && let Some(forward) = forwards
+                .iter_mut()
+                .find(|f| f.id == status.id && f.enabled)
+        {
+            forward.enabled = false;
+            disabled.push((forward.id.clone(), reason.clone()));
+        }
+    }
+    disabled
+}
+
 /// One-line live status for a forward row (text, color), mirroring the iOS
 /// row: gray "off"/"stopped", green "listening (· N active)", red failure.
 fn forward_status_line(
@@ -317,6 +342,10 @@ pub struct App {
     forwards: Vec<PortForward>,
     forward_form: Option<ForwardForm>,
     forwards_notice: Option<String>,
+    /// Setup-failure reason per forward id, retained after the failed forward
+    /// is auto-stopped (see [`disable_failed_forwards`]) so the row can keep
+    /// showing why; cleared when the forward is started again or removed.
+    forward_errors: HashMap<String, String>,
     /// Advisory-badge cache: the `RoutedSet` rebuilt only when the pushed
     /// domains/CIDRs change (`None` inside means the set failed to parse).
     routed_cache: Option<(Vec<String>, Vec<String>, Option<RoutedSet>)>,
@@ -389,6 +418,7 @@ impl App {
             forwards,
             forward_form: None,
             forwards_notice: None,
+            forward_errors: HashMap::new(),
             routed_cache: None,
             log_revision: 0,
             log_lines: Vec::new(),
@@ -711,6 +741,11 @@ impl App {
             });
         }
         if let Some(saved) = save {
+            if saved.enabled {
+                // The edit may fix what failed (e.g. a new local port); the
+                // fresh start attempt supersedes the old failure.
+                self.forward_errors.remove(&saved.id);
+            }
             match self.forwards.iter_mut().find(|f| f.id == saved.id) {
                 Some(slot) => *slot = saved,
                 None => self.forwards.push(saved),
@@ -751,9 +786,12 @@ impl App {
                     let status = snapshot.forwards.iter().find(|s| s.id == forward.id);
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
-                            let mut enabled = forward.enabled;
-                            if ui.checkbox(&mut enabled, "").changed() {
-                                action = Some(RowAction::Toggle(i, enabled));
+                            // Start/stop, not a desired-state checkbox: Start
+                            // attempts the setup now, and a setup failure snaps
+                            // it back to stopped (see disable_failed_forwards).
+                            let label = if forward.enabled { "Stop" } else { "Start" };
+                            if ui.small_button(label).clicked() {
+                                action = Some(RowAction::Toggle(i, !forward.enabled));
                             }
                             ui.label(RichText::new(forward.display_name()).strong());
                             if let Some(tunneled) = forward_badge(
@@ -784,6 +822,11 @@ impl App {
                         ui.monospace(forward.route_description());
                         let (text, color) = forward_status_line(forward, status, snapshot.phase);
                         ui.label(RichText::new(text).small().color(color));
+                        // The setup failure that auto-stopped this forward,
+                        // kept visible until it is started again or removed.
+                        if let Some(reason) = self.forward_errors.get(&forward.id) {
+                            ui.label(RichText::new(reason.as_str()).small().color(RED));
+                        }
                         if forward.enabled
                             && let Some(error) = status.and_then(|s| s.last_conn_error.as_deref())
                         {
@@ -805,6 +848,10 @@ impl App {
 
         match action {
             Some(RowAction::Toggle(i, enabled)) => {
+                if enabled {
+                    // A fresh start attempt supersedes the old failure.
+                    self.forward_errors.remove(&self.forwards[i].id);
+                }
                 self.forwards[i].enabled = enabled;
                 self.commit_forwards();
             }
@@ -812,6 +859,7 @@ impl App {
                 self.forward_form = Some(ForwardForm::edit(&self.forwards[i]));
             }
             Some(RowAction::Delete(i)) => {
+                self.forward_errors.remove(&self.forwards[i].id);
                 self.forwards.remove(i);
                 self.commit_forwards();
             }
@@ -963,6 +1011,14 @@ impl eframe::App for App {
         self.snapshot = self.controller.snapshot();
         let snapshot = self.snapshot.clone();
 
+        // Runs every frame (not just on the Forwards tab) so a forward whose
+        // setup failed snaps back to stopped promptly.
+        let failed = disable_failed_forwards(&mut self.forwards, &snapshot.forwards);
+        if !failed.is_empty() {
+            self.forward_errors.extend(failed);
+            self.commit_forwards();
+        }
+
         while let Ok(event) = self.tray_rx.try_recv() {
             // Windows convention: left click on the tray icon toggles the
             // window. On macOS the left click opens the menu natively.
@@ -1069,6 +1125,37 @@ mod tests {
             remote_port: 80,
             enabled: true,
         }
+    }
+
+    #[test]
+    fn failed_forward_is_toggled_off() {
+        let mut forwards = vec![existing_forward("a", 8080), existing_forward("b", 8081)];
+        let statuses = vec![
+            ForwardStatus {
+                id: "a".into(),
+                state: ForwardState::Failed("port 8080 is in use".into()),
+                active: 0,
+                last_conn_error: None,
+            },
+            ForwardStatus {
+                id: "b".into(),
+                state: ForwardState::Listening,
+                active: 0,
+                last_conn_error: None,
+            },
+        ];
+
+        let disabled = disable_failed_forwards(&mut forwards, &statuses);
+        assert_eq!(
+            disabled,
+            vec![("a".to_string(), "port 8080 is in use".to_string())]
+        );
+        assert!(!forwards[0].enabled, "failed forward flips off");
+        assert!(forwards[1].enabled, "listening forward untouched");
+
+        // Idempotent: an already-disabled forward is not reported again while
+        // its stale Failed status lingers for a frame.
+        assert!(disable_failed_forwards(&mut forwards, &statuses).is_empty());
     }
 
     #[test]
