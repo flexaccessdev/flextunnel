@@ -24,6 +24,59 @@ const GREEN: Color32 = Color32::from_rgb(60, 180, 90);
 const AMBER: Color32 = Color32::from_rgb(230, 160, 30);
 const RED: Color32 = Color32::from_rgb(220, 70, 70);
 
+/// Animated enable/disable switch (egui's canonical toggle shape), green when
+/// on — the per-forward control, replacing a Start/Stop text button.
+fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let desired_size = egui::vec2(34.0, 18.0);
+    let (rect, mut response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, "")
+    });
+    if ui.is_rect_visible(rect) {
+        let how_on = ui.ctx().animate_bool_responsive(response.id, *on);
+        let visuals = ui.style().interact_selectable(&response, *on);
+        let rect = rect.expand(visuals.expansion);
+        let radius = 0.5 * rect.height();
+        let off_fill = ui.visuals().widgets.inactive.bg_fill;
+        ui.painter().rect(
+            rect,
+            radius,
+            off_fill.lerp_to_gamma(GREEN, how_on),
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        let circle_x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), how_on);
+        ui.painter().circle(
+            egui::pos2(circle_x, rect.center().y),
+            0.75 * radius,
+            visuals.fg_stroke.color,
+            visuals.fg_stroke,
+        );
+    }
+    response
+}
+
+/// Small tinted pill badge ("tunneled", "direct", agent states).
+fn pill_label(ui: &mut egui::Ui, text: &str, color: Color32) {
+    egui::Frame::new()
+        .fill(color.gamma_multiply(0.16))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(6, 1))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).small().color(color));
+        });
+}
+
+/// Small filled status dot, vertically centered against the row text.
+fn status_dot(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Status,
@@ -253,7 +306,7 @@ fn forward_badge(
     )))
 }
 
-/// Start/stop semantics for the per-forward toggle: a forward whose initial
+/// Enable/disable semantics for the per-forward switch: a forward whose initial
 /// setup failed (its listener could not bind — e.g. the local port is in use)
 /// is flipped back off instead of sitting enabled-but-failed. `Failed` is only
 /// ever set at bind time (see `forward::run_forward`), so every failed status
@@ -277,15 +330,16 @@ fn disable_failed_forwards(
     disabled
 }
 
-/// One-line live status for a forward row (text, color), mirroring the iOS
-/// row: gray "off"/"stopped", green "listening (· N active)", red failure.
+/// One-line live status for a forward row (text, color) — the color also
+/// drives the row's status dot: gray "disabled"/"starts when connected",
+/// amber "starting…", green "listening (· N active)", red failure.
 fn forward_status_line(
     forward: &PortForward,
     status: Option<&ForwardStatus>,
     phase: Phase,
 ) -> (String, Color32) {
     if !forward.enabled {
-        return ("off".into(), Color32::GRAY);
+        return ("disabled".into(), Color32::GRAY);
     }
     match status {
         Some(status) => match &status.state {
@@ -295,10 +349,11 @@ fn forward_status_line(
             ForwardState::Listening => ("listening".into(), GREEN),
             ForwardState::Failed(reason) => (reason.clone(), RED),
         },
-        // No status = no running session for this forward.
+        // No status = no running session for this forward. The Forwards tab's
+        // connection banner explains the disconnected case in one place.
         None => match phase {
-            Phase::Idle | Phase::Failed => ("stopped — connect to start".into(), Color32::GRAY),
-            _ => ("stopped".into(), Color32::GRAY),
+            Phase::Idle | Phase::Failed => ("starts when connected".into(), Color32::GRAY),
+            _ => ("starting…".into(), AMBER),
         },
     }
 }
@@ -401,8 +456,9 @@ impl App {
             Tab::Settings
         };
 
-        // Push the persisted forwards to the tunnel thread up front so they
-        // start with the first session.
+        // Push the persisted forwards to the tunnel thread up front. They all
+        // load disabled (`enabled` is runtime-only), so nothing listens until
+        // the user flips a forward on.
         let forwards = forward::load();
         controller.set_forwards(forwards.clone());
 
@@ -625,17 +681,13 @@ impl App {
                         ));
                         for (alias, state) in snapshot.routes.agent_states(Instant::now()) {
                             let (label, color) = match state {
-                                AgentConnState::Connected => {
-                                    ("connected", egui::Color32::from_rgb(0x2e, 0xa0, 0x43))
-                                }
-                                AgentConnState::Disconnected => {
-                                    ("disconnected", egui::Color32::from_rgb(0xc0, 0x39, 0x2b))
-                                }
+                                AgentConnState::Connected => ("connected", GREEN),
+                                AgentConnState::Disconnected => ("disconnected", RED),
                                 AgentConnState::Unknown => ("unknown", egui::Color32::GRAY),
                             };
                             ui.horizontal(|ui| {
                                 ui.monospace(&alias);
-                                ui.colored_label(color, label);
+                                pill_label(ui, label, color);
                             });
                         }
                     }
@@ -667,8 +719,62 @@ impl App {
         }
     }
 
+    /// One tinted banner explaining why forwards aren't live, with an inline
+    /// Connect button where that's the fix — instead of every row repeating it.
+    fn connection_banner(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        let (color, text, show_connect) = match snapshot.phase {
+            Phase::Connected => return,
+            Phase::Idle => (
+                AMBER,
+                "Not connected — forwards are inactive until you connect.",
+                true,
+            ),
+            Phase::Failed => (
+                RED,
+                "Connection failed — forwards are inactive until you reconnect.",
+                true,
+            ),
+            Phase::Connecting => (AMBER, "Connecting — forwards start automatically.", false),
+            Phase::Reconnecting => {
+                (AMBER, "Reconnecting — forwards resume automatically.", false)
+            }
+        };
+        egui::Frame::new()
+            .fill(color.gamma_multiply(0.12))
+            .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.5)))
+            .corner_radius(8)
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    status_dot(ui, color);
+                    ui.label(RichText::new(text).small());
+                    if show_connect {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui
+                                    .add_enabled(
+                                        self.saved.is_some(),
+                                        egui::Button::new("Connect").small(),
+                                    )
+                                    .clicked()
+                                {
+                                    let ctx = ui.ctx().clone();
+                                    self.connect(&ctx);
+                                }
+                            },
+                        );
+                    }
+                });
+            });
+        ui.add_space(8.0);
+    }
+
     fn forwards_tab(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
         self.refresh_routed_cache(&snapshot.routes);
+
+        self.connection_banner(ui, snapshot);
 
         ui.horizontal(|ui| {
             if ui.button("Add forward").clicked() {
@@ -784,55 +890,82 @@ impl App {
             .show(ui, |ui| {
                 for (i, forward) in self.forwards.iter().enumerate() {
                     let status = snapshot.forwards.iter().find(|s| s.id == forward.id);
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            // Start/stop, not a desired-state checkbox: Start
-                            // attempts the setup now, and a setup failure snaps
-                            // it back to stopped (see disable_failed_forwards).
-                            let label = if forward.enabled { "Stop" } else { "Start" };
-                            if ui.small_button(label).clicked() {
-                                action = Some(RowAction::Toggle(i, !forward.enabled));
-                            }
-                            ui.label(RichText::new(forward.display_name()).strong());
-                            if let Some(tunneled) = forward_badge(
-                                snapshot.phase,
-                                &snapshot.routes,
-                                routed_set,
-                                forward,
-                            ) {
-                                let (text, color) = if tunneled {
-                                    ("tunneled", GREEN)
-                                } else {
-                                    ("direct", AMBER)
-                                };
+                    let (text, color) = forward_status_line(forward, status, snapshot.phase);
+                    egui::Frame::group(ui.style())
+                        .fill(ui.visuals().faint_bg_color)
+                        .corner_radius(8)
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                status_dot(ui, color);
+                                let name = RichText::new(forward.display_name()).strong();
+                                ui.label(if forward.enabled { name } else { name.weak() });
+                                if let Some(tunneled) = forward_badge(
+                                    snapshot.phase,
+                                    &snapshot.routes,
+                                    routed_set,
+                                    forward,
+                                ) {
+                                    let (text, color) = if tunneled {
+                                        ("tunneled", GREEN)
+                                    } else {
+                                        ("direct", AMBER)
+                                    };
+                                    pill_label(ui, text, color);
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        // Desired state, but not a plain
+                                        // checkbox: enabling attempts the setup
+                                        // now, and a setup failure snaps the
+                                        // switch back off (see
+                                        // disable_failed_forwards).
+                                        let mut enabled = forward.enabled;
+                                        if toggle_switch(ui, &mut enabled)
+                                            .on_hover_text(if enabled {
+                                                "Disable this forward"
+                                            } else {
+                                                "Enable this forward"
+                                            })
+                                            .changed()
+                                        {
+                                            action = Some(RowAction::Toggle(i, enabled));
+                                        }
+                                    },
+                                );
+                            });
+                            let route =
+                                RichText::new(forward.route_description()).monospace();
+                            ui.label(if forward.enabled { route } else { route.weak() });
+                            ui.horizontal(|ui| {
                                 ui.label(RichText::new(text).small().color(color));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("Delete").clicked() {
+                                            action = Some(RowAction::Delete(i));
+                                        }
+                                        if ui.small_button("Edit").clicked() {
+                                            action = Some(RowAction::Edit(i));
+                                        }
+                                    },
+                                );
+                            });
+                            // The setup failure that auto-disabled this forward,
+                            // kept visible until it is enabled again or removed.
+                            if let Some(reason) = self.forward_errors.get(&forward.id) {
+                                ui.label(RichText::new(reason.as_str()).small().color(RED));
                             }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.small_button("delete").clicked() {
-                                        action = Some(RowAction::Delete(i));
-                                    }
-                                    if ui.small_button("edit").clicked() {
-                                        action = Some(RowAction::Edit(i));
-                                    }
-                                },
-                            );
+                            if forward.enabled
+                                && let Some(error) =
+                                    status.and_then(|s| s.last_conn_error.as_deref())
+                            {
+                                ui.label(RichText::new(error).small().color(AMBER));
+                            }
                         });
-                        ui.monospace(forward.route_description());
-                        let (text, color) = forward_status_line(forward, status, snapshot.phase);
-                        ui.label(RichText::new(text).small().color(color));
-                        // The setup failure that auto-stopped this forward,
-                        // kept visible until it is started again or removed.
-                        if let Some(reason) = self.forward_errors.get(&forward.id) {
-                            ui.label(RichText::new(reason.as_str()).small().color(RED));
-                        }
-                        if forward.enabled
-                            && let Some(error) = status.and_then(|s| s.last_conn_error.as_deref())
-                        {
-                            ui.label(RichText::new(error).small().color(AMBER));
-                        }
-                    });
+                    ui.add_space(6.0);
                 }
             });
 
