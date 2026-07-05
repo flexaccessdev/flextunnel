@@ -31,7 +31,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// discovery phase awaits DNS/pkarr/mDNS lookups with no deadline of its own,
 /// and on a wedged endpoint (seen on iOS after the OS suspends the process and
 /// invalidates the socket state underneath it) that future can pend forever —
-/// which would stall the reconnect loop permanently instead of retrying.
+/// which would stall the reconnect loop permanently instead of retrying. The
+/// retry then nudges `Endpoint::network_change()` to rebind the dead
+/// transports (see `manage_connection`), so the wedge is repaired rather than
+/// merely timed out again.
 /// Generous: a healthy connect through discovery + relay completes well within.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -73,6 +76,14 @@ const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// one warn per ~10s at [`ACCEPT_RETRY_DELAY`] pacing — so sustained fd
 /// exhaustion doesn't flood the log; the in-between retries log at debug.
 const ACCEPT_RETRY_WARN_EVERY: u64 = 40;
+/// Consecutive aborted accepts after which the listener itself is presumed
+/// dead and rebound. A peer aborting a queued connection between the kernel
+/// accepting it and us reading it yields the same error *occasionally*; a
+/// listener socket the OS invalidated underneath us — iOS marks every socket
+/// of a suspended process defunct, and `accept()` on one fails with
+/// ECONNABORTED forever — yields it on *every* call. A short uniform burst
+/// (~1s at [`ACCEPT_RETRY_DELAY`] pacing) separates the two.
+const REBIND_AFTER_CONSECUTIVE_ABORTS: u64 = 4;
 
 /// The live QUIC connection shared with the always-on accept loop; `None` while
 /// disconnected (during a drop/backoff), so off-list targets still connect
@@ -367,7 +378,7 @@ impl ProxyClient {
         // The HTTP branch is inert (never resolves) when no HTTP listener is
         // bound, so the `select!` shape is the same either way.
         let http_accept = async {
-            match &http_listener {
+            match http_listener {
                 Some(l) => accept_loop(l, &current, &routed_set, HttpProto).await,
                 None => std::future::pending::<ProxyResult<()>>().await,
             }
@@ -379,7 +390,7 @@ impl ProxyClient {
         // orphaned accept task.
         tokio::select! {
             r = self.manage_connection(endpoint, &current, &routed_set) => r,
-            r = accept_loop(&socks_listener, &current, &routed_set, Socks5Proto) => r,
+            r = accept_loop(socks_listener, &current, &routed_set, Socks5Proto) => r,
             r = http_accept => r,
         }
     }
@@ -400,6 +411,16 @@ impl ProxyClient {
             // Until (re)authenticated, nothing is being forwarded.
             self.set_connected(false);
             *current.lock().expect("connection lock") = None;
+
+            // Retrying after a failure: the endpoint's UDP sockets may be dead
+            // underneath it (iOS defuncts them while the process is suspended;
+            // a sleeping laptop can do the same) and iroh cannot always detect
+            // that by itself, leaving reconnects wedged forever. Nudging it
+            // re-checks and rebinds the transports — harmless when nothing
+            // actually changed.
+            if attempt > 0 {
+                endpoint.network_change().await;
+            }
 
             // Establish (connect + auth). The handshake also learns the server's
             // tunnel set (drives split-tunneling) and returns the control-stream
@@ -761,50 +782,78 @@ impl LocalProto for HttpProto {
     }
 }
 
-/// Whether an `accept()` error is transient — the listener itself is fine and
-/// accepting will work again once conditions change — as opposed to a broken
-/// listener that should end the loop (and with it the client).
-///
-/// Transient: fd exhaustion (EMFILE per-process / ENFILE system-wide; no
-/// stable `io::ErrorKind` exists for these, so match the raw OS codes) and
-/// per-connection races where the peer aborted between the kernel queuing the
-/// connection and us accepting it.
-fn is_transient_accept_error(e: &io::Error) -> bool {
-    if matches!(
-        e.kind(),
-        io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::Interrupted
-    ) {
-        return true;
-    }
+/// How a failed `accept()` should be handled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptFailure {
+    /// fd exhaustion (EMFILE per-process / ENFILE system-wide; no stable
+    /// `io::ErrorKind` exists for these, so the raw OS codes are matched). The
+    /// listener itself is healthy — retry, and never rebind: replacing the
+    /// socket wouldn't free descriptors, and dropping it would throw away the
+    /// queued backlog for nothing.
+    ResourcePressure,
+    /// An aborted/reset accept: either a benign per-connection race (the peer
+    /// gave up between the kernel queuing the connection and us accepting it)
+    /// or a defunct listener failing every call — indistinguishable from one
+    /// error alone, so retry and rebind only after a
+    /// [`REBIND_AFTER_CONSECUTIVE_ABORTS`] burst.
+    Aborted,
+    /// The listener socket itself is broken (e.g. EBADF/EINVAL after the OS
+    /// invalidated it) — rebind immediately.
+    Broken,
+}
+
+fn classify_accept_error(e: &io::Error) -> AcceptFailure {
     #[cfg(unix)]
-    {
-        matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
+    if matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE)) {
+        return AcceptFailure::ResourcePressure;
     }
     #[cfg(windows)]
     {
         const WSAEMFILE: i32 = 10024;
-        e.raw_os_error() == Some(WSAEMFILE)
+        if e.raw_os_error() == Some(WSAEMFILE) {
+            return AcceptFailure::ResourcePressure;
+        }
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        false
+    match e.kind() {
+        io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::Interrupted => AcceptFailure::Aborted,
+        _ => AcceptFailure::Broken,
     }
+}
+
+/// Bind a replacement for a dead local listener. One retry after
+/// [`ACCEPT_RETRY_DELAY`] absorbs a lingering-socket race; a second failure is
+/// fatal — the port is genuinely gone (taken by another process), so ending
+/// the client (and with it the embedder's health probe) beats serving nothing
+/// while looking alive.
+async fn rebind_listener(addr: SocketAddr) -> ProxyResult<TcpListener> {
+    if let Ok(listener) = TcpListener::bind(addr).await {
+        return Ok(listener);
+    }
+    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+    Ok(TcpListener::bind(addr).await?)
 }
 
 /// Accept loop for a local front-end listener. Each accepted connection is
 /// handled by [`handle_local_conn`] parameterized on `proto`. Shared verbatim by
-/// the SOCKS5 and HTTP listeners. Transient accept errors (fd exhaustion,
-/// peer-aborted races) are retried after [`ACCEPT_RETRY_DELAY`]; returns only on
-/// a fatal listener error.
+/// the SOCKS5 and HTTP listeners.
+///
+/// Failure policy (see [`AcceptFailure`]): resource pressure and one-off
+/// aborts are retried after [`ACCEPT_RETRY_DELAY`]; a broken listener — or an
+/// abort burst, the signature of a socket the OS invalidated underneath us
+/// (iOS defuncts every socket of a suspended process, and the health probe
+/// would otherwise keep reading "alive" while nothing can connect) — is
+/// **rebound** in place on the same address. Returns only when a rebind fails.
 async fn accept_loop<P: LocalProto>(
-    listener: &TcpListener,
+    mut listener: TcpListener,
     current: &SharedConn,
     routed_set_shared: &SharedRoutedSet,
     proto: P,
 ) -> ProxyResult<()> {
+    let addr = listener.local_addr()?;
     let mut consecutive_failures: u64 = 0;
+    let mut consecutive_aborts: u64 = 0;
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(accepted) => {
@@ -814,9 +863,27 @@ async fn accept_loop<P: LocalProto>(
                     );
                     consecutive_failures = 0;
                 }
+                consecutive_aborts = 0;
                 accepted
             }
-            Err(e) if is_transient_accept_error(&e) => {
+            Err(e) => {
+                let failure = classify_accept_error(&e);
+                consecutive_aborts = match failure {
+                    AcceptFailure::Aborted => consecutive_aborts + 1,
+                    _ => 0,
+                };
+                if failure == AcceptFailure::Broken
+                    || consecutive_aborts >= REBIND_AFTER_CONSECUTIVE_ABORTS
+                {
+                    log::warn!("Local proxy listener on {addr} is dead ({e}); rebinding");
+                    // The dead socket still owns the port; release it first.
+                    drop(listener);
+                    listener = rebind_listener(addr).await?;
+                    log::info!("Local proxy listener rebound on {addr}");
+                    consecutive_failures = 0;
+                    consecutive_aborts = 0;
+                    continue;
+                }
                 if consecutive_failures.is_multiple_of(ACCEPT_RETRY_WARN_EVERY) {
                     log::warn!(
                         "Local proxy accept failed ({e}); retrying every {}ms",
@@ -829,7 +896,6 @@ async fn accept_loop<P: LocalProto>(
                 tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
                 continue;
             }
-            Err(e) => return Err(e.into()),
         };
         log::debug!("proxy connection from {peer}");
         let current = current.clone();
@@ -1005,29 +1071,60 @@ mod tests {
         })
     }
 
-    /// fd exhaustion and peer-aborted races must be retried, not kill the
-    /// client; a genuinely broken listener (e.g. bad fd) must still be fatal.
+    /// fd exhaustion must be retried without ever rebinding; aborted/reset
+    /// races retry and rebind only as a burst; a broken listener (bad fd)
+    /// must rebind immediately instead of killing the client.
     #[cfg(unix)]
     #[test]
-    fn accept_error_transience_classification() {
-        for code in [libc::EMFILE, libc::ENFILE, libc::ECONNABORTED, libc::EINTR] {
-            assert!(
-                is_transient_accept_error(&io::Error::from_raw_os_error(code)),
-                "os error {code} should be transient"
+    fn accept_error_classification() {
+        for code in [libc::EMFILE, libc::ENFILE] {
+            assert_eq!(
+                classify_accept_error(&io::Error::from_raw_os_error(code)),
+                AcceptFailure::ResourcePressure,
+                "os error {code} should be resource pressure"
+            );
+        }
+        for code in [libc::ECONNABORTED, libc::EINTR] {
+            assert_eq!(
+                classify_accept_error(&io::Error::from_raw_os_error(code)),
+                AcceptFailure::Aborted,
+                "os error {code} should be an abort"
             );
         }
         // A kind-only error (no raw OS code) must be classified by the
         // `ErrorKind` branch alone.
-        assert!(is_transient_accept_error(&io::Error::new(
-            io::ErrorKind::ConnectionReset,
-            "peer reset before accept"
-        )));
-        assert!(!is_transient_accept_error(&io::Error::from_raw_os_error(
-            libc::EBADF
-        )));
-        assert!(!is_transient_accept_error(&io::Error::from_raw_os_error(
-            libc::EINVAL
-        )));
+        assert_eq!(
+            classify_accept_error(&io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "peer reset before accept"
+            )),
+            AcceptFailure::Aborted
+        );
+        for code in [libc::EBADF, libc::EINVAL] {
+            assert_eq!(
+                classify_accept_error(&io::Error::from_raw_os_error(code)),
+                AcceptFailure::Broken,
+                "os error {code} should be broken"
+            );
+        }
+    }
+
+    /// The accept loop must survive its listener dying: a defunct listener
+    /// (simulated with an abort burst via `classify_accept_error` is not
+    /// injectable on a real socket, so exercise the rebind path directly) is
+    /// replaced by a fresh listener on the same address once the old socket is
+    /// dropped.
+    #[tokio::test]
+    async fn rebind_listener_reclaims_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // as accept_loop does: the dead socket owns the port
+        let rebound = rebind_listener(addr).await.unwrap();
+        assert_eq!(rebound.local_addr().unwrap(), addr);
+        // And it actually accepts.
+        let client = TcpStream::connect(addr);
+        let (accepted, _) = tokio::join!(rebound.accept(), client);
+        accepted.unwrap();
     }
 
     #[test]

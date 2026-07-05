@@ -63,6 +63,15 @@ impl ProxyAgent {
         let mut ever_connected = false;
         let mut attempt: u32 = 0;
         loop {
+            // Retrying after a failure: nudge the endpoint to re-check and
+            // rebind its transports first, in case the OS invalidated its UDP
+            // sockets underneath it (process suspension, machine sleep) —
+            // otherwise reconnects can stay wedged forever. Mirrors
+            // `ProxyClient::manage_connection`; harmless when nothing changed.
+            if attempt > 0 {
+                endpoint.network_change().await;
+            }
+
             let (connection, ctrl_send, ctrl_recv) = match self.establish(endpoint).await {
                 Ok(established) => {
                     ever_connected = true;
