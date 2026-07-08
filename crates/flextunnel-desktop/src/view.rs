@@ -3,7 +3,9 @@
 //! through a [`Message`]. The look (cards, pills, ghost buttons, sidebar rows)
 //! comes from the design system in [`crate::style`].
 
-use crate::app::{format_duration, App, ForwardForm, Message, ProfileForm, Selection};
+use crate::app::{
+    format_duration, App, ForwardForm, Message, ProfileForm, Selection, LOG_FILTER_ALL,
+};
 use crate::config::Profile;
 use crate::forward::{ForwardState, ForwardStatus, PortForward};
 use crate::style::{self, AMBER, GRAY, GREEN, RED};
@@ -11,7 +13,8 @@ use crate::tunnel::{Phase, Snapshot};
 use flextunnel_core::proxy::signaling::Target;
 use flextunnel_core::proxy::{reserved, AgentConnState, RoutedSet, TunnelRoutes};
 use iced::widget::{
-    button, checkbox, column, container, row, scrollable, space, text, text_input, toggler,
+    button, checkbox, column, container, pick_list, row, scrollable, space, text, text_input,
+    toggler,
 };
 use iced::{Center, Color, Element, Fill, Font};
 use std::net::SocketAddr;
@@ -761,9 +764,21 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
 // Logs
 
 fn logs_pane(app: &App) -> Element<'_, Message> {
+    let mut filter_options: Vec<String> = vec![LOG_FILTER_ALL.into()];
+    filter_options.extend(app.profiles.iter().map(|p| p.name.clone()));
+    let selected = app
+        .log_filter
+        .clone()
+        .unwrap_or_else(|| LOG_FILTER_ALL.into());
+
     let header = row![
         section_label("LOGS".to_string()),
         space().width(Fill),
+        pick_list(filter_options, Some(selected), Message::LogFilterChanged)
+            .text_size(12)
+            .padding([3, 8])
+            .style(style::picker)
+            .menu_style(style::picker_menu),
         button(text("Open folder").size(12))
             .padding([4, 10])
             .style(style::ghost)

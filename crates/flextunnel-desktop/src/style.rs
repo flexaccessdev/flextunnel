@@ -3,7 +3,8 @@
 //! light/dark mode (`Theme::extended_palette().is_dark`), so the stock
 //! palette colors never show through.
 
-use iced::widget::{button, checkbox, container, text_input, toggler};
+use iced::overlay::menu;
+use iced::widget::{button, checkbox, container, pick_list, text_input, toggler};
 use iced::{border, Border, Color, Shadow, Theme, Vector};
 
 /// Status colors, readable on both modes.
@@ -261,6 +262,44 @@ pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
         placeholder: t.faint,
         value: t.text,
         selection: t.accent.scale_alpha(0.35),
+    }
+}
+
+/// Dropdown field (the Logs pane's profile filter), matching `input`.
+pub fn picker(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
+    let t = tokens(theme);
+    let open = matches!(status, pick_list::Status::Opened { .. });
+    pick_list::Style {
+        text_color: t.text,
+        placeholder_color: t.faint,
+        handle_color: t.dim,
+        background: t.surface_hi.into(),
+        border: Border {
+            color: if open { t.accent } else { t.border },
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+    }
+}
+
+/// The dropdown's overlay menu, matching the card surfaces.
+pub fn picker_menu(theme: &Theme) -> menu::Style {
+    let t = tokens(theme);
+    menu::Style {
+        background: t.surface.into(),
+        border: Border {
+            color: t.border,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        text_color: t.text,
+        selected_text_color: t.on_accent,
+        selected_background: t.accent.into(),
+        shadow: Shadow {
+            color: Color::BLACK.scale_alpha(0.2),
+            offset: Vector::new(0.0, 2.0),
+            blur_radius: 6.0,
+        },
     }
 }
 

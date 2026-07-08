@@ -67,9 +67,13 @@ pub enum Message {
     FormSave,
     FormCancel,
     // Logs
+    LogFilterChanged(String),
     OpenLogFolder,
     CopyLogs,
 }
+
+/// Sentinel option shown in the Logs pane's profile filter.
+pub const LOG_FILTER_ALL: &str = "All profiles";
 
 /// Human description of what already occupies a local port, across every
 /// profile — profiles can run concurrently, so all local ports share one
@@ -463,8 +467,11 @@ pub struct App {
     /// that profile's pushed domains/CIDRs change.
     pub routed_caches: HashMap<ProfileId, view::RoutedCache>,
     log_revision: u64,
-    /// The in-memory log ring joined for the Logs pane, refreshed on revision
-    /// change only.
+    /// Logs-pane profile filter: only lines from that profile's session
+    /// threads (`[tunnel-<name>]`); `None` shows everything.
+    pub log_filter: Option<String>,
+    /// The in-memory log ring, filtered and joined for the Logs pane;
+    /// rebuilt on revision or filter change only.
     pub log_text: String,
     clipboard: Option<arboard::Clipboard>,
     /// Refreshed by [`App::refresh`] on every tick, rendered by `view`.
@@ -501,7 +508,9 @@ impl App {
             notice: None,
             forward_errors: HashMap::new(),
             routed_caches: HashMap::new(),
-            log_revision: 0,
+            // MAX so the first refresh always builds the log text.
+            log_revision: u64::MAX,
+            log_filter: None,
             log_text: String::new(),
             clipboard: None,
             snapshots: HashMap::new(),
@@ -747,6 +756,11 @@ impl App {
                 self.forward_form = None;
                 Task::none()
             }
+            Message::LogFilterChanged(value) => {
+                self.log_filter = (value != LOG_FILTER_ALL).then_some(value);
+                self.rebuild_log_text();
+                Task::none()
+            }
             Message::OpenLogFolder => {
                 open_log_folder();
                 Task::none()
@@ -820,6 +834,10 @@ impl App {
         self.routed_caches.remove(&id);
         self.snapshots.remove(&id);
         self.forward_form = None;
+        if self.log_filter.as_deref() == Some(removed.name.as_str()) {
+            self.log_filter = None;
+            self.rebuild_log_text();
+        }
         self.persist_profiles();
         if self.selection == Selection::Profile(id) {
             self.selection = self
@@ -889,9 +907,9 @@ impl App {
         }
 
         let revision = logging::revision();
-        if revision != self.log_revision || self.log_text.is_empty() {
+        if revision != self.log_revision {
             self.log_revision = revision;
-            self.log_text = logging::recent_lines().join("\n");
+            self.rebuild_log_text();
         }
 
         if let Some(tray) = &mut self.tray {
@@ -915,8 +933,19 @@ impl App {
         let running = self.snapshots.get(&id).is_some_and(|s| {
             matches!(s.phase, Phase::Connecting | Phase::Connected | Phase::Reconnecting)
         });
-        match self.profiles.iter_mut().find(|p| p.id == id) {
-            Some(slot) => *slot = profile,
+        match self.profiles.iter().position(|p| p.id == id) {
+            Some(pos) => {
+                // Follow a rename with the log filter (new lines carry the
+                // new thread name; old lines keep matching by text only).
+                let filter_renamed = self.log_filter.as_deref()
+                    == Some(self.profiles[pos].name.as_str())
+                    && self.profiles[pos].name != profile.name;
+                if filter_renamed {
+                    self.log_filter = Some(profile.name.clone());
+                    self.rebuild_log_text();
+                }
+                self.profiles[pos] = profile;
+            }
             None => self.profiles.push(profile),
         }
         self.persist_profiles();
@@ -963,6 +992,24 @@ impl App {
             self.controller
                 .set_forwards(profile_id, profile.forwards.clone());
         }
+    }
+
+    /// Re-join the log ring for the Logs pane, keeping only the filtered
+    /// profile's session-thread lines (`[tunnel-<name>]`) when a filter is on.
+    fn rebuild_log_text(&mut self) {
+        let lines = logging::recent_lines();
+        self.log_text = match &self.log_filter {
+            Some(name) => {
+                let tag = format!("[tunnel-{name}]");
+                lines
+                    .iter()
+                    .filter(|line| line.contains(&tag))
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            None => lines.join("\n"),
+        };
     }
 
     fn persist_profiles(&mut self) {
