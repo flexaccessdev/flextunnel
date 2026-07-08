@@ -1,7 +1,7 @@
 //! System tray icon + menu. Created and mutated only on the main thread (from
-//! the egui update loop); the tray-icon event handlers installed in `App::new`
-//! merely forward events and wake the UI, since they may fire off the main
-//! thread.
+//! the iced update loop); the tray-icon event handlers installed by the tray
+//! subscription merely forward events and wake the runtime, since they may
+//! fire off the main thread.
 
 use crate::icon::{self, TrayState};
 use crate::tunnel::Phase;
