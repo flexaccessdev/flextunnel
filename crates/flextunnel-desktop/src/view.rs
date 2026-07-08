@@ -486,10 +486,9 @@ fn forward_card<'a>(
     let status = snapshot.forwards.iter().find(|s| s.id == forward.id);
     let (pill_text, pill_color) = forward_pill(forward, status, snapshot.phase);
 
-    let mut name = text(forward.display_name()).size(14).font(semibold());
-    if !forward.enabled {
-        name = name.style(style::dim_text);
-    }
+    // The name stays prominent even while stopped — the pill and the switch
+    // carry the state.
+    let name = text(forward.display_name()).size(14).font(semibold());
 
     let mut title = row![name, pill(pill_text, pill_color)]
         .spacing(8)
@@ -690,7 +689,7 @@ fn section_label(label: impl Into<String>) -> Element<'static, Message> {
     text(label.into())
         .size(11)
         .font(semibold())
-        .style(style::faint_text)
+        .style(style::dim_text)
         .into()
 }
 
