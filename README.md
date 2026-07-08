@@ -142,31 +142,22 @@ xattr -cr /Applications/flextunnel.app
 
 Alternatively, right-click the app and choose **Open** the first time.
 
-**Windows:** two separate warnings can appear, with different causes:
+**Windows:** SmartScreen's *"Windows protected your PC"* warning is triggered by
+the Mark of the Web (the `Zone.Identifier` stream), which — like macOS
+quarantine — is set by browsers but not by command-line tools. Avoid it the same
+way: download with `curl.exe` (bundled in Windows 10+) or PowerShell instead of a
+browser. Replace `vX.Y.Z` with the release tag from the Releases page:
 
-- *SmartScreen "Windows protected your PC"* is triggered by the Mark of the Web
-  (the `Zone.Identifier` stream), which — like macOS quarantine — is set by
-  browsers but not by command-line tools. Avoid it the same way: download with
-  `curl.exe` (bundled in Windows 10+) or PowerShell instead of a browser. Replace
-  `vX.Y.Z` with the release tag from the Releases page:
+```powershell
+curl.exe -L -o flextunnel-desktop.msi `
+  https://github.com/andrewtheguy/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-windows-amd64.msi
+# or: Invoke-WebRequest -OutFile flextunnel-desktop.msi `
+#   https://github.com/andrewtheguy/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-windows-amd64.msi
+```
 
-  ```powershell
-  curl.exe -L -o flextunnel-desktop.msi `
-    https://github.com/andrewtheguy/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-windows-amd64.msi
-  # or: Invoke-WebRequest -OutFile flextunnel-desktop.msi `
-  #   https://github.com/andrewtheguy/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-windows-amd64.msi
-  ```
-
-  If you already downloaded via a browser, strip the mark instead:
-  `Unblock-File .\flextunnel-desktop-windows-amd64.msi` (or right-click →
-  Properties → **Unblock**). Otherwise click **More info → Run anyway**.
-
-- *The UAC "unknown publisher" elevation prompt* comes from the MSI being
-  unsigned, **not** from the Mark of the Web — removing the mark does not
-  suppress it, and there is no user-side workaround. It only goes away with
-  Authenticode code signing (an EV certificate earns SmartScreen reputation
-  immediately; a standard certificate accrues it over time). Building from
-  source, as above, avoids the MSI entirely.
+If you already downloaded via a browser, strip the mark instead:
+`Unblock-File .\flextunnel-desktop-windows-amd64.msi` (or right-click →
+Properties → **Unblock**). Otherwise click **More info → Run anyway**.
 
 ## Build from source
 
