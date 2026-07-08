@@ -2,6 +2,11 @@
 //! Embeds `flextunnel-core` directly — no FFI layer — and drives a single
 //! Status/Settings/Logs window plus a system tray icon. v1 scope: establish
 //! the local SOCKS5 (and optional HTTP) proxy; connect is always manual.
+//!
+//! Built on iced's daemon runtime: the process keeps running with no window
+//! open (the tray owns the lifecycle), the window is opened at launch and
+//! re-opened from the tray, and closing it just destroys the window while all
+//! state lives on in [`app::App`].
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
@@ -12,8 +17,9 @@ mod icon;
 mod logging;
 mod tray;
 mod tunnel;
+mod view;
 
-fn main() -> eframe::Result {
+fn main() -> iced::Result {
     logging::init();
     flextunnel_core::app::log_version(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     flextunnel_core::app::raise_fd_limit();
@@ -21,30 +27,8 @@ fn main() -> eframe::Result {
         log::error!("No system keychain available; settings cannot be loaded or saved");
     }
 
-    let controller = tunnel::Controller::start();
-
-    #[allow(unused_mut)]
-    let mut options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("flextunnel")
-            .with_inner_size([460.0, 580.0])
-            .with_min_inner_size([400.0, 440.0])
-            .with_icon(app::window_icon()),
-        ..Default::default()
-    };
-    // Menu-bar app: no Dock icon, no app switcher entry. The window still
-    // shows/hides from the tray menu.
-    #[cfg(target_os = "macos")]
-    {
-        use egui_winit::winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
-        options.event_loop_builder = Some(Box::new(|builder| {
-            builder.with_activation_policy(ActivationPolicy::Accessory);
-        }));
-    }
-
-    eframe::run_native(
-        "flextunnel",
-        options,
-        Box::new(|cc| Ok(Box::new(app::App::new(cc, controller)))),
-    )
+    iced::daemon(app::App::boot, app::App::update, app::App::view)
+        .title(app::App::title)
+        .subscription(app::App::subscription)
+        .run()
 }

@@ -1,8 +1,10 @@
-//! The egui application: a Status / Settings / Logs tabbed window that hides
-//! (rather than exits) on close, driven alongside the system tray. Tray and
-//! menu events are forwarded from tray-icon's handlers into channels and
-//! drained here at the top of every frame; the handlers also request a repaint
-//! so a tray click wakes the loop immediately even while the window is hidden.
+//! The iced daemon state machine: a Status / Forwards / Settings / Logs tabbed
+//! window driven alongside the system tray. The daemon owns all state, so
+//! closing the window (which destroys it) loses nothing — the tray re-opens
+//! it on demand. Tray/menu events are forwarded from tray-icon's handlers into
+//! a channel drained by a [`Subscription`], so a tray click wakes the runtime
+//! even while no window exists; a 500 ms tick keeps the snapshot and the tray
+//! state fresh the rest of the time.
 
 use crate::config::{self, AppConfig};
 use crate::forward::{self, ForwardState, ForwardStatus, PortForward};
@@ -10,90 +12,68 @@ use crate::icon;
 use crate::logging;
 use crate::tray::{self, Tray};
 use crate::tunnel::{Controller, Phase, Snapshot};
-use eframe::egui::{self, Color32, RichText, TextEdit, TextStyle, ViewportCommand};
-use flextunnel_core::proxy::signaling::Target;
-use flextunnel_core::proxy::{reserved, AgentConnState, RoutedSet, TunnelRoutes};
+use crate::view;
+use iced::futures::Stream;
+use iced::{window, Element, Size, Subscription, Task};
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::mpsc::{Receiver, channel};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tray_icon::menu::MenuEvent;
 use tray_icon::TrayIconEvent;
 
-const GREEN: Color32 = Color32::from_rgb(60, 180, 90);
-const AMBER: Color32 = Color32::from_rgb(230, 160, 30);
-const RED: Color32 = Color32::from_rgb(220, 70, 70);
-
-/// Animated enable/disable switch (egui's canonical toggle shape), green when
-/// on — the per-forward control, replacing a Start/Stop text button.
-fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
-    let desired_size = egui::vec2(34.0, 18.0);
-    let (rect, mut response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
-    if response.clicked() {
-        *on = !*on;
-        response.mark_changed();
-    }
-    response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, "")
-    });
-    if ui.is_rect_visible(rect) {
-        let how_on = ui.ctx().animate_bool_responsive(response.id, *on);
-        let visuals = ui.style().interact_selectable(&response, *on);
-        let rect = rect.expand(visuals.expansion);
-        let radius = 0.5 * rect.height();
-        let off_fill = ui.visuals().widgets.inactive.bg_fill;
-        ui.painter().rect(
-            rect,
-            radius,
-            off_fill.lerp_to_gamma(GREEN, how_on),
-            visuals.bg_stroke,
-            egui::StrokeKind::Inside,
-        );
-        let circle_x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), how_on);
-        ui.painter().circle(
-            egui::pos2(circle_x, rect.center().y),
-            0.75 * radius,
-            visuals.fg_stroke.color,
-            visuals.fg_stroke,
-        );
-    }
-    response
-}
-
-/// Small tinted pill badge ("tunneled", "direct", agent states).
-fn pill_label(ui: &mut egui::Ui, text: &str, color: Color32) {
-    egui::Frame::new()
-        .fill(color.gamma_multiply(0.16))
-        .corner_radius(8)
-        .inner_margin(egui::Margin::symmetric(6, 1))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).small().color(color));
-        });
-}
-
-/// Small filled status dot, vertically centered against the row text.
-fn status_dot(ui: &mut egui::Ui, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-    ui.painter().circle_filled(rect.center(), 4.0, color);
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Tab {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tab {
     Status,
     Forwards,
     Settings,
     Logs,
 }
 
+#[derive(Debug, Clone)]
+pub enum Message {
+    Tick,
+    SetupTray,
+    TrayMenu(String),
+    TrayIcon(TrayIconEvent),
+    WindowOpened,
+    WindowClosed(window::Id),
+    TabSelected(Tab),
+    Connect,
+    Disconnect,
+    CopyText(String),
+    // Settings form
+    ServerNodeIdChanged(String),
+    AuthTokenChanged(String),
+    SocksPortChanged(String),
+    HttpEnabledToggled(bool),
+    HttpPortChanged(String),
+    RelayUrlsChanged(String),
+    SaveSettings,
+    // Forwards
+    AddForward,
+    EditForward(usize),
+    DeleteForward(usize),
+    ToggleForward(usize, bool),
+    FormLabelChanged(String),
+    FormLocalPortChanged(String),
+    FormRemoteHostChanged(String),
+    FormRemotePortChanged(String),
+    FormEnabledToggled(bool),
+    FormSave,
+    FormCancel,
+    // Logs
+    OpenLogFolder,
+    CopyLogs,
+}
+
 /// Editable settings buffers, mirroring the iOS setup form's validation.
 #[derive(Default)]
-struct SettingsForm {
-    server_node_id: String,
-    auth_token: String,
-    socks_port: String,
-    http_enabled: bool,
-    http_port: String,
-    relay_urls: String,
+pub struct SettingsForm {
+    pub server_node_id: String,
+    pub auth_token: String,
+    pub socks_port: String,
+    pub http_enabled: bool,
+    pub http_port: String,
+    pub relay_urls: String,
 }
 
 impl SettingsForm {
@@ -111,7 +91,7 @@ impl SettingsForm {
         }
     }
 
-    fn validate(&self) -> Result<AppConfig, String> {
+    pub fn validate(&self) -> Result<AppConfig, String> {
         let server_node_id = self.server_node_id.trim();
         if server_node_id.is_empty() {
             return Err("Server node id is required".into());
@@ -204,13 +184,13 @@ fn validate_remote_host(input: &str) -> Result<String, String> {
 
 /// Editable add/edit buffers for one port forward, mirroring the iOS sheet.
 /// `editing_id` is `None` when adding.
-struct ForwardForm {
+pub struct ForwardForm {
     editing_id: Option<String>,
-    label: String,
-    local_port: String,
-    remote_host: String,
-    remote_port: String,
-    enabled: bool,
+    pub label: String,
+    pub local_port: String,
+    pub remote_host: String,
+    pub remote_port: String,
+    pub enabled: bool,
 }
 
 impl ForwardForm {
@@ -236,7 +216,7 @@ impl ForwardForm {
         }
     }
 
-    fn validate(
+    pub fn validate(
         &self,
         existing: &[PortForward],
         socks_port: u16,
@@ -275,37 +255,6 @@ impl ForwardForm {
     }
 }
 
-/// Everything is tunneled when the server pushes no routed set at all, a
-/// wildcard domain, or an all-covering CIDR (mirrors the iOS derivation).
-fn is_full_tunnel(routes: &TunnelRoutes) -> bool {
-    (routes.domains.is_empty() && routes.cidrs.is_empty())
-        || routes.domains.iter().any(|d| d == "*")
-        || routes.cidrs.iter().any(|c| c == "0.0.0.0/0" || c == "::/0")
-}
-
-/// Advisory tunneled/direct badge for a forward (`None` = hidden). Mirrors the
-/// core's routing decision — reserved hosts always tunnel, everything else per
-/// the routed set — but never gates traffic; the core decides for real per
-/// connection (like the iOS badge).
-fn forward_badge(
-    phase: Phase,
-    routes: &TunnelRoutes,
-    routed_set: Option<&RoutedSet>,
-    forward: &PortForward,
-) -> Option<bool> {
-    if phase != Phase::Connected {
-        return None;
-    }
-    if is_full_tunnel(routes) || reserved::is_reserved_host(&forward.remote_host) {
-        return Some(true);
-    }
-    let set = routed_set?;
-    Some(set.allows(&Target::Domain(
-        forward.remote_host.clone(),
-        forward.remote_port,
-    )))
-}
-
 /// Enable/disable semantics for the per-forward switch: a forward whose initial
 /// setup failed (its listener could not bind — e.g. the local port is in use)
 /// is flipped back off instead of sitting enabled-but-failed. `Failed` is only
@@ -330,35 +279,7 @@ fn disable_failed_forwards(
     disabled
 }
 
-/// One-line live status for a forward row (text, color) — the color also
-/// drives the row's status dot: gray "disabled"/"starts when connected",
-/// amber "starting…", green "listening (· N active)", red failure.
-fn forward_status_line(
-    forward: &PortForward,
-    status: Option<&ForwardStatus>,
-    phase: Phase,
-) -> (String, Color32) {
-    if !forward.enabled {
-        return ("disabled".into(), Color32::GRAY);
-    }
-    match status {
-        Some(status) => match &status.state {
-            ForwardState::Listening if status.active > 0 => {
-                (format!("listening · {} active", status.active), GREEN)
-            }
-            ForwardState::Listening => ("listening".into(), GREEN),
-            ForwardState::Failed(reason) => (reason.clone(), RED),
-        },
-        // No status = no running session for this forward. The Forwards tab's
-        // connection banner explains the disconnected case in one place.
-        None => match phase {
-            Phase::Idle | Phase::Failed => ("starts when connected".into(), Color32::GRAY),
-            _ => ("starting…".into(), AMBER),
-        },
-    }
-}
-
-fn format_duration(d: Duration) -> String {
+pub fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
     if h > 0 {
@@ -385,62 +306,62 @@ fn open_log_folder() {
     }
 }
 
+/// Menu-bar app: no Dock icon, no app switcher entry. winit applies the
+/// Regular policy during launch (overriding the bundle's LSUIElement), so this
+/// runs afterwards, from the first update.
+#[cfg(target_os = "macos")]
+fn set_accessory_policy() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+    match MainThreadMarker::new() {
+        Some(mtm) => {
+            NSApplication::sharedApplication(mtm)
+                .setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+        }
+        None => log::warn!("Not on the main thread; leaving the activation policy alone"),
+    }
+}
+
+fn window_settings() -> window::Settings {
+    let (rgba, width, height) = icon::window_icon_rgba(256);
+    window::Settings {
+        size: Size::new(460.0, 580.0),
+        min_size: Some(Size::new(400.0, 440.0)),
+        icon: window::icon::from_rgba(rgba, width, height).ok(),
+        ..window::Settings::default()
+    }
+}
+
 pub struct App {
     controller: Controller,
     tray: Option<Tray>,
-    menu_rx: Receiver<MenuEvent>,
-    tray_rx: Receiver<TrayIconEvent>,
-    tab: Tab,
-    form: SettingsForm,
-    saved: Option<AppConfig>,
-    settings_notice: Option<String>,
-    forwards: Vec<PortForward>,
-    forward_form: Option<ForwardForm>,
-    forwards_notice: Option<String>,
+    window: Option<window::Id>,
+    pub tab: Tab,
+    pub form: SettingsForm,
+    pub saved: Option<AppConfig>,
+    pub settings_notice: Option<String>,
+    pub forwards: Vec<PortForward>,
+    pub forward_form: Option<ForwardForm>,
+    pub forwards_notice: Option<String>,
     /// Setup-failure reason per forward id, retained after the failed forward
     /// is auto-stopped (see [`disable_failed_forwards`]) so the row can keep
     /// showing why; cleared when the forward is started again or removed.
-    forward_errors: HashMap<String, String>,
+    pub forward_errors: HashMap<String, String>,
     /// Advisory-badge cache: the `RoutedSet` rebuilt only when the pushed
     /// domains/CIDRs change (`None` inside means the set failed to parse).
-    routed_cache: Option<(Vec<String>, Vec<String>, Option<RoutedSet>)>,
+    pub routed_cache: view::RoutedCache,
     log_revision: u64,
-    log_lines: Vec<String>,
-    window_visible: bool,
-    quitting: bool,
+    /// The in-memory log ring joined for the Logs tab, refreshed on revision
+    /// change only.
+    pub log_text: String,
     clipboard: Option<arboard::Clipboard>,
-    /// Refreshed in `logic()` each frame, rendered by `ui()`.
-    snapshot: Snapshot,
+    /// Refreshed by [`App::refresh`] on every tick, rendered by `view`.
+    pub snapshot: Snapshot,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, controller: Controller) -> Self {
-        // Forward tray/menu events into channels drained in update(). The
-        // handlers replace tray-icon's default channel delivery, and the
-        // repaint request wakes the loop even while the window is hidden.
-        let (menu_tx, menu_rx) = channel();
-        let ctx = cc.egui_ctx.clone();
-        MenuEvent::set_event_handler(Some(move |event| {
-            let _ = menu_tx.send(event);
-            ctx.request_repaint();
-        }));
-        let (tray_tx, tray_rx) = channel();
-        let ctx = cc.egui_ctx.clone();
-        TrayIconEvent::set_event_handler(Some(move |event| {
-            let _ = tray_tx.send(event);
-            ctx.request_repaint();
-        }));
-
-        // Created here so it lands on the main thread with the event loop live
-        // (a macOS requirement). Kept for the app's lifetime — dropping the
-        // TrayIcon removes it from the tray.
-        let tray = match Tray::new() {
-            Ok(tray) => Some(tray),
-            Err(e) => {
-                log::error!("Failed to create the tray icon: {e:#}");
-                None
-            }
-        };
+    pub fn boot() -> (Self, Task<Message>) {
+        let controller = Controller::start();
 
         let saved = match config::load() {
             Ok(saved) => saved,
@@ -462,11 +383,10 @@ impl App {
         let forwards = forward::load();
         controller.set_forwards(forwards.clone());
 
-        Self {
+        let mut app = Self {
             controller,
-            tray,
-            menu_rx,
-            tray_rx,
+            tray: None,
+            window: None,
             tab,
             form,
             saved,
@@ -477,12 +397,350 @@ impl App {
             forward_errors: HashMap::new(),
             routed_cache: None,
             log_revision: 0,
-            log_lines: Vec::new(),
-            window_visible: true,
-            quitting: false,
+            log_text: String::new(),
             clipboard: None,
             snapshot: Snapshot::default(),
+        };
+        let open = app.open_window();
+        // The tray is created via a task so it lands on the main thread with
+        // the event loop already running (a macOS requirement).
+        (app, Task::batch([Task::done(Message::SetupTray), open]))
+    }
+
+    pub fn title(&self, _window: window::Id) -> String {
+        "flextunnel".into()
+    }
+
+    pub fn subscription(&self) -> Subscription<Message> {
+        Subscription::batch([
+            // Steady heartbeat so the snapshot and tray state stay fresh even
+            // while no window exists; tray events wake the runtime instantly.
+            iced::time::every(Duration::from_millis(500)).map(|_| Message::Tick),
+            window::close_events().map(Message::WindowClosed),
+            Subscription::run(tray_events),
+        ])
+    }
+
+    pub fn view(&self, _window: window::Id) -> Element<'_, Message> {
+        view::root(self)
+    }
+
+    pub fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Tick => {
+                self.refresh();
+                Task::none()
+            }
+            Message::SetupTray => {
+                #[cfg(target_os = "macos")]
+                set_accessory_policy();
+                match Tray::new() {
+                    Ok(tray) => self.tray = Some(tray),
+                    Err(e) => log::error!("Failed to create the tray icon: {e:#}"),
+                }
+                self.refresh();
+                Task::none()
+            }
+            Message::TrayMenu(id) => self.handle_menu_event(&id),
+            Message::TrayIcon(event) => {
+                // Windows convention: left click on the tray icon toggles the
+                // window. On macOS the left click opens the menu natively.
+                #[cfg(not(target_os = "macos"))]
+                if let TrayIconEvent::Click {
+                    button: tray_icon::MouseButton::Left,
+                    button_state: tray_icon::MouseButtonState::Up,
+                    ..
+                } = event
+                {
+                    return match self.window.take() {
+                        Some(id) => window::close(id),
+                        None => self.open_window(),
+                    };
+                }
+                let _ = event;
+                Task::none()
+            }
+            Message::WindowOpened => Task::none(),
+            Message::WindowClosed(id) => {
+                // Closing the window destroys it; the app lives on in the
+                // tray. Quit comes from the tray menu.
+                if self.window == Some(id) {
+                    self.window = None;
+                }
+                Task::none()
+            }
+            Message::TabSelected(tab) => {
+                self.tab = tab;
+                Task::none()
+            }
+            Message::Connect => self.connect(),
+            Message::Disconnect => {
+                self.controller.disconnect();
+                Task::none()
+            }
+            Message::CopyText(text) => {
+                self.copy_text(text);
+                Task::none()
+            }
+            Message::ServerNodeIdChanged(value) => {
+                self.form.server_node_id = value;
+                Task::none()
+            }
+            Message::AuthTokenChanged(value) => {
+                self.form.auth_token = value;
+                Task::none()
+            }
+            Message::SocksPortChanged(value) => {
+                self.form.socks_port = value;
+                Task::none()
+            }
+            Message::HttpEnabledToggled(enabled) => {
+                self.form.http_enabled = enabled;
+                Task::none()
+            }
+            Message::HttpPortChanged(value) => {
+                self.form.http_port = value;
+                Task::none()
+            }
+            Message::RelayUrlsChanged(value) => {
+                self.form.relay_urls = value;
+                Task::none()
+            }
+            Message::SaveSettings => {
+                self.save_settings();
+                Task::none()
+            }
+            Message::AddForward => {
+                self.forward_form = Some(ForwardForm::add());
+                Task::none()
+            }
+            Message::EditForward(i) => {
+                if let Some(forward) = self.forwards.get(i) {
+                    self.forward_form = Some(ForwardForm::edit(forward));
+                }
+                Task::none()
+            }
+            Message::DeleteForward(i) => {
+                if i < self.forwards.len() {
+                    let forward = self.forwards.remove(i);
+                    self.forward_errors.remove(&forward.id);
+                    self.commit_forwards();
+                }
+                Task::none()
+            }
+            Message::ToggleForward(i, enabled) => {
+                if let Some(forward) = self.forwards.get_mut(i) {
+                    // Desired state, but not a plain checkbox: enabling
+                    // attempts the setup now, and a setup failure snaps the
+                    // switch back off (see disable_failed_forwards).
+                    forward.enabled = enabled;
+                    let id = forward.id.clone();
+                    if enabled {
+                        // A fresh start attempt supersedes the old failure.
+                        self.forward_errors.remove(&id);
+                    }
+                    self.commit_forwards();
+                }
+                Task::none()
+            }
+            Message::FormLabelChanged(value) => {
+                if let Some(form) = &mut self.forward_form {
+                    form.label = value;
+                }
+                Task::none()
+            }
+            Message::FormLocalPortChanged(value) => {
+                if let Some(form) = &mut self.forward_form {
+                    form.local_port = value;
+                }
+                Task::none()
+            }
+            Message::FormRemoteHostChanged(value) => {
+                if let Some(form) = &mut self.forward_form {
+                    form.remote_host = value;
+                }
+                Task::none()
+            }
+            Message::FormRemotePortChanged(value) => {
+                if let Some(form) = &mut self.forward_form {
+                    form.remote_port = value;
+                }
+                Task::none()
+            }
+            Message::FormEnabledToggled(enabled) => {
+                if let Some(form) = &mut self.forward_form {
+                    form.enabled = enabled;
+                }
+                Task::none()
+            }
+            Message::FormSave => {
+                self.save_forward_form();
+                Task::none()
+            }
+            Message::FormCancel => {
+                self.forward_form = None;
+                Task::none()
+            }
+            Message::OpenLogFolder => {
+                open_log_folder();
+                Task::none()
+            }
+            Message::CopyLogs => {
+                let text = self.log_text.clone();
+                self.copy_text(text);
+                Task::none()
+            }
         }
+    }
+
+    /// The proxy ports the forward form validates against (defaults while
+    /// nothing is saved yet).
+    pub fn proxy_ports(&self) -> (u16, Option<u16>) {
+        let default = AppConfig::default();
+        let config = self.saved.as_ref().unwrap_or(&default);
+        (config.socks_port, config.http_port)
+    }
+
+    fn open_window(&mut self) -> Task<Message> {
+        let (id, open) = window::open(window_settings());
+        self.window = Some(id);
+        open.map(|_| Message::WindowOpened)
+    }
+
+    fn show_window(&mut self) -> Task<Message> {
+        match self.window {
+            Some(id) => window::gain_focus(id),
+            None => self.open_window(),
+        }
+    }
+
+    fn connect(&mut self) -> Task<Message> {
+        match &self.saved {
+            Some(config) => {
+                self.controller.connect(config.clone());
+                Task::none()
+            }
+            None => {
+                self.tab = Tab::Settings;
+                self.settings_notice = Some("Configure and save the connection first.".into());
+                self.show_window()
+            }
+        }
+    }
+
+    fn handle_menu_event(&mut self, id: &str) -> Task<Message> {
+        match id {
+            tray::MENU_CONNECT => self.connect(),
+            tray::MENU_DISCONNECT => {
+                self.controller.disconnect();
+                Task::none()
+            }
+            tray::MENU_COPY_SOCKS => {
+                if let Some(addr) = self.snapshot.socks_addr {
+                    self.copy_text(format!("socks5://{addr}"));
+                }
+                Task::none()
+            }
+            tray::MENU_OPEN => self.show_window(),
+            tray::MENU_QUIT => {
+                self.controller.shutdown();
+                iced::exit()
+            }
+            _ => Task::none(),
+        }
+    }
+
+    /// Poll the tunnel snapshot and derived state; runs on every tick and
+    /// after the tray is created.
+    fn refresh(&mut self) {
+        self.snapshot = self.controller.snapshot();
+
+        // Runs every tick (not just on the Forwards tab) so a forward whose
+        // setup failed snaps back to stopped promptly.
+        let failed = disable_failed_forwards(&mut self.forwards, &self.snapshot.forwards);
+        if !failed.is_empty() {
+            self.forward_errors.extend(failed);
+            self.commit_forwards();
+        }
+
+        view::refresh_routed_cache(&mut self.routed_cache, &self.snapshot.routes);
+
+        let revision = logging::revision();
+        if revision != self.log_revision || self.log_text.is_empty() {
+            self.log_revision = revision;
+            self.log_text = logging::recent_lines().join("\n");
+        }
+
+        if let Some(tray) = &mut self.tray {
+            tray.sync(self.snapshot.phase, self.saved.is_some(), self.snapshot.socks_addr);
+        }
+    }
+
+    fn save_settings(&mut self) {
+        let Ok(config) = self.form.validate() else {
+            return;
+        };
+        match config::save(&config) {
+            Ok(()) => {
+                let mut notice = if self.snapshot.phase == Phase::Idle {
+                    "Saved.".to_string()
+                } else {
+                    "Saved — reconnect to apply.".to_string()
+                };
+                // Soft warning only — the hard guard is the forward's bind
+                // failing visibly ("port N is in use").
+                if let Some(forward) = self.forwards.iter().find(|f| {
+                    f.enabled
+                        && (f.local_port == config.socks_port
+                            || Some(f.local_port) == config.http_port)
+                }) {
+                    notice.push_str(&format!(
+                        " Forward \"{}\" uses port {} and will fail to bind.",
+                        forward.display_name(),
+                        forward.local_port
+                    ));
+                }
+                self.saved = Some(config);
+                self.settings_notice = Some(notice);
+            }
+            Err(e) => {
+                log::error!("{e:#}");
+                self.settings_notice = Some(format!("{e:#}"));
+            }
+        }
+    }
+
+    fn save_forward_form(&mut self) {
+        let Some(form) = &self.forward_form else {
+            return;
+        };
+        let (socks_port, http_port) = self.proxy_ports();
+        let Ok(saved) = form.validate(&self.forwards, socks_port, http_port) else {
+            return;
+        };
+        if saved.enabled {
+            // The edit may fix what failed (e.g. a new local port); the fresh
+            // start attempt supersedes the old failure.
+            self.forward_errors.remove(&saved.id);
+        }
+        match self.forwards.iter_mut().find(|f| f.id == saved.id) {
+            Some(slot) => *slot = saved,
+            None => self.forwards.push(saved),
+        }
+        self.commit_forwards();
+        self.forward_form = None;
+    }
+
+    /// Persist the forward list and push it to the tunnel thread (live apply).
+    fn commit_forwards(&mut self) {
+        match forward::save(&self.forwards) {
+            Ok(()) => self.forwards_notice = None,
+            Err(e) => {
+                log::error!("Failed to save forwards: {e:#}");
+                self.forwards_notice = Some(format!("Failed to save forwards: {e:#}"));
+            }
+        }
+        self.controller.set_forwards(self.forwards.clone());
     }
 
     fn copy_text(&mut self, text: String) {
@@ -501,726 +759,31 @@ impl App {
             log::error!("Failed to copy to the clipboard: {e}");
         }
     }
-
-    fn set_window_visible(&mut self, ctx: &egui::Context, visible: bool) {
-        self.window_visible = visible;
-        ctx.send_viewport_cmd(ViewportCommand::Visible(visible));
-        if visible {
-            ctx.send_viewport_cmd(ViewportCommand::Focus);
-        }
-    }
-
-    fn connect(&mut self, ctx: &egui::Context) {
-        match &self.saved {
-            Some(config) => self.controller.connect(config.clone()),
-            None => {
-                self.tab = Tab::Settings;
-                self.settings_notice = Some("Configure and save the connection first.".into());
-                self.set_window_visible(ctx, true);
-            }
-        }
-    }
-
-    fn socks_proxy_string(snapshot: &Snapshot) -> Option<String> {
-        snapshot.socks_addr.map(|a| format!("socks5://{a}"))
-    }
-
-    fn handle_menu_event(&mut self, ctx: &egui::Context, id: &str, snapshot: &Snapshot) {
-        match id {
-            tray::MENU_CONNECT => self.connect(ctx),
-            tray::MENU_DISCONNECT => self.controller.disconnect(),
-            tray::MENU_COPY_SOCKS => {
-                if let Some(text) = Self::socks_proxy_string(snapshot) {
-                    self.copy_text(text);
-                }
-            }
-            tray::MENU_OPEN => self.set_window_visible(ctx, true),
-            tray::MENU_QUIT => {
-                self.quitting = true;
-                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(ViewportCommand::Close);
-            }
-            _ => {}
-        }
-    }
-
-    fn status_tab(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        let (color, heading) = match snapshot.phase {
-            Phase::Idle => (Color32::GRAY, "Disconnected"),
-            Phase::Connecting => (AMBER, "Connecting…"),
-            Phase::Connected => (GREEN, "Connected"),
-            Phase::Reconnecting => (AMBER, "Reconnecting…"),
-            Phase::Failed => (RED, "Connection failed"),
-        };
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-            ui.painter().circle_filled(rect.center(), 6.0, color);
-            ui.heading(heading);
-        });
-        if let Some(since) = snapshot.connected_since {
-            ui.label(format!("for {}", format_duration(since.elapsed())));
-        }
-        if let Some(error) = &snapshot.last_error {
-            ui.colored_label(RED, error);
-        }
-
-        ui.add_space(8.0);
-        match snapshot.phase {
-            Phase::Idle | Phase::Failed => {
-                let can_connect = self.saved.is_some();
-                if ui
-                    .add_enabled(can_connect, egui::Button::new("Connect"))
-                    .clicked()
-                {
-                    let ctx = ui.ctx().clone();
-                    self.connect(&ctx);
-                }
-                if !can_connect {
-                    ui.label("Save the connection settings first.");
-                }
-            }
-            _ => {
-                if ui.button("Disconnect").clicked() {
-                    self.controller.disconnect();
-                }
-            }
-        }
-
-        ui.add_space(8.0);
-        ui.separator();
-
-        let node_id = self
-            .saved
-            .as_ref()
-            .map(|c| c.server_node_id.clone())
-            .unwrap_or_default();
-        let socks = snapshot
-            .socks_addr
-            .or_else(|| {
-                self.saved
-                    .as_ref()
-                    .map(|c| SocketAddr::from(([127, 0, 0, 1], c.socks_port)))
-            })
-            .map(|a| a.to_string())
-            .unwrap_or_default();
-        let http = snapshot
-            .http_addr
-            .or_else(|| {
-                self.saved.as_ref().and_then(|c| {
-                    c.http_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p)))
-                })
-            })
-            .map(|a| a.to_string());
-
-        egui::Grid::new("status-grid")
-            .num_columns(3)
-            .spacing([12.0, 6.0])
-            .show(ui, |ui| {
-                ui.label("Server node id");
-                ui.monospace(if node_id.is_empty() { "—" } else { &node_id });
-                if !node_id.is_empty() && ui.small_button("copy").clicked() {
-                    self.copy_text(node_id.clone());
-                }
-                ui.end_row();
-
-                ui.label("SOCKS5 proxy");
-                ui.monospace(if socks.is_empty() { "—" } else { &socks });
-                if !socks.is_empty() && ui.small_button("copy").clicked() {
-                    self.copy_text(format!("socks5://{socks}"));
-                }
-                ui.end_row();
-
-                if let Some(http) = &http {
-                    ui.label("HTTP proxy");
-                    ui.monospace(http);
-                    if ui.small_button("copy").clicked() {
-                        self.copy_text(format!("http://{http}"));
-                    }
-                    ui.end_row();
-                }
-            });
-
-        if snapshot.phase == Phase::Connected {
-            ui.add_space(8.0);
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .id_salt("routes")
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    if is_full_tunnel(&snapshot.routes) {
-                        ui.label("Routing: everything through the tunnel");
-                    } else {
-                        ui.label(format!(
-                            "Split tunnel — {} domain(s), {} CIDR(s) routed through the server:",
-                            snapshot.routes.domains.len(),
-                            snapshot.routes.cidrs.len()
-                        ));
-                        for domain in &snapshot.routes.domains {
-                            ui.monospace(domain);
-                        }
-                        for cidr in &snapshot.routes.cidrs {
-                            ui.monospace(cidr);
-                        }
-                    }
-                    if !snapshot.routes.host_aliases.is_empty() {
-                        ui.add_space(8.0);
-                        ui.label(format!(
-                            "Host aliases — {} resolved server-side:",
-                            snapshot.routes.host_aliases.len()
-                        ));
-                        for (alias, target) in &snapshot.routes.host_aliases {
-                            ui.monospace(format!("{alias} → {target}"));
-                        }
-                    }
-                    if !snapshot.routes.agent_aliases.is_empty() {
-                        ui.add_space(8.0);
-                        ui.label(format!(
-                            "Agent routes — {} via agents:",
-                            snapshot.routes.agent_aliases.len()
-                        ));
-                        for (alias, state) in snapshot.routes.agent_states(Instant::now()) {
-                            let (label, color) = match state {
-                                AgentConnState::Connected => ("connected", GREEN),
-                                AgentConnState::Disconnected => ("disconnected", RED),
-                                AgentConnState::Unknown => ("unknown", egui::Color32::GRAY),
-                            };
-                            ui.horizontal(|ui| {
-                                ui.monospace(&alias);
-                                pill_label(ui, label, color);
-                            });
-                        }
-                    }
-                });
-        }
-    }
-
-    /// Persist the forward list and push it to the tunnel thread (live apply).
-    fn commit_forwards(&mut self) {
-        match forward::save(&self.forwards) {
-            Ok(()) => self.forwards_notice = None,
-            Err(e) => {
-                log::error!("Failed to save forwards: {e:#}");
-                self.forwards_notice = Some(format!("Failed to save forwards: {e:#}"));
-            }
-        }
-        self.controller.set_forwards(self.forwards.clone());
-    }
-
-    /// Rebuild the advisory-badge `RoutedSet` only when the pushed routes change.
-    fn refresh_routed_cache(&mut self, routes: &TunnelRoutes) {
-        let fresh = matches!(&self.routed_cache,
-            Some((domains, cidrs, _)) if *domains == routes.domains && *cidrs == routes.cidrs);
-        if !fresh {
-            let set = RoutedSet::new(&routes.domains, &routes.cidrs)
-                .inspect_err(|e| log::debug!("Routed set unusable for the badge: {e:#}"))
-                .ok();
-            self.routed_cache = Some((routes.domains.clone(), routes.cidrs.clone(), set));
-        }
-    }
-
-    /// One tinted banner explaining why forwards aren't live, with an inline
-    /// Connect button where that's the fix — instead of every row repeating it.
-    fn connection_banner(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        let (color, text, show_connect) = match snapshot.phase {
-            Phase::Connected => return,
-            Phase::Idle => (
-                AMBER,
-                "Not connected — forwards are inactive until you connect.",
-                true,
-            ),
-            Phase::Failed => (
-                RED,
-                "Connection failed — forwards are inactive until you reconnect.",
-                true,
-            ),
-            Phase::Connecting => (AMBER, "Connecting — forwards start automatically.", false),
-            Phase::Reconnecting => {
-                (AMBER, "Reconnecting — forwards resume automatically.", false)
-            }
-        };
-        egui::Frame::new()
-            .fill(color.gamma_multiply(0.12))
-            .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.5)))
-            .corner_radius(8)
-            .inner_margin(egui::Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    status_dot(ui, color);
-                    ui.label(RichText::new(text).small());
-                    if show_connect {
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui
-                                    .add_enabled(
-                                        self.saved.is_some(),
-                                        egui::Button::new("Connect").small(),
-                                    )
-                                    .clicked()
-                                {
-                                    let ctx = ui.ctx().clone();
-                                    self.connect(&ctx);
-                                }
-                            },
-                        );
-                    }
-                });
-            });
-        ui.add_space(8.0);
-    }
-
-    fn forwards_tab(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        self.refresh_routed_cache(&snapshot.routes);
-
-        self.connection_banner(ui, snapshot);
-
-        ui.horizontal(|ui| {
-            if ui.button("Add forward").clicked() {
-                self.forward_form = Some(ForwardForm::add());
-            }
-            if let Some(notice) = &self.forwards_notice {
-                ui.colored_label(AMBER, notice.clone());
-            }
-        });
-
-        // Inline add/edit form — one at a time; an inline group fits the small
-        // window better than a floating window.
-        let mut save: Option<PortForward> = None;
-        let mut close_form = false;
-        if let Some(form) = &mut self.forward_form {
-            let (socks_port, http_port) = {
-                let default = AppConfig::default();
-                let config = self.saved.as_ref().unwrap_or(&default);
-                (config.socks_port, config.http_port)
-            };
-            ui.add_space(6.0);
-            ui.group(|ui| {
-                egui::Grid::new("forward-form")
-                    .num_columns(2)
-                    .spacing([12.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label("Label");
-                        ui.add(
-                            TextEdit::singleline(&mut form.label)
-                                .hint_text("optional")
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.end_row();
-
-                        ui.label("Local port");
-                        ui.add(TextEdit::singleline(&mut form.local_port).desired_width(80.0));
-                        ui.end_row();
-
-                        ui.label("Remote host");
-                        ui.add(
-                            TextEdit::singleline(&mut form.remote_host)
-                                .hint_text("host or IP — resolved server-side")
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.end_row();
-
-                        ui.label("Remote port");
-                        ui.add(TextEdit::singleline(&mut form.remote_port).desired_width(80.0));
-                        ui.end_row();
-
-                        ui.label("Enabled");
-                        ui.checkbox(&mut form.enabled, "");
-                        ui.end_row();
-                    });
-                let validated = form.validate(&self.forwards, socks_port, http_port);
-                if let Err(message) = &validated {
-                    ui.colored_label(AMBER, message);
-                }
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(validated.is_ok(), egui::Button::new("Save"))
-                        .clicked()
-                    {
-                        save = validated.ok();
-                    }
-                    if ui.button("Cancel").clicked() {
-                        close_form = true;
-                    }
-                });
-            });
-        }
-        if let Some(saved) = save {
-            if saved.enabled {
-                // The edit may fix what failed (e.g. a new local port); the
-                // fresh start attempt supersedes the old failure.
-                self.forward_errors.remove(&saved.id);
-            }
-            match self.forwards.iter_mut().find(|f| f.id == saved.id) {
-                Some(slot) => *slot = saved,
-                None => self.forwards.push(saved),
-            }
-            self.commit_forwards();
-            close_form = true;
-        }
-        if close_form {
-            self.forward_form = None;
-        }
-
-        ui.add_space(8.0);
-        ui.separator();
-
-        if self.forwards.is_empty() {
-            ui.label(
-                RichText::new(
-                    "No port forwards. Add one to expose a remote service on localhost.",
-                )
-                .weak(),
-            );
-            return;
-        }
-
-        enum RowAction {
-            Toggle(usize, bool),
-            Edit(usize),
-            Delete(usize),
-        }
-        let mut action: Option<RowAction> = None;
-        let routed_set = self.routed_cache.as_ref().and_then(|(_, _, set)| set.as_ref());
-
-        egui::ScrollArea::vertical()
-            .id_salt("forwards")
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                for (i, forward) in self.forwards.iter().enumerate() {
-                    let status = snapshot.forwards.iter().find(|s| s.id == forward.id);
-                    let (text, color) = forward_status_line(forward, status, snapshot.phase);
-                    egui::Frame::group(ui.style())
-                        .fill(ui.visuals().faint_bg_color)
-                        .corner_radius(8)
-                        .inner_margin(egui::Margin::symmetric(10, 8))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                status_dot(ui, color);
-                                let name = RichText::new(forward.display_name()).strong();
-                                ui.label(if forward.enabled { name } else { name.weak() });
-                                if let Some(tunneled) = forward_badge(
-                                    snapshot.phase,
-                                    &snapshot.routes,
-                                    routed_set,
-                                    forward,
-                                ) {
-                                    let (text, color) = if tunneled {
-                                        ("tunneled", GREEN)
-                                    } else {
-                                        ("direct", AMBER)
-                                    };
-                                    pill_label(ui, text, color);
-                                }
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        // Desired state, but not a plain
-                                        // checkbox: enabling attempts the setup
-                                        // now, and a setup failure snaps the
-                                        // switch back off (see
-                                        // disable_failed_forwards).
-                                        let mut enabled = forward.enabled;
-                                        if toggle_switch(ui, &mut enabled)
-                                            .on_hover_text(if enabled {
-                                                "Disable this forward"
-                                            } else {
-                                                "Enable this forward"
-                                            })
-                                            .changed()
-                                        {
-                                            action = Some(RowAction::Toggle(i, enabled));
-                                        }
-                                    },
-                                );
-                            });
-                            let route =
-                                RichText::new(forward.route_description()).monospace();
-                            ui.label(if forward.enabled { route } else { route.weak() });
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(text).small().color(color));
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui.small_button("Delete").clicked() {
-                                            action = Some(RowAction::Delete(i));
-                                        }
-                                        if ui.small_button("Edit").clicked() {
-                                            action = Some(RowAction::Edit(i));
-                                        }
-                                    },
-                                );
-                            });
-                            // The setup failure that auto-disabled this forward,
-                            // kept visible until it is enabled again or removed.
-                            if let Some(reason) = self.forward_errors.get(&forward.id) {
-                                ui.label(RichText::new(reason.as_str()).small().color(RED));
-                            }
-                            if forward.enabled
-                                && let Some(error) =
-                                    status.and_then(|s| s.last_conn_error.as_deref())
-                            {
-                                ui.label(RichText::new(error).small().color(AMBER));
-                            }
-                        });
-                    ui.add_space(6.0);
-                }
-            });
-
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(
-                "Forwards listen on localhost only (127.0.0.1 and ::1) and relay through \
-                 this app's SOCKS5 proxy while connected.",
-            )
-            .small()
-            .weak(),
-        );
-
-        match action {
-            Some(RowAction::Toggle(i, enabled)) => {
-                if enabled {
-                    // A fresh start attempt supersedes the old failure.
-                    self.forward_errors.remove(&self.forwards[i].id);
-                }
-                self.forwards[i].enabled = enabled;
-                self.commit_forwards();
-            }
-            Some(RowAction::Edit(i)) => {
-                self.forward_form = Some(ForwardForm::edit(&self.forwards[i]));
-            }
-            Some(RowAction::Delete(i)) => {
-                self.forward_errors.remove(&self.forwards[i].id);
-                self.forwards.remove(i);
-                self.commit_forwards();
-            }
-            None => {}
-        }
-    }
-
-    fn settings_tab(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        egui::Grid::new("settings-grid")
-            .num_columns(2)
-            .spacing([12.0, 8.0])
-            .show(ui, |ui| {
-                ui.label("Server node id");
-                ui.add(
-                    TextEdit::singleline(&mut self.form.server_node_id)
-                        .desired_width(f32::INFINITY),
-                );
-                ui.end_row();
-
-                ui.label("Auth token");
-                ui.add(
-                    TextEdit::singleline(&mut self.form.auth_token)
-                        .password(true)
-                        .desired_width(240.0),
-                );
-                ui.end_row();
-
-                ui.label("SOCKS5 port");
-                ui.add(TextEdit::singleline(&mut self.form.socks_port).desired_width(80.0));
-                ui.end_row();
-
-                ui.label("HTTP proxy");
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.form.http_enabled, "enable");
-                    if self.form.http_enabled {
-                        ui.label("port");
-                        ui.add(
-                            TextEdit::singleline(&mut self.form.http_port).desired_width(80.0),
-                        );
-                    }
-                });
-                ui.end_row();
-
-                ui.label("Relay URLs");
-                ui.add(
-                    TextEdit::singleline(&mut self.form.relay_urls)
-                        .hint_text("comma-separated, optional")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.end_row();
-            });
-
-        ui.add_space(8.0);
-        let validated = self.form.validate();
-        let dirty = match (&validated, &self.saved) {
-            (Ok(candidate), Some(saved)) => candidate != saved,
-            (Ok(_), None) => true,
-            (Err(_), _) => false,
-        };
-        if let Err(message) = &validated {
-            ui.colored_label(AMBER, message);
-        }
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(validated.is_ok() && dirty, egui::Button::new("Save"))
-                .clicked()
-            {
-                let config = validated.as_ref().expect("validated").clone();
-                match config::save(&config) {
-                    Ok(()) => {
-                        let mut notice = if snapshot.phase == Phase::Idle {
-                            "Saved.".to_string()
-                        } else {
-                            "Saved — reconnect to apply.".to_string()
-                        };
-                        // Soft warning only — the hard guard is the forward's
-                        // bind failing visibly ("port N is in use").
-                        if let Some(forward) = self.forwards.iter().find(|f| {
-                            f.enabled
-                                && (f.local_port == config.socks_port
-                                    || Some(f.local_port) == config.http_port)
-                        }) {
-                            notice.push_str(&format!(
-                                " Forward \"{}\" uses port {} and will fail to bind.",
-                                forward.display_name(),
-                                forward.local_port
-                            ));
-                        }
-                        self.saved = Some(config);
-                        self.settings_notice = Some(notice);
-                    }
-                    Err(e) => {
-                        log::error!("{e:#}");
-                        self.settings_notice = Some(format!("{e:#}"));
-                    }
-                }
-            }
-            if let Some(notice) = &self.settings_notice {
-                ui.label(notice.clone());
-            }
-        });
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new("Stored as a single item in the system keychain.")
-                .small()
-                .weak(),
-        );
-    }
-
-    fn logs_tab(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui.button("Open log folder").clicked() {
-                open_log_folder();
-            }
-            if ui.button("Copy all").clicked() {
-                self.copy_text(self.log_lines.join("\n"));
-            }
-        });
-        ui.separator();
-
-        let revision = logging::revision();
-        if revision != self.log_revision || self.log_lines.is_empty() {
-            self.log_revision = revision;
-            self.log_lines = logging::recent_lines();
-        }
-        let row_height = ui.text_style_height(&TextStyle::Monospace);
-        egui::ScrollArea::both()
-            .stick_to_bottom(true)
-            .auto_shrink([false, false])
-            // `show_rows` measures content width from only the visible rows, so
-            // as lines of differing widths scroll past the bottom the horizontal
-            // bar would flicker on/off, stealing vertical space and making the
-            // stuck-to-bottom view jump. Always reserving both bars keeps the
-            // viewport height stable.
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-            .show_rows(ui, row_height, self.log_lines.len(), |ui, range| {
-                for line in &self.log_lines[range] {
-                    ui.label(RichText::new(line).monospace());
-                }
-            });
-    }
 }
 
-impl eframe::App for App {
-    // Runs before every `ui()` pass and also on repaint requests while the
-    // window is hidden — which is what keeps tray clicks and the tray state
-    // live when no window is showing.
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.snapshot = self.controller.snapshot();
-        let snapshot = self.snapshot.clone();
+/// Forward tray/menu events into the runtime. The handlers replace tray-icon's
+/// default channel delivery; sending through the subscription channel wakes
+/// the event loop even while no window exists. Runs (and installs the
+/// handlers) once for the daemon's lifetime.
+fn tray_events() -> impl Stream<Item = Message> {
+    iced::stream::channel(32, async move |mut output| {
+        use iced::futures::channel::mpsc;
+        use iced::futures::{SinkExt, StreamExt};
 
-        // Runs every frame (not just on the Forwards tab) so a forward whose
-        // setup failed snaps back to stopped promptly.
-        let failed = disable_failed_forwards(&mut self.forwards, &snapshot.forwards);
-        if !failed.is_empty() {
-            self.forward_errors.extend(failed);
-            self.commit_forwards();
-        }
-
-        while let Ok(event) = self.tray_rx.try_recv() {
-            // Windows convention: left click on the tray icon toggles the
-            // window. On macOS the left click opens the menu natively.
-            #[cfg(not(target_os = "macos"))]
-            if let TrayIconEvent::Click {
-                button: tray_icon::MouseButton::Left,
-                button_state: tray_icon::MouseButtonState::Up,
-                ..
-            } = event
-            {
-                let visible = !self.window_visible;
-                self.set_window_visible(ctx, visible);
+        let (tx, mut rx) = mpsc::unbounded();
+        let menu_tx = tx.clone();
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            let _ = menu_tx.unbounded_send(Message::TrayMenu(event.id().as_ref().to_owned()));
+        }));
+        TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+            let _ = tx.unbounded_send(Message::TrayIcon(event));
+        }));
+        while let Some(message) = rx.next().await {
+            if output.send(message).await.is_err() {
+                return;
             }
-            let _ = event;
         }
-        let menu_events: Vec<MenuEvent> = self.menu_rx.try_iter().collect();
-        for event in menu_events {
-            self.handle_menu_event(ctx, event.id().as_ref(), &snapshot);
-        }
-
-        if let Some(tray) = &mut self.tray {
-            tray.sync(snapshot.phase, self.saved.is_some(), snapshot.socks_addr);
-        }
-
-        // Closing the window hides it; the app lives in the tray. Quit comes
-        // from the tray menu.
-        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            self.set_window_visible(ctx, false);
-        }
-
-        // Steady heartbeat so the tray state stays fresh while the window is
-        // hidden; tray handlers additionally wake the loop instantly.
-        ctx.request_repaint_after(Duration::from_millis(500));
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let snapshot = self.snapshot.clone();
-        egui::Panel::top("tabs").show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Status, "Status");
-                ui.selectable_value(&mut self.tab, Tab::Forwards, "Forwards");
-                ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
-                ui.selectable_value(&mut self.tab, Tab::Logs, "Logs");
-            });
-            ui.add_space(2.0);
-        });
-        egui::CentralPanel::default().show(ui, |ui| match self.tab {
-            Tab::Status => self.status_tab(ui, &snapshot),
-            Tab::Forwards => self.forwards_tab(ui, &snapshot),
-            Tab::Settings => self.settings_tab(ui, &snapshot),
-            Tab::Logs => self.logs_tab(ui),
-        });
-    }
-
-    fn on_exit(&mut self) {
-        self.controller.shutdown();
-    }
-}
-
-/// The window icon (full-color badge, matching the iOS light appearance).
-pub fn window_icon() -> egui::IconData {
-    let (rgba, width, height) = icon::window_icon_rgba(256);
-    egui::IconData {
-        rgba,
-        width,
-        height,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1400,20 +963,6 @@ mod tests {
         let mut form = valid_form();
         form.server_node_id = "  ".into();
         assert!(form.validate().is_err());
-    }
-
-    #[test]
-    fn full_tunnel_derivation() {
-        use flextunnel_core::proxy::TunnelRoutes;
-        let mut routes = TunnelRoutes::default();
-        assert!(is_full_tunnel(&routes));
-        routes.domains = vec!["example.com".into()];
-        assert!(!is_full_tunnel(&routes));
-        routes.domains.push("*".into());
-        assert!(is_full_tunnel(&routes));
-        routes.domains = vec!["example.com".into()];
-        routes.cidrs = vec!["0.0.0.0/0".into()];
-        assert!(is_full_tunnel(&routes));
     }
 
     #[test]
