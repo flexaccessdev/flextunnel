@@ -128,10 +128,16 @@ set `com.apple.quarantine` on downloads, but command-line tools like `curl` and
 # replace vX.Y.Z with the release tag from the Releases page
 curl -L -o flextunnel-desktop.app.zip \
   https://github.com/andrewtheguy/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-macos-arm64.app.zip
-# or: wget -O flextunnel-desktop.app.zip \
-#   https://github.com/andrewtheguy/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-macos-arm64.app.zip
-unzip flextunnel-desktop.app.zip -d /Applications
 ```
+
+Then in Finder: double-click the `.zip` to expand it, drag `flextunnel.app`
+into `/Applications`, and choose **Replace** if an older copy is already there.
+
+> **macOS zsh note:** the shell snippets in this README include `#` comment
+> lines. zsh (the macOS default shell) treats `#` as a comment on an
+> interactive prompt only after `setopt interactivecomments`; without it,
+> pasting a `#` line reports `command not found`. Run `setopt interactivecomments`
+> once per session, or just omit the comment lines when pasting.
 
 If you already downloaded via a browser, remove the quarantine attribute after
 unzipping (e.g. into `/Applications`) instead:
