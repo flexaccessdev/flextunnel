@@ -194,6 +194,10 @@ pub struct ForwardForm {
 }
 
 impl ForwardForm {
+    pub fn is_edit(&self) -> bool {
+        self.editing_id.is_some()
+    }
+
     fn add() -> Self {
         Self {
             editing_id: None,
@@ -325,8 +329,8 @@ fn set_accessory_policy() {
 fn window_settings() -> window::Settings {
     let (rgba, width, height) = icon::window_icon_rgba(256);
     window::Settings {
-        size: Size::new(460.0, 580.0),
-        min_size: Some(Size::new(400.0, 440.0)),
+        size: Size::new(500.0, 640.0),
+        min_size: Some(Size::new(430.0, 500.0)),
         icon: window::icon::from_rgba(rgba, width, height).ok(),
         ..window::Settings::default()
     }
@@ -409,6 +413,10 @@ impl App {
 
     pub fn title(&self, _window: window::Id) -> String {
         "flextunnel".into()
+    }
+
+    pub fn style(&self, theme: &iced::Theme) -> iced::theme::Style {
+        crate::style::app(theme)
     }
 
     pub fn subscription(&self) -> Subscription<Message> {

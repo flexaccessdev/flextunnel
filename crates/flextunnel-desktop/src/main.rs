@@ -15,6 +15,7 @@ mod config;
 mod forward;
 mod icon;
 mod logging;
+mod style;
 mod tray;
 mod tunnel;
 mod view;
@@ -29,6 +30,7 @@ fn main() -> iced::Result {
 
     iced::daemon(app::App::boot, app::App::update, app::App::view)
         .title(app::App::title)
+        .style(app::App::style)
         .subscription(app::App::subscription)
         .run()
 }

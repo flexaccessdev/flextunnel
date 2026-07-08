@@ -1,23 +1,20 @@
 //! Widget tree for the single Status / Forwards / Settings / Logs window,
 //! rendered from [`App`] state — all pure functions of `&App`, every mutation
-//! flows back through a [`Message`].
+//! flows back through a [`Message`]. The look (cards, pills, ghost buttons,
+//! segmented tabs) comes from the design system in [`crate::style`].
 
 use crate::app::{format_duration, App, ForwardForm, Message, Tab};
 use crate::forward::{ForwardState, ForwardStatus, PortForward};
+use crate::style::{self, AMBER, GRAY, GREEN, RED};
 use crate::tunnel::{Phase, Snapshot};
 use flextunnel_core::proxy::signaling::Target;
 use flextunnel_core::proxy::{reserved, AgentConnState, RoutedSet, TunnelRoutes};
 use iced::widget::{
-    button, checkbox, column, container, row, rule, scrollable, space, text, text_input, toggler,
+    button, checkbox, column, container, row, scrollable, space, text, text_input, toggler,
 };
-use iced::{border, Border, Center, Color, Element, Fill, Font, Theme};
+use iced::{Center, Color, Element, Fill, Font};
 use std::net::SocketAddr;
 use std::time::Instant;
-
-pub const GREEN: Color = Color::from_rgb(60.0 / 255.0, 180.0 / 255.0, 90.0 / 255.0);
-pub const AMBER: Color = Color::from_rgb(230.0 / 255.0, 160.0 / 255.0, 30.0 / 255.0);
-pub const RED: Color = Color::from_rgb(220.0 / 255.0, 70.0 / 255.0, 70.0 / 255.0);
-pub const GRAY: Color = Color::from_rgb(160.0 / 255.0, 160.0 / 255.0, 160.0 / 255.0);
 
 /// Advisory-badge cache: the `RoutedSet` rebuilt only when the pushed
 /// domains/CIDRs change (`None` inside means the set failed to parse).
@@ -66,29 +63,28 @@ fn forward_badge(
     )))
 }
 
-/// One-line live status for a forward row (text, color) — the color also
-/// drives the row's status dot: gray "disabled"/"starts when connected",
-/// amber "starting…", green "listening (· N active)", red failure.
-fn forward_status_line(
+/// Live state pill for a forward row: gray "stopped", amber "starting…",
+/// green "listening (· N)", red "failed" (the reason shows under the route).
+fn forward_pill(
     forward: &PortForward,
     status: Option<&ForwardStatus>,
     phase: Phase,
 ) -> (String, Color) {
     if !forward.enabled {
-        return ("disabled".into(), GRAY);
+        return ("stopped".into(), GRAY);
     }
     match status {
         Some(status) => match &status.state {
             ForwardState::Listening if status.active > 0 => {
-                (format!("listening · {} active", status.active), GREEN)
+                (format!("listening · {}", status.active), GREEN)
             }
             ForwardState::Listening => ("listening".into(), GREEN),
-            ForwardState::Failed(reason) => (reason.clone(), RED),
+            ForwardState::Failed(_) => ("failed".into(), RED),
         },
         // No status = no running session for this forward. The Forwards tab's
         // connection banner explains the disconnected case in one place.
         None => match phase {
-            Phase::Idle | Phase::Failed => ("starts when connected".into(), GRAY),
+            Phase::Idle | Phase::Failed => ("stopped".into(), GRAY),
             _ => ("starting…".into(), AMBER),
         },
     }
@@ -101,7 +97,7 @@ pub fn root(app: &App) -> Element<'_, Message> {
         tab_button("Settings", Tab::Settings, app.tab),
         tab_button("Logs", Tab::Logs, app.tab),
     ]
-    .spacing(6);
+    .spacing(4);
 
     let content = match app.tab {
         Tab::Status => status_tab(app),
@@ -110,20 +106,20 @@ pub fn root(app: &App) -> Element<'_, Message> {
         Tab::Logs => logs_tab(app),
     };
 
-    column![
-        container(tabs).padding([8, 12]),
-        container(content).padding([4, 12]).width(Fill).height(Fill),
-    ]
-    .into()
+    container(column![tabs, content].spacing(14))
+        .padding(16)
+        .width(Fill)
+        .height(Fill)
+        .into()
 }
 
 fn tab_button(label: &'static str, tab: Tab, current: Tab) -> Element<'static, Message> {
-    button(text(label).size(13))
-        .padding([4, 10])
+    button(text(label).size(13).font(semibold()))
+        .padding([5, 12])
         .style(if tab == current {
-            button::primary
+            style::tinted
         } else {
-            button::text
+            style::ghost
         })
         .on_press(Message::TabSelected(tab))
         .into()
@@ -139,35 +135,47 @@ fn status_tab(app: &App) -> Element<'_, Message> {
         Phase::Failed => (RED, "Connection failed"),
     };
 
-    let mut col = column![
-        row![dot(color, 12.0), text(heading).size(22)]
-            .spacing(8)
-            .align_y(Center),
-    ]
-    .spacing(6);
-
+    let mut hero = row![dot(color, 12.0), text(heading).size(20).font(semibold())]
+        .spacing(10)
+        .align_y(Center);
     if let Some(since) = snapshot.connected_since {
-        col = col.push(text(format!("for {}", format_duration(since.elapsed()))).size(13));
+        hero = hero.push(
+            text(format!("for {}", format_duration(since.elapsed())))
+                .size(13)
+                .style(style::dim_text),
+        );
     }
+
+    let mut col = column![hero].spacing(12);
+
     if let Some(error) = &snapshot.last_error {
-        col = col.push(text(error.as_str()).size(13).color(RED));
+        col = col.push(text(error.as_str()).size(12).color(RED));
     }
 
     col = match snapshot.phase {
         Phase::Idle | Phase::Failed => {
             let mut col = col.push(
-                button(text("Connect").size(14))
-                    .on_press_maybe(app.saved.is_some().then_some(Message::Connect)),
+                row![button(text("Connect").size(13).font(semibold()))
+                    .padding([7, 16])
+                    .style(style::primary)
+                    .on_press_maybe(app.saved.is_some().then_some(Message::Connect))],
             );
             if app.saved.is_none() {
-                col = col.push(text("Save the connection settings first.").size(13));
+                col = col.push(
+                    text("Save the connection settings first.")
+                        .size(12)
+                        .style(style::faint_text),
+                );
             }
             col
         }
-        _ => col.push(button(text("Disconnect").size(14)).on_press(Message::Disconnect)),
+        _ => col.push(
+            row![button(text("Disconnect").size(13))
+                .padding([7, 16])
+                .style(style::outlined)
+                .on_press(Message::Disconnect)],
+        ),
     };
-
-    col = col.push(rule::horizontal(1));
 
     let node_id = app
         .saved
@@ -193,17 +201,29 @@ fn status_tab(app: &App) -> Element<'_, Message> {
         .map(|a| a.to_string());
 
     let copy_node = (!node_id.is_empty()).then(|| node_id.clone());
-    col = col.push(info_row("Server node id", node_id, copy_node));
     let copy_socks = (!socks.is_empty()).then(|| format!("socks5://{socks}"));
-    col = col.push(info_row("SOCKS5 proxy", socks, copy_socks));
+    let mut info = column![
+        info_row("Server node id", node_id, copy_node),
+        info_row("SOCKS5 proxy", socks, copy_socks),
+    ]
+    .spacing(8);
     if let Some(http) = http {
         let copy = Some(format!("http://{http}"));
-        col = col.push(info_row("HTTP proxy", http, copy));
+        info = info.push(info_row("HTTP proxy", http, copy));
     }
 
+    col = col.push(section_label("CONNECTION"));
+    col = col.push(container(info).padding([12, 14]).width(Fill).style(style::card));
+
     if snapshot.phase == Phase::Connected {
-        col = col.push(rule::horizontal(1));
-        col = col.push(routes_section(snapshot));
+        col = col.push(section_label("ROUTING"));
+        col = col.push(
+            container(scrollable(routes_section(snapshot)).width(Fill).height(Fill))
+                .padding([12, 14])
+                .width(Fill)
+                .height(Fill)
+                .style(style::card),
+        );
     }
 
     col.into()
@@ -212,22 +232,28 @@ fn status_tab(app: &App) -> Element<'_, Message> {
 fn info_row(label: &'static str, value: String, copy: Option<String>) -> Element<'static, Message> {
     let display = if value.is_empty() { "—".into() } else { value };
     let mut r = row![
-        text(label).size(13).width(110),
-        text(display).size(13).font(Font::MONOSPACE),
+        text(label).size(12).style(style::dim_text).width(110),
+        text(display).size(12).font(Font::MONOSPACE),
     ]
-    .spacing(12)
+    .spacing(10)
     .align_y(Center);
     if let Some(copy) = copy {
-        r = r.push(small_button("copy", Message::CopyText(copy)));
+        r = r.push(space().width(Fill));
+        r = r.push(
+            button(text("Copy").size(11))
+                .padding([2, 8])
+                .style(style::ghost)
+                .on_press(Message::CopyText(copy)),
+        );
     }
     r.into()
 }
 
 fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
     let routes = &snapshot.routes;
-    let mut col = column![].spacing(2);
+    let mut col = column![].spacing(3);
     if is_full_tunnel(routes) {
-        col = col.push(text("Routing: everything through the tunnel").size(13));
+        col = col.push(text("Everything through the tunnel").size(12));
     } else {
         col = col.push(
             text(format!(
@@ -235,7 +261,7 @@ fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
                 routes.domains.len(),
                 routes.cidrs.len()
             ))
-            .size(13),
+            .size(12),
         );
         for domain in &routes.domains {
             col = col.push(mono(domain.as_str()));
@@ -251,7 +277,7 @@ fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
                 "Host aliases — {} resolved server-side:",
                 routes.host_aliases.len()
             ))
-            .size(13),
+            .size(12),
         );
         for (alias, target) in &routes.host_aliases {
             col = col.push(mono(format!("{alias} → {target}")));
@@ -264,7 +290,7 @@ fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
                 "Agent routes — {} via agents:",
                 routes.agent_aliases.len()
             ))
-            .size(13),
+            .size(12),
         );
         for (alias, state) in routes.agent_states(Instant::now()) {
             let (label, color) = match state {
@@ -272,10 +298,14 @@ fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
                 AgentConnState::Disconnected => ("disconnected", RED),
                 AgentConnState::Unknown => ("unknown", GRAY),
             };
-            col = col.push(row![mono(alias), pill(label, color)].spacing(8).align_y(Center));
+            col = col.push(
+                row![mono(alias), pill(label.to_string(), color)]
+                    .spacing(8)
+                    .align_y(Center),
+            );
         }
     }
-    scrollable(col).height(Fill).into()
+    col.into()
 }
 
 /// One tinted banner explaining why forwards aren't live, with an inline
@@ -296,71 +326,79 @@ fn connection_banner(app: &App) -> Option<Element<'_, Message>> {
         Phase::Connecting => (AMBER, "Connecting — forwards start automatically.", false),
         Phase::Reconnecting => (AMBER, "Reconnecting — forwards resume automatically.", false),
     };
-    let mut r = row![dot(color, 10.0), text(message).size(12)]
+    let mut r = row![dot(color, 8.0), text(message).size(12)]
         .spacing(8)
         .align_y(Center);
     if show_connect {
         r = r.push(space().width(Fill));
         r = r.push(
-            button(text("Connect").size(11))
-                .padding([2, 8])
+            button(text("Connect").size(11).font(semibold()))
+                .padding([3, 10])
+                .style(style::tinted)
                 .on_press_maybe(app.saved.is_some().then_some(Message::Connect)),
         );
     }
     Some(
         container(r)
-            .padding([8, 10])
+            .padding([9, 12])
             .width(Fill)
-            .style(move |_theme: &Theme| container::Style {
-                background: Some(color.scale_alpha(0.12).into()),
-                border: Border {
-                    color: color.scale_alpha(0.5),
-                    width: 1.0,
-                    radius: 8.0.into(),
-                },
-                ..container::Style::default()
-            })
+            .style(style::banner(color))
             .into(),
     )
 }
 
 fn forwards_tab(app: &App) -> Element<'_, Message> {
-    let mut col = column![].spacing(8);
+    let mut col = column![].spacing(10);
     if let Some(banner) = connection_banner(app) {
         col = col.push(banner);
     }
 
-    let mut header = row![button(text("Add forward").size(13)).on_press(Message::AddForward)]
-        .spacing(8)
-        .align_y(Center);
-    if let Some(notice) = &app.forwards_notice {
-        header = header.push(text(notice.as_str()).size(12).color(AMBER));
-    }
+    let header = row![
+        section_label(if app.forwards.is_empty() {
+            "PORT FORWARDS".to_string()
+        } else {
+            format!("PORT FORWARDS · {}", app.forwards.len())
+        }),
+        space().width(Fill),
+        button(text("+ Add").size(12).font(semibold()))
+            .padding([4, 12])
+            .style(style::tinted)
+            .on_press(Message::AddForward),
+    ]
+    .align_y(Center);
     col = col.push(header);
 
-    // Inline add/edit form — one at a time; an inline group fits the small
+    if let Some(notice) = &app.forwards_notice {
+        col = col.push(text(notice.as_str()).size(12).color(AMBER));
+    }
+
+    // Inline add/edit form — one at a time; an inline card fits the small
     // window better than a separate window.
     if let Some(form) = &app.forward_form {
         col = col.push(forward_form_view(app, form));
     }
 
-    col = col.push(rule::horizontal(1));
-
     if app.forwards.is_empty() {
         col = col.push(
-            text("No port forwards. Add one to expose a remote service on localhost.")
-                .size(13)
-                .color(GRAY),
+            container(
+                text("No port forwards yet. Add one to expose a remote service on localhost.")
+                    .size(12)
+                    .style(style::dim_text),
+            )
+            .padding(24)
+            .width(Fill)
+            .align_x(Center)
+            .style(style::card),
         );
         return col.into();
     }
 
     let routed_set = app.routed_cache.as_ref().and_then(|(_, _, set)| set.as_ref());
-    let mut list = column![].spacing(6);
+    let mut list = column![].spacing(8);
     for (i, forward) in app.forwards.iter().enumerate() {
         list = list.push(forward_card(app, i, forward, routed_set));
     }
-    col = col.push(scrollable(list).height(Fill));
+    col = col.push(scrollable(list).height(Fill).spacing(4));
 
     col = col.push(
         text(
@@ -368,7 +406,7 @@ fn forwards_tab(app: &App) -> Element<'_, Message> {
              this app's SOCKS5 proxy while connected.",
         )
         .size(11)
-        .color(GRAY),
+        .style(style::faint_text),
     );
     col.into()
 }
@@ -378,57 +416,63 @@ fn forward_form_view<'a>(app: &'a App, form: &'a ForwardForm) -> Element<'a, Mes
     let validated = form.validate(&app.forwards, socks_port, http_port);
 
     let mut col = column![
+        text(if form.is_edit() {
+            "Edit forward"
+        } else {
+            "Add forward"
+        })
+        .size(13)
+        .font(semibold()),
         form_row(
             "Label",
-            text_input("optional", &form.label)
-                .on_input(Message::FormLabelChanged)
-                .size(13),
+            input("optional", &form.label, Message::FormLabelChanged),
         ),
         form_row(
             "Local port",
-            text_input("", &form.local_port)
-                .on_input(Message::FormLocalPortChanged)
-                .size(13)
-                .width(90),
+            input("", &form.local_port, Message::FormLocalPortChanged).width(90),
         ),
         form_row(
             "Remote host",
-            text_input("host or IP — resolved server-side", &form.remote_host)
-                .on_input(Message::FormRemoteHostChanged)
-                .size(13),
+            input(
+                "host or IP — resolved server-side",
+                &form.remote_host,
+                Message::FormRemoteHostChanged,
+            ),
         ),
         form_row(
             "Remote port",
-            text_input("", &form.remote_port)
-                .on_input(Message::FormRemotePortChanged)
-                .size(13)
-                .width(90),
+            input("", &form.remote_port, Message::FormRemotePortChanged).width(90),
         ),
         form_row(
             "Enabled",
-            checkbox(form.enabled).on_toggle(Message::FormEnabledToggled),
+            checkbox(form.enabled)
+                .on_toggle(Message::FormEnabledToggled)
+                .style(style::check),
         ),
     ]
-    .spacing(8);
+    .spacing(10);
 
     if let Err(message) = &validated {
         col = col.push(text(message.clone()).size(12).color(AMBER));
     }
     col = col.push(
         row![
-            button(text("Save").size(13))
+            button(text("Save").size(13).font(semibold()))
+                .padding([6, 16])
+                .style(style::primary)
                 .on_press_maybe(validated.is_ok().then_some(Message::FormSave)),
             button(text("Cancel").size(13))
-                .style(button::secondary)
+                .padding([6, 16])
+                .style(style::outlined)
                 .on_press(Message::FormCancel),
         ]
         .spacing(8),
     );
 
     container(col)
-        .padding(10)
+        .padding([12, 14])
         .width(Fill)
-        .style(group_style)
+        .style(style::card)
         .into()
 }
 
@@ -440,86 +484,85 @@ fn forward_card<'a>(
 ) -> Element<'a, Message> {
     let snapshot = &app.snapshot;
     let status = snapshot.forwards.iter().find(|s| s.id == forward.id);
-    let (status_text, status_color) = forward_status_line(forward, status, snapshot.phase);
+    let (pill_text, pill_color) = forward_pill(forward, status, snapshot.phase);
 
-    let mut name = text(forward.display_name()).size(14).font(bold());
+    let mut name = text(forward.display_name()).size(14).font(semibold());
     if !forward.enabled {
-        name = name.color(GRAY);
+        name = name.style(style::dim_text);
     }
 
-    let mut header = row![dot(status_color, 10.0), name].spacing(8).align_y(Center);
+    let mut title = row![name, pill(pill_text, pill_color)]
+        .spacing(8)
+        .align_y(Center);
     if let Some(tunneled) = forward_badge(snapshot.phase, &snapshot.routes, routed_set, forward) {
         let (badge, color) = if tunneled {
             ("tunneled", GREEN)
         } else {
             ("direct", AMBER)
         };
-        header = header.push(pill(badge, color));
+        title = title.push(pill(badge.to_string(), color));
     }
-    header = header.push(space().width(Fill));
-    // Desired state, but not a plain checkbox: enabling attempts the setup
-    // now, and a setup failure snaps the switch back off (see
-    // disable_failed_forwards).
-    header = header.push(
-        toggler(forward.enabled)
-            .on_toggle(move |enabled| Message::ToggleForward(i, enabled))
-            .size(18)
-            .style(green_toggler),
-    );
 
-    let mut route = text(forward.route_description())
+    let route = text(forward.route_description())
         .size(12)
-        .font(Font::MONOSPACE);
-    if !forward.enabled {
-        route = route.color(GRAY);
+        .font(Font::MONOSPACE)
+        .style(style::dim_text);
+
+    let mut info = column![title, route].spacing(5).width(Fill);
+    // A live bind failure (before the switch snaps back off), then the
+    // retained reason after the auto-disable, then per-connection errors.
+    if let Some(ForwardState::Failed(reason)) = status.map(|s| &s.state) {
+        info = info.push(text(reason.clone()).size(11).color(RED));
     }
-
-    let footer = row![
-        text(status_text).size(11).color(status_color),
-        space().width(Fill),
-        small_button("Edit", Message::EditForward(i)),
-        small_button("Delete", Message::DeleteForward(i)),
-    ]
-    .spacing(6)
-    .align_y(Center);
-
-    let mut card = column![header, route, footer].spacing(4);
-    // The setup failure that auto-disabled this forward, kept visible until
-    // it is enabled again or removed.
     if let Some(reason) = app.forward_errors.get(&forward.id) {
-        card = card.push(text(reason.as_str()).size(11).color(RED));
+        info = info.push(text(reason.as_str()).size(11).color(RED));
     }
     if forward.enabled
         && let Some(error) = status.and_then(|s| s.last_conn_error.as_deref())
     {
-        card = card.push(text(error).size(11).color(AMBER));
+        info = info.push(text(error).size(11).color(AMBER));
     }
 
-    container(card)
-        .padding([8, 10])
+    let controls = row![
+        button(text("Edit").size(12))
+            .padding([4, 10])
+            .style(style::ghost)
+            .on_press(Message::EditForward(i)),
+        button(text("Delete").size(12))
+            .padding([4, 10])
+            .style(style::ghost_danger)
+            .on_press(Message::DeleteForward(i)),
+        // Desired state, but not a plain checkbox: enabling attempts the
+        // setup now, and a setup failure snaps the switch back off (see
+        // disable_failed_forwards).
+        toggler(forward.enabled)
+            .on_toggle(move |enabled| Message::ToggleForward(i, enabled))
+            .size(20)
+            .style(style::switch),
+    ]
+    .spacing(4)
+    .align_y(Center);
+
+    container(row![info, controls].spacing(12).align_y(Center))
+        .padding([12, 14])
         .width(Fill)
-        .style(card_style)
+        .style(style::card)
         .into()
 }
 
 fn settings_tab(app: &App) -> Element<'_, Message> {
     let form = &app.form;
 
-    let mut http = row![
-        checkbox(form.http_enabled)
-            .label("enable")
-            .on_toggle(Message::HttpEnabledToggled)
-    ]
-        .spacing(8)
-        .align_y(Center);
+    let mut http = row![checkbox(form.http_enabled)
+        .label("enable")
+        .text_size(13)
+        .on_toggle(Message::HttpEnabledToggled)
+        .style(style::check)]
+    .spacing(10)
+    .align_y(Center);
     if form.http_enabled {
-        http = http.push(text("port").size(13));
-        http = http.push(
-            text_input("", &form.http_port)
-                .on_input(Message::HttpPortChanged)
-                .size(13)
-                .width(90),
-        );
+        http = http.push(text("port").size(12).style(style::dim_text));
+        http = http.push(input("", &form.http_port, Message::HttpPortChanged).width(90));
     }
 
     let validated = form.validate();
@@ -529,77 +572,92 @@ fn settings_tab(app: &App) -> Element<'_, Message> {
         (Err(_), _) => false,
     };
 
-    let mut col = column![
+    let mut card = column![
         form_row(
             "Server node id",
-            text_input("", &form.server_node_id)
-                .on_input(Message::ServerNodeIdChanged)
-                .size(13),
+            input("", &form.server_node_id, Message::ServerNodeIdChanged),
         ),
         form_row(
             "Auth token",
-            text_input("", &form.auth_token)
+            input("", &form.auth_token, Message::AuthTokenChanged)
                 .secure(true)
-                .on_input(Message::AuthTokenChanged)
-                .size(13)
                 .width(240),
         ),
         form_row(
             "SOCKS5 port",
-            text_input("", &form.socks_port)
-                .on_input(Message::SocksPortChanged)
-                .size(13)
-                .width(90),
+            input("", &form.socks_port, Message::SocksPortChanged).width(90),
         ),
         form_row("HTTP proxy", http),
         form_row(
             "Relay URLs",
-            text_input("comma-separated, optional", &form.relay_urls)
-                .on_input(Message::RelayUrlsChanged)
-                .size(13),
+            input(
+                "comma-separated, optional",
+                &form.relay_urls,
+                Message::RelayUrlsChanged,
+            ),
         ),
     ]
-    .spacing(8);
+    .spacing(10);
 
     if let Err(message) = &validated {
-        col = col.push(text(message.clone()).size(12).color(AMBER));
+        card = card.push(text(message.clone()).size(12).color(AMBER));
     }
-    let mut save_row = row![
-        button(text("Save").size(13))
-            .on_press_maybe((validated.is_ok() && dirty).then_some(Message::SaveSettings)),
-    ]
-    .spacing(8)
+    let mut save_row = row![button(text("Save").size(13).font(semibold()))
+        .padding([6, 16])
+        .style(style::primary)
+        .on_press_maybe((validated.is_ok() && dirty).then_some(Message::SaveSettings))]
+    .spacing(10)
     .align_y(Center);
     if let Some(notice) = &app.settings_notice {
-        save_row = save_row.push(text(notice.as_str()).size(12));
+        save_row = save_row.push(text(notice.as_str()).size(12).style(style::dim_text));
     }
-    col = col.push(save_row);
-    col = col.push(
+    card = card.push(save_row);
+
+    column![
+        section_label("CONNECTION SETTINGS"),
+        container(card).padding([12, 14]).width(Fill).style(style::card),
         text("Stored as a single item in the system keychain.")
             .size(11)
-            .color(GRAY),
-    );
-    col.into()
+            .style(style::faint_text),
+    ]
+    .spacing(10)
+    .into()
 }
 
 fn logs_tab(app: &App) -> Element<'_, Message> {
-    column![
-        row![
-            button(text("Open log folder").size(13)).on_press(Message::OpenLogFolder),
-            button(text("Copy all").size(13)).on_press(Message::CopyLogs),
-        ]
-        .spacing(8),
-        rule::horizontal(1),
-        scrollable(text(app.log_text.as_str()).size(11).font(Font::MONOSPACE))
-            .direction(scrollable::Direction::Both {
-                vertical: scrollable::Scrollbar::new(),
-                horizontal: scrollable::Scrollbar::new(),
-            })
-            .anchor_bottom()
-            .width(Fill)
-            .height(Fill),
+    let header = row![
+        section_label("LOGS".to_string()),
+        space().width(Fill),
+        button(text("Open folder").size(12))
+            .padding([4, 10])
+            .style(style::ghost)
+            .on_press(Message::OpenLogFolder),
+        button(text("Copy all").size(12))
+            .padding([4, 10])
+            .style(style::ghost)
+            .on_press(Message::CopyLogs),
     ]
-    .spacing(8)
+    .spacing(4)
+    .align_y(Center);
+
+    let log = scrollable(text(app.log_text.as_str()).size(11).font(Font::MONOSPACE))
+        .direction(scrollable::Direction::Both {
+            vertical: scrollable::Scrollbar::new(),
+            horizontal: scrollable::Scrollbar::new(),
+        })
+        .anchor_bottom()
+        .width(Fill)
+        .height(Fill);
+
+    column![
+        header,
+        container(log)
+            .padding([8, 10])
+            .width(Fill)
+            .height(Fill)
+            .style(style::card),
+    ]
+    .spacing(10)
     .into()
 }
 
@@ -607,17 +665,32 @@ fn form_row<'a>(
     label: &'static str,
     input: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    row![text(label).size(13).width(110), input.into()]
-        .spacing(12)
-        .align_y(Center)
-        .into()
+    row![
+        text(label).size(12).style(style::dim_text).width(100),
+        input.into(),
+    ]
+    .spacing(10)
+    .align_y(Center)
+    .into()
 }
 
-fn small_button(label: &'static str, message: Message) -> Element<'static, Message> {
-    button(text(label).size(11))
-        .padding([2, 8])
-        .style(button::secondary)
-        .on_press(message)
+fn input<'a>(
+    placeholder: &'a str,
+    value: &'a str,
+    on_input: fn(String) -> Message,
+) -> iced::widget::TextInput<'a, Message> {
+    text_input(placeholder, value)
+        .on_input(on_input)
+        .size(13)
+        .padding([6, 10])
+        .style(style::input)
+}
+
+fn section_label(label: impl Into<String>) -> Element<'static, Message> {
+    text(label.into())
+        .size(11)
+        .font(semibold())
+        .style(style::faint_text)
         .into()
 }
 
@@ -625,15 +698,11 @@ fn mono<'a>(fragment: impl text::IntoFragment<'a>) -> Element<'a, Message> {
     text(fragment).size(12).font(Font::MONOSPACE).into()
 }
 
-/// Small tinted pill badge ("tunneled", "direct", agent states).
-fn pill(label: &'static str, color: Color) -> Element<'static, Message> {
-    container(text(label).size(11).color(color))
-        .padding([1, 6])
-        .style(move |_theme: &Theme| container::Style {
-            background: Some(color.scale_alpha(0.16).into()),
-            border: border::rounded(8),
-            ..container::Style::default()
-        })
+/// Small tinted pill badge (forward state, "tunneled"/"direct", agent states).
+fn pill(label: impl Into<String>, color: Color) -> Element<'static, Message> {
+    container(text(label.into()).size(11).font(semibold()).color(color))
+        .padding([2, 8])
+        .style(style::pill(color))
         .into()
 }
 
@@ -642,53 +711,15 @@ fn dot(color: Color, size: f32) -> Element<'static, Message> {
     container(space())
         .width(size)
         .height(size)
-        .style(move |_theme: &Theme| container::Style {
-            background: Some(color.into()),
-            border: border::rounded(size / 2.0),
-            ..container::Style::default()
-        })
+        .style(style::dot(color))
         .into()
 }
 
-fn bold() -> Font {
+fn semibold() -> Font {
     Font {
-        weight: iced::font::Weight::Bold,
+        weight: iced::font::Weight::Semibold,
         ..Font::DEFAULT
     }
-}
-
-/// The forward cards' faint background.
-fn card_style(theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(theme.extended_palette().background.weak.color.into()),
-        border: border::rounded(8),
-        ..container::Style::default()
-    }
-}
-
-/// Bordered group for the inline add/edit form.
-fn group_style(theme: &Theme) -> container::Style {
-    container::Style {
-        border: Border {
-            color: theme.extended_palette().background.strong.color,
-            width: 1.0,
-            radius: 8.0.into(),
-        },
-        ..container::Style::default()
-    }
-}
-
-/// The per-forward switch, green when on (the app's "running" color) instead
-/// of the theme accent.
-fn green_toggler(theme: &Theme, status: toggler::Status) -> toggler::Style {
-    let mut style = toggler::default(theme, status);
-    if matches!(
-        status,
-        toggler::Status::Active { is_toggled: true } | toggler::Status::Hovered { is_toggled: true }
-    ) {
-        style.background = GREEN.into();
-    }
-    style
 }
 
 #[cfg(test)]
