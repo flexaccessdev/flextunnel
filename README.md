@@ -117,8 +117,24 @@ cargo build --release -p flextunnel-desktop
 Otherwise:
 
 **macOS:** because the app is not notarized, Gatekeeper quarantines the
-download and shows *"flextunnel" is damaged and can't be opened*. Remove the
-quarantine attribute after unzipping (e.g. into `/Applications`):
+download and shows *"flextunnel" is damaged and can't be opened*.
+
+The cleanest fix is to avoid the quarantine flag in the first place: browsers
+set `com.apple.quarantine` on downloads, but command-line tools like `curl` and
+`wget` do not. Download and unzip from the terminal instead (into
+`/Applications`):
+
+```sh
+# replace vX.Y.Z with the release tag from the Releases page
+curl -L -o flextunnel-desktop.app.zip \
+  https://github.com/andrewtheguy/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-macos-arm64.app.zip
+# or: wget -O flextunnel-desktop.app.zip \
+#   https://github.com/andrewtheguy/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-macos-arm64.app.zip
+unzip flextunnel-desktop.app.zip -d /Applications
+```
+
+If you already downloaded via a browser, remove the quarantine attribute after
+unzipping (e.g. into `/Applications`) instead:
 
 ```sh
 xattr -cr /Applications/flextunnel.app
