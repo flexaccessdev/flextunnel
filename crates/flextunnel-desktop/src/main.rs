@@ -1,7 +1,9 @@
 //! flextunnel-desktop: a tray GUI for the flextunnel client (macOS/Windows).
-//! Embeds `flextunnel-core` directly — no FFI layer — and drives a single
-//! Status/Settings/Logs window plus a system tray icon. v1 scope: establish
-//! the local SOCKS5 (and optional HTTP) proxy; connect is always manual.
+//! Embeds `flextunnel-core` directly — no FFI layer — and drives a
+//! profile-sidebar window plus a system tray icon. Each profile is its own
+//! client config and can run its own concurrent tunnel session with its own
+//! local SOCKS5 (and optional HTTP) proxy and port forwards; connect is
+//! always manual.
 //!
 //! Built on iced's daemon runtime: the process keeps running with no window
 //! open (the tray owns the lifecycle), the window is opened at launch and

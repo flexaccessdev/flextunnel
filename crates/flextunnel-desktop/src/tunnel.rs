@@ -1,17 +1,21 @@
 //! Background tunnel controller: a dedicated thread running a Tokio runtime,
-//! driven by UI commands, publishing a status snapshot the UI polls each
-//! frame. The `ProxyClient` future is owned by the session loop, so dropping
-//! it (disconnect/shutdown) tears down the accept loops and the connection
-//! manager together, followed by a graceful endpoint close.
+//! supervising one session task per connected profile, driven by UI commands
+//! and publishing per-profile status snapshots the UI polls each frame. Each
+//! session owns its `ProxyClient` future, so dropping it (disconnect/shutdown)
+//! tears down the accept loops and the connection manager together, followed
+//! by a graceful endpoint close.
 
-use crate::config::AppConfig;
+use crate::config::Profile;
 use crate::forward::{ForwardManager, ForwardStatus, PortForward};
 use flextunnel_core::proxy::{ClientConfig, ProxyClient, TunnelRoutes};
 use flextunnel_core::transport::endpoint::create_client_endpoint;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+pub type ProfileId = String;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
@@ -49,37 +53,67 @@ impl Default for Snapshot {
     }
 }
 
+impl Snapshot {
+    /// Shared idle snapshot for profiles that never ran a session, so views
+    /// can borrow a `&Snapshot` uniformly.
+    pub fn empty() -> &'static Snapshot {
+        static EMPTY: std::sync::OnceLock<Snapshot> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(Snapshot::default)
+    }
+}
+
 enum Command {
-    Connect(AppConfig),
+    Connect(Box<Profile>),
+    Disconnect(ProfileId),
+    /// Replace one profile's desired forward list (the UI sends the full list
+    /// after every add/edit/delete/toggle); applied live mid-session.
+    SetForwards(ProfileId, Vec<PortForward>),
+    /// Disconnect and drop the profile's snapshot slot (profile deleted).
+    RemoveProfile(ProfileId),
+    Shutdown,
+}
+
+enum SessionCmd {
     Disconnect,
-    /// Replace the desired forward list (the UI sends the full list at startup
-    /// and after every add/edit/delete/toggle); applied live mid-session.
     SetForwards(Vec<PortForward>),
     Shutdown,
 }
 
+type SharedSnapshots = Arc<Mutex<HashMap<ProfileId, Snapshot>>>;
+
+/// One profile's slot in the shared snapshot map, written by its session task.
+#[derive(Clone)]
+struct SnapshotSlot {
+    shared: SharedSnapshots,
+    id: ProfileId,
+}
+
+impl SnapshotSlot {
+    fn update<F: FnOnce(&mut Snapshot)>(&self, f: F) {
+        let mut map = match self.shared.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        f(map.entry(self.id.clone()).or_default());
+    }
+}
+
 pub struct Controller {
     tx: mpsc::Sender<Command>,
-    shared: Arc<Mutex<Snapshot>>,
+    shared: SharedSnapshots,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Controller {
     pub fn start() -> Self {
         let (tx, rx) = mpsc::channel(16);
-        let shared = Arc::new(Mutex::new(Snapshot::default()));
+        let shared: SharedSnapshots = Arc::new(Mutex::new(HashMap::new()));
         let worker_shared = shared.clone();
         let thread = std::thread::Builder::new()
             .name("tunnel".into())
             .spawn(move || match flextunnel_core::app::build_runtime() {
                 Ok(rt) => rt.block_on(run_loop(rx, worker_shared)),
-                Err(e) => {
-                    log::error!("Failed to build the Tokio runtime: {e:#}");
-                    update(&worker_shared, |s| {
-                        s.phase = Phase::Failed;
-                        s.last_error = Some(format!("Failed to start: {e:#}"));
-                    });
-                }
+                Err(e) => log::error!("Failed to build the Tokio runtime: {e:#}"),
             })
             .expect("spawn tunnel thread");
         Self {
@@ -89,27 +123,33 @@ impl Controller {
         }
     }
 
-    pub fn snapshot(&self) -> Snapshot {
+    pub fn snapshots(&self) -> HashMap<ProfileId, Snapshot> {
         self.shared
             .lock()
             .map(|s| s.clone())
             .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
     }
 
-    pub fn connect(&self, config: AppConfig) {
-        let _ = self.tx.blocking_send(Command::Connect(config));
+    pub fn connect(&self, profile: Profile) {
+        let _ = self.tx.blocking_send(Command::Connect(Box::new(profile)));
     }
 
-    pub fn disconnect(&self) {
-        let _ = self.tx.blocking_send(Command::Disconnect);
+    pub fn disconnect(&self, id: &str) {
+        let _ = self.tx.blocking_send(Command::Disconnect(id.into()));
     }
 
-    pub fn set_forwards(&self, forwards: Vec<PortForward>) {
-        let _ = self.tx.blocking_send(Command::SetForwards(forwards));
+    pub fn set_forwards(&self, id: &str, forwards: Vec<PortForward>) {
+        let _ = self
+            .tx
+            .blocking_send(Command::SetForwards(id.into(), forwards));
     }
 
-    /// Stop any session and join the worker thread (blocks briefly for the
-    /// graceful endpoint close).
+    pub fn remove_profile(&self, id: &str) {
+        let _ = self.tx.blocking_send(Command::RemoveProfile(id.into()));
+    }
+
+    /// Stop all sessions and join the worker thread (blocks briefly for the
+    /// bounded graceful endpoint closes).
     pub fn shutdown(&mut self) {
         let _ = self.tx.blocking_send(Command::Shutdown);
         if let Some(thread) = self.thread.take() {
@@ -130,53 +170,92 @@ async fn bind_local(addr: SocketAddr, label: &str) -> Result<tokio::net::TcpList
     })
 }
 
-fn update<F: FnOnce(&mut Snapshot)>(shared: &Arc<Mutex<Snapshot>>, f: F) {
-    let mut s = match shared.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    f(&mut s);
+struct SessionHandle {
+    tx: mpsc::Sender<SessionCmd>,
+    task: tokio::task::JoinHandle<()>,
 }
 
-/// Publish the manager's current per-forward statuses to the snapshot.
-fn refresh_forward_statuses(shared: &Arc<Mutex<Snapshot>>, fwd_mgr: &ForwardManager) {
-    let statuses = fwd_mgr.statuses();
-    update(shared, |s| s.forwards = statuses);
-}
-
-async fn run_loop(mut rx: mpsc::Receiver<Command>, shared: Arc<Mutex<Snapshot>>) {
-    let mut forwards: Vec<PortForward> = Vec::new();
-    while let Some(cmd) = rx.recv().await {
+/// Supervisor: routes profile-scoped commands to per-profile session tasks.
+async fn run_loop(mut rx: mpsc::Receiver<Command>, shared: SharedSnapshots) {
+    let mut sessions: HashMap<ProfileId, SessionHandle> = HashMap::new();
+    loop {
+        let cmd = rx.recv().await;
+        sessions.retain(|_, handle| !handle.task.is_finished());
         match cmd {
-            Command::Connect(config) => {
-                if run_session(config, &mut forwards, &mut rx, &shared).await
-                    == SessionExit::Shutdown
-                {
-                    return;
+            Some(Command::Connect(profile)) => {
+                if sessions.contains_key(&profile.id) {
+                    log::warn!("Profile \"{}\" is already running a session", profile.name);
+                    continue;
+                }
+                let (tx, session_rx) = mpsc::channel(8);
+                let slot = SnapshotSlot {
+                    shared: shared.clone(),
+                    id: profile.id.clone(),
+                };
+                let id = profile.id.clone();
+                let task = tokio::spawn(run_session(*profile, session_rx, slot));
+                sessions.insert(id, SessionHandle { tx, task });
+            }
+            Some(Command::Disconnect(id)) => {
+                if let Some(handle) = sessions.get(&id) {
+                    let _ = handle.tx.send(SessionCmd::Disconnect).await;
                 }
             }
-            Command::Disconnect => {}
-            Command::SetForwards(f) => forwards = f,
-            Command::Shutdown => return,
+            Some(Command::SetForwards(id, forwards)) => {
+                if let Some(handle) = sessions.get(&id) {
+                    let _ = handle.tx.send(SessionCmd::SetForwards(forwards)).await;
+                }
+                // No session: nothing to do — forwards travel inside the
+                // profile on the next Connect.
+            }
+            Some(Command::RemoveProfile(id)) => {
+                if let Some(handle) = sessions.remove(&id) {
+                    let _ = handle.tx.send(SessionCmd::Disconnect).await;
+                    // Drop the slot only after the session's final writes, or
+                    // they would recreate it.
+                    let shared = shared.clone();
+                    tokio::spawn(async move {
+                        let _ = handle.task.await;
+                        remove_slot(&shared, &id);
+                    });
+                } else {
+                    remove_slot(&shared, &id);
+                }
+            }
+            Some(Command::Shutdown) | None => break,
         }
+    }
+    // Bounded grace so quitting stays responsive: ask every session to stop,
+    // give the graceful endpoint closes a shared deadline, then return — the
+    // process is going away anyway.
+    for handle in sessions.values() {
+        let _ = handle.tx.send(SessionCmd::Shutdown).await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    for (_, handle) in sessions {
+        let _ = tokio::time::timeout_at(deadline, handle.task).await;
     }
 }
 
-#[derive(PartialEq, Eq)]
-enum SessionExit {
-    Ended,
-    Shutdown,
+fn remove_slot(shared: &SharedSnapshots, id: &str) {
+    let mut map = match shared.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    map.remove(id);
 }
 
-async fn run_session(
-    config: AppConfig,
-    forwards: &mut Vec<PortForward>,
-    rx: &mut mpsc::Receiver<Command>,
-    shared: &Arc<Mutex<Snapshot>>,
-) -> SessionExit {
-    let socks_addr = SocketAddr::from(([127, 0, 0, 1], config.socks_port));
-    let http_addr = config.http_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p)));
-    update(shared, |s| {
+/// Publish the manager's current per-forward statuses to the snapshot.
+fn refresh_forward_statuses(slot: &SnapshotSlot, fwd_mgr: &ForwardManager) {
+    let statuses = fwd_mgr.statuses();
+    slot.update(|s| s.forwards = statuses);
+}
+
+async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot: SnapshotSlot) {
+    let mut forwards = profile.forwards.clone();
+    let socks_addr = SocketAddr::from(([127, 0, 0, 1], profile.socks_port));
+    let http_addr = profile.http_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p)));
+    slot.update(|s| {
         *s = Snapshot {
             phase: Phase::Connecting,
             socks_addr: Some(socks_addr),
@@ -193,7 +272,7 @@ async fn run_session(
     // the CLI's run_client); on a stop the task finishes on its own and the
     // endpoint is closed gracefully.
     let mut create = tokio::spawn({
-        let relay_urls = config.relay_urls.clone();
+        let relay_urls = profile.relay_urls.clone();
         async move { create_client_endpoint(&relay_urls, None).await }
     });
     let endpoint = loop {
@@ -202,20 +281,17 @@ async fn run_session(
                 Ok(Ok(endpoint)) => break endpoint,
                 Ok(Err(e)) | Err(e) => {
                     log::error!("Failed to create the iroh endpoint: {e:#}");
-                    update(shared, |s| {
+                    slot.update(|s| {
                         s.phase = Phase::Failed;
                         s.last_error = Some(format!("{e:#}"));
                     });
-                    return SessionExit::Ended;
+                    return;
                 }
             },
             cmd = rx.recv() => match cmd {
-                Some(Command::Connect(_)) => {
-                    log::warn!("Already running a session; disconnect first");
-                }
-                Some(Command::Disconnect) => {
-                    log::info!("Disconnecting");
-                    update(shared, |s| s.phase = Phase::Idle);
+                Some(SessionCmd::Disconnect) => {
+                    log::info!("Disconnecting \"{}\"", profile.name);
+                    slot.update(|s| s.phase = Phase::Idle);
                     // Close the endpoint gracefully once creation finishes,
                     // without holding up the disconnect.
                     tokio::spawn(async move {
@@ -223,10 +299,10 @@ async fn run_session(
                             endpoint.close().await;
                         }
                     });
-                    return SessionExit::Ended;
+                    return;
                 }
-                Some(Command::SetForwards(f)) => *forwards = f,
-                Some(Command::Shutdown) | None => {
+                Some(SessionCmd::SetForwards(f)) => forwards = f,
+                Some(SessionCmd::Shutdown) | None => {
                     // Bounded grace so quitting stays responsive: close
                     // cleanly when creation finishes quickly, otherwise just
                     // exit — the process is going away anyway.
@@ -236,19 +312,23 @@ async fn run_session(
                         }
                     })
                     .await;
-                    return SessionExit::Shutdown;
+                    return;
                 }
             }
         }
     };
-    log::info!("flextunnel client node id: {}", endpoint.id());
+    log::info!(
+        "flextunnel client node id for \"{}\": {}",
+        profile.name,
+        endpoint.id()
+    );
 
     let client = ProxyClient::new(ClientConfig {
-        server_node_id: config.server_node_id.clone(),
-        auth_token: config.auth_token.clone(),
+        server_node_id: profile.server_node_id.clone(),
+        auth_token: profile.auth_token.clone(),
         socks_listen: socks_addr,
         http_listen: http_addr,
-        relay_urls: config.relay_urls.clone(),
+        relay_urls: profile.relay_urls.clone(),
         auto_reconnect: true,
         max_reconnect_attempts: None,
     });
@@ -271,40 +351,43 @@ async fn run_session(
         Ok(listeners) => listeners,
         Err(reason) => {
             log::error!("{reason}");
-            update(shared, |s| {
+            slot.update(|s| {
                 s.phase = Phase::Failed;
                 s.last_error = Some(reason);
             });
             endpoint.close().await;
-            return SessionExit::Ended;
+            return;
         }
     };
 
     // Forwards run for the whole session (including reconnect gaps — the SOCKS
     // listener above stays bound); they die with the manager when the session
     // ends.
-    let mut fwd_mgr =
-        ForwardManager::new(config.socks_port, config.server_node_id.as_str().into(), forwards);
+    let mut fwd_mgr = ForwardManager::new(
+        profile.socks_port,
+        profile.server_node_id.as_str().into(),
+        &forwards,
+    );
 
     let run = client.run_with_listeners(&endpoint, socks_listener, http_listener);
     tokio::pin!(run);
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     let mut ever_connected = false;
 
-    let exit = loop {
+    loop {
         tokio::select! {
             res = &mut run => {
                 match res {
-                    Ok(()) => update(shared, |s| s.phase = Phase::Idle),
+                    Ok(()) => slot.update(|s| s.phase = Phase::Idle),
                     Err(e) => {
                         log::error!("Client error: {e}");
-                        update(shared, |s| {
+                        slot.update(|s| {
                             s.phase = Phase::Failed;
                             s.last_error = Some(e.to_string());
                         });
                     }
                 }
-                break SessionExit::Ended;
+                break;
             }
             _ = ticker.tick() => {
                 let routes = routes
@@ -312,7 +395,7 @@ async fn run_session(
                     .map(|r| r.clone())
                     .unwrap_or_default();
                 ever_connected |= routes.connected;
-                update(shared, |s| {
+                slot.update(|s| {
                     if routes.connected {
                         if s.phase != Phase::Connected {
                             s.connected_since = Some(Instant::now());
@@ -328,26 +411,26 @@ async fn run_session(
                     }
                     s.routes = routes;
                 });
-                refresh_forward_statuses(shared, &fwd_mgr);
+                refresh_forward_statuses(&slot, &fwd_mgr);
             }
             cmd = rx.recv() => match cmd {
-                Some(Command::Disconnect) => {
-                    log::info!("Disconnecting");
-                    update(shared, |s| s.phase = Phase::Idle);
-                    break SessionExit::Ended;
+                Some(SessionCmd::Disconnect) => {
+                    log::info!("Disconnecting \"{}\"", profile.name);
+                    slot.update(|s| s.phase = Phase::Idle);
+                    break;
                 }
-                Some(Command::Connect(_)) => {
-                    log::warn!("Already running a session; disconnect first");
+                Some(SessionCmd::SetForwards(f)) => {
+                    forwards = f;
+                    fwd_mgr.apply(&forwards);
+                    refresh_forward_statuses(&slot, &fwd_mgr);
                 }
-                Some(Command::SetForwards(f)) => {
-                    *forwards = f;
-                    fwd_mgr.apply(forwards);
-                    refresh_forward_statuses(shared, &fwd_mgr);
+                Some(SessionCmd::Shutdown) | None => {
+                    slot.update(|s| s.phase = Phase::Idle);
+                    break;
                 }
-                Some(Command::Shutdown) | None => break SessionExit::Shutdown,
             }
         }
-    };
+    }
 
     // The select loop is done with `run`; dropping it cancels the client.
     // Tear the forward listeners down with the session so their rows read
@@ -356,10 +439,9 @@ async fn run_session(
     // under panic=abort).
     drop(fwd_mgr);
     endpoint.close().await;
-    update(shared, |s| {
+    slot.update(|s| {
         s.routes.connected = false;
         s.connected_since = None;
         s.forwards.clear();
     });
-    exit
 }

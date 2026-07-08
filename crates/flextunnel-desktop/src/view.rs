@@ -1,9 +1,10 @@
-//! Widget tree for the single Status / Forwards / Settings / Logs window,
-//! rendered from [`App`] state — all pure functions of `&App`, every mutation
-//! flows back through a [`Message`]. The look (cards, pills, ghost buttons,
-//! segmented tabs) comes from the design system in [`crate::style`].
+//! Widget tree for the profile-sidebar + detail-pane window, rendered from
+//! [`App`] state — all pure functions of `&App`, every mutation flows back
+//! through a [`Message`]. The look (cards, pills, ghost buttons, sidebar rows)
+//! comes from the design system in [`crate::style`].
 
-use crate::app::{format_duration, App, ForwardForm, Message, Tab};
+use crate::app::{format_duration, App, ForwardForm, Message, ProfileForm, Selection};
+use crate::config::Profile;
 use crate::forward::{ForwardState, ForwardStatus, PortForward};
 use crate::style::{self, AMBER, GRAY, GREEN, RED};
 use crate::tunnel::{Phase, Snapshot};
@@ -81,7 +82,7 @@ fn forward_pill(
             ForwardState::Listening => ("listening".into(), GREEN),
             ForwardState::Failed(_) => ("failed".into(), RED),
         },
-        // No status = no running session for this forward. The Forwards tab's
+        // No status = no running session for this forward. The profile's
         // connection banner explains the disconnected case in one place.
         None => match phase {
             Phase::Idle | Phase::Failed => ("stopped".into(), GRAY),
@@ -90,54 +91,186 @@ fn forward_pill(
     }
 }
 
+fn phase_color(phase: Phase) -> Color {
+    match phase {
+        Phase::Idle => GRAY,
+        Phase::Connecting | Phase::Reconnecting => AMBER,
+        Phase::Connected => GREEN,
+        Phase::Failed => RED,
+    }
+}
+
+fn phase_label(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Idle => "disconnected",
+        Phase::Connecting => "connecting…",
+        Phase::Connected => "connected",
+        Phase::Reconnecting => "reconnecting…",
+        Phase::Failed => "failed",
+    }
+}
+
 pub fn root(app: &App) -> Element<'_, Message> {
-    let tabs = row![
-        tab_button("Status", Tab::Status, app.tab),
-        tab_button("Forwards", Tab::Forwards, app.tab),
-        tab_button("Settings", Tab::Settings, app.tab),
-        tab_button("Logs", Tab::Logs, app.tab),
+    row![sidebar(app), detail_pane(app)].into()
+}
+
+// ---------------------------------------------------------------------------
+// Sidebar
+
+fn sidebar(app: &App) -> Element<'_, Message> {
+    let header = row![
+        section_label("PROFILES"),
+        space().width(Fill),
+        button(text("+").size(14).font(semibold()))
+            .padding([1, 9])
+            .style(style::tinted)
+            .on_press(Message::AddProfile),
     ]
-    .spacing(4);
+    .align_y(Center);
 
-    let content = match app.tab {
-        Tab::Status => status_tab(app),
-        Tab::Forwards => forwards_tab(app),
-        Tab::Settings => settings_tab(app),
-        Tab::Logs => logs_tab(app),
-    };
+    let mut list = column![].spacing(2);
+    for profile in &app.profiles {
+        list = list.push(sidebar_profile_row(app, profile));
+    }
 
-    container(column![tabs, content].spacing(14))
-        .padding(16)
+    let logs_selected = app.selection == Selection::Logs && app.profile_form.is_none();
+    let logs_row = button(text("Logs").size(13))
+        .padding([6, 10])
         .width(Fill)
-        .height(Fill)
-        .into()
+        .style(style::sidebar_row(logs_selected))
+        .on_press(Message::Select(Selection::Logs));
+
+    container(
+        column![
+            header,
+            scrollable(list).height(Fill).spacing(4),
+            logs_row,
+            text(concat!("v", env!("CARGO_PKG_VERSION")))
+                .size(10)
+                .style(style::faint_text),
+        ]
+        .spacing(10),
+    )
+    .padding([14, 12])
+    .width(210)
+    .height(Fill)
+    .style(style::sidebar)
+    .into()
 }
 
-fn tab_button(label: &'static str, tab: Tab, current: Tab) -> Element<'static, Message> {
-    button(text(label).size(13).font(semibold()))
-        .padding([5, 12])
-        .style(if tab == current {
-            style::tinted
-        } else {
-            style::ghost
+fn sidebar_profile_row<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message> {
+    let snapshot = app.snapshot_for(&profile.id);
+    let selected = app.selection == Selection::Profile(profile.id.clone())
+        && app.profile_form.is_none();
+
+    let title = row![
+        dot(phase_color(snapshot.phase), 8.0),
+        text(profile.name.as_str()).size(13).font(semibold()),
+    ]
+    .spacing(7)
+    .align_y(Center);
+
+    let running = profile
+        .forwards
+        .iter()
+        .filter(|f| {
+            f.enabled
+                && snapshot
+                    .forwards
+                    .iter()
+                    .any(|s| s.id == f.id && s.state == ForwardState::Listening)
         })
-        .on_press(Message::TabSelected(tab))
+        .count();
+    let mut counts = format!(
+        "{} forward{}",
+        profile.forwards.len(),
+        if profile.forwards.len() == 1 { "" } else { "s" }
+    );
+    if running > 0 {
+        counts.push_str(&format!(" · {running} running"));
+    }
+
+    let mut content = column![title].spacing(3);
+    content = content.push(
+        row![
+            space().width(15),
+            text(counts).size(11).style(if running > 0 {
+                |_: &iced::Theme| iced::widget::text::Style { color: Some(GREEN) }
+            } else {
+                style::faint_text
+            }),
+        ]
+        .align_y(Center),
+    );
+    for forward in &profile.forwards {
+        let status = snapshot.forwards.iter().find(|s| s.id == forward.id);
+        let (_, color) = forward_pill(forward, status, snapshot.phase);
+        content = content.push(
+            row![
+                space().width(15),
+                dot(color, 5.0),
+                text(forward.display_name()).size(11).style(style::dim_text),
+            ]
+            .spacing(6)
+            .align_y(Center),
+        );
+    }
+
+    button(content)
+        .padding([7, 10])
+        .width(Fill)
+        .style(style::sidebar_row(selected))
+        .on_press(Message::Select(Selection::Profile(profile.id.clone())))
         .into()
 }
 
-fn status_tab(app: &App) -> Element<'_, Message> {
-    let snapshot = &app.snapshot;
-    let (color, heading) = match snapshot.phase {
-        Phase::Idle => (GRAY, "Disconnected"),
-        Phase::Connecting => (AMBER, "Connecting…"),
-        Phase::Connected => (GREEN, "Connected"),
-        Phase::Reconnecting => (AMBER, "Reconnecting…"),
-        Phase::Failed => (RED, "Connection failed"),
-    };
+// ---------------------------------------------------------------------------
+// Detail pane
 
-    let mut hero = row![dot(color, 12.0), text(heading).size(20).font(semibold())]
-        .spacing(10)
-        .align_y(Center);
+fn detail_pane(app: &App) -> Element<'_, Message> {
+    let content: Element<'_, Message> = if let Some(form) = &app.profile_form {
+        profile_form_view(app, form)
+    } else {
+        match &app.selection {
+            Selection::Logs => logs_pane(app),
+            Selection::Profile(id) => match app.profile(id) {
+                Some(profile) => profile_detail(app, profile),
+                None => empty_state(),
+            },
+        }
+    };
+    container(content).padding(16).width(Fill).height(Fill).into()
+}
+
+fn empty_state() -> Element<'static, Message> {
+    container(
+        column![
+            text("No profiles yet.").size(14).style(style::dim_text),
+            button(text("+ Add profile").size(13).font(semibold()))
+                .padding([6, 14])
+                .style(style::tinted)
+                .on_press(Message::AddProfile),
+        ]
+        .spacing(12)
+        .align_x(Center),
+    )
+    .width(Fill)
+    .height(Fill)
+    .align_x(Center)
+    .align_y(Center)
+    .into()
+}
+
+fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message> {
+    let snapshot = app.snapshot_for(&profile.id);
+
+    let mut hero = row![
+        dot(phase_color(snapshot.phase), 12.0),
+        text(profile.name.as_str()).size(20).font(semibold()),
+        pill(phase_label(snapshot.phase).to_string(), phase_color(snapshot.phase)),
+    ]
+    .spacing(10)
+    .align_y(Center);
     if let Some(since) = snapshot.connected_since {
         hero = hero.push(
             text(format!("for {}", format_duration(since.elapsed())))
@@ -145,63 +278,47 @@ fn status_tab(app: &App) -> Element<'_, Message> {
                 .style(style::dim_text),
         );
     }
+    hero = hero.push(space().width(Fill));
+    hero = hero.push(match snapshot.phase {
+        Phase::Idle | Phase::Failed => button(text("Connect").size(13).font(semibold()))
+            .padding([7, 16])
+            .style(style::primary)
+            .on_press_maybe(profile.is_ready().then(|| Message::Connect(profile.id.clone()))),
+        _ => button(text("Disconnect").size(13))
+            .padding([7, 16])
+            .style(style::outlined)
+            .on_press(Message::Disconnect(profile.id.clone())),
+    });
 
     let mut col = column![hero].spacing(12);
 
+    if let Some(notice) = &app.notice {
+        col = col.push(text(notice.as_str()).size(12).style(style::dim_text));
+    }
     if let Some(error) = &snapshot.last_error {
         col = col.push(text(error.as_str()).size(12).color(RED));
     }
+    if !profile.is_ready() {
+        col = col.push(
+            text("The auth token is missing — edit the profile to re-enter it.")
+                .size(12)
+                .color(AMBER),
+        );
+    }
 
-    col = match snapshot.phase {
-        Phase::Idle | Phase::Failed => {
-            let mut col = col.push(
-                row![button(text("Connect").size(13).font(semibold()))
-                    .padding([7, 16])
-                    .style(style::primary)
-                    .on_press_maybe(app.saved.is_some().then_some(Message::Connect))],
-            );
-            if app.saved.is_none() {
-                col = col.push(
-                    text("Save the connection settings first.")
-                        .size(12)
-                        .style(style::faint_text),
-                );
-            }
-            col
-        }
-        _ => col.push(
-            row![button(text("Disconnect").size(13))
-                .padding([7, 16])
-                .style(style::outlined)
-                .on_press(Message::Disconnect)],
-        ),
-    };
-
-    let node_id = app
-        .saved
-        .as_ref()
-        .map(|c| c.server_node_id.clone())
-        .unwrap_or_default();
+    // CONNECTION card
+    let node_id = profile.server_node_id.clone();
     let socks = snapshot
         .socks_addr
-        .or_else(|| {
-            app.saved
-                .as_ref()
-                .map(|c| SocketAddr::from(([127, 0, 0, 1], c.socks_port)))
-        })
-        .map(|a| a.to_string())
-        .unwrap_or_default();
+        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], profile.socks_port)))
+        .to_string();
     let http = snapshot
         .http_addr
-        .or_else(|| {
-            app.saved
-                .as_ref()
-                .and_then(|c| c.http_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p))))
-        })
+        .or_else(|| profile.http_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p))))
         .map(|a| a.to_string());
 
     let copy_node = (!node_id.is_empty()).then(|| node_id.clone());
-    let copy_socks = (!socks.is_empty()).then(|| format!("socks5://{socks}"));
+    let copy_socks = Some(format!("socks5://{socks}"));
     let mut info = column![
         // The full id never fits (and iced has no ellipsis overflow); both
         // ends stay visible for eyeballing, Copy carries the whole thing.
@@ -214,106 +331,116 @@ fn status_tab(app: &App) -> Element<'_, Message> {
         info = info.push(info_row("HTTP proxy", http, copy));
     }
 
-    col = col.push(section_label("CONNECTION"));
+    col = col.push(
+        row![
+            section_label("CONNECTION"),
+            space().width(Fill),
+            button(text("Edit").size(12))
+                .padding([3, 10])
+                .style(style::ghost)
+                .on_press(Message::EditProfile(profile.id.clone())),
+        ]
+        .align_y(Center),
+    );
     col = col.push(container(info).padding([12, 14]).width(Fill).style(style::card));
 
     if snapshot.phase == Phase::Connected {
         col = col.push(section_label("ROUTING"));
         col = col.push(
-            container(scrollable(routes_section(snapshot)).width(Fill).height(Fill))
+            container(routes_section(snapshot))
                 .padding([12, 14])
                 .width(Fill)
-                .height(Fill)
                 .style(style::card),
         );
     }
 
-    col.into()
-}
-
-fn info_row(label: &'static str, value: String, copy: Option<String>) -> Element<'static, Message> {
-    let display = if value.is_empty() { "—".into() } else { value };
-    let mut r = row![
-        text(label).size(12).style(style::dim_text).width(110),
-        text(display).size(12).font(Font::MONOSPACE),
-    ]
-    .spacing(10)
-    .align_y(Center);
-    if let Some(copy) = copy {
-        r = r.push(space().width(Fill));
-        r = r.push(
-            button(text("Copy").size(11))
-                .padding([2, 8])
-                .style(style::ghost)
-                .on_press(Message::CopyText(copy)),
-        );
+    // FORWARDINGS
+    if let Some(banner) = connection_banner(profile, snapshot) {
+        col = col.push(banner);
     }
-    r.into()
-}
+    col = col.push(
+        row![
+            section_label(if profile.forwards.is_empty() {
+                "PORT FORWARDS".to_string()
+            } else {
+                format!("PORT FORWARDS · {}", profile.forwards.len())
+            }),
+            space().width(Fill),
+            button(text("+ Add").size(12).font(semibold()))
+                .padding([4, 12])
+                .style(style::tinted)
+                .on_press(Message::AddForward(profile.id.clone())),
+        ]
+        .align_y(Center),
+    );
 
-fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
-    let routes = &snapshot.routes;
-    let mut col = column![].spacing(3);
-    if is_full_tunnel(routes) {
-        col = col.push(text("Everything through the tunnel").size(12));
+    // Inline add/edit form — one at a time; an inline card fits the window
+    // better than a separate one.
+    if let Some((form_profile, form)) = &app.forward_form
+        && *form_profile == profile.id
+    {
+        col = col.push(forward_form_view(app, form));
+    }
+
+    if profile.forwards.is_empty() {
+        col = col.push(
+            container(
+                text("No port forwards yet. Add one to expose a remote service on localhost.")
+                    .size(12)
+                    .style(style::dim_text),
+            )
+            .padding(24)
+            .width(Fill)
+            .align_x(Center)
+            .style(style::card),
+        );
     } else {
+        let routed_set = app
+            .routed_caches
+            .get(&profile.id)
+            .and_then(|c| c.as_ref())
+            .and_then(|(_, _, set)| set.as_ref());
+        for forward in &profile.forwards {
+            col = col.push(forward_card(app, profile, forward, snapshot, routed_set));
+        }
         col = col.push(
-            text(format!(
-                "Split tunnel — {} domain(s), {} CIDR(s) routed through the server:",
-                routes.domains.len(),
-                routes.cidrs.len()
-            ))
-            .size(12),
+            text(
+                "Forwards listen on localhost only (127.0.0.1 and ::1) and relay through \
+                 this profile's SOCKS5 proxy while connected.",
+            )
+            .size(11)
+            .style(style::faint_text),
         );
-        for domain in &routes.domains {
-            col = col.push(mono(domain.as_str()));
-        }
-        for cidr in &routes.cidrs {
-            col = col.push(mono(cidr.as_str()));
-        }
     }
-    if !routes.host_aliases.is_empty() {
-        col = col.push(space().height(8));
-        col = col.push(
-            text(format!(
-                "Host aliases — {} resolved server-side:",
-                routes.host_aliases.len()
-            ))
-            .size(12),
-        );
-        for (alias, target) in &routes.host_aliases {
-            col = col.push(mono(format!("{alias} → {target}")));
-        }
-    }
-    if !routes.agent_aliases.is_empty() {
-        col = col.push(space().height(8));
-        col = col.push(
-            text(format!(
-                "Agent routes — {} via agents:",
-                routes.agent_aliases.len()
-            ))
-            .size(12),
-        );
-        for (alias, state) in routes.agent_states(Instant::now()) {
-            let (label, color) = match state {
-                AgentConnState::Connected => ("connected", GREEN),
-                AgentConnState::Disconnected => ("disconnected", RED),
-                AgentConnState::Unknown => ("unknown", GRAY),
-            };
-            col = col.push(
-                row![mono(alias), pill(label.to_string(), color)]
-                    .spacing(8)
-                    .align_y(Center),
-            );
-        }
-    }
-    col.into()
+
+    // Delete, tucked at the very bottom behind a two-click confirm.
+    let confirming = app.confirm_delete.as_deref() == Some(profile.id.as_str());
+    col = col.push(space().height(8));
+    col = col.push(
+        row![button(
+            text(if confirming {
+                "Click again to delete this profile"
+            } else {
+                "Delete profile…"
+            })
+            .size(12)
+        )
+        .padding([4, 12])
+        .style(style::ghost_danger)
+        .on_press(Message::DeleteProfile(profile.id.clone()))]
+        .align_y(Center),
+    );
+
+    scrollable(col.padding([0, 4])).height(Fill).spacing(4).into()
 }
 
 /// One tinted banner explaining why forwards aren't live, with an inline
 /// Connect button where that's the fix — instead of every row repeating it.
-fn connection_banner(app: &App) -> Option<Element<'_, Message>> {
-    let (color, message, show_connect) = match app.snapshot.phase {
+fn connection_banner<'a>(
+    profile: &'a Profile,
+    snapshot: &'a Snapshot,
+) -> Option<Element<'a, Message>> {
+    let (color, message, show_connect) = match snapshot.phase {
         Phase::Connected => return None,
         Phase::Idle => (
             AMBER,
@@ -337,7 +464,7 @@ fn connection_banner(app: &App) -> Option<Element<'_, Message>> {
             button(text("Connect").size(11).font(semibold()))
                 .padding([3, 10])
                 .style(style::tinted)
-                .on_press_maybe(app.saved.is_some().then_some(Message::Connect)),
+                .on_press_maybe(profile.is_ready().then(|| Message::Connect(profile.id.clone()))),
         );
     }
     Some(
@@ -349,73 +476,8 @@ fn connection_banner(app: &App) -> Option<Element<'_, Message>> {
     )
 }
 
-fn forwards_tab(app: &App) -> Element<'_, Message> {
-    let mut col = column![].spacing(10);
-    if let Some(banner) = connection_banner(app) {
-        col = col.push(banner);
-    }
-
-    let header = row![
-        section_label(if app.forwards.is_empty() {
-            "PORT FORWARDS".to_string()
-        } else {
-            format!("PORT FORWARDS · {}", app.forwards.len())
-        }),
-        space().width(Fill),
-        button(text("+ Add").size(12).font(semibold()))
-            .padding([4, 12])
-            .style(style::tinted)
-            .on_press(Message::AddForward),
-    ]
-    .align_y(Center);
-    col = col.push(header);
-
-    if let Some(notice) = &app.forwards_notice {
-        col = col.push(text(notice.as_str()).size(12).color(AMBER));
-    }
-
-    // Inline add/edit form — one at a time; an inline card fits the small
-    // window better than a separate window.
-    if let Some(form) = &app.forward_form {
-        col = col.push(forward_form_view(app, form));
-    }
-
-    if app.forwards.is_empty() {
-        col = col.push(
-            container(
-                text("No port forwards yet. Add one to expose a remote service on localhost.")
-                    .size(12)
-                    .style(style::dim_text),
-            )
-            .padding(24)
-            .width(Fill)
-            .align_x(Center)
-            .style(style::card),
-        );
-        return col.into();
-    }
-
-    let routed_set = app.routed_cache.as_ref().and_then(|(_, _, set)| set.as_ref());
-    let mut list = column![].spacing(8);
-    for (i, forward) in app.forwards.iter().enumerate() {
-        list = list.push(forward_card(app, i, forward, routed_set));
-    }
-    col = col.push(scrollable(list).height(Fill).spacing(4));
-
-    col = col.push(
-        text(
-            "Forwards listen on localhost only (127.0.0.1 and ::1) and relay through \
-             this app's SOCKS5 proxy while connected.",
-        )
-        .size(11)
-        .style(style::faint_text),
-    );
-    col.into()
-}
-
 fn forward_form_view<'a>(app: &'a App, form: &'a ForwardForm) -> Element<'a, Message> {
-    let (socks_port, http_port) = app.proxy_ports();
-    let validated = form.validate(&app.forwards, socks_port, http_port);
+    let validated = form.validate(&app.profiles);
 
     let mut col = column![
         text(if form.is_edit() {
@@ -480,11 +542,11 @@ fn forward_form_view<'a>(app: &'a App, form: &'a ForwardForm) -> Element<'a, Mes
 
 fn forward_card<'a>(
     app: &'a App,
-    i: usize,
+    profile: &'a Profile,
     forward: &'a PortForward,
+    snapshot: &'a Snapshot,
     routed_set: Option<&RoutedSet>,
 ) -> Element<'a, Message> {
-    let snapshot = &app.snapshot;
     let status = snapshot.forwards.iter().find(|s| s.id == forward.id);
     let (pill_text, pill_color) = forward_pill(forward, status, snapshot.phase);
 
@@ -524,20 +586,24 @@ fn forward_card<'a>(
         info = info.push(text(error).size(11).color(AMBER));
     }
 
+    let profile_id = profile.id.clone();
+    let forward_id = forward.id.clone();
     let controls = row![
         button(text("Edit").size(12))
             .padding([4, 10])
             .style(style::ghost)
-            .on_press(Message::EditForward(i)),
+            .on_press(Message::EditForward(profile.id.clone(), forward.id.clone())),
         button(text("Delete").size(12))
             .padding([4, 10])
             .style(style::ghost_danger)
-            .on_press(Message::DeleteForward(i)),
+            .on_press(Message::DeleteForward(profile.id.clone(), forward.id.clone())),
         // Desired state, but not a plain checkbox: enabling attempts the
         // setup now, and a setup failure snaps the switch back off (see
         // disable_failed_forwards).
         toggler(forward.enabled)
-            .on_toggle(move |enabled| Message::ToggleForward(i, enabled))
+            .on_toggle(move |enabled| {
+                Message::ToggleForward(profile_id.clone(), forward_id.clone(), enabled)
+            })
             .size(20)
             .style(style::switch),
     ]
@@ -551,9 +617,69 @@ fn forward_card<'a>(
         .into()
 }
 
-fn settings_tab(app: &App) -> Element<'_, Message> {
-    let form = &app.form;
+fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
+    let routes = &snapshot.routes;
+    let mut col = column![].spacing(3);
+    if is_full_tunnel(routes) {
+        col = col.push(text("Everything through the tunnel").size(12));
+    } else {
+        col = col.push(
+            text(format!(
+                "Split tunnel — {} domain(s), {} CIDR(s) routed through the server:",
+                routes.domains.len(),
+                routes.cidrs.len()
+            ))
+            .size(12),
+        );
+        for domain in &routes.domains {
+            col = col.push(mono(domain.as_str()));
+        }
+        for cidr in &routes.cidrs {
+            col = col.push(mono(cidr.as_str()));
+        }
+    }
+    if !routes.host_aliases.is_empty() {
+        col = col.push(space().height(8));
+        col = col.push(
+            text(format!(
+                "Host aliases — {} resolved server-side:",
+                routes.host_aliases.len()
+            ))
+            .size(12),
+        );
+        for (alias, target) in &routes.host_aliases {
+            col = col.push(mono(format!("{alias} → {target}")));
+        }
+    }
+    if !routes.agent_aliases.is_empty() {
+        col = col.push(space().height(8));
+        col = col.push(
+            text(format!(
+                "Agent routes — {} via agents:",
+                routes.agent_aliases.len()
+            ))
+            .size(12),
+        );
+        for (alias, state) in routes.agent_states(Instant::now()) {
+            let (label, color) = match state {
+                AgentConnState::Connected => ("connected", GREEN),
+                AgentConnState::Disconnected => ("disconnected", RED),
+                AgentConnState::Unknown => ("unknown", GRAY),
+            };
+            col = col.push(
+                row![mono(alias), pill(label.to_string(), color)]
+                    .spacing(8)
+                    .align_y(Center),
+            );
+        }
+    }
+    col.into()
+}
 
+// ---------------------------------------------------------------------------
+// Profile form
+
+fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Message> {
     let mut http = row![checkbox(form.http_enabled)
         .label("enable")
         .text_size(13)
@@ -566,14 +692,10 @@ fn settings_tab(app: &App) -> Element<'_, Message> {
         http = http.push(input("", &form.http_port, Message::HttpPortChanged).width(90));
     }
 
-    let validated = form.validate();
-    let dirty = match (&validated, &app.saved) {
-        (Ok(candidate), Some(saved)) => candidate != saved,
-        (Ok(_), None) => true,
-        (Err(_), _) => false,
-    };
+    let validated = form.validate(&app.profiles);
 
     let mut card = column![
+        form_row("Name", input("e.g. prod", &form.name, Message::ProfileNameChanged)),
         form_row(
             "Server node id",
             input("", &form.server_node_id, Message::ServerNodeIdChanged),
@@ -603,21 +725,31 @@ fn settings_tab(app: &App) -> Element<'_, Message> {
     if let Err(message) = &validated {
         card = card.push(text(message.clone()).size(12).color(AMBER));
     }
-    let mut save_row = row![button(text("Save").size(13).font(semibold()))
-        .padding([6, 16])
-        .style(style::primary)
-        .on_press_maybe((validated.is_ok() && dirty).then_some(Message::SaveSettings))]
-    .spacing(10)
+    let mut buttons = row![
+        button(text("Save").size(13).font(semibold()))
+            .padding([6, 16])
+            .style(style::primary)
+            .on_press_maybe(validated.is_ok().then_some(Message::ProfileFormSave)),
+        button(text("Cancel").size(13))
+            .padding([6, 16])
+            .style(style::outlined)
+            .on_press(Message::ProfileFormCancel),
+    ]
+    .spacing(8)
     .align_y(Center);
-    if let Some(notice) = &app.settings_notice {
-        save_row = save_row.push(text(notice.as_str()).size(12).style(style::dim_text));
+    if let Some(notice) = &app.notice {
+        buttons = buttons.push(text(notice.as_str()).size(12).style(style::dim_text));
     }
-    card = card.push(save_row);
+    card = card.push(buttons);
 
     column![
-        section_label("CONNECTION SETTINGS"),
+        section_label(if form.is_edit() {
+            "EDIT PROFILE"
+        } else {
+            "NEW PROFILE"
+        }),
         container(card).padding([12, 14]).width(Fill).style(style::card),
-        text("Stored as a single item in the system keychain.")
+        text("The auth token is stored in the system keychain; everything else in a local file.")
             .size(11)
             .style(style::faint_text),
     ]
@@ -625,7 +757,10 @@ fn settings_tab(app: &App) -> Element<'_, Message> {
     .into()
 }
 
-fn logs_tab(app: &App) -> Element<'_, Message> {
+// ---------------------------------------------------------------------------
+// Logs
+
+fn logs_pane(app: &App) -> Element<'_, Message> {
     let header = row![
         section_label("LOGS".to_string()),
         space().width(Fill),
@@ -660,6 +795,29 @@ fn logs_tab(app: &App) -> Element<'_, Message> {
     ]
     .spacing(10)
     .into()
+}
+
+// ---------------------------------------------------------------------------
+// Shared bits
+
+fn info_row(label: &'static str, value: String, copy: Option<String>) -> Element<'static, Message> {
+    let display = if value.is_empty() { "—".into() } else { value };
+    let mut r = row![
+        text(label).size(12).style(style::dim_text).width(110),
+        text(display).size(12).font(Font::MONOSPACE),
+    ]
+    .spacing(10)
+    .align_y(Center);
+    if let Some(copy) = copy {
+        r = r.push(space().width(Fill));
+        r = r.push(
+            button(text("Copy").size(11))
+                .padding([2, 8])
+                .style(style::ghost)
+                .on_press(Message::CopyText(copy)),
+        );
+    }
+    r.into()
 }
 
 fn form_row<'a>(
@@ -709,7 +867,7 @@ fn mono<'a>(fragment: impl text::IntoFragment<'a>) -> Element<'a, Message> {
     text(fragment).size(12).font(Font::MONOSPACE).into()
 }
 
-/// Small tinted pill badge (forward state, "tunneled"/"direct", agent states).
+/// Small tinted pill badge (forward state, phase, agent states).
 fn pill(label: impl Into<String>, color: Color) -> Element<'static, Message> {
     container(text(label.into()).size(11).font(semibold()).color(color))
         .padding([2, 8])

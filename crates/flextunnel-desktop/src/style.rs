@@ -167,6 +167,32 @@ pub fn outlined(theme: &Theme, status: button::Status) -> button::Style {
     style
 }
 
+/// The profile sidebar: a raised column visually split from the detail pane.
+pub fn sidebar(theme: &Theme) -> container::Style {
+    let t = tokens(theme);
+    container::Style {
+        background: Some(t.surface.into()),
+        ..container::Style::default()
+    }
+}
+
+/// One sidebar row (profile or Logs): accent-tinted when selected, quiet
+/// otherwise.
+pub fn sidebar_row(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let t = tokens(theme);
+        if selected {
+            return plain(Some(t.accent.scale_alpha(0.16)), t.text, 8.0);
+        }
+        match status {
+            button::Status::Hovered | button::Status::Pressed => {
+                plain(Some(t.surface_hi), t.text, 8.0)
+            }
+            _ => plain(None, t.text, 8.0),
+        }
+    }
+}
+
 /// Card container: raised surface, hairline border, soft radius.
 pub fn card(theme: &Theme) -> container::Style {
     let t = tokens(theme);

@@ -19,7 +19,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -81,56 +80,6 @@ impl PortForward {
             && self.remote_port == other.remote_port
             && self.enabled == other.enabled
     }
-}
-
-/// Forwards live in a plain JSON file, not the keychain config blob — they are
-/// not secret, and Windows credential blobs cap out around 2.5 KB. Same
-/// treatment as the iOS app's `forwards.json`.
-fn forwards_path() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("flextunnel").join("forwards.json"))
-}
-
-pub fn load() -> Vec<PortForward> {
-    let Some(path) = forwards_path() else {
-        return Vec::new();
-    };
-    load_from(&path)
-}
-
-pub fn save(forwards: &[PortForward]) -> anyhow::Result<()> {
-    let path = forwards_path()
-        .ok_or_else(|| anyhow::anyhow!("no local data directory to store forwards in"))?;
-    save_to(&path, forwards)
-}
-
-fn load_from(path: &Path) -> Vec<PortForward> {
-    let raw = match std::fs::read(path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Vec::new(),
-        Err(e) => {
-            log::error!("Failed to read {}: {e}", path.display());
-            return Vec::new();
-        }
-    };
-    match serde_json::from_slice(&raw) {
-        Ok(forwards) => forwards,
-        Err(e) => {
-            log::error!("Failed to parse {}: {e}", path.display());
-            Vec::new()
-        }
-    }
-}
-
-/// Write via a temp file + rename so a crash mid-write can't truncate the list.
-fn save_to(path: &Path, forwards: &[PortForward]) -> anyhow::Result<()> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("forwards path has no parent directory"))?;
-    std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(forwards)?)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
 }
 
 /// Live state of one forward's listener. "Stopped" is represented by absence:
@@ -503,26 +452,6 @@ mod tests {
             remote_port: 7,
             enabled: true,
         }
-    }
-
-    #[test]
-    fn persistence_roundtrip_and_corrupt_tolerance() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("forwards.json");
-
-        assert_eq!(load_from(&path), Vec::new());
-
-        let mut forwards = vec![forward(18081), forward(18082)];
-        forwards[1].enabled = false;
-        save_to(&path, &forwards).expect("save");
-        // `enabled` is runtime-only: not written, and off after a reload.
-        let raw = std::fs::read_to_string(&path).expect("read raw");
-        assert!(!raw.contains("enabled"), "enabled leaked into the file: {raw}");
-        forwards[0].enabled = false;
-        assert_eq!(load_from(&path), forwards);
-
-        std::fs::write(&path, b"not json").expect("write");
-        assert_eq!(load_from(&path), Vec::new());
     }
 
     #[test]
