@@ -310,20 +310,36 @@ fn open_log_folder() {
     }
 }
 
-/// Menu-bar app: no Dock icon, no app switcher entry. winit applies the
-/// Regular policy during launch (overriding the bundle's LSUIElement), so this
-/// runs afterwards, from the first update.
-#[cfg(target_os = "macos")]
-fn set_accessory_policy() {
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
-    match MainThreadMarker::new() {
-        Some(mtm) => {
-            NSApplication::sharedApplication(mtm)
-                .setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+/// Menu-bar app with a Dock presence only while the window is open: Regular
+/// (Dock icon, app switcher) when it exists, Accessory when it closes. winit
+/// applies Regular during launch anyway (overriding the bundle's LSUIElement),
+/// so this only has to run on the open/close transitions afterwards. No-op off
+/// macOS.
+fn set_activation_policy(regular: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+        match MainThreadMarker::new() {
+            Some(mtm) => {
+                let app = NSApplication::sharedApplication(mtm);
+                app.setActivationPolicy(if regular {
+                    NSApplicationActivationPolicy::Regular
+                } else {
+                    NSApplicationActivationPolicy::Accessory
+                });
+                if regular {
+                    // Switching Accessory → Regular does not bring the app
+                    // forward on its own.
+                    #[allow(deprecated)]
+                    app.activateIgnoringOtherApps(true);
+                }
+            }
+            None => log::warn!("Not on the main thread; leaving the activation policy alone"),
         }
-        None => log::warn!("Not on the main thread; leaving the activation policy alone"),
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = regular;
 }
 
 fn window_settings() -> window::Settings {
@@ -440,8 +456,7 @@ impl App {
                 Task::none()
             }
             Message::SetupTray => {
-                #[cfg(target_os = "macos")]
-                set_accessory_policy();
+                set_activation_policy(self.window.is_some());
                 match Tray::new() {
                     Ok(tray) => self.tray = Some(tray),
                     Err(e) => log::error!("Failed to create the tray icon: {e:#}"),
@@ -471,9 +486,10 @@ impl App {
             Message::WindowOpened => Task::none(),
             Message::WindowClosed(id) => {
                 // Closing the window destroys it; the app lives on in the
-                // tray. Quit comes from the tray menu.
+                // tray (and off the Dock). Quit comes from the tray menu.
                 if self.window == Some(id) {
                     self.window = None;
+                    set_activation_policy(false);
                 }
                 Task::none()
             }
@@ -612,6 +628,7 @@ impl App {
     fn open_window(&mut self) -> Task<Message> {
         let (id, open) = window::open(window_settings());
         self.window = Some(id);
+        set_activation_policy(true);
         open.map(|_| Message::WindowOpened)
     }
 
