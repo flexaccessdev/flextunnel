@@ -17,6 +17,10 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 pub const DEFAULT_SOCKS_PORT: u16 = 1080;
+/// Suggested HTTP proxy port for the profile form. Deliberately high — 8080
+/// is taken by half the dev servers in the world (mirrors the iOS FFI's
+/// choice of 18080 for its SOCKS default).
+pub const DEFAULT_HTTP_PORT: u16 = 18080;
 
 const KEYCHAIN_SERVICE: &str = "flextunnel-desktop";
 

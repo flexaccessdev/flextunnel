@@ -7,7 +7,7 @@
 //! tray click wakes the runtime even while no window exists; a 500 ms tick
 //! keeps the snapshots and the tray state fresh the rest of the time.
 
-use crate::config::{self, Profile, DEFAULT_SOCKS_PORT};
+use crate::config::{self, Profile, DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT};
 use crate::forward::{ForwardState, ForwardStatus, PortForward};
 use crate::icon;
 use crate::logging;
@@ -138,7 +138,7 @@ impl ProfileForm {
     fn add(profiles: &[Profile]) -> Self {
         Self {
             socks_port: next_free_port(profiles).to_string(),
-            http_port: "8080".into(),
+            http_port: DEFAULT_HTTP_PORT.to_string(),
             ..Self::default()
         }
     }
@@ -154,7 +154,7 @@ impl ProfileForm {
             http_port: profile
                 .http_port
                 .map(|p| p.to_string())
-                .unwrap_or_else(|| "8080".into()),
+                .unwrap_or_else(|| DEFAULT_HTTP_PORT.to_string()),
             relay_urls: profile.relay_urls.join(", "),
         }
     }
