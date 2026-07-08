@@ -16,9 +16,15 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 pub type ProfileId = String;
+
+/// Bound on the GUI thread's wait for a connection-path reply (see
+/// [`Controller::query_conn_path`]). Generous versus the sub-millisecond happy
+/// path — it exists only to fail open (empty result) rather than hang if a
+/// session stalls.
+const CONN_PATH_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
@@ -75,8 +81,9 @@ enum Command {
     RemoveProfile(ProfileId),
     /// One-shot request for the profile's current iroh connection path(s),
     /// answered on the reply channel (the UI's connection-path CTA). Empty when
-    /// no session is running.
-    QueryConnPath(ProfileId, oneshot::Sender<Vec<ConnPath>>),
+    /// no session is running. A `std` channel (not tokio `oneshot`) so the GUI
+    /// caller can wait with a bounded [`std::sync::mpsc::Receiver::recv_timeout`].
+    QueryConnPath(ProfileId, std::sync::mpsc::Sender<Vec<ConnPath>>),
     Shutdown,
 }
 
@@ -84,7 +91,7 @@ enum SessionCmd {
     Disconnect,
     SetForwards(Vec<PortForward>),
     /// Answer the reply channel with the live connection's path snapshot, once.
-    QueryConnPath(oneshot::Sender<Vec<ConnPath>>),
+    QueryConnPath(std::sync::mpsc::Sender<Vec<ConnPath>>),
     Shutdown,
 }
 
@@ -162,10 +169,13 @@ impl Controller {
     }
 
     /// Fetch the profile's current iroh connection path(s), once. Returns empty
-    /// when no session is running (or the request can't be answered). Blocks
-    /// briefly on the session's reply — the round-trip is a channel hop.
+    /// when no session is running, the request can't be sent, or the session
+    /// doesn't answer within [`CONN_PATH_TIMEOUT`]. The round-trip is a channel
+    /// hop (normally sub-millisecond), but the deadline is what guarantees a
+    /// wedged session can never freeze the GUI thread calling this from
+    /// `App::update`.
     pub fn query_conn_path(&self, id: &str) -> Vec<ConnPath> {
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         if self
             .tx
             .blocking_send(Command::QueryConnPath(id.into(), reply_tx))
@@ -173,7 +183,7 @@ impl Controller {
         {
             return Vec::new();
         }
-        reply_rx.blocking_recv().unwrap_or_default()
+        reply_rx.recv_timeout(CONN_PATH_TIMEOUT).unwrap_or_default()
     }
 
     /// Stop all sessions and join the worker thread (blocks briefly for the

@@ -424,8 +424,8 @@ fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message
     }
     let mut header = row![section_label("CONNECTION"), space().width(Fill)].align_y(Center);
     if snapshot.phase == Phase::Connected {
-        // A one-shot readout of the live iroh path — the result flashes in the
-        // notice line (see `App::notice`), so it reads as a point-in-time check
+        // A one-shot readout of the live iroh path, shown in a dismissable
+        // modal overlay (see `App::conn_path_modal`) — a point-in-time check
         // rather than a live field.
         header = header.push(
             button(text("Connection path").size(12))
