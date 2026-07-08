@@ -164,7 +164,9 @@ impl ProfileForm {
     }
 
     pub fn validate(&self, profiles: &[Profile]) -> Result<Profile, String> {
-        let name = self.name.trim();
+        // Normalize into the stored shape (see `Profile::is_valid_name`):
+        // words separated by single spaces, nothing leading or trailing.
+        let name = self.name.split_whitespace().collect::<Vec<_>>().join(" ");
         if name.is_empty() {
             return Err("Profile name is required".into());
         }
@@ -182,6 +184,17 @@ impl ProfileForm {
         let server_node_id = self.server_node_id.trim();
         if server_node_id.is_empty() {
             return Err("Server node id is required".into());
+        }
+        // One profile per server: a second profile against the same server is
+        // an accidental duplicate, not a use case.
+        if let Some(other) = profiles.iter().find(|p| {
+            p.server_node_id == server_node_id
+                && Some(p.id.as_str()) != self.editing_id.as_deref()
+        }) {
+            return Err(format!(
+                "Profile \"{}\" already connects to this server",
+                other.name
+            ));
         }
         let auth_token = self.auth_token.trim();
         if auth_token.is_empty() {
@@ -220,7 +233,7 @@ impl ProfileForm {
             .unwrap_or_default();
         Ok(Profile {
             id: self.editing_id.clone().unwrap_or_else(Profile::new_id),
-            name: name.into(),
+            name,
             server_node_id: server_node_id.into(),
             auth_token: auth_token.into(),
             socks_port,
@@ -1226,6 +1239,15 @@ mod tests {
     }
 
     #[test]
+    fn name_whitespace_is_normalized() {
+        let mut form = valid_form();
+        form.name = "  staging   aws \t kube  ".into();
+        let profile = form.validate(&[]).expect("valid");
+        assert_eq!(profile.name, "staging aws kube");
+        assert!(Profile::is_valid_name(&profile.name));
+    }
+
+    #[test]
     fn validate_trims_and_parses() {
         let profile = valid_form().validate(&[]).expect("valid");
         assert_eq!(profile.name, "prod");
@@ -1267,6 +1289,14 @@ mod tests {
         let existing = [existing_profile("p1", 2080, vec![])];
         let mut form = valid_form();
         form.name = " profile-p1 ".into();
+        assert!(form.validate(&existing).is_err());
+        // …unless it is the profile being edited.
+        form.editing_id = Some("p1".into());
+        assert!(form.validate(&existing).is_ok());
+
+        // Duplicate server node id…
+        let mut form = valid_form();
+        form.server_node_id = "node".into();
         assert!(form.validate(&existing).is_err());
         // …unless it is the profile being edited.
         form.editing_id = Some("p1".into());

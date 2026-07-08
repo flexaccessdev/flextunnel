@@ -68,6 +68,19 @@ impl Profile {
         format!("{:016x}", rand::random::<u64>())
     }
 
+    /// A well-formed profile name: 1-64 characters, words separated by single
+    /// spaces — no leading/trailing spaces, no consecutive spaces, no other
+    /// whitespace. The form normalizes into this shape; only a hand-edited
+    /// file can violate it.
+    pub fn is_valid_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 64
+            && !name.starts_with(' ')
+            && !name.ends_with(' ')
+            && !name.contains("  ")
+            && !name.chars().any(|c| c.is_whitespace() && c != ' ')
+    }
+
     /// Whether the profile can be connected: a missing token happens when its
     /// keychain entry was lost (the user re-enters it in the edit form).
     pub fn is_ready(&self) -> bool {
@@ -151,17 +164,61 @@ fn token_entry(profile_id: &str) -> Result<keyring_core::Entry> {
         .context("Failed to open keychain entry")
 }
 
+/// Drop structurally invalid entries from a (possibly hand-edited) profiles
+/// file, keeping the first occurrence of duplicates: duplicate profile ids
+/// break the session/snapshot keying, malformed or duplicate names break
+/// everything keyed by name (session thread names / log attribution, tray
+/// submenus), and duplicate server node ids mean two profiles for one server.
+/// The form rejects all of these; this is the backstop.
+fn drop_invalid(profiles: Vec<Profile>) -> Vec<Profile> {
+    let mut ids = std::collections::HashSet::new();
+    let mut names = std::collections::HashSet::new();
+    let mut servers = std::collections::HashSet::new();
+    profiles
+        .into_iter()
+        .filter(|p| {
+            if !ids.insert(p.id.clone()) {
+                log::error!("Ignoring profile \"{}\": duplicate profile id {}", p.name, p.id);
+                return false;
+            }
+            if !Profile::is_valid_name(&p.name) {
+                log::error!(
+                    "Ignoring profile {}: invalid name {:?} (1-64 chars, single spaces \
+                     between words only)",
+                    p.id,
+                    p.name
+                );
+                return false;
+            }
+            if !names.insert(p.name.clone()) {
+                log::error!("Ignoring a profile: duplicate profile name \"{}\"", p.name);
+                return false;
+            }
+            if !servers.insert(p.server_node_id.clone()) {
+                log::error!(
+                    "Ignoring profile \"{}\": another profile already uses its server node id",
+                    p.name
+                );
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
 /// Load all profiles; an empty list when nothing has been saved yet. In
 /// keychain mode each profile's token is filled from its keychain entry — a
 /// missing entry loads as an empty token with a warning instead of failing.
+/// Entries duplicating another's profile id or server node id are ignored.
 pub fn load_profiles() -> Result<Vec<Profile>> {
     match BACKEND.get() {
-        Some(Backend::File(path)) => load_dev_file(path),
+        Some(Backend::File(path)) => Ok(drop_invalid(load_dev_file(path)?)),
         _ => {
-            let mut profiles: Vec<Profile> = match read_json(&profiles_path()?)? {
+            let profiles: Vec<Profile> = match read_json(&profiles_path()?)? {
                 Some(profiles) => profiles,
                 None => return Ok(Vec::new()),
             };
+            let mut profiles = drop_invalid(profiles);
             for profile in &mut profiles {
                 match token_entry(&profile.id)?.get_password() {
                     Ok(token) => profile.auth_token = token,
@@ -308,6 +365,52 @@ mod tests {
         assert!(!json.contains("token"), "token leaked: {json}");
         // `enabled` is runtime-only on forwards and must not leak either.
         assert!(!json.contains("enabled"), "enabled leaked: {json}");
+    }
+
+    #[test]
+    fn duplicate_ids_and_servers_are_dropped() {
+        let a = profile();
+        let mut same_server = profile();
+        same_server.id = "b".into();
+        same_server.name = "b".into();
+        let mut same_id = profile();
+        same_id.name = "c".into();
+        same_id.server_node_id = "other".into();
+        let mut same_name = profile();
+        same_name.id = "n".into();
+        same_name.server_node_id = "elsewhere".into();
+        let mut bad_name = profile();
+        bad_name.id = "w".into();
+        bad_name.name = " padded ".into();
+        bad_name.server_node_id = "padded-server".into();
+        let mut unique = profile();
+        unique.id = "d".into();
+        unique.name = "d".into();
+        unique.server_node_id = "unique".into();
+
+        let kept = drop_invalid(vec![
+            a.clone(),
+            same_server,
+            same_id,
+            same_name,
+            bad_name,
+            unique.clone(),
+        ]);
+        assert_eq!(kept, vec![a, unique]);
+    }
+
+    #[test]
+    fn name_format_rules() {
+        assert!(Profile::is_valid_name("prod"));
+        assert!(Profile::is_valid_name("staging aws kube"));
+
+        assert!(!Profile::is_valid_name(""));
+        assert!(!Profile::is_valid_name(" prod"));
+        assert!(!Profile::is_valid_name("prod "));
+        assert!(!Profile::is_valid_name("staging  aws"));
+        assert!(!Profile::is_valid_name("staging\taws"));
+        assert!(!Profile::is_valid_name("staging\naws"));
+        assert!(!Profile::is_valid_name(&"a".repeat(65)));
     }
 
     #[test]

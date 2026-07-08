@@ -182,6 +182,9 @@ struct SessionHandle {
     /// Resolves when the session's thread finishes (its receiver dropping
     /// also marks `tx` closed).
     done: tokio::sync::oneshot::Receiver<()>,
+    /// For the supervisor's duplicate-server guard and its error message.
+    server_node_id: String,
+    profile_name: String,
 }
 
 /// Spawn one profile's session on its own OS thread with its own runtime, all
@@ -196,6 +199,8 @@ fn spawn_session(profile: Profile, shared: &SharedSnapshots) -> Option<SessionHa
         id: profile.id.clone(),
     };
     let error_slot = slot.clone();
+    let server_node_id = profile.server_node_id.clone();
+    let profile_name = profile.name.clone();
     let thread_name = format!("tunnel-{}", profile.name);
     let runtime_name = thread_name.clone();
     let spawned = std::thread::Builder::new().name(thread_name).spawn(move || {
@@ -220,7 +225,12 @@ fn spawn_session(profile: Profile, shared: &SharedSnapshots) -> Option<SessionHa
         let _ = done_tx.send(());
     });
     match spawned {
-        Ok(_) => Some(SessionHandle { tx, done }),
+        Ok(_) => Some(SessionHandle {
+            tx,
+            done,
+            server_node_id,
+            profile_name,
+        }),
         Err(e) => {
             log::error!("Failed to spawn the session thread: {e:#}");
             error_slot.update(|s| {
@@ -243,6 +253,30 @@ async fn run_loop(mut rx: mpsc::Receiver<Command>, shared: SharedSnapshots) {
             Some(Command::Connect(profile)) => {
                 if sessions.contains_key(&profile.id) {
                     log::warn!("Profile \"{}\" is already running a session", profile.name);
+                    continue;
+                }
+                // Backend duplicate-server guard: whatever path asked for the
+                // connection, never run two sessions against one server.
+                if let Some(other) = sessions
+                    .values()
+                    .find(|h| h.server_node_id == profile.server_node_id)
+                {
+                    let reason = format!(
+                        "Profile \"{}\" is already connected to this server",
+                        other.profile_name
+                    );
+                    log::error!("Not connecting \"{}\": {reason}", profile.name);
+                    SnapshotSlot {
+                        shared: shared.clone(),
+                        id: profile.id.clone(),
+                    }
+                    .update(|s| {
+                        *s = Snapshot {
+                            phase: Phase::Failed,
+                            last_error: Some(reason),
+                            ..Snapshot::default()
+                        };
+                    });
                     continue;
                 }
                 let id = profile.id.clone();
