@@ -11,7 +11,7 @@
 use crate::config::Profile;
 use crate::forward::{ForwardManager, ForwardStatus, PortForward};
 use flextunnel_core::proxy::{ClientConfig, ProxyClient, TunnelRoutes};
-use flextunnel_core::transport::endpoint::create_client_endpoint;
+use flextunnel_core::transport::endpoint::{create_client_endpoint, ConnPath};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -36,6 +36,8 @@ pub struct Snapshot {
     pub socks_addr: Option<SocketAddr>,
     pub http_addr: Option<SocketAddr>,
     pub routes: TunnelRoutes,
+    /// Current iroh connection path(s) (relay/direct); empty unless connected.
+    pub conn_paths: Vec<ConnPath>,
     pub last_error: Option<String>,
     /// Live status per running forward; empty while no session runs, which the
     /// UI renders as "stopped".
@@ -50,6 +52,7 @@ impl Default for Snapshot {
             socks_addr: None,
             http_addr: None,
             routes: TunnelRoutes::default(),
+            conn_paths: Vec::new(),
             last_error: None,
             forwards: Vec::new(),
         }
@@ -489,8 +492,10 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
                     .lock()
                     .map(|r| r.clone())
                     .unwrap_or_default();
+                let paths = client.conn_paths();
                 ever_connected |= routes.connected;
                 slot.update(|s| {
+                    s.conn_paths = paths;
                     if routes.connected {
                         if s.phase != Phase::Connected {
                             s.connected_since = Some(Instant::now());
@@ -537,6 +542,7 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
     slot.update(|s| {
         s.routes.connected = false;
         s.connected_since = None;
+        s.conn_paths.clear();
         s.forwards.clear();
     });
 }

@@ -38,6 +38,8 @@ pub enum Message {
     WindowClosed(window::Id),
     Select(Selection),
     CopyText(String),
+    /// Toggle the connection-path (relay/direct) detail in the CONNECTION card.
+    ToggleConnPath,
     // Profiles
     AddProfile,
     EditProfile(ProfileId),
@@ -539,6 +541,9 @@ pub struct App {
     pub confirm_delete: Option<ProfileId>,
     /// Transient status line in the detail pane (save results/failures).
     pub notice: Option<String>,
+    /// Whether the CONNECTION card shows the live iroh path (relay/direct);
+    /// reset when the selection changes.
+    pub show_conn_path: bool,
     /// Transient export/import result shown in the sidebar.
     pub io_notice: Option<String>,
     /// Setup-failure reason per forward id, retained after the failed forward
@@ -589,6 +594,7 @@ impl App {
             forward_form: None,
             confirm_delete: None,
             notice: None,
+            show_conn_path: false,
             io_notice: None,
             forward_errors: HashMap::new(),
             routed_caches: HashMap::new(),
@@ -677,10 +683,15 @@ impl App {
                 self.forward_form = None;
                 self.confirm_delete = None;
                 self.notice = None;
+                self.show_conn_path = false;
                 Task::none()
             }
             Message::CopyText(text) => {
                 self.copy_text(text);
+                Task::none()
+            }
+            Message::ToggleConnPath => {
+                self.show_conn_path = !self.show_conn_path;
                 Task::none()
             }
             Message::AddProfile => {

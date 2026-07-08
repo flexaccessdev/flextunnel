@@ -183,6 +183,63 @@ pub async fn create_client_endpoint(
     Ok(endpoint)
 }
 
+/// Which kind of transport a connection path uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnPathKind {
+    /// A direct peer-to-peer path (holepunched UDP).
+    Direct,
+    /// A path relayed through an iroh relay server.
+    Relay,
+    /// Any other transport iroh reports (forward-compatible catch-all).
+    Other,
+}
+
+/// A single connection path snapshot for status display, decoupled from iroh's
+/// borrowed [`PathList`] so it can be stored and shown on demand (e.g. the
+/// desktop's "connection path" CTA, mirroring `ezvpn client status`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnPath {
+    pub kind: ConnPathKind,
+    /// Human line like `Direct 1.2.3.4:52186 (rtt 1ms)` or
+    /// `Relay https://… (rtt 42ms)`.
+    pub display: String,
+    /// Whether iroh currently routes traffic over this path.
+    pub selected: bool,
+}
+
+/// Snapshot the current path(s) of a live connection for a status UI, showing
+/// *all* paths (not just the selected one) so a direct path iroh has discovered
+/// but not selected is still visible. [`Connection::paths`] is itself a
+/// point-in-time snapshot, so this needs no background watcher.
+pub fn connection_paths(conn: &Connection) -> Vec<ConnPath> {
+    snapshot_paths(&conn.paths())
+}
+
+/// Convert a borrowed [`PathList`] snapshot into owned [`ConnPath`]s.
+fn snapshot_paths(paths: &PathList<'_>) -> Vec<ConnPath> {
+    paths
+        .iter()
+        .map(|path| {
+            let rtt = path.rtt();
+            let selected = path.is_selected();
+            let (kind, display) = match path.remote_addr() {
+                TransportAddr::Ip(addr) => {
+                    (ConnPathKind::Direct, format!("Direct {addr} (rtt {rtt:.0?})"))
+                }
+                TransportAddr::Relay(url) => {
+                    (ConnPathKind::Relay, format!("Relay {url} (rtt {rtt:.0?})"))
+                }
+                other => (ConnPathKind::Other, format!("{other:?} (rtt {rtt:.0?})")),
+            };
+            ConnPath {
+                kind,
+                display,
+                selected,
+            }
+        })
+        .collect()
+}
+
 /// Format the currently-selected path(s) of a connection for logging, e.g.
 /// `Direct [2607:…]:52186 (rtt 1ms)` or `Relay https://… (rtt 42ms)`.
 fn format_paths(paths: &PathList<'_>) -> String {

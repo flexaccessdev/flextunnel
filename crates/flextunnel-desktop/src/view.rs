@@ -12,6 +12,7 @@ use crate::style::{self, AMBER, GRAY, GREEN, RED};
 use crate::tunnel::{Phase, Snapshot};
 use flextunnel_core::proxy::signaling::Target;
 use flextunnel_core::proxy::{reserved, AgentConnState, RoutedSet, TunnelRoutes};
+use flextunnel_core::transport::endpoint::{ConnPath, ConnPathKind};
 use iced::widget::{
     button, checkbox, column, container, pick_list, row, scrollable, space, text, text_input,
     toggler,
@@ -347,18 +348,37 @@ fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message
         let copy = Some(format!("http://{http}"));
         info = info.push(info_row("HTTP proxy", http, copy));
     }
+    // Live iroh path (relay/direct), revealed on demand by the header CTA —
+    // mirrors `ezvpn client status`'s path line.
+    let connected = snapshot.phase == Phase::Connected;
+    if connected && app.show_conn_path {
+        info = info.push(space().height(4));
+        info = info.push(conn_path_section(&snapshot.conn_paths));
+    }
 
-    col = col.push(
-        row![
-            section_label("CONNECTION"),
-            space().width(Fill),
-            button(text("Edit").size(12))
-                .padding([3, 10])
-                .style(style::ghost)
-                .on_press(Message::EditProfile(profile.id.clone())),
-        ]
-        .align_y(Center),
+    let mut header = row![section_label("CONNECTION"), space().width(Fill)].align_y(Center);
+    if connected {
+        header = header.push(
+            button(
+                text(if app.show_conn_path {
+                    "Hide path"
+                } else {
+                    "Connection path"
+                })
+                .size(12),
+            )
+            .padding([3, 10])
+            .style(style::ghost)
+            .on_press(Message::ToggleConnPath),
+        );
+    }
+    header = header.push(
+        button(text("Edit").size(12))
+            .padding([3, 10])
+            .style(style::ghost)
+            .on_press(Message::EditProfile(profile.id.clone())),
     );
+    col = col.push(header);
     col = col.push(container(info).padding([12, 14]).width(Fill).style(style::card));
 
     if snapshot.phase == Phase::Connected {
@@ -632,6 +652,31 @@ fn forward_card<'a>(
         .width(Fill)
         .style(style::card)
         .into()
+}
+
+/// The connection's current iroh path(s): a dot colored by transport (direct
+/// vs relay), the `ezvpn`-style line, and an "active" pill on the selected
+/// path. Empty until iroh has established a path.
+fn conn_path_section(paths: &[ConnPath]) -> Element<'_, Message> {
+    if paths.is_empty() {
+        return text("Establishing path…").size(12).style(style::dim_text).into();
+    }
+    let mut col = column![].spacing(4);
+    for path in paths {
+        let color = match path.kind {
+            ConnPathKind::Direct => GREEN,
+            ConnPathKind::Relay => AMBER,
+            ConnPathKind::Other => GRAY,
+        };
+        let mut r = row![dot(color, 6.0), mono(path.display.clone())]
+            .spacing(8)
+            .align_y(Center);
+        if path.selected {
+            r = r.push(pill("active".to_string(), GREEN));
+        }
+        col = col.push(r);
+    }
+    col.into()
 }
 
 fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
