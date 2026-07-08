@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 pub type ProfileId = String;
 
@@ -36,8 +36,6 @@ pub struct Snapshot {
     pub socks_addr: Option<SocketAddr>,
     pub http_addr: Option<SocketAddr>,
     pub routes: TunnelRoutes,
-    /// Current iroh connection path(s) (relay/direct); empty unless connected.
-    pub conn_paths: Vec<ConnPath>,
     pub last_error: Option<String>,
     /// Live status per running forward; empty while no session runs, which the
     /// UI renders as "stopped".
@@ -52,7 +50,6 @@ impl Default for Snapshot {
             socks_addr: None,
             http_addr: None,
             routes: TunnelRoutes::default(),
-            conn_paths: Vec::new(),
             last_error: None,
             forwards: Vec::new(),
         }
@@ -76,12 +73,18 @@ enum Command {
     SetForwards(ProfileId, Vec<PortForward>),
     /// Disconnect and drop the profile's snapshot slot (profile deleted).
     RemoveProfile(ProfileId),
+    /// One-shot request for the profile's current iroh connection path(s),
+    /// answered on the reply channel (the UI's connection-path CTA). Empty when
+    /// no session is running.
+    QueryConnPath(ProfileId, oneshot::Sender<Vec<ConnPath>>),
     Shutdown,
 }
 
 enum SessionCmd {
     Disconnect,
     SetForwards(Vec<PortForward>),
+    /// Answer the reply channel with the live connection's path snapshot, once.
+    QueryConnPath(oneshot::Sender<Vec<ConnPath>>),
     Shutdown,
 }
 
@@ -156,6 +159,21 @@ impl Controller {
 
     pub fn remove_profile(&self, id: &str) {
         let _ = self.tx.blocking_send(Command::RemoveProfile(id.into()));
+    }
+
+    /// Fetch the profile's current iroh connection path(s), once. Returns empty
+    /// when no session is running (or the request can't be answered). Blocks
+    /// briefly on the session's reply — the round-trip is a channel hop.
+    pub fn query_conn_path(&self, id: &str) -> Vec<ConnPath> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .blocking_send(Command::QueryConnPath(id.into(), reply_tx))
+            .is_err()
+        {
+            return Vec::new();
+        }
+        reply_rx.blocking_recv().unwrap_or_default()
     }
 
     /// Stop all sessions and join the worker thread (blocks briefly for the
@@ -299,6 +317,12 @@ async fn run_loop(mut rx: mpsc::Receiver<Command>, shared: SharedSnapshots) {
                 // No session: nothing to do — forwards travel inside the
                 // profile on the next Connect.
             }
+            Some(Command::QueryConnPath(id, reply)) => {
+                if let Some(handle) = sessions.get(&id) {
+                    let _ = handle.tx.send(SessionCmd::QueryConnPath(reply)).await;
+                }
+                // No session: `reply` drops, and the caller gets an empty Vec.
+            }
             Some(Command::RemoveProfile(id)) => {
                 if let Some(handle) = sessions.remove(&id) {
                     let _ = handle.tx.send(SessionCmd::Disconnect).await;
@@ -400,6 +424,10 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
                     return;
                 }
                 Some(SessionCmd::SetForwards(f)) => forwards = f,
+                // No connection yet during endpoint creation — report none.
+                Some(SessionCmd::QueryConnPath(reply)) => {
+                    let _ = reply.send(Vec::new());
+                }
                 Some(SessionCmd::Shutdown) | None => {
                     // Bounded grace so quitting stays responsive: close
                     // cleanly when creation finishes quickly, otherwise just
@@ -492,10 +520,8 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
                     .lock()
                     .map(|r| r.clone())
                     .unwrap_or_default();
-                let paths = client.conn_paths();
                 ever_connected |= routes.connected;
                 slot.update(|s| {
-                    s.conn_paths = paths;
                     if routes.connected {
                         if s.phase != Phase::Connected {
                             s.connected_since = Some(Instant::now());
@@ -524,6 +550,9 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
                     fwd_mgr.apply(&forwards);
                     refresh_forward_statuses(&slot, &fwd_mgr);
                 }
+                Some(SessionCmd::QueryConnPath(reply)) => {
+                    let _ = reply.send(client.conn_paths());
+                }
                 Some(SessionCmd::Shutdown) | None => {
                     slot.update(|s| s.phase = Phase::Idle);
                     break;
@@ -542,7 +571,6 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
     slot.update(|s| {
         s.routes.connected = false;
         s.connected_since = None;
-        s.conn_paths.clear();
         s.forwards.clear();
     });
 }

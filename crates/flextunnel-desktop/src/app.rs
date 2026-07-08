@@ -14,6 +14,7 @@ use crate::logging;
 use crate::tray::{self, Tray};
 use crate::tunnel::{Controller, Phase, ProfileId, Snapshot};
 use crate::view;
+use flextunnel_core::transport::endpoint::ConnPath;
 use iced::futures::Stream;
 use iced::{window, Element, Size, Subscription, Task};
 use std::collections::HashMap;
@@ -38,8 +39,8 @@ pub enum Message {
     WindowClosed(window::Id),
     Select(Selection),
     CopyText(String),
-    /// Toggle the connection-path (relay/direct) detail in the CONNECTION card.
-    ToggleConnPath,
+    /// Fetch and flash the current iroh connection path (relay/direct) once.
+    ShowConnPath,
     // Profiles
     AddProfile,
     EditProfile(ProfileId),
@@ -527,6 +528,25 @@ fn window_settings() -> window::Settings {
     }
 }
 
+/// One-line, point-in-time summary of the connection path(s) for the notice
+/// line — the active path marked, mirroring `ezvpn client status`.
+fn conn_path_message(paths: &[ConnPath]) -> String {
+    if paths.is_empty() {
+        return "Connection path: still establishing — try again in a moment.".into();
+    }
+    let parts: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            if p.selected {
+                format!("{} (active)", p.display)
+            } else {
+                p.display.clone()
+            }
+        })
+        .collect();
+    format!("Connection path right now: {}", parts.join(" · "))
+}
+
 pub struct App {
     controller: Controller,
     tray: Option<Tray>,
@@ -539,11 +559,9 @@ pub struct App {
     pub forward_form: Option<(ProfileId, ForwardForm)>,
     /// Two-click delete guard: the profile whose Delete was clicked once.
     pub confirm_delete: Option<ProfileId>,
-    /// Transient status line in the detail pane (save results/failures).
+    /// Transient status line in the detail pane (save results/failures, and the
+    /// on-demand connection-path readout).
     pub notice: Option<String>,
-    /// Whether the CONNECTION card shows the live iroh path (relay/direct);
-    /// reset when the selection changes.
-    pub show_conn_path: bool,
     /// Transient export/import result shown in the sidebar.
     pub io_notice: Option<String>,
     /// Setup-failure reason per forward id, retained after the failed forward
@@ -594,7 +612,6 @@ impl App {
             forward_form: None,
             confirm_delete: None,
             notice: None,
-            show_conn_path: false,
             io_notice: None,
             forward_errors: HashMap::new(),
             routed_caches: HashMap::new(),
@@ -683,15 +700,21 @@ impl App {
                 self.forward_form = None;
                 self.confirm_delete = None;
                 self.notice = None;
-                self.show_conn_path = false;
                 Task::none()
             }
             Message::CopyText(text) => {
                 self.copy_text(text);
                 Task::none()
             }
-            Message::ToggleConnPath => {
-                self.show_conn_path = !self.show_conn_path;
+            Message::ShowConnPath => {
+                // A one-shot readout, surfaced in the transient notice line —
+                // not a live field. It's a point-in-time snapshot and clears on
+                // the next navigation, so it can't be mistaken for the current
+                // path.
+                if let Selection::Profile(id) = &self.selection {
+                    let paths = self.controller.query_conn_path(&id.clone());
+                    self.notice = Some(conn_path_message(&paths));
+                }
                 Task::none()
             }
             Message::AddProfile => {
