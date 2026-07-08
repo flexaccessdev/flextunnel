@@ -1,9 +1,12 @@
-//! Background tunnel controller: a dedicated thread running a Tokio runtime,
-//! supervising one session task per connected profile, driven by UI commands
-//! and publishing per-profile status snapshots the UI polls each frame. Each
-//! session owns its `ProxyClient` future, so dropping it (disconnect/shutdown)
-//! tears down the accept loops and the connection manager together, followed
-//! by a graceful endpoint close.
+//! Background tunnel controller: a supervisor thread routing UI commands to
+//! one session per connected profile, each on its own OS thread running its
+//! own Tokio runtime whose threads are named `tunnel-<profile>` — so every
+//! log line a session emits (core internals included) is attributed to its
+//! profile by thread name (see `logging`). Status is published as per-profile
+//! snapshots the UI polls each frame. Each session owns its `ProxyClient`
+//! future, so dropping it (disconnect/shutdown) tears down the accept loops
+//! and the connection manager together, followed by a graceful endpoint
+//! close.
 
 use crate::config::Profile;
 use crate::forward::{ForwardManager, ForwardStatus, PortForward};
@@ -109,11 +112,15 @@ impl Controller {
         let (tx, rx) = mpsc::channel(16);
         let shared: SharedSnapshots = Arc::new(Mutex::new(HashMap::new()));
         let worker_shared = shared.clone();
+        // The supervisor only routes commands; sessions get their own
+        // runtimes, so a single-threaded one suffices here.
         let thread = std::thread::Builder::new()
             .name("tunnel".into())
-            .spawn(move || match flextunnel_core::app::build_runtime() {
-                Ok(rt) => rt.block_on(run_loop(rx, worker_shared)),
-                Err(e) => log::error!("Failed to build the Tokio runtime: {e:#}"),
+            .spawn(move || {
+                match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    Ok(rt) => rt.block_on(run_loop(rx, worker_shared)),
+                    Err(e) => log::error!("Failed to build the Tokio runtime: {e:#}"),
+                }
             })
             .expect("spawn tunnel thread");
         Self {
@@ -172,29 +179,76 @@ async fn bind_local(addr: SocketAddr, label: &str) -> Result<tokio::net::TcpList
 
 struct SessionHandle {
     tx: mpsc::Sender<SessionCmd>,
-    task: tokio::task::JoinHandle<()>,
+    /// Resolves when the session's thread finishes (its receiver dropping
+    /// also marks `tx` closed).
+    done: tokio::sync::oneshot::Receiver<()>,
 }
 
-/// Supervisor: routes profile-scoped commands to per-profile session tasks.
+/// Spawn one profile's session on its own OS thread with its own runtime, all
+/// threads named `tunnel-<profile>` so the logger can attribute every line
+/// the session emits. `None` when the thread could not be spawned (the
+/// snapshot is set to Failed instead).
+fn spawn_session(profile: Profile, shared: &SharedSnapshots) -> Option<SessionHandle> {
+    let (tx, session_rx) = mpsc::channel(8);
+    let (done_tx, done) = tokio::sync::oneshot::channel();
+    let slot = SnapshotSlot {
+        shared: shared.clone(),
+        id: profile.id.clone(),
+    };
+    let error_slot = slot.clone();
+    let thread_name = format!("tunnel-{}", profile.name);
+    let runtime_name = thread_name.clone();
+    let spawned = std::thread::Builder::new().name(thread_name).spawn(move || {
+        // One worker is plenty for a tunnel session; multi_thread (rather
+        // than current_thread) keeps the runtime semantics identical to the
+        // other flextunnel binaries.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name(runtime_name)
+            .enable_all()
+            .build();
+        match runtime {
+            Ok(rt) => rt.block_on(run_session(profile, session_rx, slot)),
+            Err(e) => {
+                log::error!("Failed to build the session runtime: {e:#}");
+                slot.update(|s| {
+                    s.phase = Phase::Failed;
+                    s.last_error = Some(format!("Failed to start: {e:#}"));
+                });
+            }
+        }
+        let _ = done_tx.send(());
+    });
+    match spawned {
+        Ok(_) => Some(SessionHandle { tx, done }),
+        Err(e) => {
+            log::error!("Failed to spawn the session thread: {e:#}");
+            error_slot.update(|s| {
+                s.phase = Phase::Failed;
+                s.last_error = Some(format!("Failed to start: {e:#}"));
+            });
+            None
+        }
+    }
+}
+
+/// Supervisor: routes profile-scoped commands to per-profile sessions.
 async fn run_loop(mut rx: mpsc::Receiver<Command>, shared: SharedSnapshots) {
     let mut sessions: HashMap<ProfileId, SessionHandle> = HashMap::new();
     loop {
         let cmd = rx.recv().await;
-        sessions.retain(|_, handle| !handle.task.is_finished());
+        // An ended session drops its receiver, closing the sender.
+        sessions.retain(|_, handle| !handle.tx.is_closed());
         match cmd {
             Some(Command::Connect(profile)) => {
                 if sessions.contains_key(&profile.id) {
                     log::warn!("Profile \"{}\" is already running a session", profile.name);
                     continue;
                 }
-                let (tx, session_rx) = mpsc::channel(8);
-                let slot = SnapshotSlot {
-                    shared: shared.clone(),
-                    id: profile.id.clone(),
-                };
                 let id = profile.id.clone();
-                let task = tokio::spawn(run_session(*profile, session_rx, slot));
-                sessions.insert(id, SessionHandle { tx, task });
+                if let Some(handle) = spawn_session(*profile, &shared) {
+                    sessions.insert(id, handle);
+                }
             }
             Some(Command::Disconnect(id)) => {
                 if let Some(handle) = sessions.get(&id) {
@@ -215,7 +269,7 @@ async fn run_loop(mut rx: mpsc::Receiver<Command>, shared: SharedSnapshots) {
                     // they would recreate it.
                     let shared = shared.clone();
                     tokio::spawn(async move {
-                        let _ = handle.task.await;
+                        let _ = handle.done.await;
                         remove_slot(&shared, &id);
                     });
                 } else {
@@ -233,7 +287,7 @@ async fn run_loop(mut rx: mpsc::Receiver<Command>, shared: SharedSnapshots) {
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     for (_, handle) in sessions {
-        let _ = tokio::time::timeout_at(deadline, handle.task).await;
+        let _ = tokio::time::timeout_at(deadline, handle.done).await;
     }
 }
 
@@ -292,13 +346,20 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
                 Some(SessionCmd::Disconnect) => {
                     log::info!("Disconnecting \"{}\"", profile.name);
                     slot.update(|s| s.phase = Phase::Idle);
-                    // Close the endpoint gracefully once creation finishes,
-                    // without holding up the disconnect.
-                    tokio::spawn(async move {
+                    // The UI already shows Idle and this session makes no
+                    // further snapshot writes, so release the command channel
+                    // now — an immediate reconnect may start a fresh session
+                    // while this thread lingers briefly (bounded — the
+                    // session runtime dies with the thread, so a detached
+                    // close task would be cut off) to close the endpoint
+                    // gracefully when creation finishes quickly.
+                    drop(rx);
+                    let _ = tokio::time::timeout(Duration::from_secs(2), async {
                         if let Ok(Ok(endpoint)) = create.await {
                             endpoint.close().await;
                         }
-                    });
+                    })
+                    .await;
                     return;
                 }
                 Some(SessionCmd::SetForwards(f)) => forwards = f,

@@ -167,6 +167,14 @@ impl ProfileForm {
         if name.len() > 64 {
             return Err("Profile name must be 64 characters or fewer".into());
         }
+        // Unique names keep the tray submenus and the per-profile log
+        // attribution (thread names) unambiguous.
+        if profiles
+            .iter()
+            .any(|p| p.name == name && Some(p.id.as_str()) != self.editing_id.as_deref())
+        {
+            return Err(format!("Another profile is already named \"{name}\""));
+        }
         let server_node_id = self.server_node_id.trim();
         if server_node_id.is_empty() {
             return Err("Server node id is required".into());
@@ -1207,6 +1215,15 @@ mod tests {
         let mut form = valid_form();
         form.server_node_id = "  ".into();
         assert!(form.validate(&[]).is_err());
+
+        // Duplicate profile name (they key tray submenus and log threads)…
+        let existing = [existing_profile("p1", 2080, vec![])];
+        let mut form = valid_form();
+        form.name = " profile-p1 ".into();
+        assert!(form.validate(&existing).is_err());
+        // …unless it is the profile being edited.
+        form.editing_id = Some("p1".into());
+        assert!(form.validate(&existing).is_ok());
     }
 
     #[test]
