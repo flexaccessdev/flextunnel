@@ -244,6 +244,61 @@ pub fn save_profiles(profiles: &[Profile]) -> Result<()> {
     }
 }
 
+/// Export all profiles to a user-chosen file. Non-secrets only, whatever the
+/// backend: `Profile`'s serialization always skips the token. Profile and
+/// forward ids are stripped too — they are app-local keys that the import
+/// regenerates, not part of the portable data.
+pub fn export_profiles(path: &Path, profiles: &[Profile]) -> Result<()> {
+    let mut values = serde_json::to_value(profiles)?;
+    for entry in values.as_array_mut().into_iter().flatten() {
+        if let Some(profile) = entry.as_object_mut() {
+            profile.remove("id");
+            for forward in forwards_of(profile) {
+                forward.remove("id");
+            }
+        }
+    }
+    write_json(path, &values)
+}
+
+/// Read an export file back, applying the same structural validation as a
+/// load (malformed names and in-file duplicates are dropped with logs). The
+/// caller merges the result into the current profiles and assigns final ids;
+/// missing ids (the normal export shape) get placeholders here so the entries
+/// deserialize. Tokens are never in the file, so imported entries come back
+/// with empty tokens.
+pub fn import_profiles(path: &Path) -> Result<Vec<Profile>> {
+    let mut values: serde_json::Value = read_json(path)?
+        .ok_or_else(|| anyhow::anyhow!("{} does not exist", path.display()))?;
+    for entry in values.as_array_mut().into_iter().flatten() {
+        if let Some(profile) = entry.as_object_mut() {
+            profile
+                .entry("id")
+                .or_insert_with(|| Profile::new_id().into());
+            for forward in forwards_of(profile) {
+                forward
+                    .entry("id")
+                    .or_insert_with(|| PortForward::new_id().into());
+            }
+        }
+    }
+    let profiles: Vec<Profile> = serde_json::from_value(values)
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    Ok(drop_invalid(profiles))
+}
+
+/// The mutable forward objects of a profile JSON object (empty when absent).
+fn forwards_of(
+    profile: &mut serde_json::Map<String, serde_json::Value>,
+) -> impl Iterator<Item = &mut serde_json::Map<String, serde_json::Value>> {
+    profile
+        .get_mut("forwards")
+        .and_then(|f| f.as_array_mut())
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f.as_object_mut())
+}
+
 /// Store one profile's token. Called only when the token itself changes (the
 /// profile form is saved); a no-op in dev file mode where `save_profiles`
 /// already wrote it inline.
@@ -397,6 +452,28 @@ mod tests {
             unique.clone(),
         ]);
         assert_eq!(kept, vec![a, unique]);
+    }
+
+    #[test]
+    fn export_strips_ids_and_import_regenerates_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.json");
+
+        export_profiles(&path, &[profile()]).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("\"id\""), "ids leaked into the export: {raw}");
+        assert!(!raw.contains("token"), "token leaked into the export: {raw}");
+
+        let imported = import_profiles(&path).unwrap();
+        assert_eq!(imported.len(), 1);
+        let p = &imported[0];
+        assert!(!p.id.is_empty(), "placeholder profile id assigned");
+        assert!(p.auth_token.is_empty());
+        assert_eq!(p.name, profile().name);
+        assert_eq!(p.socks_port, profile().socks_port);
+        assert_eq!(p.forwards.len(), 1);
+        assert!(!p.forwards[0].id.is_empty(), "placeholder forward id assigned");
+        assert_eq!(p.forwards[0].local_port, profile().forwards[0].local_port);
     }
 
     #[test]

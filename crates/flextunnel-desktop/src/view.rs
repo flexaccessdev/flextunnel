@@ -143,16 +143,30 @@ fn sidebar(app: &App) -> Element<'_, Message> {
         .style(style::sidebar_row(logs_selected))
         .on_press(Message::Select(Selection::Logs));
 
+    let io_row = row![
+        button(text("Export").size(11))
+            .padding([3, 10])
+            .style(style::ghost)
+            .on_press_maybe((!app.profiles.is_empty()).then_some(Message::ExportProfiles)),
+        button(text("Import").size(11))
+            .padding([3, 10])
+            .style(style::ghost)
+            .on_press(Message::ImportProfiles),
+    ]
+    .spacing(4);
+
+    let mut footer = column![logs_row, io_row].spacing(6);
+    if let Some(notice) = &app.io_notice {
+        footer = footer.push(text(notice.as_str()).size(10).style(style::dim_text));
+    }
+    footer = footer.push(
+        text(concat!("v", env!("CARGO_PKG_VERSION")))
+            .size(10)
+            .style(style::faint_text),
+    );
+
     container(
-        column![
-            header,
-            scrollable(list).height(Fill).spacing(4),
-            logs_row,
-            text(concat!("v", env!("CARGO_PKG_VERSION")))
-                .size(10)
-                .style(style::faint_text),
-        ]
-        .spacing(10),
+        column![header, scrollable(list).height(Fill).spacing(4), footer].spacing(10),
     )
     .padding([14, 12])
     .width(210)

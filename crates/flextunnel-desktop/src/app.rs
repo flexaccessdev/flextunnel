@@ -44,6 +44,10 @@ pub enum Message {
     DeleteProfile(ProfileId),
     Connect(ProfileId),
     Disconnect(ProfileId),
+    ExportProfiles,
+    ImportProfiles,
+    ExportPicked(Option<std::path::PathBuf>),
+    ImportPicked(Option<std::path::PathBuf>),
     // Profile form
     ProfileNameChanged(String),
     ServerNodeIdChanged(String),
@@ -108,6 +112,70 @@ fn port_owner(
         }
     }
     None
+}
+
+/// `desired` if no other profile (than `own_id`) uses it, else the first free
+/// "desired - 2", "desired - 3", … The base is shortened if a suffix would
+/// push past the 64-character name limit.
+fn unique_name(profiles: &[Profile], desired: String, own_id: Option<&str>) -> String {
+    let taken = |name: &str| {
+        profiles
+            .iter()
+            .any(|p| p.name == name && Some(p.id.as_str()) != own_id)
+    };
+    if !taken(&desired) {
+        return desired;
+    }
+    (2..)
+        .map(|n| {
+            let suffix = format!(" - {n}");
+            let mut base = desired.clone();
+            while base.len() + suffix.len() > 64 {
+                base.pop();
+            }
+            format!("{}{suffix}", base.trim_end())
+        })
+        .find(|candidate| !taken(candidate))
+        .expect("some numbered name is free")
+}
+
+/// Merge an imported (already structurally validated) profile list into the
+/// current one. A matching server node id replaces that profile's settings
+/// and forwards but keeps its id and token; anything else is added as a new
+/// profile with a fresh id and no token. Colliding names get a " - N" suffix,
+/// and imported forwards get fresh ids so they stay globally unique. Returns
+/// `(added, replaced-profile ids)`.
+fn merge_imported(
+    profiles: &mut Vec<Profile>,
+    imported: Vec<Profile>,
+) -> (usize, Vec<ProfileId>) {
+    let mut added = 0;
+    let mut replaced = Vec::new();
+    for mut incoming in imported {
+        for forward in &mut incoming.forwards {
+            forward.id = PortForward::new_id();
+        }
+        match profiles
+            .iter()
+            .position(|p| p.server_node_id == incoming.server_node_id)
+        {
+            Some(pos) => {
+                incoming.id = profiles[pos].id.clone();
+                incoming.auth_token = profiles[pos].auth_token.clone();
+                incoming.name = unique_name(profiles, incoming.name, Some(&incoming.id));
+                profiles[pos] = incoming;
+                replaced.push(profiles[pos].id.clone());
+            }
+            None => {
+                incoming.id = Profile::new_id();
+                incoming.auth_token = String::new();
+                incoming.name = unique_name(profiles, incoming.name, None);
+                profiles.push(incoming);
+                added += 1;
+            }
+        }
+    }
+    (added, replaced)
 }
 
 /// First port from the default upward not used by any profile or forward, as
@@ -471,6 +539,8 @@ pub struct App {
     pub confirm_delete: Option<ProfileId>,
     /// Transient status line in the detail pane (save results/failures).
     pub notice: Option<String>,
+    /// Transient export/import result shown in the sidebar.
+    pub io_notice: Option<String>,
     /// Setup-failure reason per forward id, retained after the failed forward
     /// is auto-stopped (see [`disable_failed_forwards`]) so the row can keep
     /// showing why; cleared when the forward is started again or removed.
@@ -519,6 +589,7 @@ impl App {
             forward_form: None,
             confirm_delete: None,
             notice: None,
+            io_notice: None,
             forward_errors: HashMap::new(),
             routed_caches: HashMap::new(),
             // MAX so the first refresh always builds the log text.
@@ -634,6 +705,45 @@ impl App {
             Message::Connect(id) => self.connect_profile(&id),
             Message::Disconnect(id) => {
                 self.controller.disconnect(&id);
+                Task::none()
+            }
+            Message::ExportProfiles => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .add_filter("JSON", &["json"])
+                        .set_file_name("flextunnel-profiles.json")
+                        .save_file()
+                        .await
+                        .map(|file| file.path().to_path_buf())
+                },
+                Message::ExportPicked,
+            ),
+            Message::ImportProfiles => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .add_filter("JSON", &["json"])
+                        .pick_file()
+                        .await
+                        .map(|file| file.path().to_path_buf())
+                },
+                Message::ImportPicked,
+            ),
+            Message::ExportPicked(path) => {
+                if let Some(path) = path {
+                    self.io_notice = Some(match config::export_profiles(&path, &self.profiles) {
+                        Ok(()) => format!("Exported {} profile(s).", self.profiles.len()),
+                        Err(e) => {
+                            log::error!("{e:#}");
+                            format!("Export failed: {e:#}")
+                        }
+                    });
+                }
+                Task::none()
+            }
+            Message::ImportPicked(path) => {
+                if let Some(path) = path {
+                    self.import_profiles(&path);
+                }
                 Task::none()
             }
             Message::ProfileNameChanged(value) => {
@@ -1007,6 +1117,38 @@ impl App {
         }
     }
 
+    fn import_profiles(&mut self, path: &std::path::Path) {
+        let imported = match config::import_profiles(path) {
+            Ok(imported) => imported,
+            Err(e) => {
+                log::error!("{e:#}");
+                self.io_notice = Some(format!("Import failed: {e:#}"));
+                return;
+            }
+        };
+        let (added, replaced) = merge_imported(&mut self.profiles, imported);
+        // A replaced profile's session (if live) reconciles to the imported
+        // forward list — which loads all-disabled, like any fresh load.
+        for id in &replaced {
+            if let Some(profile) = self.profile(id) {
+                self.controller.set_forwards(id, profile.forwards.clone());
+            }
+        }
+        self.persist_profiles();
+        self.io_notice = Some(format!(
+            "Imported: {added} added, {} replaced.",
+            replaced.len()
+        ));
+        // Land somewhere sensible if nothing (or a since-removed profile) was
+        // selected; added profiles still need their tokens entered.
+        if !matches!(&self.selection, Selection::Profile(id) if self.profile(id).is_some())
+            && let Some(profile) = self.profiles.first()
+        {
+            self.selection = Selection::Profile(profile.id.clone());
+        }
+        self.profile_form = None;
+    }
+
     /// Re-join the log ring for the Logs pane, keeping only the filtered
     /// profile's session-thread lines (`[tunnel-<name>]`) when a filter is on.
     fn rebuild_log_text(&mut self) {
@@ -1236,6 +1378,71 @@ mod tests {
         form.editing_id = Some("aaaa".into());
         let edited = form.validate(&taken).expect("editing the same forward");
         assert_eq!(edited.id, "aaaa");
+    }
+
+    #[test]
+    fn import_merges_by_server_id_and_uniquifies_names() {
+        // "profile-p1" on server "node" (with a token), "profile-p2" on
+        // "node-2".
+        let mut current = vec![
+            existing_profile("p1", 1080, vec![existing_forward("f1", 5000)]),
+            existing_profile("p2", 1081, vec![]),
+        ];
+        current[1].server_node_id = "node-2".into();
+        current[0].auth_token = "secret".into();
+
+        // Same server as p1: replaces settings/forwards, keeps id + token.
+        let mut same_server = existing_profile("x", 2080, vec![existing_forward("f2", 6000)]);
+        same_server.name = "renamed".into();
+        // New server, but colliding with p2's name: gets " - 2".
+        let mut name_clash = existing_profile("y", 3080, vec![]);
+        name_clash.name = "profile-p2".into();
+        name_clash.server_node_id = "node-3".into();
+
+        let (added, replaced) = merge_imported(&mut current, vec![same_server, name_clash]);
+        assert_eq!(added, 1);
+        assert_eq!(replaced, vec!["p1".to_string()]);
+
+        let p1 = &current[0];
+        assert_eq!(p1.id, "p1", "id kept");
+        assert_eq!(p1.auth_token, "secret", "token kept");
+        assert_eq!(p1.name, "renamed");
+        assert_eq!(p1.socks_port, 2080);
+        assert_eq!(p1.forwards.len(), 1);
+        assert_ne!(p1.forwards[0].id, "f2", "imported forward ids are fresh");
+
+        let new = &current[2];
+        assert_eq!(new.name, "profile-p2 - 2");
+        assert!(new.auth_token.is_empty(), "no secret in imports");
+        assert_ne!(new.id, "y", "imported profile ids are fresh");
+
+        // A second import of the same name-clashing profile bumps to " - 3"
+        // only if its server is also new; same server replaces in place.
+        let mut again = existing_profile("z", 4080, vec![]);
+        again.name = "profile-p2".into();
+        again.server_node_id = "node-4".into();
+        let (added, replaced) = merge_imported(&mut current, vec![again]);
+        assert_eq!((added, replaced.len()), (1, 0));
+        assert_eq!(current[3].name, "profile-p2 - 3");
+    }
+
+    #[test]
+    fn unique_name_respects_length_limit() {
+        let taken = existing_profile("p1", 1080, vec![]);
+        let mut long = existing_profile("p2", 1081, vec![]);
+        long.name = "a".repeat(64);
+        let profiles = [taken, long.clone()];
+
+        assert_eq!(
+            unique_name(&profiles, "fresh".into(), None),
+            "fresh",
+            "free names pass through"
+        );
+        let bumped = unique_name(&profiles, long.name.clone(), None);
+        assert_eq!(bumped, format!("{} - 2", "a".repeat(60)));
+        assert!(bumped.len() <= 64);
+        assert!(bumped.ends_with(" - 2"));
+        assert!(Profile::is_valid_name(&bumped));
     }
 
     #[test]
