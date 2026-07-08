@@ -1,7 +1,9 @@
 //! Process-wide logger for the GUI: `env_filter`-driven (same `RUST_LOG`
 //! semantics and default filter as the CLI), teeing every record into a
-//! bounded in-memory ring for the Logs tab and a size-rotated file in the
-//! platform log directory.
+//! bounded in-memory ring for the Logs pane and a size-rotated file in the
+//! platform log directory. Every line carries the emitting thread's name —
+//! each profile's session runs on threads named `tunnel-<profile>` (see
+//! `tunnel::spawn_session`), so that column tells profiles' logs apart.
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
@@ -80,10 +82,12 @@ impl log::Log for Sink {
         if !self.filter.matches(record) {
             return;
         }
+        let thread = std::thread::current();
         let line = format!(
-            "{} {:5} {}: {}",
+            "{} {:5} [{}] {}: {}",
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
             record.level(),
+            thread.name().unwrap_or("?"),
             record.target(),
             record.args()
         );

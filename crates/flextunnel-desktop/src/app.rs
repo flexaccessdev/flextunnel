@@ -1,17 +1,18 @@
-//! The iced daemon state machine: a Status / Forwards / Settings / Logs tabbed
-//! window driven alongside the system tray. The daemon owns all state, so
-//! closing the window (which destroys it) loses nothing — the tray re-opens
-//! it on demand. Tray/menu events are forwarded from tray-icon's handlers into
-//! a channel drained by a [`Subscription`], so a tray click wakes the runtime
-//! even while no window exists; a 500 ms tick keeps the snapshot and the tray
-//! state fresh the rest of the time.
+//! The iced daemon state machine: a sidebar of connection profiles plus a
+//! detail pane, driven alongside the system tray. Each profile can run its own
+//! tunnel session concurrently (its own SOCKS5 port and forwards). The daemon
+//! owns all state, so closing the window (which destroys it) loses nothing —
+//! the tray re-opens it on demand. Tray/menu events are forwarded from
+//! tray-icon's handlers into a channel drained by a [`Subscription`], so a
+//! tray click wakes the runtime even while no window exists; a 500 ms tick
+//! keeps the snapshots and the tray state fresh the rest of the time.
 
-use crate::config::{self, AppConfig};
-use crate::forward::{self, ForwardState, ForwardStatus, PortForward};
+use crate::config::{self, Profile, DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT};
+use crate::forward::{ForwardState, ForwardStatus, PortForward};
 use crate::icon;
 use crate::logging;
 use crate::tray::{self, Tray};
-use crate::tunnel::{Controller, Phase, Snapshot};
+use crate::tunnel::{Controller, Phase, ProfileId, Snapshot};
 use crate::view;
 use iced::futures::Stream;
 use iced::{window, Element, Size, Subscription, Task};
@@ -20,11 +21,10 @@ use std::time::Duration;
 use tray_icon::menu::MenuEvent;
 use tray_icon::TrayIconEvent;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Tab {
-    Status,
-    Forwards,
-    Settings,
+/// What the detail pane shows (the sidebar's selected row).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Selection {
+    Profile(ProfileId),
     Logs,
 }
 
@@ -36,23 +36,33 @@ pub enum Message {
     TrayIcon(TrayIconEvent),
     WindowOpened,
     WindowClosed(window::Id),
-    TabSelected(Tab),
-    Connect,
-    Disconnect,
+    Select(Selection),
     CopyText(String),
-    // Settings form
+    // Profiles
+    AddProfile,
+    EditProfile(ProfileId),
+    DeleteProfile(ProfileId),
+    Connect(ProfileId),
+    Disconnect(ProfileId),
+    ExportProfiles,
+    ImportProfiles,
+    ExportPicked(Option<std::path::PathBuf>),
+    ImportPicked(Option<std::path::PathBuf>),
+    // Profile form
+    ProfileNameChanged(String),
     ServerNodeIdChanged(String),
     AuthTokenChanged(String),
     SocksPortChanged(String),
     HttpEnabledToggled(bool),
     HttpPortChanged(String),
     RelayUrlsChanged(String),
-    SaveSettings,
+    ProfileFormSave,
+    ProfileFormCancel,
     // Forwards
-    AddForward,
-    EditForward(usize),
-    DeleteForward(usize),
-    ToggleForward(usize, bool),
+    AddForward(ProfileId),
+    EditForward(ProfileId, String),
+    DeleteForward(ProfileId, String),
+    ToggleForward(ProfileId, String, bool),
     FormLabelChanged(String),
     FormLocalPortChanged(String),
     FormRemoteHostChanged(String),
@@ -61,13 +71,129 @@ pub enum Message {
     FormSave,
     FormCancel,
     // Logs
+    LogFilterChanged(String),
     OpenLogFolder,
     CopyLogs,
 }
 
-/// Editable settings buffers, mirroring the iOS setup form's validation.
+/// Sentinel option shown in the Logs pane's profile filter.
+pub const LOG_FILTER_ALL: &str = "All profiles";
+
+/// Human description of what already occupies a local port, across every
+/// profile — profiles can run concurrently, so all local ports share one
+/// namespace. `exclude_profile` skips that profile's proxy ports (its own
+/// form edits them); `exclude_forward` skips the forward being edited.
+fn port_owner(
+    profiles: &[Profile],
+    port: u16,
+    exclude_profile: Option<&str>,
+    exclude_forward: Option<&str>,
+) -> Option<String> {
+    for profile in profiles {
+        if Some(profile.id.as_str()) != exclude_profile {
+            if profile.socks_port == port {
+                return Some(format!("the SOCKS5 port of profile \"{}\"", profile.name));
+            }
+            if profile.http_port == Some(port) {
+                return Some(format!("the HTTP port of profile \"{}\"", profile.name));
+            }
+        }
+        for forward in &profile.forwards {
+            if Some(forward.id.as_str()) == exclude_forward {
+                continue;
+            }
+            if forward.local_port == port {
+                return Some(format!(
+                    "forward \"{}\" in profile \"{}\"",
+                    forward.display_name(),
+                    profile.name
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// `desired` if no other profile (than `own_id`) uses it, else the first free
+/// "desired - 2", "desired - 3", … The base is shortened if a suffix would
+/// push past the 64-character name limit.
+fn unique_name(profiles: &[Profile], desired: String, own_id: Option<&str>) -> String {
+    let taken = |name: &str| {
+        profiles
+            .iter()
+            .any(|p| p.name == name && Some(p.id.as_str()) != own_id)
+    };
+    if !taken(&desired) {
+        return desired;
+    }
+    (2..)
+        .map(|n| {
+            let suffix = format!(" - {n}");
+            let mut base = desired.clone();
+            while base.len() + suffix.len() > 64 {
+                base.pop();
+            }
+            format!("{}{suffix}", base.trim_end())
+        })
+        .find(|candidate| !taken(candidate))
+        .expect("some numbered name is free")
+}
+
+/// Merge an imported (already structurally validated) profile list into the
+/// current one. A matching server node id replaces that profile's settings
+/// and forwards but keeps its id and token; anything else is added as a new
+/// profile with a fresh id and no token. Colliding names get a " - N" suffix,
+/// and imported forwards get fresh ids so they stay globally unique. Returns
+/// `(added, replaced-profile ids)`.
+fn merge_imported(
+    profiles: &mut Vec<Profile>,
+    imported: Vec<Profile>,
+) -> (usize, Vec<ProfileId>) {
+    let mut added = 0;
+    let mut replaced = Vec::new();
+    for mut incoming in imported {
+        for forward in &mut incoming.forwards {
+            forward.id = PortForward::new_id();
+        }
+        match profiles
+            .iter()
+            .position(|p| p.server_node_id == incoming.server_node_id)
+        {
+            Some(pos) => {
+                incoming.id = profiles[pos].id.clone();
+                incoming.auth_token = profiles[pos].auth_token.clone();
+                incoming.name = unique_name(profiles, incoming.name, Some(&incoming.id));
+                profiles[pos] = incoming;
+                replaced.push(profiles[pos].id.clone());
+            }
+            None => {
+                incoming.id = Profile::new_id();
+                incoming.auth_token = String::new();
+                incoming.name = unique_name(profiles, incoming.name, None);
+                profiles.push(incoming);
+                added += 1;
+            }
+        }
+    }
+    (added, replaced)
+}
+
+/// First port from the default upward not used by any profile or forward, as
+/// the suggested SOCKS5 port for a new profile.
+fn next_free_port(profiles: &[Profile]) -> u16 {
+    let mut port = DEFAULT_SOCKS_PORT;
+    while port_owner(profiles, port, None, None).is_some() && port < u16::MAX {
+        port += 1;
+    }
+    port
+}
+
+/// Editable profile buffers (the add/edit form). `editing_id` is `None` when
+/// adding.
 #[derive(Default)]
-pub struct SettingsForm {
+pub struct ProfileForm {
+    editing_id: Option<ProfileId>,
+    pub name: String,
     pub server_node_id: String,
     pub auth_token: String,
     pub socks_port: String,
@@ -76,25 +202,67 @@ pub struct SettingsForm {
     pub relay_urls: String,
 }
 
-impl SettingsForm {
-    fn from_config(config: &AppConfig) -> Self {
+impl ProfileForm {
+    pub fn is_edit(&self) -> bool {
+        self.editing_id.is_some()
+    }
+
+    fn add(profiles: &[Profile]) -> Self {
         Self {
-            server_node_id: config.server_node_id.clone(),
-            auth_token: config.auth_token.clone(),
-            socks_port: config.socks_port.to_string(),
-            http_enabled: config.http_port.is_some(),
-            http_port: config
-                .http_port
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "8080".into()),
-            relay_urls: config.relay_urls.join(", "),
+            socks_port: next_free_port(profiles).to_string(),
+            http_port: DEFAULT_HTTP_PORT.to_string(),
+            ..Self::default()
         }
     }
 
-    pub fn validate(&self) -> Result<AppConfig, String> {
+    fn edit(profile: &Profile) -> Self {
+        Self {
+            editing_id: Some(profile.id.clone()),
+            name: profile.name.clone(),
+            server_node_id: profile.server_node_id.clone(),
+            auth_token: profile.auth_token.clone(),
+            socks_port: profile.socks_port.to_string(),
+            http_enabled: profile.http_port.is_some(),
+            http_port: profile
+                .http_port
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| DEFAULT_HTTP_PORT.to_string()),
+            relay_urls: profile.relay_urls.join(", "),
+        }
+    }
+
+    pub fn validate(&self, profiles: &[Profile]) -> Result<Profile, String> {
+        // Normalize into the stored shape (see `Profile::is_valid_name`):
+        // words separated by single spaces, nothing leading or trailing.
+        let name = self.name.split_whitespace().collect::<Vec<_>>().join(" ");
+        if name.is_empty() {
+            return Err("Profile name is required".into());
+        }
+        if name.len() > 64 {
+            return Err("Profile name must be 64 characters or fewer".into());
+        }
+        // Unique names keep the tray submenus and the per-profile log
+        // attribution (thread names) unambiguous.
+        if profiles
+            .iter()
+            .any(|p| p.name == name && Some(p.id.as_str()) != self.editing_id.as_deref())
+        {
+            return Err(format!("Another profile is already named \"{name}\""));
+        }
         let server_node_id = self.server_node_id.trim();
         if server_node_id.is_empty() {
             return Err("Server node id is required".into());
+        }
+        // One profile per server: a second profile against the same server is
+        // an accidental duplicate, not a use case.
+        if let Some(other) = profiles.iter().find(|p| {
+            p.server_node_id == server_node_id
+                && Some(p.id.as_str()) != self.editing_id.as_deref()
+        }) {
+            return Err(format!(
+                "Profile \"{}\" already connects to this server",
+                other.name
+            ));
         }
         let auth_token = self.auth_token.trim();
         if auth_token.is_empty() {
@@ -102,11 +270,18 @@ impl SettingsForm {
         }
         flextunnel_core::auth::validate_client_token(auth_token)
             .map_err(|e| format!("Invalid auth token: {e}"))?;
+        let editing = self.editing_id.as_deref();
         let socks_port = parse_port(&self.socks_port, "SOCKS5 port")?;
+        if let Some(owner) = port_owner(profiles, socks_port, editing, None) {
+            return Err(format!("SOCKS5 port {socks_port} is already used by {owner}"));
+        }
         let http_port = if self.http_enabled {
             let port = parse_port(&self.http_port, "HTTP port")?;
             if port == socks_port {
                 return Err("HTTP port must differ from the SOCKS5 port".into());
+            }
+            if let Some(owner) = port_owner(profiles, port, editing, None) {
+                return Err(format!("HTTP port {port} is already used by {owner}"));
             }
             Some(port)
         } else {
@@ -119,12 +294,20 @@ impl SettingsForm {
             .filter(|s| !s.is_empty())
             .map(String::from)
             .collect();
-        Ok(AppConfig {
+        // Editing keeps the profile's forwards; the form doesn't touch them.
+        let forwards = editing
+            .and_then(|id| profiles.iter().find(|p| p.id == id))
+            .map(|p| p.forwards.clone())
+            .unwrap_or_default();
+        Ok(Profile {
+            id: self.editing_id.clone().unwrap_or_else(Profile::new_id),
+            name,
             server_node_id: server_node_id.into(),
             auth_token: auth_token.into(),
             socks_port,
             http_port,
             relay_urls,
+            forwards,
         })
     }
 }
@@ -220,12 +403,9 @@ impl ForwardForm {
         }
     }
 
-    pub fn validate(
-        &self,
-        existing: &[PortForward],
-        socks_port: u16,
-        http_port: Option<u16>,
-    ) -> Result<PortForward, String> {
+    /// Validate against every profile: local ports share one namespace since
+    /// any set of profiles can run concurrently.
+    pub fn validate(&self, profiles: &[Profile]) -> Result<PortForward, String> {
         let label = self.label.trim();
         if label.len() > 64 {
             return Err("Label must be 64 characters or fewer".into());
@@ -233,17 +413,10 @@ impl ForwardForm {
         let local_port = parse_port(&self.local_port, "Local port")?;
         let remote_host = validate_remote_host(&self.remote_host)?;
         let remote_port = parse_port(&self.remote_port, "Remote port")?;
-        if local_port == socks_port {
-            return Err(format!("Port {local_port} is the SOCKS5 proxy port"));
-        }
-        if Some(local_port) == http_port {
-            return Err(format!("Port {local_port} is the HTTP proxy port"));
-        }
-        if existing
-            .iter()
-            .any(|f| f.local_port == local_port && Some(&f.id) != self.editing_id.as_ref())
+        if let Some(owner) =
+            port_owner(profiles, local_port, None, self.editing_id.as_deref())
         {
-            return Err(format!("Another forward already uses local port {local_port}"));
+            return Err(format!("Local port {local_port} is already used by {owner}"));
         }
         Ok(PortForward {
             id: self
@@ -345,8 +518,8 @@ fn set_activation_policy(regular: bool) {
 fn window_settings() -> window::Settings {
     let (rgba, width, height) = icon::window_icon_rgba(256);
     window::Settings {
-        size: Size::new(500.0, 640.0),
-        min_size: Some(Size::new(430.0, 500.0)),
+        size: Size::new(860.0, 640.0),
+        min_size: Some(Size::new(680.0, 500.0)),
         icon: window::icon::from_rgba(rgba, width, height).ok(),
         ..window::Settings::default()
     }
@@ -356,70 +529,75 @@ pub struct App {
     controller: Controller,
     tray: Option<Tray>,
     window: Option<window::Id>,
-    pub tab: Tab,
-    pub form: SettingsForm,
-    pub saved: Option<AppConfig>,
-    pub settings_notice: Option<String>,
-    pub forwards: Vec<PortForward>,
-    pub forward_form: Option<ForwardForm>,
-    pub forwards_notice: Option<String>,
+    /// Ordered source of truth; persisted via `config::save_profiles`.
+    pub profiles: Vec<Profile>,
+    pub selection: Selection,
+    pub profile_form: Option<ProfileForm>,
+    /// The open forward form and the profile it belongs to.
+    pub forward_form: Option<(ProfileId, ForwardForm)>,
+    /// Two-click delete guard: the profile whose Delete was clicked once.
+    pub confirm_delete: Option<ProfileId>,
+    /// Transient status line in the detail pane (save results/failures).
+    pub notice: Option<String>,
+    /// Transient export/import result shown in the sidebar.
+    pub io_notice: Option<String>,
     /// Setup-failure reason per forward id, retained after the failed forward
     /// is auto-stopped (see [`disable_failed_forwards`]) so the row can keep
     /// showing why; cleared when the forward is started again or removed.
+    /// Forward ids are globally unique, so one map covers every profile.
     pub forward_errors: HashMap<String, String>,
-    /// Advisory-badge cache: the `RoutedSet` rebuilt only when the pushed
-    /// domains/CIDRs change (`None` inside means the set failed to parse).
-    pub routed_cache: view::RoutedCache,
+    /// Advisory-badge caches per profile: each `RoutedSet` rebuilt only when
+    /// that profile's pushed domains/CIDRs change.
+    pub routed_caches: HashMap<ProfileId, view::RoutedCache>,
     log_revision: u64,
-    /// The in-memory log ring joined for the Logs tab, refreshed on revision
-    /// change only.
+    /// Logs-pane profile filter: only lines from that profile's session
+    /// threads (`[tunnel-<name>]`); `None` shows everything.
+    pub log_filter: Option<String>,
+    /// The in-memory log ring, filtered and joined for the Logs pane;
+    /// rebuilt on revision or filter change only.
     pub log_text: String,
     clipboard: Option<arboard::Clipboard>,
     /// Refreshed by [`App::refresh`] on every tick, rendered by `view`.
-    pub snapshot: Snapshot,
+    pub snapshots: HashMap<ProfileId, Snapshot>,
 }
 
 impl App {
     pub fn boot() -> (Self, Task<Message>) {
         let controller = Controller::start();
 
-        let saved = match config::load() {
-            Ok(saved) => saved,
+        let profiles = match config::load_profiles() {
+            Ok(profiles) => profiles,
             Err(e) => {
                 log::error!("{e:#}");
-                None
+                Vec::new()
             }
         };
-        let form = SettingsForm::from_config(saved.as_ref().unwrap_or(&AppConfig::default()));
-        let tab = if saved.is_some() {
-            Tab::Status
-        } else {
-            Tab::Settings
-        };
-
-        // Push the persisted forwards to the tunnel thread up front. They all
-        // load disabled (`enabled` is runtime-only), so nothing listens until
-        // the user flips a forward on.
-        let forwards = forward::load();
-        controller.set_forwards(forwards.clone());
+        let selection = profiles
+            .first()
+            .map(|p| Selection::Profile(p.id.clone()))
+            .unwrap_or(Selection::Logs);
+        // First run: go straight to creating a profile.
+        let profile_form = profiles.is_empty().then(|| ProfileForm::add(&[]));
 
         let mut app = Self {
             controller,
             tray: None,
             window: None,
-            tab,
-            form,
-            saved,
-            settings_notice: None,
-            forwards,
+            profiles,
+            selection,
+            profile_form,
             forward_form: None,
-            forwards_notice: None,
+            confirm_delete: None,
+            notice: None,
+            io_notice: None,
             forward_errors: HashMap::new(),
-            routed_cache: None,
-            log_revision: 0,
+            routed_caches: HashMap::new(),
+            // MAX so the first refresh always builds the log text.
+            log_revision: u64::MAX,
+            log_filter: None,
             log_text: String::new(),
             clipboard: None,
-            snapshot: Snapshot::default(),
+            snapshots: HashMap::new(),
         };
         let open = app.open_window();
         // The tray is created via a task so it lands on the main thread with
@@ -437,7 +615,7 @@ impl App {
 
     pub fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
-            // Steady heartbeat so the snapshot and tray state stay fresh even
+            // Steady heartbeat so the snapshots and tray state stay fresh even
             // while no window exists; tray events wake the runtime instantly.
             iced::time::every(Duration::from_millis(500)).map(|_| Message::Tick),
             window::close_events().map(Message::WindowClosed),
@@ -493,106 +671,202 @@ impl App {
                 }
                 Task::none()
             }
-            Message::TabSelected(tab) => {
-                self.tab = tab;
-                Task::none()
-            }
-            Message::Connect => self.connect(),
-            Message::Disconnect => {
-                self.controller.disconnect();
+            Message::Select(selection) => {
+                self.selection = selection;
+                self.profile_form = None;
+                self.forward_form = None;
+                self.confirm_delete = None;
+                self.notice = None;
                 Task::none()
             }
             Message::CopyText(text) => {
                 self.copy_text(text);
                 Task::none()
             }
+            Message::AddProfile => {
+                self.profile_form = Some(ProfileForm::add(&self.profiles));
+                self.forward_form = None;
+                self.confirm_delete = None;
+                self.notice = None;
+                Task::none()
+            }
+            Message::EditProfile(id) => {
+                if let Some(profile) = self.profiles.iter().find(|p| p.id == id) {
+                    self.profile_form = Some(ProfileForm::edit(profile));
+                    self.forward_form = None;
+                    self.notice = None;
+                }
+                Task::none()
+            }
+            Message::DeleteProfile(id) => {
+                self.delete_profile(id);
+                Task::none()
+            }
+            Message::Connect(id) => self.connect_profile(&id),
+            Message::Disconnect(id) => {
+                self.controller.disconnect(&id);
+                Task::none()
+            }
+            Message::ExportProfiles => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .add_filter("JSON", &["json"])
+                        .set_file_name("flextunnel-profiles.json")
+                        .save_file()
+                        .await
+                        .map(|file| file.path().to_path_buf())
+                },
+                Message::ExportPicked,
+            ),
+            Message::ImportProfiles => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .add_filter("JSON", &["json"])
+                        .pick_file()
+                        .await
+                        .map(|file| file.path().to_path_buf())
+                },
+                Message::ImportPicked,
+            ),
+            Message::ExportPicked(path) => {
+                if let Some(path) = path {
+                    self.io_notice = Some(match config::export_profiles(&path, &self.profiles) {
+                        Ok(()) => format!("Exported {} profile(s).", self.profiles.len()),
+                        Err(e) => {
+                            log::error!("{e:#}");
+                            format!("Export failed: {e:#}")
+                        }
+                    });
+                }
+                Task::none()
+            }
+            Message::ImportPicked(path) => {
+                if let Some(path) = path {
+                    self.import_profiles(&path);
+                }
+                Task::none()
+            }
+            Message::ProfileNameChanged(value) => {
+                if let Some(form) = &mut self.profile_form {
+                    form.name = value;
+                }
+                Task::none()
+            }
             Message::ServerNodeIdChanged(value) => {
-                self.form.server_node_id = value;
+                if let Some(form) = &mut self.profile_form {
+                    form.server_node_id = value;
+                }
                 Task::none()
             }
             Message::AuthTokenChanged(value) => {
-                self.form.auth_token = value;
+                if let Some(form) = &mut self.profile_form {
+                    form.auth_token = value;
+                }
                 Task::none()
             }
             Message::SocksPortChanged(value) => {
-                self.form.socks_port = value;
+                if let Some(form) = &mut self.profile_form {
+                    form.socks_port = value;
+                }
                 Task::none()
             }
             Message::HttpEnabledToggled(enabled) => {
-                self.form.http_enabled = enabled;
+                if let Some(form) = &mut self.profile_form {
+                    form.http_enabled = enabled;
+                }
                 Task::none()
             }
             Message::HttpPortChanged(value) => {
-                self.form.http_port = value;
+                if let Some(form) = &mut self.profile_form {
+                    form.http_port = value;
+                }
                 Task::none()
             }
             Message::RelayUrlsChanged(value) => {
-                self.form.relay_urls = value;
-                Task::none()
-            }
-            Message::SaveSettings => {
-                self.save_settings();
-                Task::none()
-            }
-            Message::AddForward => {
-                self.forward_form = Some(ForwardForm::add());
-                Task::none()
-            }
-            Message::EditForward(i) => {
-                if let Some(forward) = self.forwards.get(i) {
-                    self.forward_form = Some(ForwardForm::edit(forward));
+                if let Some(form) = &mut self.profile_form {
+                    form.relay_urls = value;
                 }
                 Task::none()
             }
-            Message::DeleteForward(i) => {
-                if i < self.forwards.len() {
-                    let forward = self.forwards.remove(i);
-                    self.forward_errors.remove(&forward.id);
-                    self.commit_forwards();
+            Message::ProfileFormSave => {
+                self.save_profile_form();
+                Task::none()
+            }
+            Message::ProfileFormCancel => {
+                self.profile_form = None;
+                Task::none()
+            }
+            Message::AddForward(profile_id) => {
+                self.forward_form = Some((profile_id, ForwardForm::add()));
+                Task::none()
+            }
+            Message::EditForward(profile_id, forward_id) => {
+                if let Some(forward) = self
+                    .profiles
+                    .iter()
+                    .find(|p| p.id == profile_id)
+                    .and_then(|p| p.forwards.iter().find(|f| f.id == forward_id))
+                {
+                    self.forward_form = Some((profile_id, ForwardForm::edit(forward)));
                 }
                 Task::none()
             }
-            Message::ToggleForward(i, enabled) => {
-                if let Some(forward) = self.forwards.get_mut(i) {
+            Message::DeleteForward(profile_id, forward_id) => {
+                if let Some(profile) = self.profiles.iter_mut().find(|p| p.id == profile_id) {
+                    let before = profile.forwards.len();
+                    profile.forwards.retain(|f| f.id != forward_id);
+                    if profile.forwards.len() != before {
+                        self.forward_errors.remove(&forward_id);
+                        self.commit_forwards(&profile_id);
+                    }
+                }
+                Task::none()
+            }
+            Message::ToggleForward(profile_id, forward_id, enabled) => {
+                if let Some(forward) = self
+                    .profiles
+                    .iter_mut()
+                    .find(|p| p.id == profile_id)
+                    .and_then(|p| p.forwards.iter_mut().find(|f| f.id == forward_id))
+                {
                     // Desired state, but not a plain checkbox: enabling
                     // attempts the setup now, and a setup failure snaps the
                     // switch back off (see disable_failed_forwards).
                     forward.enabled = enabled;
-                    let id = forward.id.clone();
                     if enabled {
                         // A fresh start attempt supersedes the old failure.
-                        self.forward_errors.remove(&id);
+                        self.forward_errors.remove(&forward_id);
                     }
-                    self.commit_forwards();
+                    self.commit_forwards(&profile_id);
                 }
                 Task::none()
             }
             Message::FormLabelChanged(value) => {
-                if let Some(form) = &mut self.forward_form {
+                if let Some((_, form)) = &mut self.forward_form {
                     form.label = value;
                 }
                 Task::none()
             }
             Message::FormLocalPortChanged(value) => {
-                if let Some(form) = &mut self.forward_form {
+                if let Some((_, form)) = &mut self.forward_form {
                     form.local_port = value;
                 }
                 Task::none()
             }
             Message::FormRemoteHostChanged(value) => {
-                if let Some(form) = &mut self.forward_form {
+                if let Some((_, form)) = &mut self.forward_form {
                     form.remote_host = value;
                 }
                 Task::none()
             }
             Message::FormRemotePortChanged(value) => {
-                if let Some(form) = &mut self.forward_form {
+                if let Some((_, form)) = &mut self.forward_form {
                     form.remote_port = value;
                 }
                 Task::none()
             }
             Message::FormEnabledToggled(enabled) => {
-                if let Some(form) = &mut self.forward_form {
+                if let Some((_, form)) = &mut self.forward_form {
                     form.enabled = enabled;
                 }
                 Task::none()
@@ -603,6 +877,11 @@ impl App {
             }
             Message::FormCancel => {
                 self.forward_form = None;
+                Task::none()
+            }
+            Message::LogFilterChanged(value) => {
+                self.log_filter = (value != LOG_FILTER_ALL).then_some(value);
+                self.rebuild_log_text();
                 Task::none()
             }
             Message::OpenLogFolder => {
@@ -617,12 +896,17 @@ impl App {
         }
     }
 
-    /// The proxy ports the forward form validates against (defaults while
-    /// nothing is saved yet).
-    pub fn proxy_ports(&self) -> (u16, Option<u16>) {
-        let default = AppConfig::default();
-        let config = self.saved.as_ref().unwrap_or(&default);
-        (config.socks_port, config.http_port)
+    pub fn profile(&self, id: &str) -> Option<&Profile> {
+        self.profiles.iter().find(|p| p.id == id)
+    }
+
+    /// The profile's latest snapshot, or the shared idle one before its first
+    /// session.
+    pub fn snapshot_for(&self, id: &str) -> &Snapshot {
+        match self.snapshots.get(id) {
+            Some(snapshot) => snapshot,
+            None => Snapshot::empty(),
+        }
     }
 
     fn open_window(&mut self) -> Task<Message> {
@@ -639,108 +923,175 @@ impl App {
         }
     }
 
-    fn connect(&mut self) -> Task<Message> {
-        match &self.saved {
-            Some(config) => {
-                self.controller.connect(config.clone());
-                Task::none()
-            }
-            None => {
-                self.tab = Tab::Settings;
-                self.settings_notice = Some("Configure and save the connection first.".into());
-                self.show_window()
-            }
+    fn connect_profile(&mut self, id: &str) -> Task<Message> {
+        let Some(profile) = self.profile(id).cloned() else {
+            return Task::none();
+        };
+        if profile.is_ready() {
+            self.controller.connect(profile);
+            Task::none()
+        } else {
+            // The token's keychain entry was lost — re-enter it.
+            self.selection = Selection::Profile(profile.id.clone());
+            self.profile_form = Some(ProfileForm::edit(&profile));
+            self.notice = Some("Enter the auth token to connect.".into());
+            self.show_window()
+        }
+    }
+
+    fn delete_profile(&mut self, id: ProfileId) {
+        if self.confirm_delete.as_deref() != Some(id.as_str()) {
+            self.confirm_delete = Some(id);
+            return;
+        }
+        self.confirm_delete = None;
+        let Some(pos) = self.profiles.iter().position(|p| p.id == id) else {
+            return;
+        };
+        self.controller.remove_profile(&id);
+        config::delete_profile_secret(&id);
+        let removed = self.profiles.remove(pos);
+        for forward in &removed.forwards {
+            self.forward_errors.remove(&forward.id);
+        }
+        self.routed_caches.remove(&id);
+        self.snapshots.remove(&id);
+        self.forward_form = None;
+        if self.log_filter.as_deref() == Some(removed.name.as_str()) {
+            self.log_filter = None;
+            self.rebuild_log_text();
+        }
+        self.persist_profiles();
+        if self.selection == Selection::Profile(id) {
+            self.selection = self
+                .profiles
+                .get(pos.min(self.profiles.len().saturating_sub(1)))
+                .map(|p| Selection::Profile(p.id.clone()))
+                .unwrap_or(Selection::Logs);
+        }
+        if self.profiles.is_empty() {
+            self.profile_form = Some(ProfileForm::add(&[]));
         }
     }
 
     fn handle_menu_event(&mut self, id: &str) -> Task<Message> {
         match id {
-            tray::MENU_CONNECT => self.connect(),
-            tray::MENU_DISCONNECT => {
-                self.controller.disconnect();
-                Task::none()
-            }
-            tray::MENU_COPY_SOCKS => {
-                if let Some(addr) = self.snapshot.socks_addr {
-                    self.copy_text(format!("socks5://{addr}"));
-                }
-                Task::none()
-            }
             tray::MENU_OPEN => self.show_window(),
             tray::MENU_QUIT => {
                 self.controller.shutdown();
                 iced::exit()
             }
-            _ => Task::none(),
+            _ => {
+                if let Some(profile_id) = id.strip_prefix(tray::MENU_CONNECT_PREFIX) {
+                    let profile_id = profile_id.to_string();
+                    return self.connect_profile(&profile_id);
+                }
+                if let Some(profile_id) = id.strip_prefix(tray::MENU_DISCONNECT_PREFIX) {
+                    self.controller.disconnect(profile_id);
+                } else if let Some(profile_id) = id.strip_prefix(tray::MENU_COPY_SOCKS_PREFIX)
+                    && let Some(addr) = self.snapshots.get(profile_id).and_then(|s| s.socks_addr)
+                {
+                    self.copy_text(format!("socks5://{addr}"));
+                }
+                Task::none()
+            }
         }
     }
 
-    /// Poll the tunnel snapshot and derived state; runs on every tick and
+    /// Poll the tunnel snapshots and derived state; runs on every tick and
     /// after the tray is created.
     fn refresh(&mut self) {
-        self.snapshot = self.controller.snapshot();
+        self.snapshots = self.controller.snapshots();
 
-        // Runs every tick (not just on the Forwards tab) so a forward whose
-        // setup failed snaps back to stopped promptly.
-        let failed = disable_failed_forwards(&mut self.forwards, &self.snapshot.forwards);
-        if !failed.is_empty() {
-            self.forward_errors.extend(failed);
-            self.commit_forwards();
+        // Runs every tick so a forward whose setup failed snaps back to
+        // stopped promptly, per profile.
+        let mut failed_in: Vec<ProfileId> = Vec::new();
+        for profile in &mut self.profiles {
+            let Some(snapshot) = self.snapshots.get(&profile.id) else {
+                continue;
+            };
+            let failed = disable_failed_forwards(&mut profile.forwards, &snapshot.forwards);
+            if !failed.is_empty() {
+                self.forward_errors.extend(failed);
+                failed_in.push(profile.id.clone());
+            }
+            view::refresh_routed_cache(
+                self.routed_caches.entry(profile.id.clone()).or_default(),
+                &snapshot.routes,
+            );
+        }
+        for id in &failed_in {
+            if let Some(profile) = self.profile(id) {
+                self.controller.set_forwards(id, profile.forwards.clone());
+            }
+        }
+        if !failed_in.is_empty() {
+            self.persist_profiles();
         }
 
-        view::refresh_routed_cache(&mut self.routed_cache, &self.snapshot.routes);
-
         let revision = logging::revision();
-        if revision != self.log_revision || self.log_text.is_empty() {
+        if revision != self.log_revision {
             self.log_revision = revision;
-            self.log_text = logging::recent_lines().join("\n");
+            self.rebuild_log_text();
         }
 
         if let Some(tray) = &mut self.tray {
-            tray.sync(self.snapshot.phase, self.saved.is_some(), self.snapshot.socks_addr);
+            tray.sync(&self.profiles, &self.snapshots);
         }
     }
 
-    fn save_settings(&mut self) {
-        let Ok(config) = self.form.validate() else {
+    fn save_profile_form(&mut self) {
+        let Some(form) = &self.profile_form else {
             return;
         };
-        match config::save(&config) {
-            Ok(()) => {
-                let mut notice = if self.snapshot.phase == Phase::Idle {
-                    "Saved.".to_string()
-                } else {
-                    "Saved — reconnect to apply.".to_string()
-                };
-                // Soft warning only — the hard guard is the forward's bind
-                // failing visibly ("port N is in use").
-                if let Some(forward) = self.forwards.iter().find(|f| {
-                    f.enabled
-                        && (f.local_port == config.socks_port
-                            || Some(f.local_port) == config.http_port)
-                }) {
-                    notice.push_str(&format!(
-                        " Forward \"{}\" uses port {} and will fail to bind.",
-                        forward.display_name(),
-                        forward.local_port
-                    ));
-                }
-                self.saved = Some(config);
-                self.settings_notice = Some(notice);
-            }
-            Err(e) => {
-                log::error!("{e:#}");
-                self.settings_notice = Some(format!("{e:#}"));
-            }
+        let Ok(profile) = form.validate(&self.profiles) else {
+            return;
+        };
+        if let Err(e) = config::save_profile_secret(&profile.id, &profile.auth_token) {
+            log::error!("{e:#}");
+            self.notice = Some(format!("{e:#}"));
+            return;
         }
+        let id = profile.id.clone();
+        let running = self.snapshots.get(&id).is_some_and(|s| {
+            matches!(s.phase, Phase::Connecting | Phase::Connected | Phase::Reconnecting)
+        });
+        match self.profiles.iter().position(|p| p.id == id) {
+            Some(pos) => {
+                // Follow a rename with the log filter (new lines carry the
+                // new thread name; old lines keep matching by text only).
+                let filter_renamed = self.log_filter.as_deref()
+                    == Some(self.profiles[pos].name.as_str())
+                    && self.profiles[pos].name != profile.name;
+                if filter_renamed {
+                    self.log_filter = Some(profile.name.clone());
+                    self.rebuild_log_text();
+                }
+                self.profiles[pos] = profile;
+            }
+            None => self.profiles.push(profile),
+        }
+        self.persist_profiles();
+        if self.notice.is_none() {
+            self.notice = Some(if running {
+                "Saved — reconnect to apply.".into()
+            } else {
+                "Saved.".into()
+            });
+        }
+        self.selection = Selection::Profile(id);
+        self.profile_form = None;
     }
 
     fn save_forward_form(&mut self) {
-        let Some(form) = &self.forward_form else {
+        let Some((profile_id, form)) = &self.forward_form else {
             return;
         };
-        let (socks_port, http_port) = self.proxy_ports();
-        let Ok(saved) = form.validate(&self.forwards, socks_port, http_port) else {
+        let profile_id = profile_id.clone();
+        let Ok(saved) = form.validate(&self.profiles) else {
+            return;
+        };
+        let Some(profile) = self.profiles.iter_mut().find(|p| p.id == profile_id) else {
             return;
         };
         if saved.enabled {
@@ -748,24 +1099,79 @@ impl App {
             // start attempt supersedes the old failure.
             self.forward_errors.remove(&saved.id);
         }
-        match self.forwards.iter_mut().find(|f| f.id == saved.id) {
+        match profile.forwards.iter_mut().find(|f| f.id == saved.id) {
             Some(slot) => *slot = saved,
-            None => self.forwards.push(saved),
+            None => profile.forwards.push(saved),
         }
-        self.commit_forwards();
+        self.commit_forwards(&profile_id);
         self.forward_form = None;
     }
 
-    /// Persist the forward list and push it to the tunnel thread (live apply).
-    fn commit_forwards(&mut self) {
-        match forward::save(&self.forwards) {
-            Ok(()) => self.forwards_notice = None,
+    /// Persist all profiles and push one profile's forwards to its session
+    /// (live apply).
+    fn commit_forwards(&mut self, profile_id: &str) {
+        self.persist_profiles();
+        if let Some(profile) = self.profile(profile_id) {
+            self.controller
+                .set_forwards(profile_id, profile.forwards.clone());
+        }
+    }
+
+    fn import_profiles(&mut self, path: &std::path::Path) {
+        let imported = match config::import_profiles(path) {
+            Ok(imported) => imported,
             Err(e) => {
-                log::error!("Failed to save forwards: {e:#}");
-                self.forwards_notice = Some(format!("Failed to save forwards: {e:#}"));
+                log::error!("{e:#}");
+                self.io_notice = Some(format!("Import failed: {e:#}"));
+                return;
+            }
+        };
+        let (added, replaced) = merge_imported(&mut self.profiles, imported);
+        // A replaced profile's session (if live) reconciles to the imported
+        // forward list — which loads all-disabled, like any fresh load.
+        for id in &replaced {
+            if let Some(profile) = self.profile(id) {
+                self.controller.set_forwards(id, profile.forwards.clone());
             }
         }
-        self.controller.set_forwards(self.forwards.clone());
+        self.persist_profiles();
+        self.io_notice = Some(format!(
+            "Imported: {added} added, {} replaced.",
+            replaced.len()
+        ));
+        // Land somewhere sensible if nothing (or a since-removed profile) was
+        // selected; added profiles still need their tokens entered.
+        if !matches!(&self.selection, Selection::Profile(id) if self.profile(id).is_some())
+            && let Some(profile) = self.profiles.first()
+        {
+            self.selection = Selection::Profile(profile.id.clone());
+        }
+        self.profile_form = None;
+    }
+
+    /// Re-join the log ring for the Logs pane, keeping only the filtered
+    /// profile's session-thread lines (`[tunnel-<name>]`) when a filter is on.
+    fn rebuild_log_text(&mut self) {
+        let lines = logging::recent_lines();
+        self.log_text = match &self.log_filter {
+            Some(name) => {
+                let tag = format!("[tunnel-{name}]");
+                lines
+                    .iter()
+                    .filter(|line| line.contains(&tag))
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            None => lines.join("\n"),
+        };
+    }
+
+    fn persist_profiles(&mut self) {
+        if let Err(e) = config::save_profiles(&self.profiles) {
+            log::error!("Failed to save profiles: {e:#}");
+            self.notice = Some(format!("Failed to save profiles: {e:#}"));
+        }
     }
 
     fn copy_text(&mut self, text: String) {
@@ -815,8 +1221,10 @@ fn tray_events() -> impl Stream<Item = Message> {
 mod tests {
     use super::*;
 
-    fn valid_form() -> SettingsForm {
-        SettingsForm {
+    fn valid_form() -> ProfileForm {
+        ProfileForm {
+            editing_id: None,
+            name: " prod ".into(),
             server_node_id: " node-id ".into(),
             auth_token: flextunnel_core::auth::generate_client_token(),
             socks_port: "1080".into(),
@@ -845,6 +1253,19 @@ mod tests {
             remote_host: "other.internal".into(),
             remote_port: 80,
             enabled: true,
+        }
+    }
+
+    fn existing_profile(id: &str, socks_port: u16, forwards: Vec<PortForward>) -> Profile {
+        Profile {
+            id: id.into(),
+            name: format!("profile-{id}"),
+            server_node_id: "node".into(),
+            auth_token: "token".into(),
+            socks_port,
+            http_port: None,
+            relay_urls: Vec::new(),
+            forwards,
         }
     }
 
@@ -881,9 +1302,8 @@ mod tests {
 
     #[test]
     fn forward_form_trims_and_builds() {
-        let forward = valid_forward_form()
-            .validate(&[], 1080, None)
-            .expect("valid");
+        let profiles = [existing_profile("p1", 1080, vec![])];
+        let forward = valid_forward_form().validate(&profiles).expect("valid");
         assert_eq!(forward.label, "db");
         assert_eq!(forward.local_port, 5432);
         assert_eq!(forward.remote_host, "db.internal");
@@ -920,80 +1340,209 @@ mod tests {
 
     #[test]
     fn forward_form_rejects_bad_input() {
+        let base = [existing_profile("p1", 1080, vec![])];
+
         let mut form = valid_forward_form();
         form.local_port = "0".into();
-        assert!(form.validate(&[], 1080, None).is_err());
+        assert!(form.validate(&base).is_err());
 
         let mut form = valid_forward_form();
         form.remote_host = "  ".into();
-        assert!(form.validate(&[], 1080, None).is_err());
+        assert!(form.validate(&base).is_err());
 
         let mut form = valid_forward_form();
         form.remote_host = "networking..internal".into();
-        assert!(form.validate(&[], 1080, None).is_err());
+        assert!(form.validate(&base).is_err());
 
         let mut form = valid_forward_form();
         form.label = "x".repeat(65);
-        assert!(form.validate(&[], 1080, None).is_err());
+        assert!(form.validate(&base).is_err());
 
         let mut form = valid_forward_form();
         form.remote_port = "70000".into();
-        assert!(form.validate(&[], 1080, None).is_err());
+        assert!(form.validate(&base).is_err());
 
-        // Collisions with the proxy ports.
+        // Collisions with any profile's proxy ports.
         let form = valid_forward_form();
-        assert!(form.validate(&[], 5432, None).is_err());
-        assert!(form.validate(&[], 1080, Some(5432)).is_err());
+        assert!(form.validate(&[existing_profile("p1", 5432, vec![])]).is_err());
+        let mut http_profile = existing_profile("p1", 1080, vec![]);
+        http_profile.http_port = Some(5432);
+        assert!(form.validate(std::slice::from_ref(&http_profile)).is_err());
 
-        // Duplicate local port among existing forwards…
-        let taken = existing_forward("aaaa", 5432);
-        assert!(form.validate(std::slice::from_ref(&taken), 1080, None).is_err());
+        // Duplicate local port among any profile's forwards…
+        let taken = [existing_profile("p2", 1081, vec![existing_forward("aaaa", 5432)])];
+        assert!(form.validate(&taken).is_err());
 
         // …unless it is the forward being edited (id reused).
         let mut form = valid_forward_form();
         form.editing_id = Some("aaaa".into());
-        let edited = form
-            .validate(std::slice::from_ref(&taken), 1080, None)
-            .expect("editing the same forward");
+        let edited = form.validate(&taken).expect("editing the same forward");
         assert_eq!(edited.id, "aaaa");
     }
 
     #[test]
-    fn validate_trims_and_parses() {
-        let config = valid_form().validate().expect("valid");
-        assert_eq!(config.server_node_id, "node-id");
-        assert_eq!(config.socks_port, 1080);
-        assert_eq!(config.http_port, None);
+    fn import_merges_by_server_id_and_uniquifies_names() {
+        // "profile-p1" on server "node" (with a token), "profile-p2" on
+        // "node-2".
+        let mut current = vec![
+            existing_profile("p1", 1080, vec![existing_forward("f1", 5000)]),
+            existing_profile("p2", 1081, vec![]),
+        ];
+        current[1].server_node_id = "node-2".into();
+        current[0].auth_token = "secret".into();
+
+        // Same server as p1: replaces settings/forwards, keeps id + token.
+        let mut same_server = existing_profile("x", 2080, vec![existing_forward("f2", 6000)]);
+        same_server.name = "renamed".into();
+        // New server, but colliding with p2's name: gets " - 2".
+        let mut name_clash = existing_profile("y", 3080, vec![]);
+        name_clash.name = "profile-p2".into();
+        name_clash.server_node_id = "node-3".into();
+
+        let (added, replaced) = merge_imported(&mut current, vec![same_server, name_clash]);
+        assert_eq!(added, 1);
+        assert_eq!(replaced, vec!["p1".to_string()]);
+
+        let p1 = &current[0];
+        assert_eq!(p1.id, "p1", "id kept");
+        assert_eq!(p1.auth_token, "secret", "token kept");
+        assert_eq!(p1.name, "renamed");
+        assert_eq!(p1.socks_port, 2080);
+        assert_eq!(p1.forwards.len(), 1);
+        assert_ne!(p1.forwards[0].id, "f2", "imported forward ids are fresh");
+
+        let new = &current[2];
+        assert_eq!(new.name, "profile-p2 - 2");
+        assert!(new.auth_token.is_empty(), "no secret in imports");
+        assert_ne!(new.id, "y", "imported profile ids are fresh");
+
+        // A second import of the same name-clashing profile bumps to " - 3"
+        // only if its server is also new; same server replaces in place.
+        let mut again = existing_profile("z", 4080, vec![]);
+        again.name = "profile-p2".into();
+        again.server_node_id = "node-4".into();
+        let (added, replaced) = merge_imported(&mut current, vec![again]);
+        assert_eq!((added, replaced.len()), (1, 0));
+        assert_eq!(current[3].name, "profile-p2 - 3");
+    }
+
+    #[test]
+    fn unique_name_respects_length_limit() {
+        let taken = existing_profile("p1", 1080, vec![]);
+        let mut long = existing_profile("p2", 1081, vec![]);
+        long.name = "a".repeat(64);
+        let profiles = [taken, long.clone()];
+
         assert_eq!(
-            config.relay_urls,
+            unique_name(&profiles, "fresh".into(), None),
+            "fresh",
+            "free names pass through"
+        );
+        let bumped = unique_name(&profiles, long.name.clone(), None);
+        assert_eq!(bumped, format!("{} - 2", "a".repeat(60)));
+        assert!(bumped.len() <= 64);
+        assert!(bumped.ends_with(" - 2"));
+        assert!(Profile::is_valid_name(&bumped));
+    }
+
+    #[test]
+    fn name_whitespace_is_normalized() {
+        let mut form = valid_form();
+        form.name = "  staging   aws \t kube  ".into();
+        let profile = form.validate(&[]).expect("valid");
+        assert_eq!(profile.name, "staging aws kube");
+        assert!(Profile::is_valid_name(&profile.name));
+    }
+
+    #[test]
+    fn validate_trims_and_parses() {
+        let profile = valid_form().validate(&[]).expect("valid");
+        assert_eq!(profile.name, "prod");
+        assert_eq!(profile.server_node_id, "node-id");
+        assert_eq!(profile.socks_port, 1080);
+        assert_eq!(profile.http_port, None);
+        assert_eq!(
+            profile.relay_urls,
             vec!["https://a.example".to_string(), "https://b.example".to_string()]
         );
+        assert!(!profile.id.is_empty());
+        assert!(profile.forwards.is_empty());
     }
 
     #[test]
     fn validate_rejects_bad_input() {
         let mut form = valid_form();
+        form.name = "  ".into();
+        assert!(form.validate(&[]).is_err());
+
+        let mut form = valid_form();
         form.auth_token = "not-a-token".into();
-        assert!(form.validate().is_err());
+        assert!(form.validate(&[]).is_err());
 
         let mut form = valid_form();
         form.socks_port = "0".into();
-        assert!(form.validate().is_err());
+        assert!(form.validate(&[]).is_err());
 
         let mut form = valid_form();
         form.http_enabled = true;
         form.http_port = form.socks_port.clone();
-        assert!(form.validate().is_err());
+        assert!(form.validate(&[]).is_err());
 
         let mut form = valid_form();
         form.server_node_id = "  ".into();
-        assert!(form.validate().is_err());
+        assert!(form.validate(&[]).is_err());
+
+        // Duplicate profile name (they key tray submenus and log threads)…
+        let existing = [existing_profile("p1", 2080, vec![])];
+        let mut form = valid_form();
+        form.name = " profile-p1 ".into();
+        assert!(form.validate(&existing).is_err());
+        // …unless it is the profile being edited.
+        form.editing_id = Some("p1".into());
+        assert!(form.validate(&existing).is_ok());
+
+        // Duplicate server node id…
+        let mut form = valid_form();
+        form.server_node_id = "node".into();
+        assert!(form.validate(&existing).is_err());
+        // …unless it is the profile being edited.
+        form.editing_id = Some("p1".into());
+        assert!(form.validate(&existing).is_ok());
     }
 
     #[test]
-    fn duration_formatting() {
-        assert_eq!(format_duration(Duration::from_secs(59)), "59s");
-        assert_eq!(format_duration(Duration::from_secs(61)), "1m 01s");
-        assert_eq!(format_duration(Duration::from_secs(3725)), "1h 02m 05s");
+    fn profile_ports_share_one_namespace() {
+        let existing = [existing_profile("p1", 1080, vec![existing_forward("f1", 5000)])];
+
+        // Another profile's SOCKS port.
+        let form = valid_form();
+        assert!(form.validate(&existing).is_err());
+
+        // Another profile's forward local port (as SOCKS or HTTP).
+        let mut form = valid_form();
+        form.socks_port = "5000".into();
+        assert!(form.validate(&existing).is_err());
+        let mut form = valid_form();
+        form.socks_port = "1090".into();
+        form.http_enabled = true;
+        form.http_port = "5000".into();
+        assert!(form.validate(&existing).is_err());
+
+        // A free port is fine.
+        let mut form = valid_form();
+        form.socks_port = "1081".into();
+        assert!(form.validate(&existing).is_ok());
+
+        // Editing a profile skips its own proxy ports but keeps its forwards.
+        let mut form = valid_form();
+        form.editing_id = Some("p1".into());
+        form.socks_port = "1080".into();
+        let edited = form.validate(&existing).expect("own port is not a clash");
+        assert_eq!(edited.id, "p1");
+        assert_eq!(edited.forwards, existing[0].forwards);
+
+        // A forward in another profile can't take a port a new profile's own
+        // forward holds — and vice versa (covered by forward_form tests).
+        assert_eq!(next_free_port(&existing), 1081);
     }
 }

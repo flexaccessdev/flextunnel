@@ -1,30 +1,25 @@
-//! System tray icon + menu. Created and mutated only on the main thread (from
-//! the iced update loop); the tray-icon event handlers installed by the tray
-//! subscription merely forward events and wake the runtime, since they may
-//! fire off the main thread.
+//! System tray icon + menu: an aggregate status line plus one submenu per
+//! profile (status, Connect, Disconnect, Copy SOCKS5 Address). Created and
+//! mutated only on the main thread (from the iced update loop); the tray-icon
+//! event handlers installed by the tray subscription merely forward events and
+//! wake the runtime, since they may fire off the main thread.
+//!
+//! Per-profile menu item ids carry the profile id after a prefix
+//! (`connect:<id>`), parsed by `App::handle_menu_event`.
 
+use crate::config::Profile;
 use crate::icon::{self, TrayState};
-use crate::tunnel::Phase;
+use crate::tunnel::{Phase, Snapshot};
 use anyhow::Result;
-use std::net::SocketAddr;
-use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
+use std::collections::HashMap;
+use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
-pub const MENU_CONNECT: &str = "connect";
-pub const MENU_DISCONNECT: &str = "disconnect";
-pub const MENU_COPY_SOCKS: &str = "copy-socks";
 pub const MENU_OPEN: &str = "open";
 pub const MENU_QUIT: &str = "quit";
-
-pub fn tray_state(phase: Phase) -> TrayState {
-    match phase {
-        Phase::Idle => TrayState::Idle,
-        Phase::Connecting => TrayState::Connecting,
-        Phase::Connected => TrayState::Connected,
-        Phase::Reconnecting => TrayState::Reconnecting,
-        Phase::Failed => TrayState::Failed,
-    }
-}
+pub const MENU_CONNECT_PREFIX: &str = "connect:";
+pub const MENU_DISCONNECT_PREFIX: &str = "disconnect:";
+pub const MENU_COPY_SOCKS_PREFIX: &str = "copy-socks:";
 
 pub fn status_line(phase: Phase) -> &'static str {
     match phase {
@@ -36,13 +31,64 @@ pub fn status_line(phase: Phase) -> &'static str {
     }
 }
 
-pub struct Tray {
-    tray: TrayIcon,
+fn profile_phase(snapshots: &HashMap<String, Snapshot>, id: &str) -> Phase {
+    snapshots.get(id).map(|s| s.phase).unwrap_or(Phase::Idle)
+}
+
+/// The icon reflects the worst/most-notable state across profiles: a failure
+/// beats connected beats in-progress beats idle.
+fn aggregate_state(phases: &[Phase]) -> TrayState {
+    if phases.contains(&Phase::Failed) {
+        TrayState::Failed
+    } else if phases.contains(&Phase::Connected) {
+        TrayState::Connected
+    } else if phases.contains(&Phase::Reconnecting) {
+        TrayState::Reconnecting
+    } else if phases.contains(&Phase::Connecting) {
+        TrayState::Connecting
+    } else {
+        TrayState::Idle
+    }
+}
+
+fn aggregate_line(phases: &[Phase]) -> String {
+    let connected = phases.iter().filter(|p| **p == Phase::Connected).count();
+    if phases.is_empty() {
+        "No profiles".into()
+    } else if connected > 0 {
+        format!("{connected} of {} connected", phases.len())
+    } else if phases.contains(&Phase::Failed) {
+        "Connection failed".into()
+    } else if phases
+        .iter()
+        .any(|p| matches!(p, Phase::Connecting | Phase::Reconnecting))
+    {
+        "Connecting…".into()
+    } else {
+        "Disconnected".into()
+    }
+}
+
+/// Retained handles into one profile's submenu, mutated in place on phase
+/// changes so the whole menu is only rebuilt when the profile set changes.
+struct ProfileItems {
     status: MenuItem,
     connect: MenuItem,
     disconnect: MenuItem,
     copy_socks: MenuItem,
-    synced: Option<(TrayState, bool, bool)>,
+}
+
+/// Everything `sync` reacts to; native calls only happen when it changes.
+type SyncKey = (TrayState, String, Vec<(String, String, Phase, bool, bool)>);
+
+pub struct Tray {
+    tray: TrayIcon,
+    status: MenuItem,
+    items: HashMap<String, ProfileItems>,
+    /// The `(id, name)` list the current menu was built from; a change (added,
+    /// removed, renamed or reordered profile) rebuilds the menu.
+    menu_profiles: Vec<(String, String)>,
+    synced: Option<SyncKey>,
 }
 
 fn make_icon(state: TrayState) -> Result<tray_icon::Icon> {
@@ -52,35 +98,11 @@ fn make_icon(state: TrayState) -> Result<tray_icon::Icon> {
 
 impl Tray {
     pub fn new() -> Result<Self> {
-        let status = MenuItem::with_id("status", status_line(Phase::Idle), false, None);
-        let connect = MenuItem::with_id(MENU_CONNECT, "Connect", false, None);
-        let disconnect = MenuItem::with_id(MENU_DISCONNECT, "Disconnect", false, None);
-        let copy_socks = MenuItem::with_id(MENU_COPY_SOCKS, "Copy SOCKS5 Address", false, None);
-        let open = MenuItem::with_id(MENU_OPEN, "Open flextunnel…", true, None);
-        let version = MenuItem::with_id(
-            "version",
-            concat!("flextunnel v", env!("CARGO_PKG_VERSION")),
-            false,
-            None,
-        );
-        let quit = MenuItem::with_id(MENU_QUIT, "Quit flextunnel", true, None);
-        let menu = Menu::with_items(&[
-            &open,
-            &PredefinedMenuItem::separator(),
-            &status,
-            &PredefinedMenuItem::separator(),
-            &connect,
-            &disconnect,
-            &copy_socks,
-            &PredefinedMenuItem::separator(),
-            &version,
-            &quit,
-        ])?;
-
+        let status = MenuItem::with_id("status", "Disconnected", false, None);
         let tray = TrayIconBuilder::new()
             .with_icon(make_icon(TrayState::Idle)?)
             .with_icon_as_template(icon::is_template())
-            .with_menu(Box::new(menu))
+            .with_menu(Box::new(Menu::new()))
             .with_tooltip("flextunnel — disconnected")
             // Windows convention: left click toggles the window (handled via
             // TrayIconEvent), right click opens the menu. macOS keeps the
@@ -88,49 +110,153 @@ impl Tray {
             .with_menu_on_left_click(cfg!(target_os = "macos"))
             .build()?;
 
-        Ok(Self {
+        let mut this = Self {
             tray,
             status,
-            connect,
-            disconnect,
-            copy_socks,
+            items: HashMap::new(),
+            menu_profiles: Vec::new(),
             synced: None,
-        })
+        };
+        this.rebuild_menu(&[])?;
+        Ok(this)
     }
 
-    /// Reflect the tunnel state in the icon/menu. Native calls only happen on
+    fn rebuild_menu(&mut self, profiles: &[Profile]) -> Result<()> {
+        let menu = Menu::new();
+        menu.append(&MenuItem::with_id(MENU_OPEN, "Open flextunnel…", true, None))?;
+        menu.append(&PredefinedMenuItem::separator())?;
+        menu.append(&self.status)?;
+        menu.append(&PredefinedMenuItem::separator())?;
+
+        self.items.clear();
+        for profile in profiles {
+            let status =
+                MenuItem::with_id(format!("profile-status:{}", profile.id), "…", false, None);
+            let connect = MenuItem::with_id(
+                format!("{MENU_CONNECT_PREFIX}{}", profile.id),
+                "Connect",
+                false,
+                None,
+            );
+            let disconnect = MenuItem::with_id(
+                format!("{MENU_DISCONNECT_PREFIX}{}", profile.id),
+                "Disconnect",
+                false,
+                None,
+            );
+            let copy_socks = MenuItem::with_id(
+                format!("{MENU_COPY_SOCKS_PREFIX}{}", profile.id),
+                "Copy SOCKS5 Address",
+                false,
+                None,
+            );
+            let submenu = Submenu::with_items(
+                &profile.name,
+                true,
+                &[&status, &connect, &disconnect, &copy_socks],
+            )?;
+            menu.append(&submenu)?;
+            self.items.insert(
+                profile.id.clone(),
+                ProfileItems {
+                    status,
+                    connect,
+                    disconnect,
+                    copy_socks,
+                },
+            );
+        }
+        if !profiles.is_empty() {
+            menu.append(&PredefinedMenuItem::separator())?;
+        }
+
+        menu.append(&MenuItem::with_id(
+            "version",
+            concat!("flextunnel v", env!("CARGO_PKG_VERSION")),
+            false,
+            None,
+        ))?;
+        menu.append(&MenuItem::with_id(MENU_QUIT, "Quit flextunnel", true, None))?;
+        self.tray.set_menu(Some(Box::new(menu)));
+        self.menu_profiles = profiles
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone()))
+            .collect();
+        Ok(())
+    }
+
+    /// Reflect the tunnel states in the icon/menu. Native calls only happen on
     /// a change; called every UI frame.
-    pub fn sync(&mut self, phase: Phase, can_connect: bool, socks_addr: Option<SocketAddr>) {
-        let state = tray_state(phase);
-        let key = (state, can_connect, socks_addr.is_some());
-        if self.synced == Some(key) {
+    pub fn sync(&mut self, profiles: &[Profile], snapshots: &HashMap<String, Snapshot>) {
+        let phases: Vec<Phase> = profiles
+            .iter()
+            .map(|p| profile_phase(snapshots, &p.id))
+            .collect();
+        let state = aggregate_state(&phases);
+        let line = aggregate_line(&phases);
+        let key: SyncKey = (
+            state,
+            line.clone(),
+            profiles
+                .iter()
+                .zip(&phases)
+                .map(|(p, phase)| {
+                    let copyable = snapshots
+                        .get(&p.id)
+                        .is_some_and(|s| s.socks_addr.is_some());
+                    (p.id.clone(), p.name.clone(), *phase, p.is_ready(), copyable)
+                })
+                .collect(),
+        );
+        if self.synced.as_ref() == Some(&key) {
             return;
         }
-        let icon_changed = self.synced.map(|(s, ..)| s) != Some(state);
+        let icon_changed = self.synced.as_ref().map(|(s, ..)| *s) != Some(state);
         self.synced = Some(key);
 
-        self.status.set_text(status_line(phase));
-        self.connect
-            .set_enabled(matches!(phase, Phase::Idle | Phase::Failed) && can_connect);
-        self.disconnect.set_enabled(matches!(
-            phase,
-            Phase::Connecting | Phase::Connected | Phase::Reconnecting
-        ));
-        self.copy_socks
-            .set_enabled(phase == Phase::Connected && socks_addr.is_some());
+        let names: Vec<(String, String)> = profiles
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone()))
+            .collect();
+        if names != self.menu_profiles
+            && let Err(e) = self.rebuild_menu(profiles)
+        {
+            log::error!("Failed to rebuild the tray menu: {e:#}");
+            return;
+        }
 
-        if icon_changed {
-            if let Ok(icon) = make_icon(state) {
-                // `set_icon` alone re-sets the macOS image as non-template
-                // (rendering it solid black instead of adapting to the menu
-                // bar), so pass the template flag through explicitly.
-                let _ = self
-                    .tray
-                    .set_icon_with_as_template(Some(icon), icon::is_template());
-            }
+        self.status.set_text(&line);
+        for profile in profiles {
+            let Some(items) = self.items.get(&profile.id) else {
+                continue;
+            };
+            let phase = profile_phase(snapshots, &profile.id);
+            items.status.set_text(status_line(phase));
+            items.connect.set_enabled(
+                matches!(phase, Phase::Idle | Phase::Failed) && profile.is_ready(),
+            );
+            items.disconnect.set_enabled(matches!(
+                phase,
+                Phase::Connecting | Phase::Connected | Phase::Reconnecting
+            ));
+            items.copy_socks.set_enabled(
+                phase == Phase::Connected
+                    && snapshots
+                        .get(&profile.id)
+                        .is_some_and(|s| s.socks_addr.is_some()),
+            );
+        }
+
+        if icon_changed
+            && let Ok(icon) = make_icon(state)
+        {
+            // `set_icon` alone re-sets the macOS image as non-template
+            // (rendering it solid black instead of adapting to the menu
+            // bar), so pass the template flag through explicitly.
             let _ = self
                 .tray
-                .set_tooltip(Some(format!("flextunnel — {}", status_line(phase))));
+                .set_icon_with_as_template(Some(icon), icon::is_template());
         }
+        let _ = self.tray.set_tooltip(Some(format!("flextunnel — {line}")));
     }
 }
