@@ -805,14 +805,18 @@ fn logs_pane(app: &App) -> Element<'_, Message> {
     .spacing(4)
     .align_y(Center);
 
-    let log = scrollable(text(app.log_text.as_str()).size(11).font(Font::MONOSPACE))
-        .direction(scrollable::Direction::Both {
-            vertical: scrollable::Scrollbar::new().spacing(4),
-            horizontal: scrollable::Scrollbar::new().spacing(4),
-        })
-        .anchor_bottom()
-        .width(Fill)
-        .height(Fill);
+    let log = scrollable(
+        text(app.log_text.as_str())
+            .size(11)
+            .font(Font::MONOSPACE)
+            .width(Fill),
+    )
+    .direction(scrollable::Direction::Vertical(
+        scrollable::Scrollbar::new().spacing(4),
+    ))
+    .anchor_bottom()
+    .width(Fill)
+    .height(Fill);
 
     column![
         header,
