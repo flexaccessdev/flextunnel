@@ -39,8 +39,11 @@ pub enum Message {
     WindowClosed(window::Id),
     Select(Selection),
     CopyText(String),
-    /// Fetch and flash the current iroh connection path (relay/direct) once.
+    /// Fetch the current iroh connection path (relay/direct) once and open the
+    /// modal showing it.
     ShowConnPath,
+    /// Close the connection-path modal.
+    DismissConnPath,
     // Profiles
     AddProfile,
     EditProfile(ProfileId),
@@ -528,25 +531,6 @@ fn window_settings() -> window::Settings {
     }
 }
 
-/// One-line, point-in-time summary of the connection path(s) for the notice
-/// line — the active path marked, mirroring `ezvpn client status`.
-fn conn_path_message(paths: &[ConnPath]) -> String {
-    if paths.is_empty() {
-        return "Connection path: still establishing — try again in a moment.".into();
-    }
-    let parts: Vec<String> = paths
-        .iter()
-        .map(|p| {
-            if p.selected {
-                format!("{} (active)", p.display)
-            } else {
-                p.display.clone()
-            }
-        })
-        .collect();
-    format!("Connection path right now: {}", parts.join(" · "))
-}
-
 pub struct App {
     controller: Controller,
     tray: Option<Tray>,
@@ -559,9 +543,11 @@ pub struct App {
     pub forward_form: Option<(ProfileId, ForwardForm)>,
     /// Two-click delete guard: the profile whose Delete was clicked once.
     pub confirm_delete: Option<ProfileId>,
-    /// Transient status line in the detail pane (save results/failures, and the
-    /// on-demand connection-path readout).
+    /// Transient status line in the detail pane (save results/failures).
     pub notice: Option<String>,
+    /// Open connection-path modal: a point-in-time path snapshot (`ezvpn
+    /// status`-style), overlaid until dismissed. `None` when closed.
+    pub conn_path_modal: Option<Vec<ConnPath>>,
     /// Transient export/import result shown in the sidebar.
     pub io_notice: Option<String>,
     /// Setup-failure reason per forward id, retained after the failed forward
@@ -612,6 +598,7 @@ impl App {
             forward_form: None,
             confirm_delete: None,
             notice: None,
+            conn_path_modal: None,
             io_notice: None,
             forward_errors: HashMap::new(),
             routed_caches: HashMap::new(),
@@ -700,6 +687,7 @@ impl App {
                 self.forward_form = None;
                 self.confirm_delete = None;
                 self.notice = None;
+                self.conn_path_modal = None;
                 Task::none()
             }
             Message::CopyText(text) => {
@@ -707,14 +695,18 @@ impl App {
                 Task::none()
             }
             Message::ShowConnPath => {
-                // A one-shot readout, surfaced in the transient notice line —
-                // not a live field. It's a point-in-time snapshot and clears on
-                // the next navigation, so it can't be mistaken for the current
-                // path.
+                // A one-shot readout shown in a dismissable modal overlay — a
+                // point-in-time snapshot that sits above the layout (not in it)
+                // so it can't be mistaken for a live field and leaves the pane
+                // untouched.
                 if let Selection::Profile(id) = &self.selection {
                     let paths = self.controller.query_conn_path(&id.clone());
-                    self.notice = Some(conn_path_message(&paths));
+                    self.conn_path_modal = Some(paths);
                 }
+                Task::none()
+            }
+            Message::DismissConnPath => {
+                self.conn_path_modal = None;
                 Task::none()
             }
             Message::AddProfile => {

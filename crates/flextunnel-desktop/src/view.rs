@@ -12,9 +12,10 @@ use crate::style::{self, AMBER, GRAY, GREEN, RED};
 use crate::tunnel::{Phase, Snapshot};
 use flextunnel_core::proxy::signaling::Target;
 use flextunnel_core::proxy::{reserved, AgentConnState, RoutedSet, TunnelRoutes};
+use flextunnel_core::transport::endpoint::{ConnPath, ConnPathKind};
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, space, text, text_input,
-    toggler,
+    button, center, checkbox, column, container, mouse_area, opaque, pick_list, row, scrollable,
+    space, stack, text, text_input, toggler,
 };
 use iced::{Center, Color, Element, Fill, Font};
 use std::net::SocketAddr;
@@ -114,7 +115,81 @@ fn phase_label(phase: Phase) -> &'static str {
 }
 
 pub fn root(app: &App) -> Element<'_, Message> {
-    row![sidebar(app), detail_pane(app)].into()
+    let base = row![sidebar(app), detail_pane(app)];
+    match &app.conn_path_modal {
+        Some(paths) => modal(base, conn_path_modal(paths)),
+        None => base.into(),
+    }
+}
+
+/// Overlay `content`, centered on a dimmed backdrop, as a stack layer above
+/// `base` — so it never touches `base`'s layout. Clicking the backdrop
+/// dismisses; the content card swallows its own clicks.
+fn modal<'a>(
+    base: impl Into<Element<'a, Message>>,
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    stack![
+        base.into(),
+        opaque(
+            mouse_area(center(opaque(content)).style(|_theme| container::Style {
+                background: Some(Color { a: 0.7, ..Color::BLACK }.into()),
+                ..container::Style::default()
+            }))
+            .on_press(Message::DismissConnPath),
+        ),
+    ]
+    .into()
+}
+
+/// The connection-path modal card: a point-in-time snapshot of how the profile
+/// reaches the server, each path dotted by transport (direct/relay) with the
+/// active one pilled — mirrors `ezvpn client status`.
+fn conn_path_modal(paths: &[ConnPath]) -> Element<'_, Message> {
+    let mut card = column![
+        row![
+            text("Connection path").size(15).font(semibold()),
+            space().width(Fill),
+            button(text("Close").size(12))
+                .padding([3, 10])
+                .style(style::ghost)
+                .on_press(Message::DismissConnPath),
+        ]
+        .align_y(Center),
+        text("Snapshot taken just now — how this profile reaches the server.")
+            .size(11)
+            .style(style::dim_text),
+    ]
+    .spacing(10);
+
+    if paths.is_empty() {
+        card = card.push(
+            text("No path yet — still establishing. Close this and try again in a moment.")
+                .size(12)
+                .style(style::dim_text),
+        );
+    } else {
+        for path in paths {
+            let color = match path.kind {
+                ConnPathKind::Direct => GREEN,
+                ConnPathKind::Relay => AMBER,
+                ConnPathKind::Other => GRAY,
+            };
+            let mut r = row![dot(color, 7.0), mono(path.display.clone())]
+                .spacing(8)
+                .align_y(Center);
+            if path.selected {
+                r = r.push(pill("active".to_string(), GREEN));
+            }
+            card = card.push(r);
+        }
+    }
+
+    container(card)
+        .padding([16, 18])
+        .max_width(480)
+        .style(style::card)
+        .into()
 }
 
 // ---------------------------------------------------------------------------
