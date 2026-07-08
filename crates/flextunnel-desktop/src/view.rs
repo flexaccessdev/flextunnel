@@ -807,8 +807,8 @@ fn logs_pane(app: &App) -> Element<'_, Message> {
 
     let log = scrollable(text(app.log_text.as_str()).size(11).font(Font::MONOSPACE))
         .direction(scrollable::Direction::Both {
-            vertical: scrollable::Scrollbar::new(),
-            horizontal: scrollable::Scrollbar::new(),
+            vertical: scrollable::Scrollbar::new().spacing(4),
+            horizontal: scrollable::Scrollbar::new().spacing(4),
         })
         .anchor_bottom()
         .width(Fill)
