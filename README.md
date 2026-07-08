@@ -125,8 +125,9 @@ set `com.apple.quarantine` on downloads, but command-line tools like `curl` and
 `/Applications`):
 
 ```sh
-# replace vX.Y.Z with the release tag from the Releases page
-curl -L -o flextunnel-desktop.app.zip \
+# replace vX.Y.Z with the real release tag from the Releases page — a wrong
+# tag 404s and (with -f) curl fails instead of saving the tiny "Not Found" page
+curl -fL -o flextunnel-desktop.app.zip \
   https://github.com/andrewtheguy/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-macos-arm64.app.zip
 ```
 
