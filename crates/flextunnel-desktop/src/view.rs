@@ -203,7 +203,9 @@ fn status_tab(app: &App) -> Element<'_, Message> {
     let copy_node = (!node_id.is_empty()).then(|| node_id.clone());
     let copy_socks = (!socks.is_empty()).then(|| format!("socks5://{socks}"));
     let mut info = column![
-        info_row("Server node id", node_id, copy_node),
+        // The full id never fits (and iced has no ellipsis overflow); both
+        // ends stay visible for eyeballing, Copy carries the whole thing.
+        info_row("Server node id", truncate_middle(&node_id, 22), copy_node),
         info_row("SOCKS5 proxy", socks, copy_socks),
     ]
     .spacing(8);
@@ -685,6 +687,16 @@ fn input<'a>(
         .style(style::input)
 }
 
+/// Shorten to `max` characters by replacing the middle with an ellipsis.
+/// ASCII-safe inputs only (node ids, addresses).
+fn truncate_middle(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.into();
+    }
+    let keep = (max - 1) / 2;
+    format!("{}…{}", &s[..keep], &s[s.len() - keep..])
+}
+
 fn section_label(label: impl Into<String>) -> Element<'static, Message> {
     text(label.into())
         .size(11)
@@ -724,6 +736,15 @@ fn semibold() -> Font {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn middle_truncation() {
+        assert_eq!(truncate_middle("short", 22), "short");
+        let id = "feedfacefeedfacefeedfacefeedface";
+        let shown = truncate_middle(id, 22);
+        assert_eq!(shown, "feedfacefe…cefeedface");
+        assert!(shown.chars().count() <= 22);
+    }
 
     #[test]
     fn full_tunnel_derivation() {
