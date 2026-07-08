@@ -4,6 +4,7 @@
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::signaling::{self, ControlMsg, Hello, Target};
 use crate::proxy::{dial, http, reserved, socks5, RoutedSet};
+use crate::transport::endpoint::{connection_paths, ConnPath};
 use crate::transport::{HEARTBEAT_INTERVAL, LIVENESS_WINDOW};
 use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -238,6 +239,11 @@ struct ServerNonceTracker {
 pub struct ProxyClient {
     config: ClientConfig,
     routes: Arc<Mutex<TunnelRoutes>>,
+    /// The live server connection, published by the connection manager while
+    /// up and `None` during a drop/backoff. Also the accept loops' routing
+    /// handle; held as a field so status callers (the desktop's connection-path
+    /// CTA) can snapshot its iroh paths on demand via [`Self::conn_paths`].
+    current: SharedConn,
     /// Random per-process identity of this client, sent in every `Hello` so the
     /// server can tell a benign reconnect (same nonce) from two distinct client
     /// processes sharing a node id (different nonces → a duplicate-client bug).
@@ -254,6 +260,7 @@ impl ProxyClient {
         Self {
             config,
             routes: Arc::new(Mutex::new(TunnelRoutes::default())),
+            current: Arc::new(Mutex::new(None)),
             instance_nonce: rand::rng().random(),
             nonce_tracker: Mutex::new(ServerNonceTracker::default()),
             duplicate_server: AtomicBool::new(false),
@@ -300,6 +307,17 @@ impl ProxyClient {
     /// display what is routed. Refreshed on every (re)connect.
     pub fn routes(&self) -> Arc<Mutex<TunnelRoutes>> {
         self.routes.clone()
+    }
+
+    /// Snapshot the current connection's iroh paths (relay/direct) for a status
+    /// UI. Empty while disconnected (during a drop/backoff or before the first
+    /// connect). Cheap and synchronous — [`connection_paths`] reads a
+    /// point-in-time snapshot, so no background watcher is involved.
+    pub fn conn_paths(&self) -> Vec<ConnPath> {
+        match self.current.lock().expect("connection lock").as_ref() {
+            Some(conn) => connection_paths(conn),
+            None => Vec::new(),
+        }
     }
 
     /// Flip the connected flag without disturbing the last-known route set.
@@ -371,8 +389,9 @@ impl ProxyClient {
         // accept loops independent of the connection is what lets off-list targets
         // keep connecting directly while the tunnel is down — only on-list targets
         // fail until it recovers. The policy starts None so the client fails closed
-        // until it is known.
-        let current: SharedConn = Arc::new(Mutex::new(None));
+        // until it is known. `current` is the client's own field so status callers
+        // can snapshot the connection's paths (see [`Self::conn_paths`]).
+        let current = self.current.clone();
         let routed_set: SharedRoutedSet = Arc::new(Mutex::new(None));
 
         // The HTTP branch is inert (never resolves) when no HTTP listener is

@@ -14,6 +14,7 @@ use crate::logging;
 use crate::tray::{self, Tray};
 use crate::tunnel::{Controller, Phase, ProfileId, Snapshot};
 use crate::view;
+use flextunnel_core::transport::endpoint::ConnPath;
 use iced::futures::Stream;
 use iced::{window, Element, Size, Subscription, Task};
 use std::collections::HashMap;
@@ -38,6 +39,11 @@ pub enum Message {
     WindowClosed(window::Id),
     Select(Selection),
     CopyText(String),
+    /// Fetch the current iroh connection path (relay/direct) once and open the
+    /// modal showing it.
+    ShowConnPath,
+    /// Close the connection-path modal.
+    DismissConnPath,
     // Profiles
     AddProfile,
     EditProfile(ProfileId),
@@ -539,6 +545,9 @@ pub struct App {
     pub confirm_delete: Option<ProfileId>,
     /// Transient status line in the detail pane (save results/failures).
     pub notice: Option<String>,
+    /// Open connection-path modal: a point-in-time path snapshot (`ezvpn
+    /// status`-style), overlaid until dismissed. `None` when closed.
+    pub conn_path_modal: Option<Vec<ConnPath>>,
     /// Transient export/import result shown in the sidebar.
     pub io_notice: Option<String>,
     /// Setup-failure reason per forward id, retained after the failed forward
@@ -589,6 +598,7 @@ impl App {
             forward_form: None,
             confirm_delete: None,
             notice: None,
+            conn_path_modal: None,
             io_notice: None,
             forward_errors: HashMap::new(),
             routed_caches: HashMap::new(),
@@ -677,10 +687,26 @@ impl App {
                 self.forward_form = None;
                 self.confirm_delete = None;
                 self.notice = None;
+                self.conn_path_modal = None;
                 Task::none()
             }
             Message::CopyText(text) => {
                 self.copy_text(text);
+                Task::none()
+            }
+            Message::ShowConnPath => {
+                // A one-shot readout shown in a dismissable modal overlay — a
+                // point-in-time snapshot that sits above the layout (not in it)
+                // so it can't be mistaken for a live field and leaves the pane
+                // untouched.
+                if let Selection::Profile(id) = &self.selection {
+                    let paths = self.controller.query_conn_path(&id.clone());
+                    self.conn_path_modal = Some(paths);
+                }
+                Task::none()
+            }
+            Message::DismissConnPath => {
+                self.conn_path_modal = None;
                 Task::none()
             }
             Message::AddProfile => {

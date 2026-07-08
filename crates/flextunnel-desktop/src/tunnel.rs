@@ -11,7 +11,7 @@
 use crate::config::Profile;
 use crate::forward::{ForwardManager, ForwardStatus, PortForward};
 use flextunnel_core::proxy::{ClientConfig, ProxyClient, TunnelRoutes};
-use flextunnel_core::transport::endpoint::create_client_endpoint;
+use flextunnel_core::transport::endpoint::{create_client_endpoint, ConnPath};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -19,6 +19,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 pub type ProfileId = String;
+
+/// Bound on the GUI thread's wait for a connection-path reply (see
+/// [`Controller::query_conn_path`]). Generous versus the sub-millisecond happy
+/// path — it exists only to fail open (empty result) rather than hang if a
+/// session stalls.
+const CONN_PATH_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
@@ -73,12 +79,19 @@ enum Command {
     SetForwards(ProfileId, Vec<PortForward>),
     /// Disconnect and drop the profile's snapshot slot (profile deleted).
     RemoveProfile(ProfileId),
+    /// One-shot request for the profile's current iroh connection path(s),
+    /// answered on the reply channel (the UI's connection-path CTA). Empty when
+    /// no session is running. A `std` channel (not tokio `oneshot`) so the GUI
+    /// caller can wait with a bounded [`std::sync::mpsc::Receiver::recv_timeout`].
+    QueryConnPath(ProfileId, std::sync::mpsc::Sender<Vec<ConnPath>>),
     Shutdown,
 }
 
 enum SessionCmd {
     Disconnect,
     SetForwards(Vec<PortForward>),
+    /// Answer the reply channel with the live connection's path snapshot, once.
+    QueryConnPath(std::sync::mpsc::Sender<Vec<ConnPath>>),
     Shutdown,
 }
 
@@ -153,6 +166,24 @@ impl Controller {
 
     pub fn remove_profile(&self, id: &str) {
         let _ = self.tx.blocking_send(Command::RemoveProfile(id.into()));
+    }
+
+    /// Fetch the profile's current iroh connection path(s), once. Returns empty
+    /// when no session is running, the request can't be sent, or the session
+    /// doesn't answer within [`CONN_PATH_TIMEOUT`]. The round-trip is a channel
+    /// hop (normally sub-millisecond), but the deadline is what guarantees a
+    /// wedged session can never freeze the GUI thread calling this from
+    /// `App::update`.
+    pub fn query_conn_path(&self, id: &str) -> Vec<ConnPath> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        if self
+            .tx
+            .blocking_send(Command::QueryConnPath(id.into(), reply_tx))
+            .is_err()
+        {
+            return Vec::new();
+        }
+        reply_rx.recv_timeout(CONN_PATH_TIMEOUT).unwrap_or_default()
     }
 
     /// Stop all sessions and join the worker thread (blocks briefly for the
@@ -296,6 +327,12 @@ async fn run_loop(mut rx: mpsc::Receiver<Command>, shared: SharedSnapshots) {
                 // No session: nothing to do — forwards travel inside the
                 // profile on the next Connect.
             }
+            Some(Command::QueryConnPath(id, reply)) => {
+                if let Some(handle) = sessions.get(&id) {
+                    let _ = handle.tx.send(SessionCmd::QueryConnPath(reply)).await;
+                }
+                // No session: `reply` drops, and the caller gets an empty Vec.
+            }
             Some(Command::RemoveProfile(id)) => {
                 if let Some(handle) = sessions.remove(&id) {
                     let _ = handle.tx.send(SessionCmd::Disconnect).await;
@@ -397,6 +434,10 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
                     return;
                 }
                 Some(SessionCmd::SetForwards(f)) => forwards = f,
+                // No connection yet during endpoint creation — report none.
+                Some(SessionCmd::QueryConnPath(reply)) => {
+                    let _ = reply.send(Vec::new());
+                }
                 Some(SessionCmd::Shutdown) | None => {
                     // Bounded grace so quitting stays responsive: close
                     // cleanly when creation finishes quickly, otherwise just
@@ -518,6 +559,9 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
                     forwards = f;
                     fwd_mgr.apply(&forwards);
                     refresh_forward_statuses(&slot, &fwd_mgr);
+                }
+                Some(SessionCmd::QueryConnPath(reply)) => {
+                    let _ = reply.send(client.conn_paths());
                 }
                 Some(SessionCmd::Shutdown) | None => {
                     slot.update(|s| s.phase = Phase::Idle);

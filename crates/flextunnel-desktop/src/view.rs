@@ -12,9 +12,10 @@ use crate::style::{self, AMBER, GRAY, GREEN, RED};
 use crate::tunnel::{Phase, Snapshot};
 use flextunnel_core::proxy::signaling::Target;
 use flextunnel_core::proxy::{reserved, AgentConnState, RoutedSet, TunnelRoutes};
+use flextunnel_core::transport::endpoint::{ConnPath, ConnPathKind};
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, space, text, text_input,
-    toggler,
+    button, center, checkbox, column, container, mouse_area, opaque, pick_list, row, scrollable,
+    space, stack, text, text_input, toggler,
 };
 use iced::{Center, Color, Element, Fill, Font};
 use std::net::SocketAddr;
@@ -114,7 +115,81 @@ fn phase_label(phase: Phase) -> &'static str {
 }
 
 pub fn root(app: &App) -> Element<'_, Message> {
-    row![sidebar(app), detail_pane(app)].into()
+    let base = row![sidebar(app), detail_pane(app)];
+    match &app.conn_path_modal {
+        Some(paths) => modal(base, conn_path_modal(paths)),
+        None => base.into(),
+    }
+}
+
+/// Overlay `content`, centered on a dimmed backdrop, as a stack layer above
+/// `base` — so it never touches `base`'s layout. Clicking the backdrop
+/// dismisses; the content card swallows its own clicks.
+fn modal<'a>(
+    base: impl Into<Element<'a, Message>>,
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    stack![
+        base.into(),
+        opaque(
+            mouse_area(center(opaque(content)).style(|_theme| container::Style {
+                background: Some(Color { a: 0.7, ..Color::BLACK }.into()),
+                ..container::Style::default()
+            }))
+            .on_press(Message::DismissConnPath),
+        ),
+    ]
+    .into()
+}
+
+/// The connection-path modal card: a point-in-time snapshot of how the profile
+/// reaches the server, each path dotted by transport (direct/relay) with the
+/// active one pilled — mirrors `ezvpn client status`.
+fn conn_path_modal(paths: &[ConnPath]) -> Element<'_, Message> {
+    let mut card = column![
+        row![
+            text("Connection path").size(15).font(semibold()),
+            space().width(Fill),
+            button(text("Close").size(12))
+                .padding([3, 10])
+                .style(style::ghost)
+                .on_press(Message::DismissConnPath),
+        ]
+        .align_y(Center),
+        text("Snapshot taken just now — how this profile reaches the server.")
+            .size(11)
+            .style(style::dim_text),
+    ]
+    .spacing(10);
+
+    if paths.is_empty() {
+        card = card.push(
+            text("No path yet — still establishing. Close this and try again in a moment.")
+                .size(12)
+                .style(style::dim_text),
+        );
+    } else {
+        for path in paths {
+            let color = match path.kind {
+                ConnPathKind::Direct => GREEN,
+                ConnPathKind::Relay => AMBER,
+                ConnPathKind::Other => GRAY,
+            };
+            let mut r = row![dot(color, 7.0), mono(path.display.clone())]
+                .spacing(8)
+                .align_y(Center);
+            if path.selected {
+                r = r.push(pill("active".to_string(), GREEN));
+            }
+            card = card.push(r);
+        }
+    }
+
+    container(card)
+        .padding([16, 18])
+        .max_width(480)
+        .style(style::card)
+        .into()
 }
 
 // ---------------------------------------------------------------------------
@@ -347,18 +422,25 @@ fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message
         let copy = Some(format!("http://{http}"));
         info = info.push(info_row("HTTP proxy", http, copy));
     }
-
-    col = col.push(
-        row![
-            section_label("CONNECTION"),
-            space().width(Fill),
-            button(text("Edit").size(12))
+    let mut header = row![section_label("CONNECTION"), space().width(Fill)].align_y(Center);
+    if snapshot.phase == Phase::Connected {
+        // A one-shot readout of the live iroh path, shown in a dismissable
+        // modal overlay (see `App::conn_path_modal`) — a point-in-time check
+        // rather than a live field.
+        header = header.push(
+            button(text("Connection path").size(12))
                 .padding([3, 10])
                 .style(style::ghost)
-                .on_press(Message::EditProfile(profile.id.clone())),
-        ]
-        .align_y(Center),
+                .on_press(Message::ShowConnPath),
+        );
+    }
+    header = header.push(
+        button(text("Edit").size(12))
+            .padding([3, 10])
+            .style(style::ghost)
+            .on_press(Message::EditProfile(profile.id.clone())),
     );
+    col = col.push(header);
     col = col.push(container(info).padding([12, 14]).width(Fill).style(style::card));
 
     if snapshot.phase == Phase::Connected {
@@ -805,14 +887,18 @@ fn logs_pane(app: &App) -> Element<'_, Message> {
     .spacing(4)
     .align_y(Center);
 
-    let log = scrollable(text(app.log_text.as_str()).size(11).font(Font::MONOSPACE))
-        .direction(scrollable::Direction::Both {
-            vertical: scrollable::Scrollbar::new(),
-            horizontal: scrollable::Scrollbar::new(),
-        })
-        .anchor_bottom()
-        .width(Fill)
-        .height(Fill);
+    let log = scrollable(
+        text(app.log_text.as_str())
+            .size(11)
+            .font(Font::MONOSPACE)
+            .width(Fill),
+    )
+    .direction(scrollable::Direction::Vertical(
+        scrollable::Scrollbar::new().spacing(4),
+    ))
+    .anchor_bottom()
+    .width(Fill)
+    .height(Fill);
 
     column![
         header,
