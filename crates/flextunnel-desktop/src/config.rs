@@ -74,7 +74,7 @@ impl Profile {
     /// file can violate it.
     pub fn is_valid_name(name: &str) -> bool {
         !name.is_empty()
-            && name.len() <= 64
+            && name.chars().count() <= 64
             && !name.starts_with(' ')
             && !name.ends_with(' ')
             && !name.contains("  ")
