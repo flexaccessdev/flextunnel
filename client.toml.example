@@ -11,6 +11,10 @@ server_node_id = "<server endpoint id>"
 # Local SOCKS5 listen address (default 127.0.0.1:1080).
 socks_listen = "127.0.0.1:1080"
 
+# Optional HTTP proxy listen address (CONNECT + absolute-URI plain-HTTP
+# forwarding). Unset means disabled; the SOCKS5 listener still runs.
+# http_listen = "127.0.0.1:8081"
+
 # Auth token for this client. Provide exactly one of `auth_token` or `auth_token_file`.
 auth_token = "ftcXXXXXXX"
 # auth_token_file = "~/.config/flextunnel/token.txt"

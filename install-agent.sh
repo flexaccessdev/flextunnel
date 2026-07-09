@@ -446,10 +446,10 @@ show_usage() {
     echo ""
     echo "Examples:"
     echo "  $0                              # Install latest release"
-    echo "  $0 20251210172710               # Install specific release"
+    echo "  $0 vX.Y.Z                       # Install specific release"
     echo "  $0 --prerelease                 # Install latest prerelease"
     echo "  $0 --download-only              # Download latest to current directory"
-    echo "  $0 --download-only 20251210172710  # Download specific release"
+    echo "  $0 --download-only vX.Y.Z       # Download specific release"
     echo ""
     echo "Supported platforms: Linux (amd64, arm64), macOS (arm64)"
 }

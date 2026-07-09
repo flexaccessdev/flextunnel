@@ -17,9 +17,9 @@ interactively.
 - flextunnel-agent never shells out to another process, so PATH resolution
   for *its own* execution isn't a concern — NSSM is given the exe's full
   path directly.
-- It calls `dirs::home_dir()` for `--default-config` and any unset
-  `--auth-token-file`/blocklist path. Under a service this resolves to the
-  **service account's** profile, not yours (e.g. `LocalSystem` maps to
+- It calls `dirs::home_dir()` for `--default-config` and for `~` expansion in
+  config paths. Under a service this resolves to the **service account's**
+  profile, not yours (e.g. `LocalSystem` maps to
   `C:\Windows\System32\config\systemprofile`), so **don't use
   `--default-config`** — pass explicit absolute paths instead.
 - `RUST_LOG` (via `env_logger`) only takes effect if it's set on the service
@@ -63,9 +63,9 @@ replace the file. From an **elevated** PowerShell session:
 # 1. Stop the service so the binary is no longer locked.
 nssm stop flextunnel-agent
 
-# 2. Install the new binary (checksum-verified) over the old one. Pass the
-#    release tag explicitly, or omit it to take the latest release.
-.\install-agent.ps1 v0.0.31
+# 2. Install the new binary (checksum-verified) over the old one. Replace
+#    vX.Y.Z with the release tag from GitHub releases.
+.\install-agent.ps1 vX.Y.Z
 
 # 3. Reinstall and start the service. This removes the stopped service and
 #    recreates it with the same config — pass the same -ConfigPath (and any
@@ -101,7 +101,7 @@ nssm set $svc AppStderr C:\ProgramData\flextunnel\logs\flextunnel-agent.err.log
 nssm set $svc AppRotateFiles 1
 nssm set $svc AppRotateOnline 1
 nssm set $svc AppRotateBytes 10485760
-nssm set $svc AppEnvironmentExtra "RUST_LOG=info"
+nssm set $svc AppEnvironmentExtra "RUST_LOG=info,iroh=warn,tracing=warn"
 nssm set $svc Start SERVICE_AUTO_START
 nssm set $svc AppExit Default Restart
 nssm set $svc AppRestartDelay 5000

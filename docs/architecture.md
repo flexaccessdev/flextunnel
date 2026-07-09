@@ -1,17 +1,19 @@
 # Architecture
 
-flextunnel is a **SOCKS5-over-QUIC proxy**: a local SOCKS5 listener on the
-**client** forwards each TCP `CONNECT` over a reliable QUIC bi-stream to the
-**server**, which performs DNS resolution and the outbound connection *from its
-own network*. Transport, NAT traversal, relay fallback, and TLS 1.3 encryption
-come from [iroh](https://www.iroh.computer/). Neither side needs a TUN device or
+flextunnel is a **SOCKS5/HTTP-proxy-over-QUIC split tunnel**: local proxy
+listeners on the **client** parse each request, match it against the
+server-pushed tunnel set, and either direct-connect off-list targets from the
+client device or tunnel on-list targets over reliable QUIC bi-streams to the
+**server**. Tunneled targets are resolved and connected *from the server's own
+network*. Transport, NAT traversal, relay fallback, and TLS 1.3 encryption come
+from [iroh](https://www.iroh.computer/). Neither side needs a TUN device or
 admin/root — it is ordinary userspace sockets end to end.
 
 ## High-level flow
 
 ```
-local app ──SOCKS5──► flextunnel client                        flextunnel server
-                      (127.0.0.1:1080)                          (no root, no TUN)
+local app ──SOCKS5/HTTP──► flextunnel client                    flextunnel server
+                      (127.0.0.1:1080 / optional HTTP)           (no root, no TUN)
                           │                                          │
                           │   one iroh QUIC Connection               │
                           │   (fixed ALPN + TLS 1.3)                 │
@@ -19,15 +21,17 @@ local app ──SOCKS5──► flextunnel client                        flextun
                           ├── control bi-stream ───────────────────►│  validate auth token
                           │      Hello / HelloResponse               │
                           │                                          │
-   per CONNECT  ──────────┼── data bi-stream #1 ───────────────────►│  resolve DNS, TcpStream::connect
+   per routed request ────┼── data bi-stream #1 ───────────────────►│  resolve DNS, TcpStream::connect
                           │      [request hdr][reply][raw bytes]     │      ───► target host:port
                           ├── data bi-stream #2 ───────────────────►│           (server's network)
                           └── data bi-stream #N ───────────────────►│
+                          └── off-list targets: direct connect from client
 ```
 
 All streams from one client multiplex over a **single** QUIC `Connection`. The
-control stream authenticates once; each subsequent bi-stream carries one proxied
-TCP connection.
+control stream authenticates once; each subsequent data bi-stream carries one
+tunneled proxied TCP connection. Direct off-list connections never touch the
+server.
 
 ## Module map (`src/`)
 
@@ -43,8 +47,10 @@ TCP connection.
 | `transport/endpoint.rs` | iroh `Endpoint` creation (relay mode, DNS discovery), secret/relay helpers |
 | `proxy/signaling.rs` | length-prefixed `Hello`/`HelloResponse`, control frames, per-stream `Target` codec, `REP_*` codes |
 | `proxy/socks5.rs` | client-side RFC 1928: method negotiation + `CONNECT` parsing + replies |
-| `proxy/client.rs` | connect + auth + SOCKS5 listener + reconnect loop |
-| `proxy/server.rs` | accept + auth + per-stream DNS/connect/pipe; agent registry + reverse routing |
+| `proxy/client.rs` | connect + auth + SOCKS5/HTTP listeners + split-tunnel routing + reconnect loop |
+| `proxy/http.rs` | client-side HTTP proxy front-end: `CONNECT` tunneling + absolute-URI plain-HTTP forwarding |
+| `proxy/routed_set.rs` | parsed tunnel set: client split-tunnel decision + server whitelist enforcement |
+| `proxy/server.rs` | accept + auth + routed-set whitelist + per-stream DNS/connect/pipe; status page; agent registry + reverse routing |
 | `proxy/agent.rs` | reverse-routing exit point: dial + auth (`role=Agent`, derived network id) + accept server-opened streams + dial loopback |
 | `proxy/dial.rs` | `Target` → TCP dial + `connect_and_pipe` (the shared server/agent exit-point body) |
 
@@ -72,11 +78,11 @@ secret: both peers must offer the same ALPN or negotiation fails. Access control
 is enforced by the auth handshake below, not by the ALPN.
 
 ### 2. Auth handshake (control stream)
-The protocol version is `PROTOCOL_VERSION = 5`. On the first bi-stream the
+The protocol version is `PROTOCOL_VERSION = 6`. On the first bi-stream the
 connecting peer sends
 `Hello { version, auth_token, client_instance_nonce, duplicate_server_observed, role, machine_id }`
 and the server replies
-`HelloResponse { version, accepted, reject_reason, server_instance_nonce, routed_* }`,
+`HelloResponse { version, accepted, reject_reason, server_instance_nonce, routed_*, host_aliases, agent_aliases, connected_agents }`,
 both length-prefixed JSON via `signaling::write_message` / `read_message` (4-byte
 big-endian length + payload, capped at `MAX_HANDSHAKE_SIZE` = 64 KiB). The server
 checks the token against the role's accepted set (`ftc` client tokens or `fta`
@@ -98,9 +104,10 @@ the client bounds waiting for the server `HelloResponse` with the same timeout
 otherwise prevents the idle timeout from firing on a peer that connects but
 never speaks.
 
-### 3. Per-CONNECT data streams
-For each accepted SOCKS5 `CONNECT`, the client opens a new bi-stream and writes a
-compact request header, then reads a one-byte reply, then pipes raw bytes:
+### 3. Per-request data streams
+For each on-list local request that needs the tunnel, the client opens a new
+bi-stream and writes a compact request header, then reads a one-byte reply, then
+pipes raw bytes:
 
 ```
 Request (client→server):  [ver=1][atyp][addr][port:u16 BE]
@@ -115,12 +122,14 @@ translation table. The header is parsed with `read_exact` (ATYP fixes the
 length; domains ≤ 255 bytes).
 
 ### 4. Server-side resolve + connect
-The server reads the `Target`, then (bounded by `CONNECT_TIMEOUT` = 10s) either
+The server reads the requested `Target`, enforces the routed-set whitelist on
+that requested target, handles reserved `flextunnel.internal` status routes and
+agent routes, then (bounded by `CONNECT_TIMEOUT` = 10s in `proxy/dial.rs`) either
 `TcpStream::connect`s a literal address or, for a domain, calls
-`tokio::net::lookup_host` and connects to the first address that accepts —
-**DNS happens on the server**, which is what lets clients reach names/IPs that
-only resolve or route from the server's network. Connect failures map to SOCKS5
-reply codes via `signaling::map_io_err`.
+`tokio::net::lookup_host` and connects to the first address that accepts.
+**DNS happens on the server** for tunneled domain targets, which is what lets
+clients reach names/IPs that only resolve or route from the server's network.
+Connect failures map to SOCKS5 reply codes via `signaling::map_io_err`.
 
 ### 5. Byte piping
 Both ends join the iroh `(SendStream, RecvStream)` halves with
@@ -133,7 +142,7 @@ maps to a stream FIN). Per-stream errors stay per-stream — the shared QUIC
 After the handshake the control bi-stream stays open. The client sends a
 `ControlMsg::Heartbeat { seq }` every `HEARTBEAT_INTERVAL` (10s) and the server
 replies `HeartbeatAck { seq }`, framed with the same length-prefixed helpers
-(capped at `MAX_CONTROL_MSG_SIZE`). This is an app-level liveness signal *on top
+(capped at `MAX_CONTROL_MSG_SIZE` = 16 KiB). This is an app-level liveness signal *on top
 of* QUIC keep-alive: it catches an *application-level* stall — a peer still
 answering QUIC keep-alive at the transport level but no longer sending
 heartbeats — within `LIVENESS_WINDOW` (33s: three heartbeat intervals plus 3s
@@ -165,17 +174,15 @@ the persisted client entry is largely an audit record.
 to its identity — it is identified by its stable **network id** (`ftm1…`), a
 one-way, versioned hash of its OS-native machine id (`/etc/machine-id` on Linux,
 `IOPlatformUUID` on macOS, `MachineGuid` on Windows) that the agent derives so the
-raw id never reaches the server. A single-instance file lock in the
-`flextunnel-agent` binary already guarantees one agent *process* per machine, so
-the server needs no nonce/liveness machinery: it tracks the one active connection
-per network id, and a *second concurrent* connection presenting the same id is
-necessarily a **different machine** (e.g. a cloned VM image whose machine id was
-never regenerated). On that collision the server tears both down and records the
-network id in the blocklist (`blocked_agents`). Because the network id is stable
-(unlike an ephemeral client id), that block keeps rejecting the id until the
-operator fixes the duplicate and clears the entry. A benign reconnect is not a collision: its prior connection is already
-gone (the reconnect backoff outlasts QUIC dead-connection detection), so it
-registers fresh.
+raw id never reaches the server. The `flextunnel-agent` binary's loopback-UDP
+singleton already guarantees one agent *process* per machine. The server tracks
+one active connection per network id and uses the agent's instance nonce to
+distinguish a benign same-process reconnect (same nonce, supersedes the stale
+connection) from a genuine duplicate (different nonce, e.g. a cloned VM image
+whose machine id was never regenerated). On that collision the server tears both
+down and records the network id in the blocklist (`blocked_agents`). Because the
+network id is stable (unlike an ephemeral client id), that block keeps rejecting
+the id until the operator fixes the duplicate and clears the entry.
 
 **Duplicate server (self-block).** Server identity is persistent, so two servers
 sharing one secret key is a plausible misconfiguration — but only observable when
@@ -199,13 +206,15 @@ atomically (temp + rename) and loaded at startup.
 
 ## Concurrency model
 
-- **Server:** one tokio task per accepted iroh connection (`handle_connection`),
-  and within it one task per accepted bi-stream (`handle_socks_stream`). No
-  shared mutable state on the data path; the accepted-token set is read-only.
+- **Server:** one tokio task per accepted iroh connection (`handle_connection`,
+  capped at `MAX_CONCURRENT_CONNECTIONS`), and within it one task per accepted
+  data bi-stream (`handle_socks_stream`). No shared mutable state on the data
+  path; the accepted-token set is read-only.
 - **Client:** one task per accepted local TCP connection (`handle_local_conn`),
-  all sharing the single `Connection` clone. The SOCKS5 listener and the QUIC
-  connection liveness are raced with `tokio::select!` so a dropped connection
-  breaks the accept loop into the reconnect path.
+  from the SOCKS5 listener and optional HTTP listener. All tunneled requests
+  share the single `Connection` clone; off-list requests direct-connect locally.
+  The local listeners and the QUIC connection liveness are raced with
+  `tokio::select!` so a dropped connection breaks into the reconnect path.
 
 ## Reconnect policy (client)
 
@@ -219,7 +228,7 @@ Implemented in `ProxyClient::run` / `handle_failure`:
   backoff + jitter** (1s → 60s), indefinitely, unless `--max-reconnect-attempts`
   caps it or `--no-auto-reconnect` disables it.
 - Permanent errors (`AuthenticationFailed` / `Config`) never retry.
-- The local SOCKS5 listener stays bound across reconnects, so local apps queue
+- The local proxy listeners stay bound across reconnects, so local apps queue
   rather than get connection-refused during the gap.
 
 On every exit path both `run_server` and `run_client` call
@@ -250,9 +259,10 @@ defenses.
 - **The server is the exit point.** Anyone with valid tokens can reach whatever
   the server's network can reach (including its `localhost`). Treat token
   distribution accordingly; scope server network access if needed.
-- **The local SOCKS5 listener is unauthenticated** and binds to loopback by
-  default — access control lives at the QUIC layer, not in SOCKS5. Binding it
-  off-loopback exposes an open proxy on the LAN; don't, unless you add auth.
+- **The local SOCKS5/HTTP proxy listeners are unauthenticated** and bind to
+  loopback by default — access control lives at the QUIC layer, not in the local
+  proxy front-ends. Binding them off-loopback exposes an open proxy on the LAN;
+  don't, unless you add auth.
 - iroh's relay/discovery operators can see connection *metadata* (which endpoints
   talk), never the encrypted payload.
 
@@ -266,12 +276,17 @@ defenses.
 | `HEARTBEAT_INTERVAL` | 10s | `transport/mod.rs` |
 | `LIVENESS_WINDOW` | 33s | `transport/mod.rs` |
 | `RELAY_CONNECT_TIMEOUT` (`endpoint.online()`) | 10s | `transport/endpoint.rs` |
+| `CONNECT_TIMEOUT` (client/agent server connect) | 30s | `proxy/client.rs` |
 | `HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs`, `proxy/server.rs`, `proxy/agent.rs` |
+| `LOCAL_HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs` |
+| `TUNNEL_OPEN_TIMEOUT` | 30s | `proxy/client.rs` |
 | `CONNECT_TIMEOUT` (server/agent dial) | 10s | `proxy/dial.rs` |
+| `MAX_CONCURRENT_CONNECTIONS` | 1024 | `proxy/server.rs` |
 | reconnect backoff | 1s → 60s + ≤500ms jitter | `proxy/client.rs` |
 | `MAX_HANDSHAKE_SIZE` | 64 KiB | `proxy/signaling.rs` |
-| `MAX_CONTROL_MSG_SIZE` | 1 KiB | `proxy/signaling.rs` |
-| `PROTOCOL_VERSION` | 4 | `proxy/signaling.rs` |
+| `MAX_CONTROL_MSG_SIZE` | 16 KiB | `proxy/signaling.rs` |
+| `MAX_HTTP_HEADER` | 64 KiB | `proxy/http.rs` |
+| `PROTOCOL_VERSION` | 6 | `proxy/signaling.rs` |
 | auth token length | 49 chars | `auth.rs` |
 | `ALPN` | `flextunnel/1` | `transport/mod.rs` |
 
@@ -284,7 +299,8 @@ the project `README.md` for the user-facing comparison.
 
 ## Roadmap
 
-HTTP proxy support is planned; the wire protocol and server are unaffected. See
+HTTP proxy support is implemented on the client side; the wire protocol and
+server remain front-end-agnostic. See
 [`http-proxy-roadmap.md`](./http-proxy-roadmap.md).
 
 Reverse routing is loopback-only in v1. A follow-up will let one agent (machine

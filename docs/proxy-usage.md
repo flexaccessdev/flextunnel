@@ -1,15 +1,18 @@
 # Using the flextunnel proxies
 
-The flextunnel client exposes up to two local proxy listeners, both tunneling
-TCP over the same QUIC connection and sharing the same routing core:
+The flextunnel client exposes up to two local proxy listeners, both sharing the
+same routing core:
 
 - a **SOCKS5** listener (default `127.0.0.1:1080`), always on; and
 - an optional **HTTP proxy** listener (`--http-listen 127.0.0.1:8081`), off
   unless you enable it.
 
 Which one you point a tool at depends only on what that tool can speak — the
-server sees the same tunneled `CONNECT` either way and neither knows nor cares
-which front-end you used. This guide covers, in order:
+client applies the server-pushed tunnel set after parsing the request. On-list
+targets are tunneled over the QUIC connection; off-list targets are connected
+directly from the client device. For on-list targets, the server sees the same
+wire `Target` either way and does not care which local front-end you used. This
+guide covers, in order:
 
 1. **The one rule** — always let the *server* resolve names.
 2. **Which listener to use** — SOCKS5 vs HTTP proxy, and when only one works.
@@ -26,18 +29,24 @@ which front-end you used. This guide covers, in order:
 
 ## The one rule: let the server resolve names
 
-flextunnel's whole point is that DNS and the outbound connection happen on the
-**server's** network. The server only accepts targets in its `routed_domains`
-set and maps some of them via `[host_aliases]` (e.g. `networking.internal` →
-`127.0.0.1` on the server). Those names usually **do not resolve on the client
-at all**.
+flextunnel's whole point is that DNS and the outbound connection for **routed**
+targets happen on the **server's** network. The server only accepts targets in
+its `routed_domains` / `routed_cidrs` tunnel set and maps some names via
+`[host_aliases]` (e.g. `networking.internal` -> `127.0.0.1` on the server).
+Those names usually **do not resolve on the client at all**.
+
+The tunnel set is pushed to the client during the handshake. Anything outside
+that set is direct-connected from the client, so add every internal hostname or
+alias you intend to route to `routed_domains`; add literal IP destinations to
+`routed_cidrs` only when you really want those IPs tunneled.
 
 So whatever you use must send the target **hostname** to the proxy and let
 flextunnel resolve it. The two front-ends reach this differently:
 
-- **HTTP proxy** — always sends the hostname to the proxy (`CONNECT host:port`
-  or an absolute-URI `GET http://host/…`), so DNS happens server-side with no
-  extra configuration. There is no client-DNS footgun here.
+- **HTTP proxy** — sends the hostname to flextunnel (`CONNECT host:port` or an
+  absolute-URI `GET http://host/...`), so DNS happens server-side for on-list
+  targets with no extra configuration. There is no SOCKS-style client-DNS
+  footgun here.
 - **SOCKS5** — *can* resolve either at the client or at the proxy, and the
   default in many tools is the wrong one. You want the `socks5h` behavior (the
   `h` means "resolve host at the proxy"). Never pre-resolve the name to an IP on
@@ -78,13 +87,10 @@ flextunnel client \
 ### `curl`
 
 ```sh
-# DNS + connection resolved server-side (note socks5h)
+# For an on-list target, DNS + connection happen server-side (note socks5h)
 curl -x socks5h://127.0.0.1:1080 https://example.com
 
-# a service on the SERVER's own localhost
-curl -x socks5h://127.0.0.1:1080 http://127.0.0.1:8000/
-
-# a host alias defined on the server
+# a host alias defined on the server, for example networking.internal -> 127.0.0.1
 curl -x socks5h://127.0.0.1:1080 http://networking.internal/
 
 # flextunnel server status, as plain text
@@ -169,7 +175,8 @@ environment variable (which would otherwise proxy *every* context).
 Use the `socks5h://` scheme so flextunnel resolves the API server's hostname
 server-side — the same "let the server resolve names" rule as everywhere else.
 The `server:` host must be a name the flextunnel **server** can resolve and
-reach (a `routed_domains` entry or a `[host_aliases]` name):
+reach, and it must be on the tunnel set (a `routed_domains` entry or a
+`[host_aliases]` name that is also listed in `routed_domains`):
 
 ```yaml
 apiVersion: v1
@@ -194,10 +201,10 @@ users:
 ```
 
 `proxy-url` also accepts `http://` — point it at the HTTP proxy front-end
-(`proxy-url: http://127.0.0.1:8081`) if you'd rather not run the SOCKS5
-listener; kubectl always sends the API server hostname to an HTTP proxy, so DNS
-still happens server-side there too. Plain `socks5://` (no `h`) would resolve
-`k8s.internal` on the client and fail — use `socks5h://`.
+(`proxy-url: http://127.0.0.1:8081`) if that fits your tooling better; kubectl
+sends the API server hostname to an HTTP proxy, so DNS still happens
+server-side for on-list targets there too. Plain `socks5://` (no `h`) would
+resolve `k8s.internal` on the client and fail — use `socks5h://`.
 
 > Note the DNS semantics: with `socks5h://`, a `server:` of
 > `https://localhost:6443` means *the flextunnel server's* localhost, not your
@@ -206,18 +213,19 @@ still happens server-side there too. Plain `socks5://` (no `h`) would resolve
 ### Web browsers
 
 Point the browser's SOCKS proxy at `127.0.0.1:1080` **with remote DNS enabled**
-so hostnames resolve on the server:
+so on-list hostnames resolve on the server:
 
 - **Firefox** — set a manual SOCKS v5 proxy of `127.0.0.1:1080` in its network
   settings, and enable the option to proxy DNS through SOCKS v5 so hostnames
-  resolve on the server rather than locally.
+  for tunneled targets resolve on the server rather than locally.
 - **Chrome / Chromium** — configure a SOCKS5 proxy of `127.0.0.1:1080` (Chrome
-  sends the hostname to the proxy, so DNS happens server-side).
+  sends the hostname to the proxy, so DNS happens server-side for on-list
+  targets).
 
 A browser can also use the HTTP proxy on `127.0.0.1:8081` instead — it sends the
-hostname either way, so DNS still happens server-side. For per-site control
-instead of a system-wide switch, a browser extension like FoxyProxy lets you
-route only the internal domains through the proxy.
+hostname either way, so DNS still happens server-side for on-list targets. For
+per-site control instead of a system-wide switch, a browser extension like
+FoxyProxy lets you route only the internal domains through the proxy.
 
 > These browser paths were not tested here; verify the exact settings in your
 > browser version.

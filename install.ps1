@@ -360,10 +360,10 @@ Environment variables:
 
 Examples:
   .\install.ps1                              # Install latest release
-  .\install.ps1 20251210172710               # Install specific release
+  .\install.ps1 vX.Y.Z                       # Install specific release
   .\install.ps1 -PreRelease                  # Install latest prerelease
   .\install.ps1 -DownloadOnly                # Download latest to current directory
-  .\install.ps1 -DownloadOnly 20251210172710 # Download specific release
+  .\install.ps1 -DownloadOnly vX.Y.Z         # Download specific release
   `$env:RELEASE_TAG='latest'; .\install.ps1  # Use environment variable
 
 Supported platforms: Windows (amd64)

@@ -1,9 +1,11 @@
 # flextunnel
 
-A SOCKS5-over-QUIC proxy. The **client** runs a local SOCKS5 listener; each
-`CONNECT` is tunneled as a reliable QUIC bi-stream to the **server**, which
-performs **DNS resolution and the outbound TCP connection from its own
-network**, then pipes bytes back.
+A SOCKS5/HTTP-proxy-over-QUIC split tunnel. The **client** runs a local SOCKS5
+listener and, optionally, an HTTP proxy listener. Each request is matched
+against the server-pushed tunnel set: routed targets are tunneled as reliable
+QUIC bi-streams to the **server**, which performs **DNS resolution and the
+outbound TCP connection from its own network**, then pipes bytes back; off-list
+targets are connected directly from the client device.
 
 This lets you reach hosts that are only reachable from the server side — a
 private network, the server's own `localhost`, or names that only resolve via
@@ -15,7 +17,7 @@ Transport, NAT traversal, relay fallback, and TLS 1.3 encryption are provided by
 `EndpointId`, so the server needs no public inbound port or port forwarding.
 
 ```
-local app ──SOCKS5──► flextunnel client (127.0.0.1:1080)
+local app ──SOCKS5/HTTP──► flextunnel client (127.0.0.1:1080 / optional :8081)
                           │  one iroh QUIC connection (fixed ALPN + auth handshake)
                           │  ├─ control stream:  Hello / HelloResponse
                           │  └─ N data streams:  [target header][reply][raw bytes]
@@ -137,8 +139,7 @@ set `com.apple.quarantine` on downloads, but command-line tools like `curl` and
 `wget` do not. Download the disk image from the terminal instead:
 
 ```sh
-# replace vX.Y.Z with the real release tag from the Releases page — a wrong
-# tag 404s and (with -f) curl fails instead of saving the tiny "Not Found" page
+# Replace vX.Y.Z with the release tag from the Releases page.
 curl -fL -o flextunnel-desktop.dmg \
   https://github.com/andrewtheguy/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-macos-arm64.dmg
 ```
@@ -205,12 +206,29 @@ flextunnel generate-auth-token                  # a client auth token
 Keep `server.key` private (written `0600` on Unix). Share the **EndpointId**
 and the **auth token** with clients.
 
-### 2. Run the server (no root needed)
+### 2. Configure and run the server (no root needed)
+
+The routed set is required and is configured in `server.toml`. This example is a
+full tunnel; narrow it later with specific domains/CIDRs if you want split
+tunneling.
+
+```toml
+secret_file = "./server.key"
+
+# Accepted client auth tokens (prefix `ftc`, from `flextunnel generate-auth-token`).
+# Within this config file, inline tokens and a token file combine.
+auth_tokens = ["ftcXXXXXXX"]
+# auth_tokens_file = "/etc/flextunnel/auth_tokens.txt"
+
+routed_domains = ["*"]
+routed_cidrs = ["0.0.0.0/0", "::/0"]
+
+[host_aliases]
+"server.internal" = "127.0.0.1"
+```
 
 ```sh
-flextunnel server \
-    --secret-file server.key \
-    --auth-token  <AUTH_TOKEN>
+flextunnel server -c server.toml
 ```
 
 It prints `flextunnel server Node ID: <ENDPOINT_ID>` — give that to clients.
@@ -226,15 +244,15 @@ flextunnel client \
 
 ### 4. Use it
 
-Point any SOCKS5 client at `127.0.0.1:1080`. Use `socks5h://` so the **server**
-resolves DNS (the whole point — names resolve from the server's network):
+Point any SOCKS5 client at `127.0.0.1:1080`. Use `socks5h://` so routed
+hostnames reach flextunnel as names and are resolved on the server side:
 
 ```sh
-# DNS + external, resolved server-side
+# With the full-tunnel routed set above, DNS + connect happen server-side.
 curl -x socks5h://127.0.0.1:1080 https://example.com
 
-# a service on the SERVER's own localhost
-curl -x socks5h://127.0.0.1:1080 http://127.0.0.1:8000/
+# a server-side host alias, for example server.internal -> 127.0.0.1
+curl -x socks5h://127.0.0.1:1080 http://server.internal:8000/
 
 # SSH through the proxy
 ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
@@ -327,6 +345,7 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `--default-config` | Load `~/.config/flextunnel/client.toml`. |
 | `-n, --server-node-id <ID>` | Server EndpointId. |
 | `--socks-listen <ADDR>` | Local SOCKS5 bind address (default `127.0.0.1:1080`). |
+| `--http-listen <ADDR>` | Optional HTTP proxy bind address (CONNECT + plain-HTTP forwarding). |
 | `--auth-token <TOKEN>` / `--auth-token-file <FILE>` | Client auth token (one required). |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). |
 | `--dns-server <URL>` | Custom discovery DNS server, or `none` to disable. |
@@ -358,7 +377,7 @@ client file:
 ```toml
 server_node_id = "<server endpoint id>"
 socks_listen   = "127.0.0.1:1080"
-auth_token     = "v…"          # or: auth_token_file = "~/.config/flextunnel/token.txt"
+auth_token     = "ftc…"        # or: auth_token_file = "~/.config/flextunnel/token.txt"
 ```
 
 Secrets may be inline (as above) or kept in separate files via the `*_file`
