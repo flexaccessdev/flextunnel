@@ -201,7 +201,13 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
     let requested = cfg.socks_port.unwrap_or(0);
     let listener = runtime
         .block_on(TcpListener::bind((Ipv4Addr::LOCALHOST, requested)))
-        .map_err(|e| format!("failed to bind 127.0.0.1:{requested} (already in use?): {e}"))?;
+        .map_err(|e| {
+            if requested == 0 {
+                format!("failed to bind an ephemeral loopback SOCKS port: {e}")
+            } else {
+                format!("failed to bind 127.0.0.1:{requested} (already in use?): {e}")
+            }
+        })?;
     // Read the actually-bound port (matters for the ephemeral case, where
     // `requested` is 0 and the OS picked the real port).
     let port = listener

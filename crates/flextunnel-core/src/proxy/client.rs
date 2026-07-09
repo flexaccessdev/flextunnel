@@ -895,6 +895,87 @@ async fn rebind_listener(addr: SocketAddr) -> ProxyResult<TcpListener> {
     Ok(TcpListener::bind(addr).await?)
 }
 
+/// What an accept error means for the loop after the failure state machine has
+/// digested it.
+enum AcceptOutcome {
+    /// The listener is dead (broken, or an abort burst): rebind it in place.
+    Rebind,
+    /// A transient failure: back off and retry the same listener.
+    Retry,
+}
+
+/// Shared accept-failure state machine for the local listeners. Tracks the
+/// consecutive-failure and consecutive-abort counters and turns each accept
+/// result into the rebind-or-retry decision, so [`accept_loop`] and
+/// [`accept_loop_unix`] carry only their transport-specific accept, rebind, and
+/// log-label differences. `label` prefixes the recovery/retry log lines
+/// (e.g. "Local proxy" / "Unix SOCKS5").
+struct AcceptRetry {
+    label: &'static str,
+    consecutive_failures: u64,
+    consecutive_aborts: u64,
+}
+
+impl AcceptRetry {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            consecutive_failures: 0,
+            consecutive_aborts: 0,
+        }
+    }
+
+    /// Record a successful accept, logging recovery if we had been failing.
+    fn record_success(&mut self) {
+        if self.consecutive_failures > 0 {
+            log::info!(
+                "{} accepting again after {} failed attempt(s)",
+                self.label,
+                self.consecutive_failures
+            );
+            self.consecutive_failures = 0;
+        }
+        self.consecutive_aborts = 0;
+    }
+
+    /// Record an accept error and decide whether to rebind or retry.
+    fn record_error(&mut self, e: &io::Error) -> AcceptOutcome {
+        let failure = classify_accept_error(e);
+        self.consecutive_aborts = match failure {
+            AcceptFailure::Aborted => self.consecutive_aborts + 1,
+            _ => 0,
+        };
+        if failure == AcceptFailure::Broken
+            || self.consecutive_aborts >= REBIND_AFTER_CONSECUTIVE_ABORTS
+        {
+            AcceptOutcome::Rebind
+        } else {
+            AcceptOutcome::Retry
+        }
+    }
+
+    /// Reset the counters after a successful rebind.
+    fn record_rebind(&mut self) {
+        self.consecutive_failures = 0;
+        self.consecutive_aborts = 0;
+    }
+
+    /// Log the retry (warn periodically, debug otherwise) and back off.
+    async fn wait_retry(&mut self, e: &io::Error) {
+        if self.consecutive_failures.is_multiple_of(ACCEPT_RETRY_WARN_EVERY) {
+            log::warn!(
+                "{} accept failed ({e}); retrying every {}ms",
+                self.label,
+                ACCEPT_RETRY_DELAY.as_millis()
+            );
+        } else {
+            log::debug!("{} accept failed ({e}); retrying", self.label);
+        }
+        self.consecutive_failures += 1;
+        tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+    }
+}
+
 /// Accept loop for a local front-end listener. Each accepted connection is
 /// handled by [`handle_local_conn`] parameterized on `proto`. Shared verbatim by
 /// the SOCKS5 and HTTP listeners.
@@ -912,48 +993,25 @@ async fn accept_loop<P: LocalProto>(
     proto: P,
 ) -> ProxyResult<()> {
     let addr = listener.local_addr()?;
-    let mut consecutive_failures: u64 = 0;
-    let mut consecutive_aborts: u64 = 0;
+    let mut retry = AcceptRetry::new("Local proxy");
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(accepted) => {
-                if consecutive_failures > 0 {
-                    log::info!(
-                        "Local proxy accepting again after {consecutive_failures} failed attempt(s)"
-                    );
-                    consecutive_failures = 0;
-                }
-                consecutive_aborts = 0;
+                retry.record_success();
                 accepted
             }
             Err(e) => {
-                let failure = classify_accept_error(&e);
-                consecutive_aborts = match failure {
-                    AcceptFailure::Aborted => consecutive_aborts + 1,
-                    _ => 0,
-                };
-                if failure == AcceptFailure::Broken
-                    || consecutive_aborts >= REBIND_AFTER_CONSECUTIVE_ABORTS
-                {
-                    log::warn!("Local proxy listener on {addr} is dead ({e}); rebinding");
-                    // The dead socket still owns the port; release it first.
-                    drop(listener);
-                    listener = rebind_listener(addr).await?;
-                    log::info!("Local proxy listener rebound on {addr}");
-                    consecutive_failures = 0;
-                    consecutive_aborts = 0;
-                    continue;
+                match retry.record_error(&e) {
+                    AcceptOutcome::Rebind => {
+                        log::warn!("Local proxy listener on {addr} is dead ({e}); rebinding");
+                        // The dead socket still owns the port; release it first.
+                        drop(listener);
+                        listener = rebind_listener(addr).await?;
+                        log::info!("Local proxy listener rebound on {addr}");
+                        retry.record_rebind();
+                    }
+                    AcceptOutcome::Retry => retry.wait_retry(&e).await,
                 }
-                if consecutive_failures.is_multiple_of(ACCEPT_RETRY_WARN_EVERY) {
-                    log::warn!(
-                        "Local proxy accept failed ({e}); retrying every {}ms",
-                        ACCEPT_RETRY_DELAY.as_millis()
-                    );
-                } else {
-                    log::debug!("Local proxy accept failed ({e}); retrying");
-                }
-                consecutive_failures += 1;
-                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
                 continue;
             }
         };
@@ -984,48 +1042,25 @@ async fn accept_loop_unix(
         .local_addr()
         .ok()
         .and_then(|a| a.as_pathname().map(|p| p.to_path_buf()));
-    let mut consecutive_failures: u64 = 0;
-    let mut consecutive_aborts: u64 = 0;
+    let mut retry = AcceptRetry::new("Unix SOCKS5");
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _addr)) => {
-                if consecutive_failures > 0 {
-                    log::info!(
-                        "Unix SOCKS5 accepting again after {consecutive_failures} failed attempt(s)"
-                    );
-                    consecutive_failures = 0;
-                }
-                consecutive_aborts = 0;
+                retry.record_success();
                 stream
             }
             Err(e) => {
-                let failure = classify_accept_error(&e);
-                consecutive_aborts = match failure {
-                    AcceptFailure::Aborted => consecutive_aborts + 1,
-                    _ => 0,
-                };
-                if failure == AcceptFailure::Broken
-                    || consecutive_aborts >= REBIND_AFTER_CONSECUTIVE_ABORTS
-                {
-                    let Some(path) = &path else { return Err(e.into()) };
-                    log::warn!("Unix SOCKS5 listener at {path:?} is dead ({e}); rebinding");
-                    drop(listener);
-                    listener = rebind_unix_listener(path).await?;
-                    log::info!("Unix SOCKS5 listener rebound at {path:?}");
-                    consecutive_failures = 0;
-                    consecutive_aborts = 0;
-                    continue;
+                match retry.record_error(&e) {
+                    AcceptOutcome::Rebind => {
+                        let Some(path) = &path else { return Err(e.into()) };
+                        log::warn!("Unix SOCKS5 listener at {path:?} is dead ({e}); rebinding");
+                        drop(listener);
+                        listener = rebind_unix_listener(path).await?;
+                        log::info!("Unix SOCKS5 listener rebound at {path:?}");
+                        retry.record_rebind();
+                    }
+                    AcceptOutcome::Retry => retry.wait_retry(&e).await,
                 }
-                if consecutive_failures.is_multiple_of(ACCEPT_RETRY_WARN_EVERY) {
-                    log::warn!(
-                        "Unix SOCKS5 accept failed ({e}); retrying every {}ms",
-                        ACCEPT_RETRY_DELAY.as_millis()
-                    );
-                } else {
-                    log::debug!("Unix SOCKS5 accept failed ({e}); retrying");
-                }
-                consecutive_failures += 1;
-                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
                 continue;
             }
         };
