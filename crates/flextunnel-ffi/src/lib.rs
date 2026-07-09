@@ -4,9 +4,10 @@
 //! slices) and drives the in-process SOCKS5 proxy primarily with these calls:
 //!
 //! 1. [`flextunnel_start`] — parse the JSON config, create an iroh endpoint,
-//!    bind a loopback SOCKS5 listener on a **fixed** port, and spawn the
-//!    connect/auth/serve loop on an embedded runtime. Returns an opaque handle
-//!    and writes `{"socks_port": N}` to the caller's buffer so the app can point
+//!    bind a loopback SOCKS5 listener (an OS-assigned **ephemeral** port by
+//!    default), and spawn the connect/auth/serve loop on an embedded runtime.
+//!    Returns an opaque handle and writes `{"socks_port": N}` (the actual bound
+//!    port) to the caller's buffer so the app can point
 //!    `WKWebsiteDataStore.proxyConfigurations` at `127.0.0.1:N`. At most **one**
 //!    instance may run at a time (a process-global guard rejects a second).
 //! 2. [`flextunnel_health`] — cheap liveness probe: is the serve loop still
@@ -37,7 +38,7 @@
 //! {
 //!   "server_node_id": "<iroh endpoint id>",
 //!   "auth_token": "<flextunnel auth token>",
-//!   "socks_port": 18080,
+//!   "socks_port": 0,
 //!   "relay_urls": ["https://relay.example/"],
 //!   "dns_server": null
 //! }
@@ -63,15 +64,10 @@ use flextunnel_core::error::ProxyResult;
 use flextunnel_core::proxy::{ClientConfig, ProxyClient, TunnelRoutes};
 use flextunnel_core::transport::endpoint::{ConnPathKind, create_client_endpoint};
 
-/// Loopback SOCKS5 port used when the config omits `socks_port`. Fixed (not an
-/// OS-assigned ephemeral port) so the proxy is always reachable at a known
-/// address — easier to point tools at and to debug.
-const DEFAULT_SOCKS_PORT: u16 = 18080;
-
 /// Process-global guard enforcing **at most one** running proxy instance. A
-/// second [`flextunnel_start`] while one is live is rejected rather than racing
-/// for the fixed port. Claimed on a successful start, released by
-/// [`flextunnel_stop`] (or any start failure path).
+/// second [`flextunnel_start`] while one is live is rejected rather than racing.
+/// Claimed on a successful start, released by [`flextunnel_stop`] (or any start
+/// failure path).
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Opaque handle owned by the Swift side. Created by [`flextunnel_start`], freed
@@ -95,7 +91,8 @@ pub struct FlextunnelHandle {
 struct FfiConfig {
     server_node_id: String,
     auth_token: String,
-    /// Fixed loopback port to bind (defaults to [`DEFAULT_SOCKS_PORT`]).
+    /// Loopback port to bind. Omitted or `0` binds an OS-assigned ephemeral port
+    /// (the actual port is returned in the result JSON).
     #[serde(default)]
     socks_port: Option<u16>,
     #[serde(default)]
@@ -195,14 +192,22 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
     let runtime = flextunnel_core::app::build_runtime()
         .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
 
-    // Bind the loopback listener on the fixed port. The listener backlog queues
-    // the WKWebView's first connections until the connect/auth handshake
-    // completes and the serve loop starts accepting. A bind failure here is
-    // almost always "port already in use" — e.g. a stale instance.
-    let port = cfg.socks_port.unwrap_or(DEFAULT_SOCKS_PORT);
+    // Bind the loopback listener. The default (socks_port 0 / omitted) is an
+    // OS-assigned ephemeral port — unpredictable, so it isn't a fixed target for
+    // other local processes — reported back to the app via the result JSON. A
+    // caller may still pin a specific port. The listener backlog queues the
+    // WKWebView's first connections until the connect/auth handshake completes
+    // and the serve loop starts accepting.
+    let requested = cfg.socks_port.unwrap_or(0);
     let listener = runtime
-        .block_on(TcpListener::bind((Ipv4Addr::LOCALHOST, port)))
-        .map_err(|e| format!("failed to bind 127.0.0.1:{port} (already in use?): {e}"))?;
+        .block_on(TcpListener::bind((Ipv4Addr::LOCALHOST, requested)))
+        .map_err(|e| format!("failed to bind 127.0.0.1:{requested} (already in use?): {e}"))?;
+    // Read the actually-bound port (matters for the ephemeral case, where
+    // `requested` is 0 and the OS picked the real port).
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("failed to read bound SOCKS port: {e}"))?
+        .port();
 
     let endpoint = runtime
         .block_on(create_client_endpoint(&cfg.relay_urls, cfg.dns_server.as_deref()))
