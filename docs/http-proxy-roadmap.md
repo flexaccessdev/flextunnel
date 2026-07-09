@@ -1,7 +1,10 @@
 # Roadmap: HTTP proxy support
 
 Status: **Phases 1–2 implemented** (HTTP `CONNECT` tunneling + absolute-URI
-plain-HTTP forwarding). Phase 3 remains proposed. The client exposes a
+plain-HTTP forwarding), plus part of Phase 3's hardening (header-size cap,
+shared handshake timeout, request-smuggling defenses, docs). The remaining
+Phase 3 items — a centralized `rep`→status mapping, a shared concurrency cap,
+and keep-alive forwarding — are still open. The client exposes a
 **SOCKS5** listener
 (`crates/flextunnel-core/src/proxy/socks5.rs`) and, when `--http-listen` is set,
 an **HTTP proxy** front-end (`crates/flextunnel-core/src/proxy/http.rs`) —
@@ -36,7 +39,7 @@ An HTTP proxy only helps clients that speak HTTP (CONNECT or absolute-URI).
 **Raw-TCP apps — databases via JDBC/native clients, RDP, SSH —
 do not speak HTTP CONNECT**, so they still need SOCKS5 (with the client-DNS
 caveat) or a `socat` port forward. See
-[`docs/socks5-usage.md`](socks5-usage.md) for those recipes. HTTP proxy
+[`docs/proxy-usage.md`](proxy-usage.md) for those recipes. HTTP proxy
 *complements* the `socat` approach rather than replacing it.
 
 ## Key insight: the wire protocol does not change
@@ -156,14 +159,26 @@ both forward unchanged. As designed:
 - **Proxy authentication:** out of scope. Both listeners are expected to bind
   loopback only (the SOCKS5 default is deliberately no-auth for the same
   reason), so there's no untrusted network to authenticate against.
-- **Status-code mapping table:** centralize `rep` → HTTP status and
-  `rep` → SOCKS5 reply so both front-ends stay consistent.
-- **Limits:** max header size, request timeout, and a concurrency cap shared with
-  the SOCKS5 path.
-- **Keep-alive forwarding:** reuse one client↔proxy socket for multiple
-  forwarded requests (today each request forces `Connection: close`).
-- **Docs:** add an HTTP-proxy section to `README.md` with `https_proxy=` usage
-  (done alongside Phases 1–2).
+- **Request-smuggling / header-injection defenses — ✅ done.** `read_request`
+  rejects (`400`) a request line with any control byte, a header value carrying
+  a bare CR/LF/NUL, and obs-fold continuation lines; header names have
+  tolerated-but-invalid whitespace before the colon stripped (RFC 9112 §5.1)
+  rather than replayed. This keeps a smuggled byte from being reintroduced into
+  the rewritten upstream head. (`crates/flextunnel-core/src/proxy/http.rs`.)
+- **Limits — partially done.** Max header size (`MAX_HTTP_HEADER`, 64 KiB) and a
+  request timeout are shipped — the request head is read under the shared
+  `LOCAL_HANDSHAKE_TIMEOUT` in `client.rs`, the same bound the SOCKS5 handshake
+  uses. A **concurrency cap** shared with the SOCKS5 path is **not** implemented
+  (each accepted connection is spawned unbounded).
+- **Status-code mapping table — not done.** `rep` → HTTP status still lives in
+  `http::write_reply` and `rep` → SOCKS5 reply in `socks5.rs`, each mapping the
+  codes itself. Centralizing the two so they can't drift apart is still open.
+- **Keep-alive forwarding — not done.** Each forwarded plain-HTTP request opens
+  one tunnel and forces `Connection: close`; reusing one client↔proxy socket
+  across multiple forwarded requests remains future work.
+- **Docs — ✅ done.** `README.md` has an HTTP-proxy section with `https_proxy=`
+  usage, and [`docs/proxy-usage.md`](proxy-usage.md) covers which listener each
+  tool needs.
 
 ## Non-goals (for now)
 

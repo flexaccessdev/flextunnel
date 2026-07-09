@@ -1,26 +1,28 @@
-# Using the flextunnel SOCKS5 proxy
+# Using the flextunnel proxies
 
-The flextunnel client exposes a local **SOCKS5** listener (default
-`127.0.0.1:1080`) and tunnels TCP `CONNECT`. Anything that speaks SOCKS5 can be
-pointed straight at it; anything that can't gets a small adapter in front.
+The flextunnel client exposes up to two local proxy listeners, both tunneling
+TCP over the same QUIC connection and sharing the same routing core:
 
-> If a tool only speaks an **HTTP proxy** (or its SOCKS5 support resolves DNS
-> client-side, which breaks routed internal names), run the client with
-> `--http-listen 127.0.0.1:8081` and point the tool at `http://127.0.0.1:8081`
-> — e.g. `https_proxy=http://127.0.0.1:8081 http_proxy=http://127.0.0.1:8081`.
-> The front-end handles both HTTPS (`CONNECT` tunneling) and plain-HTTP
-> (absolute-URI forwarding). Raw-TCP apps (databases, RDP) still need SOCKS5 or
-> a `socat` forward. See [`http-proxy-roadmap.md`](http-proxy-roadmap.md).
+- a **SOCKS5** listener (default `127.0.0.1:1080`), always on; and
+- an optional **HTTP proxy** listener (`--http-listen 127.0.0.1:8081`), off
+  unless you enable it.
 
-This guide covers, in order:
+Which one you point a tool at depends only on what that tool can speak — the
+server sees the same tunneled `CONNECT` either way and neither knows nor cares
+which front-end you used. This guide covers, in order:
 
 1. **The one rule** — always let the *server* resolve names.
-2. **Programs that speak SOCKS5 natively** — `curl`, `wget`, `git`, `ssh`,
+2. **Which listener to use** — SOCKS5 vs HTTP proxy, and when only one works.
+3. **Programs that speak SOCKS5 natively** — `curl`, `git`, `kubectl`, `ssh`,
    browsers, and other common tools.
-3. **`ssh` through the proxy** — reach an internal SSH host, then use SSH's own
+4. **Programs that need the HTTP proxy** — tools that can't speak SOCKS5 at
+   all, or whose SOCKS5 support resolves DNS client-side (which breaks routed
+   internal names): `wget`, Docker, JVM/JDBC, .NET, and the generic
+   `https_proxy=` path.
+5. **`ssh` through the proxy** — reach an internal SSH host, then use SSH's own
    `-L` / `-D` forwards for a second hop.
-4. **Adapters for programs that don't speak SOCKS5** — put a plain local TCP
-   port in front of the proxy with `socat`.
+6. **Adapters for programs that don't speak either proxy** — put a plain local
+   TCP port in front of the proxy with `socat` (databases, RDP, JDBC natives).
 
 ## The one rule: let the server resolve names
 
@@ -31,13 +33,45 @@ set and maps some of them via `[host_aliases]` (e.g. `networking.internal` →
 at all**.
 
 So whatever you use must send the target **hostname** to the proxy and let
-flextunnel resolve it — the `socks5h` behavior (the `h` means "resolve host at
-the proxy"). Never pre-resolve the name to an IP on the client, and don't attach
-a client-side resolver.
+flextunnel resolve it. The two front-ends reach this differently:
+
+- **HTTP proxy** — always sends the hostname to the proxy (`CONNECT host:port`
+  or an absolute-URI `GET http://host/…`), so DNS happens server-side with no
+  extra configuration. There is no client-DNS footgun here.
+- **SOCKS5** — *can* resolve either at the client or at the proxy, and the
+  default in many tools is the wrong one. You want the `socks5h` behavior (the
+  `h` means "resolve host at the proxy"). Never pre-resolve the name to an IP on
+  the client, and don't attach a client-side resolver.
 
 The single most common mistake is using `socks5://` (client-side DNS) where you
 want `socks5h://` (proxy-side DNS). With flextunnel, **you almost always want
-the `h`.**
+the `h`.** This mistake is impossible with the HTTP proxy, which is one reason
+to prefer it for tools whose SOCKS5 support is client-DNS-only (see below).
+
+## Which listener to use
+
+| Your tool… | Use |
+|---|---|
+| speaks SOCKS5 with remote DNS (`socks5h`) — curl, ssh, browsers, apt | **SOCKS5** `127.0.0.1:1080` |
+| needs raw TCP — databases, RDP, native JDBC | **SOCKS5** (or a `socat` forward, section 6) |
+| only speaks an HTTP proxy — `wget`, Docker pulls, older .NET | **HTTP proxy** `127.0.0.1:8081` |
+| speaks SOCKS5 but only with **client-side** DNS — JVM `socksProxyHost`, .NET 6+ | **HTTP proxy** (client DNS can't resolve routed names) |
+
+The HTTP proxy handles **HTTPS and any TCP** via `CONNECT` tunneling and
+**plain HTTP** via absolute-URI forwarding. What it *cannot* do is carry a
+protocol that isn't HTTP: a database wire protocol, RDP, or SSH does not speak
+HTTP `CONNECT`, so those still go through SOCKS5 or a `socat` forward. The HTTP
+proxy *complements* SOCKS5; it doesn't replace it.
+
+Enable the HTTP proxy by adding `--http-listen` when you start the client (the
+SOCKS5 listener stays on):
+
+```sh
+flextunnel client \
+    --server-node-id <ENDPOINT_ID> \
+    --auth-token     <AUTH_TOKEN> \
+    --http-listen    127.0.0.1:8081
+```
 
 ## 1. Programs that speak SOCKS5 natively
 
@@ -74,32 +108,12 @@ response includes `version`, `server_node_id`, `routed_domains`,
 `routed_cidrs`, `host_aliases`, `agent_routes`, and duplicate-id blocklist
 counts under `duplicate_id_blocklist`. These names are reserved by flextunnel
 and are always tunneled, even when they are not in the server's routed set. If
-the client is also running the optional HTTP proxy front-end, query the same
-endpoints with:
+the client is also running the HTTP proxy front-end, query the same endpoints
+through it instead:
 
 ```sh
 curl -sS -x http://127.0.0.1:8081 http://flextunnel.internal/status.txt
 curl -sS -x http://127.0.0.1:8081 http://flextunnel.internal/status.json
-```
-
-### `wget` — no SOCKS support
-
-GNU `wget` (tested with 1.25.0) **cannot use a SOCKS5 proxy**. Its `*_proxy`
-environment variables only accept HTTP/HTTPS proxies — pointing them at the
-SOCKS listener fails immediately:
-
-```sh
-$ https_proxy=socks5h://127.0.0.1:1080 wget http://networking.internal/
-Error parsing proxy URL socks5h://127.0.0.1:1080: Unsupported scheme.
-```
-
-Use `curl -x socks5h://…` for one-off downloads, or a `socat` port forward
-(section 3) if you specifically need `wget`:
-
-```sh
-socat TCP-LISTEN:8080,bind=127.0.0.1,reuseaddr,fork \
-      SOCKS5-CONNECT:127.0.0.1:1080:networking.internal:80 &
-wget --header 'Host: networking.internal' -O file http://localhost:8080/file
 ```
 
 ### `git`
@@ -133,13 +147,61 @@ GIT_SSH_COMMAND='ssh -o "ProxyCommand=nc -X 5 -x 127.0.0.1:1080 %h %p"' \
   git clone ssh://networking.internal/repo.git
 ```
 
-Or make it permanent in `~/.ssh/config` (see section 2) so plain
+Or make it permanent in `~/.ssh/config` (see section 5) so plain
 `git clone ssh://networking.internal/repo.git` just works:
 
 ```
 Host networking.internal
     ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p
 ```
+
+### `kubectl` (inline `proxy-url` in kubeconfig)
+
+`kubectl` (and any client-go–based tool) can route a **single cluster's** API
+traffic through a proxy declared inline in the kubeconfig, via the
+`proxy-url` field under `clusters[].cluster`. SOCKS5 support for this field is
+**stable since Kubernetes 1.24** — that release also fixed `kubectl exec`,
+which was the one subcommand that didn't work through a SOCKS proxy before. This
+is the preferred pattern: it scopes the proxy to just the one cluster context,
+and a kubeconfig `proxy-url` takes precedence over the global `HTTPS_PROXY`
+environment variable (which would otherwise proxy *every* context).
+
+Use the `socks5h://` scheme so flextunnel resolves the API server's hostname
+server-side — the same "let the server resolve names" rule as everywhere else.
+The `server:` host must be a name the flextunnel **server** can resolve and
+reach (a `routed_domains` entry or a `[host_aliases]` name):
+
+```yaml
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://k8s.internal:6443
+    proxy-url: socks5h://127.0.0.1:1080   # flextunnel resolves k8s.internal
+    certificate-authority-data: LS0tLS1C…  # shortened
+  name: internal
+contexts:
+- context:
+    cluster: internal
+    user: internal
+  name: internal
+current-context: internal
+users:
+- name: internal
+  user:
+    client-certificate-data: LS0tLS1C…    # shortened
+    client-key-data: LS0tLS1C…            # shortened
+```
+
+`proxy-url` also accepts `http://` — point it at the HTTP proxy front-end
+(`proxy-url: http://127.0.0.1:8081`) if you'd rather not run the SOCKS5
+listener; kubectl always sends the API server hostname to an HTTP proxy, so DNS
+still happens server-side there too. Plain `socks5://` (no `h`) would resolve
+`k8s.internal` on the client and fail — use `socks5h://`.
+
+> Note the DNS semantics: with `socks5h://`, a `server:` of
+> `https://localhost:6443` means *the flextunnel server's* localhost, not your
+> laptop's — the whole point when the API server sits on the server's network.
 
 ### Web browsers
 
@@ -152,8 +214,10 @@ so hostnames resolve on the server:
 - **Chrome / Chromium** — configure a SOCKS5 proxy of `127.0.0.1:1080` (Chrome
   sends the hostname to the proxy, so DNS happens server-side).
 
-For per-site control instead of a system-wide switch, a browser extension like
-FoxyProxy lets you route only the internal domains through `127.0.0.1:1080`.
+A browser can also use the HTTP proxy on `127.0.0.1:8081` instead — it sends the
+hostname either way, so DNS still happens server-side. For per-site control
+instead of a system-wide switch, a browser extension like FoxyProxy lets you
+route only the internal domains through the proxy.
 
 > These browser paths were not tested here; verify the exact settings in your
 > browser version.
@@ -167,14 +231,100 @@ FoxyProxy lets you route only the internal domains through `127.0.0.1:1080`.
   or Go binaries, where a `socat` port forward is more reliable. (Not tested
   here.)
 - **Package managers / language toolchains** (`pip`, `npm`, `cargo`, `apt`)
-  generally honor the `ALL_PROXY` / `https_proxy` environment variables; prefer
-  the `socks5h://` form. (Not tested here — consult each tool's proxy docs.)
+  generally honor the `ALL_PROXY` / `https_proxy` environment variables. `apt`
+  understands `socks5h://` directly; for the others, if the SOCKS path needs an
+  extra plugin (see section 2 for `pip`), the HTTP proxy is the simpler route.
+  (Not tested here — consult each tool's proxy docs.)
 
-## 2. `ssh` through the SOCKS5 proxy
+## 2. Programs that need the HTTP proxy
 
-To reach an SSH server that only listens on the server's network, run SSH's
-connection *through* the proxy with a `ProxyCommand`. OpenBSD `nc` (`netcat`)
-speaks SOCKS5 with `-X 5 -x`:
+These are the cases the SOCKS5 listener alone cannot serve — either the tool has
+no SOCKS5 support, or its SOCKS5 support resolves DNS on the client, which can't
+resolve flextunnel's routed names. Start the client with `--http-listen`
+(section "Which listener to use") and point the tool at
+`http://127.0.0.1:8081`. The HTTP proxy sends the hostname to the proxy, so the
+server still resolves it.
+
+The generic pattern — the standard proxy env vars, which a large number of tools
+honor:
+
+```sh
+export https_proxy=http://127.0.0.1:8081
+export http_proxy=http://127.0.0.1:8081
+curl https://example.com          # HTTPS → CONNECT tunnel
+curl http://networking.internal/  # plain HTTP → absolute-URI forwarding
+```
+
+### `wget` — no SOCKS support, but HTTP proxy works
+
+GNU `wget` (tested with 1.25.0) **cannot use a SOCKS5 proxy** — its `*_proxy`
+variables only accept HTTP/HTTPS proxies, so pointing them at the SOCKS listener
+fails immediately:
+
+```sh
+$ https_proxy=socks5h://127.0.0.1:1080 wget http://networking.internal/
+Error parsing proxy URL socks5h://127.0.0.1:1080: Unsupported scheme.
+```
+
+With the HTTP proxy front-end this is exactly what `wget` wants — no `socat`
+workaround needed:
+
+```sh
+https_proxy=http://127.0.0.1:8081 http_proxy=http://127.0.0.1:8081 \
+  wget http://networking.internal/file
+```
+
+### JVM tools (Gradle, JDBC over HTTP, anything using `socksProxyHost`)
+
+The JVM *does* support SOCKS5, but it resolves the hostname on the **client**
+(`-DsocksProxyHost`), so a routed name like `networking.internal` fails to
+resolve even though "SOCKS is supported." Use the JVM's HTTP proxy properties
+against the HTTP listener instead, which sends the hostname to the proxy:
+
+```sh
+java -Dhttp.proxyHost=127.0.0.1  -Dhttp.proxyPort=8081 \
+     -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=8081 \
+     -jar app.jar
+```
+
+(A JDBC *native* wire protocol is not HTTP and cannot use either the JVM HTTP
+proxy or CONNECT — route those through `socat`, section 6.)
+
+### .NET
+
+Pre-.NET-6 has no SOCKS support at all; .NET 6+ added SOCKS5 but without remote
+DNS (`socks5h`), so routed names don't resolve. Both work against the HTTP
+proxy — set `https_proxy` / `http_proxy`, or configure `HttpClient.Proxy` /
+`defaultProxy` to `http://127.0.0.1:8081`.
+
+### Docker, npm/yarn, and other HTTP-only clients
+
+- **Docker** daemon and `docker build` image pulls speak HTTP/HTTPS proxies
+  only; set `HTTPS_PROXY=http://127.0.0.1:8081` (in the daemon's environment,
+  or `~/.docker/config.json` for the CLI).
+- **npm / yarn** — `npm config set proxy http://127.0.0.1:8081` and
+  `https-proxy` likewise, or the `https_proxy` env var.
+- **Python `requests` / `pip`** — the HTTP proxy works out of the box
+  (`https_proxy=http://127.0.0.1:8081`). SOCKS5 support requires the extra
+  `requests[socks]` / PySocks install, so the HTTP proxy is the lower-friction
+  path.
+
+### Caveat: one request per upstream connection
+
+The plain-HTTP forwarding path opens a fresh tunnel per request and forces
+`Connection: close`, so keep-alive reuse across requests doesn't happen — a
+client that tries to reuse the socket sees a clean close and retries on a new
+connection. This is transparent to well-behaved clients but shows up as extra
+connection churn under high plain-HTTP request rates. HTTPS (`CONNECT`) tunnels
+are unaffected — they carry a single long-lived stream. `https://` URLs always
+go over `CONNECT` automatically; you never send them as absolute-URI forwards.
+
+## 3. `ssh` through the proxy
+
+SSH is a raw-TCP protocol — it does not speak HTTP `CONNECT`, so route it
+through **SOCKS5**, not the HTTP proxy. To reach an SSH server that only listens
+on the flextunnel server's network, run SSH's connection *through* the proxy
+with a `ProxyCommand`. OpenBSD `nc` (`netcat`) speaks SOCKS5 with `-X 5 -x`:
 
 ```sh
 ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@workstation.internal
@@ -212,13 +362,13 @@ Here `db.internal` is resolved by `workstation.internal`, not by flextunnel —
 useful for reaching hosts that the flextunnel server itself can't see but the
 SSH box can.
 
-## 3. Adapters for programs that don't speak SOCKS5
+## 4. Adapters for programs that don't speak either proxy
 
-Database clients, RDP, JDBC drivers, `psql`, and many GUI apps have no SOCKS5
-option. Put `socat` in front of the proxy to present a **plain local TCP port**
-that forwards through it.
+Database clients, RDP, JDBC native drivers, `psql`, and many GUI apps have no
+SOCKS5 option and don't speak HTTP `CONNECT` either. Put `socat` in front of the
+proxy to present a **plain local TCP port** that forwards through it.
 
-`socat`'s `SOCKS5-CONNECT` address dials a target *through* a SOCKS5 proxy and
+`socat`'s `SOCKS5-CONNECT` address dials a target *through* the SOCKS5 proxy and
 sends the target as a **domain name** (it emits SOCKS5 `ATYP=DOMAIN`, so
 flextunnel resolves it server-side).
 
@@ -275,11 +425,17 @@ match. Either send the header explicitly:
 curl -H 'Host: networking.internal' http://localhost:8080/
 ```
 
-…or skip the port forward entirely and use the SOCKS5-native path, which
-preserves the real hostname:
+…or skip the port forward entirely and use a proxy path that preserves the real
+hostname — SOCKS5:
 
 ```sh
 curl -x socks5h://127.0.0.1:1080 http://networking.internal:8080/
+```
+
+…or the HTTP proxy (which regenerates `Host` from the request URI):
+
+```sh
+curl -x http://127.0.0.1:8081 http://networking.internal:8080/
 ```
 
 (or point the browser's SOCKS proxy at `127.0.0.1:1080` with remote DNS

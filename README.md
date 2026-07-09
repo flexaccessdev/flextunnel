@@ -266,7 +266,7 @@ counts under `duplicate_id_blocklist`.
 For more ways to use the proxy — `curl`/`git`/browser recipes, `ssh` through the
 tunnel, and putting a plain local TCP port in front of it for apps that can't
 speak SOCKS5 (databases, RDP, most GUIs) — see
-[`docs/socks5-usage.md`](docs/socks5-usage.md).
+[`docs/proxy-usage.md`](docs/proxy-usage.md).
 
 #### HTTP proxy front-end (optional)
 
@@ -544,9 +544,11 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
 - [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) — the HTTP proxy
   front-end (CONNECT tunneling + absolute-URI forwarding): motivation, design,
   and remaining hardening work.
-- [`docs/socks5-usage.md`](docs/socks5-usage.md) — using the SOCKS5 proxy:
-  native clients (`curl`, `git`, browsers), `ssh` through the tunnel, and
-  `socat`/`ssh -L`/`-D` port forwards for apps that don't speak SOCKS5.
+- [`docs/proxy-usage.md`](docs/proxy-usage.md) — using the SOCKS5 and HTTP
+  proxies: which listener a tool needs, native SOCKS5 clients (`curl`, `git`,
+  browsers), HTTP-proxy-only tools (`wget`, Docker, JVM/JDBC, .NET), `ssh`
+  through the tunnel, and `socat`/`ssh -L`/`-D` forwards for apps that speak
+  neither.
 
 ## How it relates to ezvpn
 
