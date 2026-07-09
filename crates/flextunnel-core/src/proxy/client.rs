@@ -17,8 +17,8 @@ use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, UnixListener};
 
 /// Reconnect backoff: base 1s, doubling per attempt, capped at 60s.
 const RECONNECT_BACKOFF_MAX: u64 = 60;
@@ -372,6 +372,23 @@ impl ProxyClient {
         socks_listener: TcpListener,
         http_listener: Option<TcpListener>,
     ) -> ProxyResult<()> {
+        self.run_with_listeners_ext(endpoint, socks_listener, http_listener, None)
+            .await
+    }
+
+    /// Like [`run_with_listeners`](Self::run_with_listeners) but also serves a
+    /// SOCKS5 front-end on an optional **Unix domain socket** listener. The iOS
+    /// embedder uses this to expose the proxy over a socket file inside the app's
+    /// sandbox container (reachable only by this app) instead of a loopback TCP
+    /// port (reachable by any process on the device). Both front-ends speak the
+    /// same SOCKS5 protocol and share the one live tunnel + route policy.
+    pub async fn run_with_listeners_ext(
+        &self,
+        endpoint: &Endpoint,
+        socks_listener: TcpListener,
+        http_listener: Option<TcpListener>,
+        unix_listener: Option<UnixListener>,
+    ) -> ProxyResult<()> {
         log::info!(
             "SOCKS5 proxy listening on {} (TCP CONNECT only)",
             socks_listener.local_addr()?
@@ -381,6 +398,9 @@ impl ProxyClient {
                 "HTTP proxy listening on {} (CONNECT tunneling + plain-HTTP forwarding)",
                 l.local_addr()?
             );
+        }
+        if let Some(l) = &unix_listener {
+            log::info!("SOCKS5 proxy also listening on unix socket {:?}", l.local_addr()?);
         }
 
         // Shared state between the always-on accept loops and the connection
@@ -403,6 +423,14 @@ impl ProxyClient {
             }
         };
 
+        // Same for the optional Unix-domain SOCKS5 front-end.
+        let unix_accept = async {
+            match unix_listener {
+                Some(l) => accept_loop_unix(l, &current, &routed_set).await,
+                None => std::future::pending::<ProxyResult<()>>().await,
+            }
+        };
+
         // One task, N concurrent futures. When the manager returns (a fatal
         // first-connect failure or a clean stop) the accept loops are dropped with
         // it, so `flextunnel_stop`'s `task.abort()` tears everything down — no
@@ -411,6 +439,7 @@ impl ProxyClient {
             r = self.manage_connection(endpoint, &current, &routed_set) => r,
             r = accept_loop(socks_listener, &current, &routed_set, Socks5Proto) => r,
             r = http_accept => r,
+            r = unix_accept => r,
         }
     }
 
@@ -745,17 +774,29 @@ struct LocalRequest {
 ///
 /// Methods return `impl Future + Send` (not bare `async fn`) so the futures are
 /// `Send`, which [`accept_loop`] needs to `tokio::spawn` a generic handler.
+/// The local front-end stream can be a TCP loopback socket or a Unix domain
+/// socket (see [`accept_loop`] / [`accept_loop_unix`]), so the request parsing
+/// and byte-splicing are generic over any async stream.
+trait LocalStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> LocalStream for S {}
+
 trait LocalProto: Clone + Send + Sync + 'static {
     /// Parse the local handshake into a [`LocalRequest`]. Any error the caller
     /// can't yet answer with a reply code (a bad request, an unsupported
-    /// method) must be written to `tcp` here before returning `Err`, mirroring
+    /// method) must be written to `stream` here before returning `Err`, mirroring
     /// how [`socks5::read_connect_request`] writes its own error replies.
-    fn read_request(&self, tcp: &mut TcpStream)
-    -> impl Future<Output = Result<LocalRequest>> + Send;
+    fn read_request<S: LocalStream>(
+        &self,
+        stream: &mut S,
+    ) -> impl Future<Output = Result<LocalRequest>> + Send;
 
     /// Answer the local app with the response corresponding to server reply
     /// code `rep` ([`signaling::REP_SUCCESS`] et al.).
-    fn reply(&self, tcp: &mut TcpStream, rep: u8) -> impl Future<Output = io::Result<()>> + Send;
+    fn reply<S: LocalStream>(
+        &self,
+        stream: &mut S,
+        rep: u8,
+    ) -> impl Future<Output = io::Result<()>> + Send;
 }
 
 /// SOCKS5 front-end (RFC 1928): method negotiation + CONNECT parsing, 10-byte
@@ -764,16 +805,16 @@ trait LocalProto: Clone + Send + Sync + 'static {
 struct Socks5Proto;
 
 impl LocalProto for Socks5Proto {
-    async fn read_request(&self, tcp: &mut TcpStream) -> Result<LocalRequest> {
-        socks5::negotiate_method(tcp).await?;
+    async fn read_request<S: LocalStream>(&self, stream: &mut S) -> Result<LocalRequest> {
+        socks5::negotiate_method(stream).await?;
         Ok(LocalRequest {
-            target: socks5::read_connect_request(tcp).await?,
+            target: socks5::read_connect_request(stream).await?,
             upstream_preamble: None,
         })
     }
 
-    async fn reply(&self, tcp: &mut TcpStream, rep: u8) -> io::Result<()> {
-        socks5::write_reply(tcp, rep).await
+    async fn reply<S: LocalStream>(&self, stream: &mut S, rep: u8) -> io::Result<()> {
+        socks5::write_reply(stream, rep).await
     }
 }
 
@@ -783,8 +824,8 @@ impl LocalProto for Socks5Proto {
 struct HttpProto;
 
 impl LocalProto for HttpProto {
-    async fn read_request(&self, tcp: &mut TcpStream) -> Result<LocalRequest> {
-        Ok(match http::read_request(tcp).await? {
+    async fn read_request<S: LocalStream>(&self, stream: &mut S) -> Result<LocalRequest> {
+        Ok(match http::read_request(stream).await? {
             http::HttpRequest::Connect(target) => LocalRequest {
                 target,
                 upstream_preamble: None,
@@ -796,8 +837,8 @@ impl LocalProto for HttpProto {
         })
     }
 
-    async fn reply(&self, tcp: &mut TcpStream, rep: u8) -> io::Result<()> {
-        http::write_reply(tcp, rep).await
+    async fn reply<S: LocalStream>(&self, stream: &mut S, rep: u8) -> io::Result<()> {
+        http::write_reply(stream, rep).await
     }
 }
 
@@ -854,6 +895,87 @@ async fn rebind_listener(addr: SocketAddr) -> ProxyResult<TcpListener> {
     Ok(TcpListener::bind(addr).await?)
 }
 
+/// What an accept error means for the loop after the failure state machine has
+/// digested it.
+enum AcceptOutcome {
+    /// The listener is dead (broken, or an abort burst): rebind it in place.
+    Rebind,
+    /// A transient failure: back off and retry the same listener.
+    Retry,
+}
+
+/// Shared accept-failure state machine for the local listeners. Tracks the
+/// consecutive-failure and consecutive-abort counters and turns each accept
+/// result into the rebind-or-retry decision, so [`accept_loop`] and
+/// [`accept_loop_unix`] carry only their transport-specific accept, rebind, and
+/// log-label differences. `label` prefixes the recovery/retry log lines
+/// (e.g. "Local proxy" / "Unix SOCKS5").
+struct AcceptRetry {
+    label: &'static str,
+    consecutive_failures: u64,
+    consecutive_aborts: u64,
+}
+
+impl AcceptRetry {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            consecutive_failures: 0,
+            consecutive_aborts: 0,
+        }
+    }
+
+    /// Record a successful accept, logging recovery if we had been failing.
+    fn record_success(&mut self) {
+        if self.consecutive_failures > 0 {
+            log::info!(
+                "{} accepting again after {} failed attempt(s)",
+                self.label,
+                self.consecutive_failures
+            );
+            self.consecutive_failures = 0;
+        }
+        self.consecutive_aborts = 0;
+    }
+
+    /// Record an accept error and decide whether to rebind or retry.
+    fn record_error(&mut self, e: &io::Error) -> AcceptOutcome {
+        let failure = classify_accept_error(e);
+        self.consecutive_aborts = match failure {
+            AcceptFailure::Aborted => self.consecutive_aborts + 1,
+            _ => 0,
+        };
+        if failure == AcceptFailure::Broken
+            || self.consecutive_aborts >= REBIND_AFTER_CONSECUTIVE_ABORTS
+        {
+            AcceptOutcome::Rebind
+        } else {
+            AcceptOutcome::Retry
+        }
+    }
+
+    /// Reset the counters after a successful rebind.
+    fn record_rebind(&mut self) {
+        self.consecutive_failures = 0;
+        self.consecutive_aborts = 0;
+    }
+
+    /// Log the retry (warn periodically, debug otherwise) and back off.
+    async fn wait_retry(&mut self, e: &io::Error) {
+        if self.consecutive_failures.is_multiple_of(ACCEPT_RETRY_WARN_EVERY) {
+            log::warn!(
+                "{} accept failed ({e}); retrying every {}ms",
+                self.label,
+                ACCEPT_RETRY_DELAY.as_millis()
+            );
+        } else {
+            log::debug!("{} accept failed ({e}); retrying", self.label);
+        }
+        self.consecutive_failures += 1;
+        tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+    }
+}
+
 /// Accept loop for a local front-end listener. Each accepted connection is
 /// handled by [`handle_local_conn`] parameterized on `proto`. Shared verbatim by
 /// the SOCKS5 and HTTP listeners.
@@ -871,48 +993,25 @@ async fn accept_loop<P: LocalProto>(
     proto: P,
 ) -> ProxyResult<()> {
     let addr = listener.local_addr()?;
-    let mut consecutive_failures: u64 = 0;
-    let mut consecutive_aborts: u64 = 0;
+    let mut retry = AcceptRetry::new("Local proxy");
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(accepted) => {
-                if consecutive_failures > 0 {
-                    log::info!(
-                        "Local proxy accepting again after {consecutive_failures} failed attempt(s)"
-                    );
-                    consecutive_failures = 0;
-                }
-                consecutive_aborts = 0;
+                retry.record_success();
                 accepted
             }
             Err(e) => {
-                let failure = classify_accept_error(&e);
-                consecutive_aborts = match failure {
-                    AcceptFailure::Aborted => consecutive_aborts + 1,
-                    _ => 0,
-                };
-                if failure == AcceptFailure::Broken
-                    || consecutive_aborts >= REBIND_AFTER_CONSECUTIVE_ABORTS
-                {
-                    log::warn!("Local proxy listener on {addr} is dead ({e}); rebinding");
-                    // The dead socket still owns the port; release it first.
-                    drop(listener);
-                    listener = rebind_listener(addr).await?;
-                    log::info!("Local proxy listener rebound on {addr}");
-                    consecutive_failures = 0;
-                    consecutive_aborts = 0;
-                    continue;
+                match retry.record_error(&e) {
+                    AcceptOutcome::Rebind => {
+                        log::warn!("Local proxy listener on {addr} is dead ({e}); rebinding");
+                        // The dead socket still owns the port; release it first.
+                        drop(listener);
+                        listener = rebind_listener(addr).await?;
+                        log::info!("Local proxy listener rebound on {addr}");
+                        retry.record_rebind();
+                    }
+                    AcceptOutcome::Retry => retry.wait_retry(&e).await,
                 }
-                if consecutive_failures.is_multiple_of(ACCEPT_RETRY_WARN_EVERY) {
-                    log::warn!(
-                        "Local proxy accept failed ({e}); retrying every {}ms",
-                        ACCEPT_RETRY_DELAY.as_millis()
-                    );
-                } else {
-                    log::debug!("Local proxy accept failed ({e}); retrying");
-                }
-                consecutive_failures += 1;
-                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
                 continue;
             }
         };
@@ -928,14 +1027,77 @@ async fn accept_loop<P: LocalProto>(
     }
 }
 
+/// Accept loop for the optional Unix-domain SOCKS5 front-end. Mirrors
+/// [`accept_loop`] but for a [`UnixListener`]; the per-connection handling is
+/// shared (generic over the stream type). Kept separate from the TCP loop
+/// because rebinding a socket file means unlinking + re-binding a path rather
+/// than a `SocketAddr`. iOS defuncts every socket of a suspended process, so the
+/// same "rebind a listener the OS invalidated underneath us" policy applies.
+async fn accept_loop_unix(
+    mut listener: UnixListener,
+    current: &SharedConn,
+    routed_set_shared: &SharedRoutedSet,
+) -> ProxyResult<()> {
+    let path = listener
+        .local_addr()
+        .ok()
+        .and_then(|a| a.as_pathname().map(|p| p.to_path_buf()));
+    let mut retry = AcceptRetry::new("Unix SOCKS5");
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _addr)) => {
+                retry.record_success();
+                stream
+            }
+            Err(e) => {
+                match retry.record_error(&e) {
+                    AcceptOutcome::Rebind => {
+                        let Some(path) = &path else { return Err(e.into()) };
+                        log::warn!("Unix SOCKS5 listener at {path:?} is dead ({e}); rebinding");
+                        drop(listener);
+                        listener = rebind_unix_listener(path).await?;
+                        log::info!("Unix SOCKS5 listener rebound at {path:?}");
+                        retry.record_rebind();
+                    }
+                    AcceptOutcome::Retry => retry.wait_retry(&e).await,
+                }
+                continue;
+            }
+        };
+        log::debug!("unix proxy connection accepted");
+        let current = current.clone();
+        let routed_set_shared = routed_set_shared.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                handle_local_conn(Socks5Proto, stream, current, routed_set_shared).await
+            {
+                log::debug!("unix proxy connection ended: {e}");
+            }
+        });
+    }
+}
+
+/// Rebind a Unix-domain listener: remove the stale socket file (a defunct socket
+/// still owns the path) then bind it again, with one retry after
+/// [`ACCEPT_RETRY_DELAY`] to absorb a lingering-file race.
+async fn rebind_unix_listener(path: &std::path::Path) -> ProxyResult<UnixListener> {
+    let _ = std::fs::remove_file(path);
+    if let Ok(l) = UnixListener::bind(path) {
+        return Ok(l);
+    }
+    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+    let _ = std::fs::remove_file(path);
+    Ok(UnixListener::bind(path)?)
+}
+
 /// Handle one local proxy connection: parse the front-end request, then route by
 /// the current route policy — refused with a general-failure reply until the
 /// policy is known (fail closed), otherwise an on-list target is tunneled to the
 /// server (or answered with a network-unreachable reply if the tunnel is down)
 /// and an off-list target is dialed directly from this device.
-async fn handle_local_conn<P: LocalProto>(
+async fn handle_local_conn<P: LocalProto, S: LocalStream>(
     proto: P,
-    mut tcp: TcpStream,
+    mut tcp: S,
     current: SharedConn,
     routed_set_shared: SharedRoutedSet,
 ) -> Result<()> {
@@ -1031,9 +1193,9 @@ async fn handle_local_conn<P: LocalProto>(
 /// of a success reply). Used for off-routed-set targets in split-tunnel mode.
 /// The dial is bounded by the same deadline as opening a tunnel so a slow target
 /// can't pin the task.
-async fn direct_connect<P: LocalProto>(
+async fn direct_connect<P: LocalProto, S: LocalStream>(
     proto: P,
-    mut tcp: TcpStream,
+    mut tcp: S,
     target: &signaling::Target,
     upstream_preamble: Option<Vec<u8>>,
 ) -> Result<()> {
@@ -1077,6 +1239,7 @@ async fn open_tunnel(
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpStream, UnixStream};
 
     fn test_client() -> ProxyClient {
         ProxyClient::new(ClientConfig {
@@ -1144,6 +1307,59 @@ mod tests {
         let client = TcpStream::connect(addr);
         let (accepted, _) = tokio::join!(rebound.accept(), client);
         accepted.unwrap();
+    }
+
+    /// End-to-end over a real Unix-domain socket: `accept_loop_unix` accepts a
+    /// connection, the (generic) `handle_local_conn` speaks SOCKS5, and an
+    /// off-list target takes the direct path — proving the UDS front-end serves
+    /// SOCKS5 exactly like the TCP one.
+    #[tokio::test]
+    async fn unix_socks_direct_path_serves_socks5() {
+        // A local origin the proxy will dial directly (off-list).
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = origin.accept().await.unwrap();
+            let mut buf = [0u8; 16];
+            let n = sock.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"ping");
+            sock.write_all(b"pong").await.unwrap();
+        });
+
+        // The Unix-domain SOCKS5 front-end.
+        let path = std::env::temp_dir().join(format!("ftuds{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        // 127.0.0.1 is off-list, so the CONNECT takes the direct path.
+        let routed = RoutedSet::new(&["nothing.internal".to_string()], &["10.0.0.0/8".to_string()])
+            .unwrap();
+        let current: SharedConn = Arc::new(Mutex::new(None));
+        let policy: SharedRoutedSet = Arc::new(Mutex::new(Some(Arc::new(routed))));
+        tokio::spawn(async move {
+            accept_loop_unix(listener, &current, &policy).await.ok();
+        });
+
+        // SOCKS5 client over the unix socket: greet, CONNECT 127.0.0.1:origin.
+        let mut app = UnixStream::connect(&path).await.unwrap();
+        app.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut method = [0u8; 2];
+        app.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [0x05, 0x00], "no-auth method selected");
+        let p = origin_port.to_be_bytes();
+        app.write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, p[0], p[1]])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 10];
+        app.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], signaling::REP_SUCCESS, "SOCKS5 CONNECT succeeded");
+
+        // The tunnel/direct byte-splice is live: round-trip through it.
+        app.write_all(b"ping").await.unwrap();
+        let mut got = [0u8; 4];
+        app.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"pong");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

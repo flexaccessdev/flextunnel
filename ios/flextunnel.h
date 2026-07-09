@@ -12,16 +12,18 @@
  *
  *   1. flextunnel_init_logging()                          (once, optional)
  *   2. flextunnel_start(configJson, buf, len) -> handle   (or NULL on error)
- *        On success `buf` holds {"socks_port": N}; configure the WKWebView
- *        proxy with NWEndpoint host 127.0.0.1, port N.
+ *        On success `buf` holds {"socks_port": N} (the ACTUAL bound port);
+ *        configure the WKWebView proxy with NWEndpoint host 127.0.0.1, port N.
  *        On error `buf` holds the error message. At most ONE instance may run
  *        at a time; a second start while one is live returns NULL.
  *   3. flextunnel_health(handle) -> 1 running / 0 ended / -1 null  (poll)
  *   -  flextunnel_conn_path(handle, buf, len)             (on-demand path readout)
  *   4. flextunnel_stop(handle)                            (on teardown)
  *
- * The SOCKS5 listener binds a FIXED loopback port (default 18080, or
- * "socks_port" in the config) for predictable debugging.
+ * The SOCKS5 listener binds an OS-assigned EPHEMERAL loopback port by default
+ * (omit "socks_port" or pass 0) — unpredictable, so it isn't a fixed target for
+ * other local processes. Read the chosen port from the result JSON. A caller
+ * may still pin a specific port via "socks_port".
  *
  * All functions are NULL-safe and never unwind into Swift.
  */
@@ -50,9 +52,10 @@ void flextunnel_init_logging(void);
  *
  * config_json : NUL-terminated UTF-8 JSON, e.g.
  *   {"server_node_id":"<id>","auth_token":"<token>",
- *    "socks_port":18080,"relay_urls":[],"dns_server":null}
- *   socks_port is optional (defaults to 18080). The split-tunnel routed set (the
- *   tunnel set) is configured on the server and pushed to the client during the
+ *    "socks_port":0,"relay_urls":[],"dns_server":null}
+ *   socks_port is optional; omit or 0 for an OS-assigned ephemeral port (read the
+ *   actual port from the result JSON). The split-tunnel routed set (the tunnel
+ *   set) is configured on the server and pushed to the client during the
  *   handshake, so the app sends no routed set of its own.
  * out_buf/out_len : caller buffer. On success receives {"socks_port":N};
  *   on failure receives an error message. Always NUL-terminated. If out_buf is
