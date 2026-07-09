@@ -18,7 +18,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 
 /// Reconnect backoff: base 1s, doubling per attempt, capped at 60s.
 const RECONNECT_BACKOFF_MAX: u64 = 60;
@@ -372,8 +374,14 @@ impl ProxyClient {
         socks_listener: TcpListener,
         http_listener: Option<TcpListener>,
     ) -> ProxyResult<()> {
-        self.run_with_listeners_ext(endpoint, socks_listener, http_listener, None)
-            .await
+        self.run_with_listeners_ext(
+            endpoint,
+            socks_listener,
+            http_listener,
+            #[cfg(unix)]
+            None,
+        )
+        .await
     }
 
     /// Like [`run_with_listeners`](Self::run_with_listeners) but also serves a
@@ -382,12 +390,17 @@ impl ProxyClient {
     /// sandbox container (reachable only by this app) instead of a loopback TCP
     /// port (reachable by any process on the device). Both front-ends speak the
     /// same SOCKS5 protocol and share the one live tunnel + route policy.
+    ///
+    /// The extra Unix-domain listener is Unix-only; there is no Windows
+    /// equivalent (a named-pipe front-end was considered but dropped for lack of
+    /// a clear use case), so on Windows this takes the same arguments as
+    /// [`run_with_listeners`].
     pub async fn run_with_listeners_ext(
         &self,
         endpoint: &Endpoint,
         socks_listener: TcpListener,
         http_listener: Option<TcpListener>,
-        unix_listener: Option<UnixListener>,
+        #[cfg(unix)] unix_listener: Option<UnixListener>,
     ) -> ProxyResult<()> {
         log::info!(
             "SOCKS5 proxy listening on {} (TCP CONNECT only)",
@@ -399,6 +412,7 @@ impl ProxyClient {
                 l.local_addr()?
             );
         }
+        #[cfg(unix)]
         if let Some(l) = &unix_listener {
             log::info!("SOCKS5 proxy also listening on unix socket {:?}", l.local_addr()?);
         }
@@ -423,12 +437,15 @@ impl ProxyClient {
             }
         };
 
-        // Same for the optional Unix-domain SOCKS5 front-end.
+        // Same for the optional Unix-domain SOCKS5 front-end. Unix only: on other
+        // platforms this branch is inert (there is no Unix-domain listener), so
+        // the `select!` shape stays identical.
         let unix_accept = async {
-            match unix_listener {
-                Some(l) => accept_loop_unix(l, &current, &routed_set).await,
-                None => std::future::pending::<ProxyResult<()>>().await,
+            #[cfg(unix)]
+            if let Some(l) = unix_listener {
+                return accept_loop_unix(l, &current, &routed_set).await;
             }
+            std::future::pending::<ProxyResult<()>>().await
         };
 
         // One task, N concurrent futures. When the manager returns (a fatal
@@ -1033,6 +1050,7 @@ async fn accept_loop<P: LocalProto>(
 /// because rebinding a socket file means unlinking + re-binding a path rather
 /// than a `SocketAddr`. iOS defuncts every socket of a suspended process, so the
 /// same "rebind a listener the OS invalidated underneath us" policy applies.
+#[cfg(unix)]
 async fn accept_loop_unix(
     mut listener: UnixListener,
     current: &SharedConn,
@@ -1080,6 +1098,7 @@ async fn accept_loop_unix(
 /// Rebind a Unix-domain listener: remove the stale socket file (a defunct socket
 /// still owns the path) then bind it again, with one retry after
 /// [`ACCEPT_RETRY_DELAY`] to absorb a lingering-file race.
+#[cfg(unix)]
 async fn rebind_unix_listener(path: &std::path::Path) -> ProxyResult<UnixListener> {
     let _ = std::fs::remove_file(path);
     if let Ok(l) = UnixListener::bind(path) {
@@ -1239,7 +1258,9 @@ async fn open_tunnel(
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
-    use tokio::net::{TcpStream, UnixStream};
+    use tokio::net::TcpStream;
+    #[cfg(unix)]
+    use tokio::net::UnixStream;
 
     fn test_client() -> ProxyClient {
         ProxyClient::new(ClientConfig {
@@ -1313,6 +1334,7 @@ mod tests {
     /// connection, the (generic) `handle_local_conn` speaks SOCKS5, and an
     /// off-list target takes the direct path — proving the UDS front-end serves
     /// SOCKS5 exactly like the TCP one.
+    #[cfg(unix)]
     #[tokio::test]
     async fn unix_socks_direct_path_serves_socks5() {
         // A local origin the proxy will dial directly (off-list).
