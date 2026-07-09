@@ -17,6 +17,7 @@
  *        On error `buf` holds the error message. At most ONE instance may run
  *        at a time; a second start while one is live returns NULL.
  *   3. flextunnel_health(handle) -> 1 running / 0 ended / -1 null  (poll)
+ *   -  flextunnel_conn_path(handle, buf, len)             (on-demand path readout)
  *   4. flextunnel_stop(handle)                            (on teardown)
  *
  * The SOCKS5 listener binds a FIXED loopback port (default 18080, or
@@ -92,6 +93,26 @@ int flextunnel_health(const FlextunnelHandle *handle);
  * out_len > 0): the error returns write an empty string.
  */
 int flextunnel_routes(const FlextunnelHandle *handle, char *out_buf, size_t out_len);
+
+/*
+ * Snapshot the live connection's iroh path(s) as JSON into out_buf, mirroring
+ * `ezvpn client status`:
+ *   {"paths":[
+ *     {"kind":"direct","display":"Direct 1.2.3.4:52186 (rtt 1ms)","selected":true},
+ *     {"kind":"relay","display":"Relay https://relay.example/ (rtt 42ms)","selected":false}]}
+ * A point-in-time snapshot of how the client currently reaches the server,
+ * showing ALL discovered paths (not just the selected one). kind is "direct",
+ * "relay", or "other" (forward-compatible catch-all); selected marks the path
+ * iroh routes over right now. The array is EMPTY while disconnected (during a
+ * drop/backoff or before the first connect), so only offer this once the tunnel
+ * link is up.
+ *
+ * Returns 1 on success (full JSON written), 0 if out_buf was too small (the JSON
+ * is truncated; retry larger), and -1 for a NULL handle. out_buf is always
+ * NUL-terminated when usable (non-NULL, out_len > 0); the NULL-handle return
+ * writes an empty string.
+ */
+int flextunnel_conn_path(const FlextunnelHandle *handle, char *out_buf, size_t out_len);
 
 /*
  * Stop the proxy and free the handle. After this call the handle is invalid.
