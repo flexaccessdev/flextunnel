@@ -765,6 +765,11 @@ fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
             col = col.push(route_row(alias, Some(pill(label.to_string(), color))));
         }
     }
+    // The reserved status host is always tunneled to the server, regardless of
+    // the routed set — surface it so it's discoverable (and copyable).
+    col = col.push(space().height(8));
+    col = col.push(text("Server status page — always tunneled:").size(12));
+    col = col.push(route_row(reserved::STATUS_HOST.to_string(), None));
     col.into()
 }
 
