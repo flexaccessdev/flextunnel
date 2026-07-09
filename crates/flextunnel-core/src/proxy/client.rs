@@ -21,8 +21,6 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
-#[cfg(windows)]
-use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
 /// Reconnect backoff: base 1s, doubling per attempt, capped at 60s.
 const RECONNECT_BACKOFF_MAX: u64 = 60;
@@ -376,24 +374,33 @@ impl ProxyClient {
         socks_listener: TcpListener,
         http_listener: Option<TcpListener>,
     ) -> ProxyResult<()> {
-        self.run_with_listeners_ext(endpoint, socks_listener, http_listener, None)
-            .await
+        self.run_with_listeners_ext(
+            endpoint,
+            socks_listener,
+            http_listener,
+            #[cfg(unix)]
+            None,
+        )
+        .await
     }
 
     /// Like [`run_with_listeners`](Self::run_with_listeners) but also serves a
-    /// SOCKS5 front-end on an optional **local IPC** listener ([`IpcListener`]):
-    /// a Unix domain socket on Unix, a Windows named pipe on Windows. The iOS
+    /// SOCKS5 front-end on an optional **Unix domain socket** listener. The iOS
     /// embedder uses this to expose the proxy over a socket file inside the app's
     /// sandbox container (reachable only by this app) instead of a loopback TCP
-    /// port (reachable by any process on the device); the named pipe is its
-    /// Windows analogue. Both front-ends speak the same SOCKS5 protocol and share
-    /// the one live tunnel + route policy.
+    /// port (reachable by any process on the device). Both front-ends speak the
+    /// same SOCKS5 protocol and share the one live tunnel + route policy.
+    ///
+    /// The extra Unix-domain listener is Unix-only; there is no Windows
+    /// equivalent (a named-pipe front-end was considered but dropped for lack of
+    /// a clear use case), so on Windows this takes the same arguments as
+    /// [`run_with_listeners`].
     pub async fn run_with_listeners_ext(
         &self,
         endpoint: &Endpoint,
         socks_listener: TcpListener,
         http_listener: Option<TcpListener>,
-        ipc_listener: Option<IpcListener>,
+        #[cfg(unix)] unix_listener: Option<UnixListener>,
     ) -> ProxyResult<()> {
         log::info!(
             "SOCKS5 proxy listening on {} (TCP CONNECT only)",
@@ -405,8 +412,9 @@ impl ProxyClient {
                 l.local_addr()?
             );
         }
-        if ipc_listener.is_some() {
-            log::info!("SOCKS5 proxy also listening on local IPC endpoint (unix socket / named pipe)");
+        #[cfg(unix)]
+        if let Some(l) = &unix_listener {
+            log::info!("SOCKS5 proxy also listening on unix socket {:?}", l.local_addr()?);
         }
 
         // Shared state between the always-on accept loops and the connection
@@ -429,12 +437,15 @@ impl ProxyClient {
             }
         };
 
-        // Same for the optional local-IPC SOCKS5 front-end.
-        let ipc_accept = async {
-            match ipc_listener {
-                Some(l) => accept_loop_ipc(l, &current, &routed_set).await,
-                None => std::future::pending::<ProxyResult<()>>().await,
+        // Same for the optional Unix-domain SOCKS5 front-end. Unix only: on other
+        // platforms this branch is inert (there is no Unix-domain listener), so
+        // the `select!` shape stays identical.
+        let unix_accept = async {
+            #[cfg(unix)]
+            if let Some(l) = unix_listener {
+                return accept_loop_unix(l, &current, &routed_set).await;
             }
+            std::future::pending::<ProxyResult<()>>().await
         };
 
         // One task, N concurrent futures. When the manager returns (a fatal
@@ -445,7 +456,7 @@ impl ProxyClient {
             r = self.manage_connection(endpoint, &current, &routed_set) => r,
             r = accept_loop(socks_listener, &current, &routed_set, Socks5Proto) => r,
             r = http_accept => r,
-            r = ipc_accept => r,
+            r = unix_accept => r,
         }
     }
 
@@ -780,10 +791,9 @@ struct LocalRequest {
 ///
 /// Methods return `impl Future + Send` (not bare `async fn`) so the futures are
 /// `Send`, which [`accept_loop`] needs to `tokio::spawn` a generic handler.
-/// The local front-end stream can be a TCP loopback socket or a local-IPC
-/// stream — a Unix domain socket / Windows named pipe (see [`accept_loop`] /
-/// [`accept_loop_ipc`]) — so the request parsing and byte-splicing are generic
-/// over any async stream.
+/// The local front-end stream can be a TCP loopback socket or a Unix domain
+/// socket (see [`accept_loop`] / [`accept_loop_unix`]), so the request parsing
+/// and byte-splicing are generic over any async stream.
 trait LocalStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> LocalStream for S {}
 
@@ -914,9 +924,9 @@ enum AcceptOutcome {
 /// Shared accept-failure state machine for the local listeners. Tracks the
 /// consecutive-failure and consecutive-abort counters and turns each accept
 /// result into the rebind-or-retry decision, so [`accept_loop`] and
-/// [`accept_loop_ipc`] carry only their transport-specific accept, rebind, and
+/// [`accept_loop_unix`] carry only their transport-specific accept, rebind, and
 /// log-label differences. `label` prefixes the recovery/retry log lines
-/// (e.g. "Local proxy" / "Unix SOCKS5" / "Named pipe SOCKS5").
+/// (e.g. "Local proxy" / "Unix SOCKS5").
 struct AcceptRetry {
     label: &'static str,
     consecutive_failures: u64,
@@ -1034,76 +1044,15 @@ async fn accept_loop<P: LocalProto>(
     }
 }
 
-/// Platform-native local IPC listener for the optional SOCKS5 front-end: a
-/// Unix domain socket on Unix, a Windows [`NamedPipeListener`] on Windows.
-/// Reachable only locally (a socket file in the app sandbox / a named pipe),
-/// unlike a loopback TCP port that any local process can connect to.
-#[cfg(unix)]
-pub type IpcListener = UnixListener;
-#[cfg(windows)]
-pub type IpcListener = NamedPipeListener;
-
-/// A Windows named-pipe server that hands out one connected instance per client,
-/// standing up a fresh instance for the next — the accept-loop analogue of a
-/// `UnixListener`. Bound to a pipe name such as `\\.\pipe\flextunnel`.
-///
-/// Named pipes have no single "listening" object: each [`NamedPipeServer`]
-/// instance serves exactly one client, so [`accept`](Self::accept) waits on the
-/// current instance and immediately creates the next, keeping the name
-/// continuously connectable.
-#[cfg(windows)]
-pub struct NamedPipeListener {
-    /// The next, not-yet-connected server instance.
-    server: NamedPipeServer,
-    /// The pipe name, needed to create each following instance and to rebind.
-    name: std::ffi::OsString,
-}
-
-#[cfg(windows)]
-impl NamedPipeListener {
-    /// Bind the first instance of a named pipe. `first_pipe_instance` makes this
-    /// fail if another process already owns the name — the accidental-duplicate
-    /// guard the rest of the client relies on.
-    pub fn bind(name: impl Into<std::ffi::OsString>) -> io::Result<Self> {
-        let name = name.into();
-        let server = ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(&name)?;
-        Ok(Self { server, name })
-    }
-
-    /// Create a subsequent (non-first) instance of an already-owned name. Used
-    /// after each accept and when rebinding, where other instances (in-flight
-    /// client handlers) may still be alive, so `first_pipe_instance` must not be
-    /// set.
-    fn open(name: &std::ffi::OsStr) -> io::Result<Self> {
-        let server = ServerOptions::new().create(name)?;
-        Ok(Self {
-            server,
-            name: name.to_os_string(),
-        })
-    }
-
-    /// Wait for a client, returning the now-connected instance and standing up a
-    /// fresh instance for the next client. Shaped like `UnixListener::accept` so
-    /// the shared accept loop can drive it.
-    async fn accept(&mut self) -> io::Result<NamedPipeServer> {
-        self.server.connect().await?;
-        let next = ServerOptions::new().create(&self.name)?;
-        Ok(std::mem::replace(&mut self.server, next))
-    }
-}
-
-/// Accept loop for the optional local-IPC SOCKS5 front-end. Mirrors
-/// [`accept_loop`] but for an [`IpcListener`]; the per-connection handling is
+/// Accept loop for the optional Unix-domain SOCKS5 front-end. Mirrors
+/// [`accept_loop`] but for a [`UnixListener`]; the per-connection handling is
 /// shared (generic over the stream type). Kept separate from the TCP loop
-/// because rebinding means unlinking + re-binding a socket path / recreating a
-/// pipe instance rather than reclaiming a `SocketAddr`. iOS defuncts every
-/// socket of a suspended process, so the same "rebind a listener the OS
-/// invalidated underneath us" policy applies on Unix.
+/// because rebinding a socket file means unlinking + re-binding a path rather
+/// than a `SocketAddr`. iOS defuncts every socket of a suspended process, so the
+/// same "rebind a listener the OS invalidated underneath us" policy applies.
 #[cfg(unix)]
-async fn accept_loop_ipc(
-    mut listener: IpcListener,
+async fn accept_loop_unix(
+    mut listener: UnixListener,
     current: &SharedConn,
     routed_set_shared: &SharedRoutedSet,
 ) -> ProxyResult<()> {
@@ -1124,7 +1073,7 @@ async fn accept_loop_ipc(
                         let Some(path) = &path else { return Err(e.into()) };
                         log::warn!("Unix SOCKS5 listener at {path:?} is dead ({e}); rebinding");
                         drop(listener);
-                        listener = rebind_ipc_listener(path).await?;
+                        listener = rebind_unix_listener(path).await?;
                         log::info!("Unix SOCKS5 listener rebound at {path:?}");
                         retry.record_rebind();
                     }
@@ -1150,7 +1099,7 @@ async fn accept_loop_ipc(
 /// still owns the path) then bind it again, with one retry after
 /// [`ACCEPT_RETRY_DELAY`] to absorb a lingering-file race.
 #[cfg(unix)]
-async fn rebind_ipc_listener(path: &std::path::Path) -> ProxyResult<IpcListener> {
+async fn rebind_unix_listener(path: &std::path::Path) -> ProxyResult<UnixListener> {
     let _ = std::fs::remove_file(path);
     if let Ok(l) = UnixListener::bind(path) {
         return Ok(l);
@@ -1158,64 +1107,6 @@ async fn rebind_ipc_listener(path: &std::path::Path) -> ProxyResult<IpcListener>
     tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
     let _ = std::fs::remove_file(path);
     Ok(UnixListener::bind(path)?)
-}
-
-/// Accept loop for the optional named-pipe SOCKS5 front-end (Windows analogue of
-/// the Unix loop above). Each accepted [`NamedPipeServer`] instance is one
-/// client connection, handled by the shared [`handle_local_conn`]; a broken
-/// listener is recreated in place under the same [`AcceptRetry`] policy.
-#[cfg(windows)]
-async fn accept_loop_ipc(
-    mut listener: IpcListener,
-    current: &SharedConn,
-    routed_set_shared: &SharedRoutedSet,
-) -> ProxyResult<()> {
-    let name = listener.name.clone();
-    let mut retry = AcceptRetry::new("Named pipe SOCKS5");
-    loop {
-        let stream = match listener.accept().await {
-            Ok(stream) => {
-                retry.record_success();
-                stream
-            }
-            Err(e) => {
-                match retry.record_error(&e) {
-                    AcceptOutcome::Rebind => {
-                        log::warn!("Named pipe SOCKS5 listener {name:?} is dead ({e}); rebinding");
-                        drop(listener);
-                        listener = rebind_ipc_listener(&name).await?;
-                        log::info!("Named pipe SOCKS5 listener rebound at {name:?}");
-                        retry.record_rebind();
-                    }
-                    AcceptOutcome::Retry => retry.wait_retry(&e).await,
-                }
-                continue;
-            }
-        };
-        log::debug!("named pipe proxy connection accepted");
-        let current = current.clone();
-        let routed_set_shared = routed_set_shared.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                handle_local_conn(Socks5Proto, stream, current, routed_set_shared).await
-            {
-                log::debug!("named pipe proxy connection ended: {e}");
-            }
-        });
-    }
-}
-
-/// Rebind a named-pipe listener by creating a fresh (non-first) instance of the
-/// same name, with one retry after [`ACCEPT_RETRY_DELAY`]. In-flight client
-/// handlers may still hold instances of the name, so `first_pipe_instance` is
-/// not set (see [`NamedPipeListener::open`]).
-#[cfg(windows)]
-async fn rebind_ipc_listener(name: &std::ffi::OsStr) -> ProxyResult<IpcListener> {
-    if let Ok(l) = NamedPipeListener::open(name) {
-        return Ok(l);
-    }
-    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
-    Ok(NamedPipeListener::open(name)?)
 }
 
 /// Handle one local proxy connection: parse the front-end request, then route by
@@ -1439,7 +1330,7 @@ mod tests {
         accepted.unwrap();
     }
 
-    /// End-to-end over a real Unix-domain socket: `accept_loop_ipc` accepts a
+    /// End-to-end over a real Unix-domain socket: `accept_loop_unix` accepts a
     /// connection, the (generic) `handle_local_conn` speaks SOCKS5, and an
     /// off-list target takes the direct path — proving the UDS front-end serves
     /// SOCKS5 exactly like the TCP one.
@@ -1467,7 +1358,7 @@ mod tests {
         let current: SharedConn = Arc::new(Mutex::new(None));
         let policy: SharedRoutedSet = Arc::new(Mutex::new(Some(Arc::new(routed))));
         tokio::spawn(async move {
-            accept_loop_ipc(listener, &current, &policy).await.ok();
+            accept_loop_unix(listener, &current, &policy).await.ok();
         });
 
         // SOCKS5 client over the unix socket: greet, CONNECT 127.0.0.1:origin.
@@ -1491,65 +1382,6 @@ mod tests {
         assert_eq!(&got, b"pong");
 
         let _ = std::fs::remove_file(&path);
-    }
-
-    /// Windows analogue of `unix_socks_direct_path_serves_socks5`: `accept_loop_ipc`
-    /// accepts a client on a named pipe, `handle_local_conn` speaks SOCKS5, and an
-    /// off-list target takes the direct path — proving the named-pipe front-end
-    /// serves SOCKS5 exactly like the TCP one.
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn named_pipe_socks_direct_path_serves_socks5() {
-        use tokio::net::windows::named_pipe::ClientOptions;
-
-        // A local origin the proxy will dial directly (off-list).
-        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin_port = origin.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let (mut sock, _) = origin.accept().await.unwrap();
-            let mut buf = [0u8; 16];
-            let n = sock.read(&mut buf).await.unwrap();
-            assert_eq!(&buf[..n], b"ping");
-            sock.write_all(b"pong").await.unwrap();
-        });
-
-        // The named-pipe SOCKS5 front-end (name unique per test process).
-        let name = format!(r"\\.\pipe\flextunnel-test-{}", std::process::id());
-        let listener = NamedPipeListener::bind(name.clone()).unwrap();
-        // 127.0.0.1 is off-list, so the CONNECT takes the direct path.
-        let routed = RoutedSet::new(&["nothing.internal".to_string()], &["10.0.0.0/8".to_string()])
-            .unwrap();
-        let current: SharedConn = Arc::new(Mutex::new(None));
-        let policy: SharedRoutedSet = Arc::new(Mutex::new(Some(Arc::new(routed))));
-        tokio::spawn(async move {
-            accept_loop_ipc(listener, &current, &policy).await.ok();
-        });
-
-        // SOCKS5 client over the named pipe: greet, CONNECT 127.0.0.1:origin.
-        let mut app = loop {
-            match ClientOptions::new().open(&name) {
-                Ok(c) => break c,
-                // The server instance may not be ready for the first nanosecond.
-                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
-            }
-        };
-        app.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut method = [0u8; 2];
-        app.read_exact(&mut method).await.unwrap();
-        assert_eq!(method, [0x05, 0x00], "no-auth method selected");
-        let p = origin_port.to_be_bytes();
-        app.write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, p[0], p[1]])
-            .await
-            .unwrap();
-        let mut reply = [0u8; 10];
-        app.read_exact(&mut reply).await.unwrap();
-        assert_eq!(reply[1], signaling::REP_SUCCESS, "SOCKS5 CONNECT succeeded");
-
-        // The direct byte-splice is live: round-trip through it.
-        app.write_all(b"ping").await.unwrap();
-        let mut got = [0u8; 4];
-        app.read_exact(&mut got).await.unwrap();
-        assert_eq!(&got, b"pong");
     }
 
     #[test]
