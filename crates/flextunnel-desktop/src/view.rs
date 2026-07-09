@@ -665,10 +665,15 @@ fn forward_card<'a>(
         title = title.push(pill(badge.to_string(), color));
     }
 
-    let route = text(forward.route_description())
-        .size(12)
-        .font(Font::MONOSPACE)
-        .style(style::dim_text);
+    let route = row![
+        text(forward.route_description())
+            .size(12)
+            .font(Font::MONOSPACE)
+            .style(style::dim_text),
+        copy_button(forward.route_description()),
+    ]
+    .spacing(8)
+    .align_y(Center);
 
     let mut info = column![title, route].spacing(5).width(Fill);
     // A live bind failure (before the switch snaps back off), then the
@@ -731,10 +736,10 @@ fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
             .size(12),
         );
         for domain in &routes.domains {
-            col = col.push(mono(domain.as_str()));
+            col = col.push(route_row(domain.clone(), None));
         }
         for cidr in &routes.cidrs {
-            col = col.push(mono(cidr.as_str()));
+            col = col.push(route_row(cidr.clone(), None));
         }
     }
     if !routes.host_aliases.is_empty() {
@@ -747,7 +752,7 @@ fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
             .size(12),
         );
         for (alias, target) in &routes.host_aliases {
-            col = col.push(mono(format!("{alias} → {target}")));
+            col = col.push(route_row(format!("{alias} → {target}"), None));
         }
     }
     if !routes.agent_aliases.is_empty() {
@@ -765,11 +770,7 @@ fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
                 AgentConnState::Disconnected => ("disconnected", RED),
                 AgentConnState::Unknown => ("unknown", GRAY),
             };
-            col = col.push(
-                row![mono(alias), pill(label.to_string(), color)]
-                    .spacing(8)
-                    .align_y(Center),
-            );
+            col = col.push(route_row(alias, Some(pill(label.to_string(), color))));
         }
     }
     col.into()
@@ -925,13 +926,30 @@ fn info_row(label: &'static str, value: String, copy: Option<String>) -> Element
     .align_y(Center);
     if let Some(copy) = copy {
         r = r.push(space().width(Fill));
-        r = r.push(
-            button(text("Copy").size(11))
-                .padding([2, 8])
-                .style(style::ghost)
-                .on_press(Message::CopyText(copy)),
-        );
+        r = r.push(copy_button(copy));
     }
+    r.into()
+}
+
+/// Small quiet "Copy" button feeding `Message::CopyText` — iced `text` isn't
+/// selectable, so this is the only way to lift a value out of the UI.
+fn copy_button(value: String) -> Element<'static, Message> {
+    button(text("Copy").size(11))
+        .padding([2, 8])
+        .style(style::ghost)
+        .on_press(Message::CopyText(value))
+        .into()
+}
+
+/// A monospace routing entry with a right-aligned Copy button. `trailing` is an
+/// optional badge (e.g. an agent's connection pill) shown before the button.
+fn route_row<'a>(value: String, trailing: Option<Element<'a, Message>>) -> Element<'a, Message> {
+    let mut r = row![mono(value.clone())].spacing(8).align_y(Center);
+    if let Some(trailing) = trailing {
+        r = r.push(trailing);
+    }
+    r = r.push(space().width(Fill));
+    r = r.push(copy_button(value));
     r.into()
 }
 
