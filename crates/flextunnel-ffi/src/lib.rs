@@ -12,7 +12,9 @@
 //! 2. [`flextunnel_health`] — cheap liveness probe: is the serve loop still
 //!    running, or did it give up (bad node id / auth / unreachable server)?
 //! 3. [`flextunnel_routes`] — snapshot the server-pushed split-tunnel set for UI.
-//! 4. [`flextunnel_stop`] — abort the loop, close the endpoint, free the handle.
+//! 4. [`flextunnel_conn_path`] — snapshot the live iroh path(s) (relay/direct)
+//!    for an on-demand "connection path" status readout.
+//! 5. [`flextunnel_stop`] — abort the loop, close the endpoint, free the handle.
 //!
 //! Unlike the ezvpn FFI there is **no VPN / Network Extension and no `utun` fd**:
 //! flextunnel is pure-userspace SOCKS5-over-QUIC, so the listener runs entirely
@@ -59,7 +61,7 @@ use tokio::net::TcpListener;
 
 use flextunnel_core::error::ProxyResult;
 use flextunnel_core::proxy::{ClientConfig, ProxyClient, TunnelRoutes};
-use flextunnel_core::transport::endpoint::create_client_endpoint;
+use flextunnel_core::transport::endpoint::{ConnPathKind, create_client_endpoint};
 
 /// Loopback SOCKS5 port used when the config omits `socks_port`. Fixed (not an
 /// OS-assigned ephemeral port) so the proxy is always reachable at a known
@@ -78,6 +80,10 @@ pub struct FlextunnelHandle {
     runtime: tokio::runtime::Runtime,
     /// Kept so [`flextunnel_stop`] can close it gracefully before drop.
     endpoint: iroh::Endpoint,
+    /// The client driving the serve loop. Shared with the spawned `task` (which
+    /// holds a clone) so status callers can snapshot its live iroh paths on
+    /// demand via [`flextunnel_conn_path`].
+    client: Arc<ProxyClient>,
     /// The running connect/serve loop.
     task: tokio::task::JoinHandle<ProxyResult<()>>,
     /// Live tunnel set (split-tunnel domains/CIDRs the server pushed), refreshed
@@ -202,7 +208,7 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
         .block_on(create_client_endpoint(&cfg.relay_urls, cfg.dns_server.as_deref()))
         .map_err(|e| format!("failed to create iroh endpoint: {e}"))?;
 
-    let client = ProxyClient::new(ClientConfig {
+    let client = Arc::new(ProxyClient::new(ClientConfig {
         server_node_id: cfg.server_node_id,
         auth_token: cfg.auth_token,
         // Unused: the listener is already bound above and passed in directly.
@@ -212,22 +218,26 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
         relay_urls: cfg.relay_urls,
         auto_reconnect: true,
         max_reconnect_attempts: None,
-    });
+    }));
 
-    // Share the live tunnel set out of the client before it moves into the task,
-    // so `flextunnel_routes` can read what the server pushes on connect.
+    // Share the live tunnel set out of the client, so `flextunnel_routes` can
+    // read what the server pushes on connect.
     let routes = client.routes();
 
     // Clone the endpoint into the task; the original stays in the handle so
-    // `flextunnel_stop` can close it after aborting the task.
+    // `flextunnel_stop` can close it after aborting the task. The client is
+    // shared (Arc) so the handle keeps a clone for `flextunnel_conn_path` while
+    // the task drives the serve loop.
     let ep = endpoint.clone();
-    let task = runtime.spawn(async move { client.run_with_listener(&ep, listener).await });
+    let client_task = client.clone();
+    let task = runtime.spawn(async move { client_task.run_with_listener(&ep, listener).await });
 
     let result_json = serde_json::json!({ "socks_port": port }).to_string();
     Ok((
         FlextunnelHandle {
             runtime,
             endpoint,
+            client,
             task,
             routes,
         },
@@ -340,6 +350,60 @@ pub unsafe extern "C" fn flextunnel_routes(
             return -1;
         }
     };
+    if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
+}
+
+/// Snapshot the live connection's iroh path(s) as JSON into `out_buf`, mirroring
+/// `ezvpn client status` / the desktop's "connection path" readout:
+///
+/// ```json
+/// { "paths": [
+///     {"kind":"direct","display":"Direct 1.2.3.4:52186 (rtt 1ms)","selected":true},
+///     {"kind":"relay","display":"Relay https://relay.example/ (rtt 42ms)","selected":false}
+/// ] }
+/// ```
+///
+/// This is a **point-in-time** snapshot of how the client currently reaches the
+/// server, showing *all* discovered paths (not just the selected one); `kind` is
+/// `"direct"`, `"relay"`, or `"other"` (a forward-compatible catch-all) and
+/// `selected` marks the path iroh routes over right now. The array is **empty**
+/// while disconnected (during a drop/backoff or before the first connect), so
+/// callers should only offer this once the tunnel link is up.
+///
+/// Returns `1` on success (full JSON written), `0` if `out_buf` was too small
+/// (the JSON is truncated; retry with a larger buffer), and `-1` for a null
+/// handle. `out_buf` is always NUL-terminated when usable (non-null,
+/// `out_len > 0`): the null-handle return writes an empty string.
+///
+/// # Safety
+/// `handle` must be a valid pointer returned by [`flextunnel_start`] and not yet
+/// passed to [`flextunnel_stop`]. `out_buf` must point to at least `out_len`
+/// writable bytes (may be null only if `out_len` is 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flextunnel_conn_path(
+    handle: *const FlextunnelHandle,
+    out_buf: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    if handle.is_null() {
+        write_cstr(out_buf, out_len, "");
+        return -1;
+    }
+    let handle = unsafe { &*handle };
+    let paths: Vec<_> = handle
+        .client
+        .conn_paths()
+        .into_iter()
+        .map(|p| {
+            let kind = match p.kind {
+                ConnPathKind::Direct => "direct",
+                ConnPathKind::Relay => "relay",
+                ConnPathKind::Other => "other",
+            };
+            serde_json::json!({ "kind": kind, "display": p.display, "selected": p.selected })
+        })
+        .collect();
+    let json = serde_json::json!({ "paths": paths }).to_string();
     if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
 }
 
