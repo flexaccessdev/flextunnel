@@ -104,7 +104,7 @@ published to `ghcr.io/andrewtheguy/flextunnel`.
 ### Desktop app (tray GUI, client mode)
 
 Stable releases also include the desktop client
-(`flextunnel-desktop-macos-arm64.app.zip` and
+(`flextunnel-desktop-macos-arm64.dmg` and
 `flextunnel-desktop-windows-amd64.msi`). The installers are **unsigned** — if
 you'd rather not apply the workarounds below, build it yourself instead:
 
@@ -121,18 +121,18 @@ download and shows *"flextunnel" is damaged and can't be opened*.
 
 The cleanest fix is to avoid the quarantine flag in the first place: browsers
 set `com.apple.quarantine` on downloads, but command-line tools like `curl` and
-`wget` do not. Download and unzip from the terminal instead (into
-`/Applications`):
+`wget` do not. Download the disk image from the terminal instead:
 
 ```sh
 # replace vX.Y.Z with the real release tag from the Releases page — a wrong
 # tag 404s and (with -f) curl fails instead of saving the tiny "Not Found" page
-curl -fL -o flextunnel-desktop.app.zip \
-  https://github.com/andrewtheguy/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-macos-arm64.app.zip
+curl -fL -o flextunnel-desktop.dmg \
+  https://github.com/andrewtheguy/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-macos-arm64.dmg
 ```
 
-Then in Finder: double-click the `.zip` to expand it, drag `flextunnel.app`
-into `/Applications`, and choose **Replace** if an older copy is already there.
+Then in Finder: double-click the `.dmg` to open it, drag `flextunnel.app` onto
+the **Applications** shortcut in the window (choose **Replace** if an older copy
+is already there), then eject the mounted image.
 
 > **macOS zsh note:** the shell snippets in this README include `#` comment
 > lines. zsh (the macOS default shell) treats `#` as a comment on an
@@ -140,8 +140,9 @@ into `/Applications`, and choose **Replace** if an older copy is already there.
 > pasting a `#` line reports `command not found`. Run `setopt interactivecomments`
 > once per session, or just omit the comment lines when pasting.
 
-If you already downloaded via a browser, remove the quarantine attribute after
-unzipping (e.g. into `/Applications`) instead:
+If you already downloaded the `.dmg` via a browser, the quarantine flag
+propagates to the app you copy out of it; remove it after installing (into
+`/Applications`) instead:
 
 ```sh
 xattr -cr /Applications/flextunnel.app
@@ -156,7 +157,7 @@ way: download with `curl.exe` (bundled in Windows 10+) or PowerShell instead of 
 browser. Replace `vX.Y.Z` with the release tag from the Releases page:
 
 ```powershell
-curl.exe -L -o flextunnel-desktop.msi `
+curl.exe -fL -o flextunnel-desktop.msi `
   https://github.com/andrewtheguy/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-windows-amd64.msi
 # or: Invoke-WebRequest -OutFile flextunnel-desktop.msi `
 #   https://github.com/andrewtheguy/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-windows-amd64.msi
