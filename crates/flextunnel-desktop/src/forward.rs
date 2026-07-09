@@ -65,11 +65,12 @@ impl PortForward {
         }
     }
 
-    pub fn route_description(&self) -> String {
-        format!(
-            "localhost:{} → {}:{}",
-            self.local_port, self.remote_host, self.remote_port
-        )
+    pub fn local_endpoint(&self) -> String {
+        format!("localhost:{}", self.local_port)
+    }
+
+    pub fn remote_endpoint(&self) -> String {
+        format!("{}:{}", self.remote_host, self.remote_port)
     }
 
     /// Whether two configs relay identically. Display-only fields (the label)
@@ -458,7 +459,8 @@ mod tests {
     fn names_and_descriptions() {
         let mut f = forward(8080);
         assert_eq!(f.display_name(), "echo.internal:7");
-        assert_eq!(f.route_description(), "localhost:8080 → echo.internal:7");
+        assert_eq!(f.local_endpoint(), "localhost:8080");
+        assert_eq!(f.remote_endpoint(), "echo.internal:7");
         f.label = "  echo  ".into();
         assert_eq!(f.display_name(), "echo");
     }

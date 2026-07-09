@@ -159,14 +159,16 @@ jobs:
 
       - uses: cargo-bins/cargo-binstall@main
 
-      - name: Package desktop app (.app, unsigned)
-        # Unsigned: downloads get the quarantine attribute; the README documents
-        # the standard `xattr` workaround.
+      - name: Package desktop app (.dmg, unsigned)
+        # Unsigned: browser downloads get the quarantine attribute; the README
+        # documents the standard curl/xattr workaround. The dmg format wraps the
+        # .app in a drag-to-Applications disk image (cargo-packager builds the
+        # .app bundle first as a prerequisite).
         run: |
           cargo binstall -y --force cargo-packager@0.11.8
           cargo build --release -p flextunnel-desktop --target aarch64-apple-darwin
-          cargo packager --release -p flextunnel-desktop --formats app --target aarch64-apple-darwin
-          ditto -c -k --keepParent target/aarch64-apple-darwin/release/flextunnel.app target/release/flextunnel-desktop-macos-arm64.app.zip
+          cargo packager --release -p flextunnel-desktop --formats dmg --target aarch64-apple-darwin
+          mv target/aarch64-apple-darwin/release/*.dmg target/release/flextunnel-desktop-macos-arm64.dmg
 
       - uses: actions/upload-artifact@v4
         with:
@@ -181,7 +183,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: release-desktop-macos-arm64
-          path: target/release/flextunnel-desktop-macos-arm64.app.zip
+          path: target/release/flextunnel-desktop-macos-arm64.dmg
 
   build-ios:
     needs: setup
