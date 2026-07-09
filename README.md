@@ -114,6 +114,19 @@ cargo build --release -p flextunnel-desktop
 # quarantined, so no workaround is needed
 ```
 
+That produces the bare executable, **not** a `.app` bundle — so on macOS it has
+no `Info.plist` and will show a Dock icon instead of running as a pure menu-bar
+app. For the proper bundle, build it the way CI does with `cargo-packager`
+(macOS only; `app` gives `flextunnel.app`, `dmg` gives the drag-to-Applications
+disk image):
+
+```sh
+cargo install cargo-packager   # or: cargo binstall cargo-packager
+cargo packager --release -p flextunnel-desktop --formats app
+# bundle: target/release/flextunnel.app  (locally built → not quarantined,
+# so no Gatekeeper workaround needed; use --formats dmg for a .dmg instead)
+```
+
 Otherwise:
 
 **macOS:** because the app is not notarized, Gatekeeper quarantines the
