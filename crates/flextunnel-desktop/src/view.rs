@@ -665,15 +665,7 @@ fn forward_card<'a>(
         title = title.push(pill(badge.to_string(), color));
     }
 
-    let route = row![
-        text(forward.route_description())
-            .size(12)
-            .font(Font::MONOSPACE)
-            .style(style::dim_text),
-        copy_button(forward.route_description()),
-    ]
-    .spacing(8)
-    .align_y(Center);
+    let route = arrow_copy_row(forward.local_endpoint(), forward.remote_endpoint(), true);
 
     let mut info = column![title, route].spacing(5).width(Fill);
     // A live bind failure (before the switch snaps back off), then the
@@ -752,7 +744,7 @@ fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
             .size(12),
         );
         for (alias, target) in &routes.host_aliases {
-            col = col.push(route_row(format!("{alias} → {target}"), None));
+            col = col.push(arrow_copy_row(alias.clone(), target.clone(), false));
         }
     }
     if !routes.agent_aliases.is_empty() {
@@ -939,6 +931,27 @@ fn copy_button(value: String) -> Element<'static, Message> {
         .style(style::ghost)
         .on_press(Message::CopyText(value))
         .into()
+}
+
+/// A `left → right` entry with its own Copy button on each side — used for host
+/// aliases (alias / server-resolved target) and port forwards (local / remote
+/// endpoint), where either side may be the value you want. `dim` renders the
+/// values in the secondary text color (the forward route under its bold name).
+fn arrow_copy_row<'a>(left: String, right: String, dim: bool) -> Element<'a, Message> {
+    let cell = |value: String| -> Element<'static, Message> {
+        let t = text(value).size(12).font(Font::MONOSPACE);
+        if dim { t.style(style::dim_text).into() } else { t.into() }
+    };
+    row![
+        cell(left.clone()),
+        copy_button(left),
+        cell("→".into()),
+        cell(right.clone()),
+        copy_button(right),
+    ]
+    .spacing(8)
+    .align_y(Center)
+    .into()
 }
 
 /// A monospace routing entry with a right-aligned Copy button. `trailing` is an
