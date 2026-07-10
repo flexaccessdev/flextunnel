@@ -1,0 +1,192 @@
+//! Outbound bridge: a persistent connection from this server to **another
+//! flextunnel server**, used to forward tunnel streams whose target matches the
+//! bridge's rules (split-tunnel across servers). The bridging server dials out
+//! on its own server endpoint, so the TLS identity it presents is its
+//! persistent server id — exactly what the target server's
+//! `allowed_bridge_servers` allowlist matches, alongside the `ftb` token.
+//!
+//! The connect/auth/heartbeat machinery mirrors [`super::agent`], with one
+//! deliberate difference in reconnect policy: a bridge retries **forever** (no
+//! fail-fast first connect, no attempt cap). The peer server may simply not be
+//! up yet, and a server daemon must not exit — or stop serving its other
+//! routes — because a peer is down. While the upstream is down, matching
+//! streams fail with host-unreachable (see `route_to_bridge` in
+//! [`super::server`]).
+
+use crate::error::{ProxyError, ProxyResult};
+use crate::proxy::client::{calculate_backoff, client_heartbeat_loop, connect_with_timeout};
+use crate::proxy::signaling::{self, Hello};
+use crate::proxy::RoutedSet;
+use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::{Endpoint, EndpointAddr, EndpointId};
+use rand::Rng;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+
+/// Deadline for the target server's handshake response (mirrors client/agent).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Resolved config for one outbound bridge (from a `[bridges.<name>]` entry),
+/// validated at startup: the endpoint id parsed, the token loaded, and the
+/// rules parsed into a [`RoutedSet`] whose coverage by the server's own routed
+/// set has been checked.
+pub struct BridgeUpstreamConfig {
+    /// The friendly `[bridges.<name>]` config key, for logs and status.
+    pub name: String,
+    /// The target server's endpoint id.
+    pub endpoint_id: EndpointId,
+    /// The `ftb` token presented in the bridge handshake.
+    pub auth_token: String,
+    /// The bridge's rules parsed into a matcher: a target this set allows is
+    /// forwarded over this bridge instead of dialed locally.
+    pub routed_set: RoutedSet,
+    /// Raw domain rules, kept for status/GUI display.
+    pub domains: Vec<String>,
+    /// Raw CIDR rules, kept for status/GUI display.
+    pub cidrs: Vec<String>,
+}
+
+/// One persistent upstream connection to another server, maintained by
+/// [`Self::run`] with reconnect/backoff + heartbeat. `conn` is `Some` while the
+/// upstream is authenticated and live, `None` during (re)connect/backoff —
+/// stream routing reads it via [`Self::active_conn`] and fails fast when down.
+pub struct BridgeUpstream {
+    pub config: BridgeUpstreamConfig,
+    /// Random per-process identity sent in every `Hello` (see the client).
+    instance_nonce: u128,
+    conn: Mutex<Option<Connection>>,
+}
+
+impl BridgeUpstream {
+    pub fn new(config: BridgeUpstreamConfig) -> Arc<Self> {
+        Arc::new(Self {
+            config,
+            instance_nonce: rand::rng().random(),
+            conn: Mutex::new(None),
+        })
+    }
+
+    /// The live upstream connection, if authenticated right now.
+    pub fn active_conn(&self) -> Option<Connection> {
+        self.conn.lock().expect("bridge conn lock").clone()
+    }
+
+    /// Whether the upstream is authenticated and live right now.
+    pub fn is_connected(&self) -> bool {
+        self.conn.lock().expect("bridge conn lock").is_some()
+    }
+
+    /// Maintain the upstream forever: connect + authenticate, publish the
+    /// connection, heartbeat until it drops, then back off and retry. Runs for
+    /// the life of the server process (spawned from `ProxyServer::run`); ends
+    /// only when `endpoint` closes underneath it, failing each retry.
+    pub async fn run(self: Arc<Self>, endpoint: Endpoint) {
+        let name = &self.config.name;
+        let mut attempt: u32 = 0;
+        loop {
+            if attempt > 0 {
+                let backoff = calculate_backoff(attempt);
+                log::debug!(
+                    "Bridge '{name}': retrying in {:.1}s (attempt {attempt})",
+                    backoff.as_secs_f64()
+                );
+                tokio::time::sleep(backoff).await;
+                // Nudge the endpoint to re-check/rebind its transports before
+                // retrying, in case the OS invalidated its UDP sockets (see
+                // `ProxyClient::manage_connection`); harmless when nothing
+                // changed.
+                endpoint.network_change().await;
+            }
+
+            let (connection, ctrl_send, ctrl_recv) = match self.establish(&endpoint).await {
+                Ok(established) => established,
+                Err(e) => {
+                    // An explicit rejection means misconfig (wrong token, or
+                    // this server missing from the target's allowlist) — log
+                    // loudly. Still retry at capped backoff: the operator may
+                    // fix the *target's* config without restarting this server.
+                    if matches!(e, ProxyError::AuthenticationFailed(_)) {
+                        log::error!("Bridge '{name}': rejected by target server: {e}");
+                    } else {
+                        log::warn!("Bridge '{name}': connect failed: {e}");
+                    }
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+            };
+
+            log::info!("Bridge '{name}': connected to {}", self.config.endpoint_id);
+            *self.conn.lock().expect("bridge conn lock") = Some(connection.clone());
+
+            // Log the selected path (relay/direct) and any later switch for the
+            // lifetime of this connection.
+            let _path_watcher = crate::transport::endpoint::watch_connection_paths(&connection);
+            let heartbeat = client_heartbeat_loop(ctrl_send, ctrl_recv, None);
+            let ended: ProxyResult<()> = tokio::select! {
+                r = heartbeat => r,
+                reason = connection.closed() => {
+                    Err(ProxyError::ConnectionLost(reason.to_string()))
+                }
+            };
+            *self.conn.lock().expect("bridge conn lock") = None;
+
+            match ended {
+                Ok(()) => log::warn!("Bridge '{name}': connection ended; reconnecting"),
+                Err(e) => log::warn!("Bridge '{name}': connection lost ({e}); reconnecting"),
+            }
+            // A successful connection resets the backoff series: the next
+            // reconnect after a drop starts at the base delay again.
+            attempt = 1;
+        }
+    }
+
+    /// Connect + authenticate as a bridge, returning the connection and the
+    /// control-stream halves (kept open for heartbeats).
+    async fn establish(
+        &self,
+        endpoint: &Endpoint,
+    ) -> ProxyResult<(Connection, SendStream, RecvStream)> {
+        // No relay hints: a bridge target is configured by endpoint id alone;
+        // discovery + the default relays find it like any server.
+        let addr = EndpointAddr::new(self.config.endpoint_id);
+        let connection = connect_with_timeout(endpoint, addr).await?;
+        log::debug!(
+            "Bridge '{}': connected to target server, authenticating...",
+            self.config.name
+        );
+        let (send, recv) = self.handshake(&connection).await?;
+        Ok((connection, send, recv))
+    }
+
+    /// Perform the bridge auth handshake on the first bi-stream, returning the
+    /// control-stream halves. The stream stays open as the heartbeat channel.
+    async fn handshake(&self, connection: &Connection) -> ProxyResult<(SendStream, RecvStream)> {
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| ProxyError::Signaling(format!("Failed to open handshake stream: {e}")))?;
+
+        let hello = Hello::new_bridge(self.config.auth_token.clone(), self.instance_nonce);
+        signaling::write_message(&mut send, &signaling::encode_hello(&hello)?).await?;
+        send.flush().await?;
+
+        let data = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            signaling::read_message(&mut recv, signaling::MAX_HANDSHAKE_SIZE),
+        )
+        .await
+        .map_err(|_| {
+            ProxyError::Signaling("timed out waiting for target-server handshake response".into())
+        })??;
+        let response = signaling::decode_hello_response(&data)?;
+
+        if !response.accepted {
+            let reason = response.reject_reason.unwrap_or_else(|| "unknown".to_string());
+            return Err(ProxyError::AuthenticationFailed(reason));
+        }
+        // The target server pushes no routed set to a bridge (it re-enforces its
+        // own set per stream); ignore any list fields.
+        Ok((send, recv))
+    }
+}

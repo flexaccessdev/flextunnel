@@ -122,6 +122,39 @@
   </section>
 
   <section>
+    <h2>Bridge routes (outbound)</h2>
+    {% if bridges.is_empty() %}
+      <p class="empty">none configured</p>
+    {% else %}
+      <table>
+      {% for bridge in bridges %}
+        <tr>
+          <td class="mono">{{ bridge.name }}</td>
+          <td class="mono">&rarr; {{ bridge.endpoint_id }}<br>[{{ bridge.domains|join(", ") }}{% if !bridge.domains.is_empty() && !bridge.cidrs.is_empty() %}, {% endif %}{{ bridge.cidrs|join(", ") }}]</td>
+          <td>{% if bridge.connected %}<span class="ok">connected</span>{% else %}<span class="warn">disconnected</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </table>
+    {% endif %}
+  </section>
+
+  <section>
+    <h2>Allowed bridge servers (inbound)</h2>
+    {% if inbound_bridges.is_empty() %}
+      <p class="empty">none configured</p>
+    {% else %}
+      <table>
+      {% for bridge in inbound_bridges %}
+        <tr>
+          <td class="mono">{{ bridge.endpoint_id }}</td>
+          <td>{% if bridge.connected %}<span class="ok">connected</span>{% else %}<span class="warn">disconnected</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </table>
+    {% endif %}
+  </section>
+
+  <section>
     <h2>Duplicate-id blocklist</h2>
     <table class="counts">
       <tr><td>File</td><td class="mono">{{ blocklist_path }}</td></tr>

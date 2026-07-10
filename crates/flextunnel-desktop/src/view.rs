@@ -760,6 +760,29 @@ fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
             col = col.push(arrow_copy_row(suffix.clone(), servers.join(", "), false));
         }
     }
+    if !routes.bridges.is_empty() {
+        col = col.push(space().height(8));
+        col = col.push(
+            text(format!(
+                "Bridge routes — {} forwarded via another server:",
+                routes.bridges.len()
+            ))
+            .size(12),
+        );
+        for bridge in &routes.bridges {
+            let rules: Vec<String> = bridge
+                .domains
+                .iter()
+                .chain(bridge.cidrs.iter())
+                .cloned()
+                .collect();
+            col = col.push(arrow_copy_row(
+                format!("{} [{}]", bridge.name, rules.join(", ")),
+                bridge.endpoint_id.clone(),
+                false,
+            ));
+        }
+    }
     if !routes.agent_aliases.is_empty() {
         col = col.push(space().height(8));
         col = col.push(

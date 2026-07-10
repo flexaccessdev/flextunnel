@@ -131,3 +131,42 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 # [dns_forwards]
 # "local.168234.xyz" = ["10.0.0.53"]              # -> internal resolver on :53
 # "corp.example.com" = ["10.1.0.10:5353", "10.1.0.11"]  # custom port + failover
+
+# Optional OUTBOUND bridge routes: forward matching targets to ANOTHER
+# flextunnel server over a persistent server-to-server connection (split-tunnel
+# across servers), instead of dialing them from this server's network. The
+# matched target is forwarded VERBATIM — the target server applies its own
+# host_aliases, agent_routes and dns_forwards, resolves domain targets on its
+# side, and re-enforces its own routed set. Single hop: a stream that arrived
+# over a bridge is never bridged again, so two servers bridging at each other
+# cannot loop.
+#
+# Each entry needs the target server's endpoint id, an `ftb` auth token accepted
+# by that server (exactly one of auth_token / auth_token_file; generate with
+# `flextunnel generate-bridge-token`), and at least one rule. Rules use the
+# routed-set syntax above (domains: exact, `*.x`, or `*`; cidrs: CIDR or bare
+# IP). Checked AFTER [agent_routes] and BEFORE [host_aliases]/local dialing;
+# when several bridges match, the first in name order wins. Every rule must be
+# reachable through the routed set above (the whitelist runs first), or the
+# server refuses to start. The upstream connection is maintained with
+# reconnect/backoff; while it is down, matching requests fail as
+# host-unreachable. This server dials out with its own server identity — the
+# endpoint id the target server must allowlist.
+# [bridges.lab]
+# endpoint_id = "<endpoint id of the target server>"
+# auth_token = "ftbXXXXXXX"
+# # auth_token_file = "/etc/flextunnel/bridge_lab.token"
+# domains = ["*.svc"]
+# cidrs = ["fd34::/64"]
+
+# Optional INBOUND bridging: allow other flextunnel servers to bridge INTO this
+# server. A connecting bridge must pass BOTH gates: its endpoint id (TLS-
+# authenticated by iroh, no extra proof needed) must be listed in
+# allowed_bridge_servers, AND it must present an `ftb` token from the
+# bridge_auth_tokens pool (a separate pool from client and agent tokens).
+# An empty/absent allowlist disables inbound bridging entirely; configuring
+# only one of the two halves is rejected at startup as dead config. Bridged-in
+# targets must also be on THIS server's routed set above.
+# allowed_bridge_servers = ["<endpoint id of the bridging server>"]
+# bridge_auth_tokens = ["ftbXXXXXXX"]
+# # bridge_auth_tokens_file = "/etc/flextunnel/bridge_auth_tokens.txt"

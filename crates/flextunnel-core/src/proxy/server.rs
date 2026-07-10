@@ -4,10 +4,13 @@
 
 use crate::blocklist::{self, BlockList};
 use crate::error::{ProxyError, ProxyResult};
+use crate::proxy::bridge::BridgeUpstream;
 use crate::proxy::signaling::{
-    self, AcceptedRoutes, ControlMsg, Hello, HelloResponse, PeerRole, Target,
+    self, AcceptedRoutes, BridgeSummary, ControlMsg, Hello, HelloResponse, PeerRole, Target,
 };
-use crate::proxy::status_page::{self, AgentRouteStatus, ServerStatusTemplate};
+use crate::proxy::status_page::{
+    self, AgentRouteStatus, BridgeInboundStatus, BridgeUpstreamStatus, ServerStatusTemplate,
+};
 use crate::proxy::{dial, reserved, DnsForwarder, RoutedSet};
 use crate::transport::LIVENESS_WINDOW;
 use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
@@ -148,6 +151,34 @@ impl Drop for AgentGuard {
     }
 }
 
+/// `bridge EndpointId → live conn_seqs`. Tracks inbound bridge connections for
+/// the status page's connected badge. A set of conn_seqs (not a single entry)
+/// tolerates a benign reconnect overlap; no nonce/duplicate machinery — bridge
+/// peers are explicitly allowlisted servers, so a duplicate id here is the
+/// duplicate-*server* problem, detected by its own clients, not by us.
+type BridgeRegistry = HashMap<EndpointId, HashSet<u64>>;
+
+/// RAII cleanup for a registered inbound bridge connection: removes its
+/// `(id, conn_seq)` entry on every handler exit path (see [`ConnGuard`]).
+struct BridgeGuard {
+    registry: Arc<Mutex<BridgeRegistry>>,
+    remote_id: EndpointId,
+    conn_seq: u64,
+}
+
+impl Drop for BridgeGuard {
+    fn drop(&mut self) {
+        if let Ok(mut reg) = self.registry.lock()
+            && let Some(seqs) = reg.get_mut(&self.remote_id)
+        {
+            seqs.remove(&self.conn_seq);
+            if seqs.is_empty() {
+                reg.remove(&self.remote_id);
+            }
+        }
+    }
+}
+
 pub struct ProxyServer {
     /// This server's own iroh `EndpointId` (persistent identity), used for the
     /// duplicate-server self-block record.
@@ -162,6 +193,16 @@ pub struct ProxyServer {
     /// Accepted **agent** auth tokens (`fta` prefix) — a separate pool so a client
     /// credential can never authenticate as an agent, or vice versa.
     agent_valid_tokens: HashSet<String>,
+    /// Accepted **bridge** auth tokens (`ftb` prefix) — a third separate pool.
+    bridge_valid_tokens: HashSet<String>,
+    /// Endpoint ids of servers allowed to bridge into this server. A connecting
+    /// bridge must present both an allowlisted (TLS-authenticated) id and a
+    /// valid `ftb` token. Empty = inbound bridging disabled.
+    allowed_bridge_servers: HashSet<EndpointId>,
+    /// Outbound bridges, sorted by name (deterministic first-match in
+    /// [`Self::bridge_for`]). Their persistent upstream connections are
+    /// maintained by tasks spawned in [`run`](Self::run).
+    bridges: Vec<Arc<BridgeUpstream>>,
     /// Reverse-routing reservations: a requested hostname (lowercased key) that
     /// matches is forwarded over the connected agent whose machine id is the
     /// value, instead of dialed from the server's own network. Checked *before*
@@ -188,6 +229,8 @@ pub struct ProxyServer {
     /// Live agent registry (one connection per machine id) for reverse routing +
     /// duplicate-agent detection.
     agent_registry: Arc<Mutex<AgentRegistry>>,
+    /// Live inbound-bridge registry, for the status page's connected badge.
+    bridge_registry: Arc<Mutex<BridgeRegistry>>,
     /// Persistent duplicate-id blocklist (shared, synced to disk on mutation).
     blocklist: Arc<Mutex<BlockList>>,
     /// Tripped when the server must stop itself (duplicate-server self-block);
@@ -195,34 +238,47 @@ pub struct ProxyServer {
     shutdown: Arc<Notify>,
 }
 
+/// Inputs for [`ProxyServer::new`], grouped into a struct so the many
+/// same-typed collections can't be swapped positionally.
+pub struct ProxyServerParams {
+    pub own_id: EndpointId,
+    pub valid_tokens: HashSet<String>,
+    pub agent_valid_tokens: HashSet<String>,
+    pub bridge_valid_tokens: HashSet<String>,
+    pub allowed_bridge_servers: HashSet<EndpointId>,
+    pub agent_routes: HashMap<String, String>,
+    pub host_aliases: HashMap<String, String>,
+    pub routed_set: RoutedSet,
+    pub routed_domains: Vec<String>,
+    pub routed_cidrs: Vec<String>,
+    pub dns_forwarder: Option<DnsForwarder>,
+    pub bridges: Vec<Arc<BridgeUpstream>>,
+    pub blocklist: BlockList,
+}
+
 impl ProxyServer {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        own_id: EndpointId,
-        valid_tokens: HashSet<String>,
-        agent_valid_tokens: HashSet<String>,
-        agent_routes: HashMap<String, String>,
-        host_aliases: HashMap<String, String>,
-        routed_set: RoutedSet,
-        routed_domains: Vec<String>,
-        routed_cidrs: Vec<String>,
-        dns_forwarder: Option<DnsForwarder>,
-        blocklist: BlockList,
-    ) -> Arc<Self> {
+    pub fn new(params: ProxyServerParams) -> Arc<Self> {
+        let mut bridges = params.bridges;
+        // Sorted by name so bridge_for's first-match is deterministic.
+        bridges.sort_by(|a, b| a.config.name.cmp(&b.config.name));
         Arc::new(Self {
-            own_id,
+            own_id: params.own_id,
             server_instance_nonce: rand::rng().random(),
-            valid_tokens,
-            agent_valid_tokens,
-            agent_routes,
-            host_aliases,
-            routed_set,
-            routed_domains,
-            routed_cidrs,
-            dns_forwarder,
+            valid_tokens: params.valid_tokens,
+            agent_valid_tokens: params.agent_valid_tokens,
+            bridge_valid_tokens: params.bridge_valid_tokens,
+            allowed_bridge_servers: params.allowed_bridge_servers,
+            bridges,
+            agent_routes: params.agent_routes,
+            host_aliases: params.host_aliases,
+            routed_set: params.routed_set,
+            routed_domains: params.routed_domains,
+            routed_cidrs: params.routed_cidrs,
+            dns_forwarder: params.dns_forwarder,
             registry: Arc::new(Mutex::new(Registry::new())),
             agent_registry: Arc::new(Mutex::new(AgentRegistry::new())),
-            blocklist: Arc::new(Mutex::new(blocklist)),
+            bridge_registry: Arc::new(Mutex::new(BridgeRegistry::new())),
+            blocklist: Arc::new(Mutex::new(params.blocklist)),
             shutdown: Arc::new(Notify::new()),
         })
     }
@@ -258,6 +314,54 @@ impl ProxyServer {
             .as_ref()
             .map(DnsForwarder::forwards)
             .unwrap_or_default()
+    }
+
+    /// The outbound bridge routes as config-only summaries, in name order.
+    /// Pushed to clients in the `HelloResponse` for their status UIs (no live
+    /// state — the handshake snapshot would go stale; the server status page
+    /// shows liveness instead).
+    fn bridge_summaries(&self) -> Vec<BridgeSummary> {
+        self.bridges
+            .iter()
+            .map(|b| BridgeSummary {
+                name: b.config.name.clone(),
+                endpoint_id: b.config.endpoint_id.to_string(),
+                domains: b.config.domains.clone(),
+                cidrs: b.config.cidrs.clone(),
+            })
+            .collect()
+    }
+
+    /// The outbound bridges with their live connected state, in name order.
+    /// Status-page only (a passive read of each upstream's connection slot).
+    fn outbound_bridge_status(&self) -> Vec<BridgeUpstreamStatus> {
+        self.bridges
+            .iter()
+            .map(|b| BridgeUpstreamStatus {
+                name: b.config.name.clone(),
+                endpoint_id: b.config.endpoint_id.to_string(),
+                domains: b.config.domains.clone(),
+                cidrs: b.config.cidrs.clone(),
+                connected: b.is_connected(),
+            })
+            .collect()
+    }
+
+    /// The allowed inbound bridge servers with their live connected state,
+    /// sorted by endpoint id. A passive read of the bridge registry
+    /// (membership == connected) — no probing.
+    fn inbound_bridge_status(&self) -> Vec<BridgeInboundStatus> {
+        let reg = self.bridge_registry.lock().expect("bridge registry lock");
+        let mut inbound: Vec<BridgeInboundStatus> = self
+            .allowed_bridge_servers
+            .iter()
+            .map(|id| BridgeInboundStatus {
+                endpoint_id: id.to_string(),
+                connected: reg.contains_key(id),
+            })
+            .collect();
+        inbound.sort_by(|a, b| a.endpoint_id.cmp(&b.endpoint_id));
+        inbound
     }
 
     /// The machine ids of all agents connected right now. A passive read of the
@@ -315,6 +419,8 @@ impl ProxyServer {
             host_aliases,
             agent_routes,
             dns_forwards: self.dns_forwards(),
+            bridges: self.outbound_bridge_status(),
+            inbound_bridges: self.inbound_bridge_status(),
             blocklist_path: bl.path().display().to_string(),
             blocked_client_count: bl.blocked_client_count(),
             blocked_agent_count: bl.blocked_agent_count(),
@@ -324,6 +430,15 @@ impl ProxyServer {
 
     /// Accept connections until the endpoint closes or the server self-blocks.
     pub async fn run(self: Arc<Self>, endpoint: &Endpoint) -> ProxyResult<()> {
+        // Maintain the outbound bridge upstreams for the life of the process.
+        // The bridging side dials out on this same server endpoint, so the TLS
+        // identity it presents is this server's persistent id — what the target
+        // server's allowlist matches. The tasks retry forever and die with the
+        // endpoint.
+        for bridge in &self.bridges {
+            tokio::spawn(bridge.clone().run(endpoint.clone()));
+        }
+
         let conn_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
         loop {
             // Acquire a slot before accepting so a flood of connections applies
@@ -568,6 +683,15 @@ impl ProxyServer {
                 .await;
         }
 
+        // Bridges too: their own token pool (`ftb`) plus the endpoint-id
+        // allowlist. They open data streams like a client, but those streams
+        // are never re-bridged (single hop). Handled fully in there.
+        if hello.role == PeerRole::Bridge {
+            return self
+                .handle_bridge(connection, remote_id, conn_seq, send, recv, hello)
+                .await;
+        }
+
         // Authenticate first: only a validated, non-blocklisted peer may influence
         // server behavior — including the duplicate-server self-block below. The
         // ALPN is not a credential, so without this gate an unauthenticated peer
@@ -665,6 +789,7 @@ impl ProxyServer {
                 agent_aliases: self.sorted_agent_aliases(),
                 connected_agents: self.connected_agent_aliases(),
                 dns_forwards: self.dns_forwards(),
+                bridges: self.bridge_summaries(),
             },
         );
         signaling::write_message(&mut send, &signaling::encode_hello_response(&resp)?).await?;
@@ -675,7 +800,7 @@ impl ProxyServer {
         // (connection closed, or heartbeat liveness lost). `_guard` cleans the
         // registry on return via Drop. The heartbeat also ships the live
         // connected-agent list back to this client (`Some(self)`).
-        let socks = self.serve_socks(&connection, remote_id);
+        let socks = self.serve_socks(&connection, remote_id, false);
         let heartbeat = server_heartbeat_loop(
             send,
             recv,
@@ -800,6 +925,111 @@ impl ProxyServer {
         server_heartbeat_loop(send, recv, None, None).await
     }
 
+    /// Serve an authenticated **bridge** connection: validate its `ftb` token
+    /// AND its TLS-authenticated endpoint id against the allowlist (both must
+    /// pass), register it for the status page, accept it, then serve its
+    /// streams like a client's — except they are flagged `from_bridge` so they
+    /// are never bridged again (single hop; prevents forwarding loops). The
+    /// bridge's targets are re-checked against *this* server's routed set, and
+    /// its domain targets are resolved (and aliased/agent-routed) here.
+    async fn handle_bridge(
+        self: Arc<Self>,
+        connection: Connection,
+        remote_id: EndpointId,
+        conn_seq: u64,
+        mut send: SendStream,
+        recv: RecvStream,
+        hello: Hello,
+    ) -> ProxyResult<()> {
+        if self.allowed_bridge_servers.is_empty() {
+            return self
+                .reject_bridge(
+                    &connection,
+                    &mut send,
+                    remote_id,
+                    "bridging is not enabled on this server",
+                )
+                .await;
+        }
+        // Both gates must pass. The endpoint id needs no further proof — iroh's
+        // TLS handshake already authenticated it.
+        if !self.bridge_valid_tokens.contains(&hello.auth_token) {
+            return self
+                .reject_bridge(&connection, &mut send, remote_id, "Invalid authentication token")
+                .await;
+        }
+        if !self.allowed_bridge_servers.contains(&remote_id) {
+            return self
+                .reject_bridge(
+                    &connection,
+                    &mut send,
+                    remote_id,
+                    "server id is not on this server's bridge allowlist",
+                )
+                .await;
+        }
+
+        // Register for the status page's connected badge. `_guard` removes the
+        // entry on any exit; overlapping entries during a reconnect are benign.
+        self.bridge_registry
+            .lock()
+            .expect("bridge registry lock")
+            .entry(remote_id)
+            .or_default()
+            .insert(conn_seq);
+        let _guard = BridgeGuard {
+            registry: self.bridge_registry.clone(),
+            remote_id,
+            conn_seq,
+        };
+
+        // Accept: bridges get no routed set (the bridging server enforces its
+        // own set before forwarding, and this server re-enforces per stream).
+        // The control stream stays open for heartbeats.
+        let resp = HelloResponse::accepted(self.server_instance_nonce, AcceptedRoutes::default());
+        signaling::write_message(&mut send, &signaling::encode_hello_response(&resp)?).await?;
+        send.flush().await?;
+        log::info!("Bridge server {remote_id} authenticated");
+
+        // Unlike agents, bridges open data streams to us — serve them like a
+        // client's, flagged `from_bridge`. No registry-liveness refresh and no
+        // connected-agent list on the heartbeat (bridges don't display it).
+        let socks = self.serve_socks(&connection, remote_id, true);
+        let heartbeat = server_heartbeat_loop(send, recv, None, None);
+        tokio::select! {
+            r = socks => r,
+            r = heartbeat => r,
+        }
+    }
+
+    /// Reject a bridge handshake: write a rejection response, close gracefully,
+    /// and return the auth-failure error. Mirrors [`Self::reject_agent`].
+    async fn reject_bridge(
+        &self,
+        connection: &Connection,
+        send: &mut SendStream,
+        remote_id: EndpointId,
+        reason: &str,
+    ) -> ProxyResult<()> {
+        log::warn!("Rejecting bridge {remote_id}: {reason}");
+        let resp = HelloResponse::rejected(self.server_instance_nonce, reason);
+        let _ = signaling::write_message(send, &signaling::encode_hello_response(&resp)?).await;
+        let _ = send.finish();
+        // Give the bridge a moment to read the rejection, then close with the reason.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        connection.close(1u32.into(), b"authentication rejected");
+        Err(ProxyError::AuthenticationFailed(format!(
+            "bridge {remote_id} rejected: {reason}"
+        )))
+    }
+
+    /// The first (name-ordered) outbound bridge whose rules match `target`, if
+    /// any. Matching uses the requested target verbatim — before aliasing — so
+    /// what is forwarded is exactly what the client asked for.
+    fn bridge_for(&self, target: &Target) -> Option<&Arc<BridgeUpstream>> {
+        self.bridges.iter().find(|b| b.config.routed_set.allows(target))
+    }
+
     /// Reject an agent handshake: write a rejection response, close gracefully,
     /// and return the auth-failure error. Mirrors the client rejection path.
     async fn reject_agent(
@@ -822,13 +1052,20 @@ impl ProxyServer {
     }
 
     /// Accept and dispatch SOCKS5 bi-streams until the connection closes.
-    async fn serve_socks(self: &Arc<Self>, connection: &Connection, remote_id: EndpointId) -> ProxyResult<()> {
+    /// `from_bridge` marks streams arriving over an inbound bridge connection;
+    /// they are served identically except they are never bridged again.
+    async fn serve_socks(
+        self: &Arc<Self>,
+        connection: &Connection,
+        remote_id: EndpointId,
+        from_bridge: bool,
+    ) -> ProxyResult<()> {
         loop {
             match connection.accept_bi().await {
                 Ok((send, recv)) => {
                     let server = Arc::clone(self);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_socks_stream(send, recv, &server).await {
+                        if let Err(e) = handle_socks_stream(send, recv, &server, from_bridge).await {
                             log::debug!("SOCKS5 stream ended: {e}");
                         }
                     });
@@ -940,13 +1177,16 @@ fn apply_alias(target: Target, aliases: &HashMap<String, String>) -> Target {
     target
 }
 
-/// Handle one SOCKS5 stream from a client: read the target, then either route it
-/// to a reserved **agent** (reverse routing) or, for everything else, resolve +
-/// connect from the server's own network and pipe bytes.
+/// Handle one SOCKS5 stream from a client (or an inbound bridge): read the
+/// target, then route it to a reserved **agent** (reverse routing), forward it
+/// over an outbound **bridge** to another server, or — for everything else —
+/// resolve + connect from the server's own network and pipe bytes.
+/// `from_bridge` streams skip the bridge step (single hop, no forwarding loops).
 async fn handle_socks_stream(
     mut send: SendStream,
     mut recv: RecvStream,
     server: &Arc<ProxyServer>,
+    from_bridge: bool,
 ) -> io::Result<()> {
     let requested = signaling::read_request(&mut recv).await?;
 
@@ -976,10 +1216,20 @@ async fn handle_socks_stream(
 
     // Agent routes take precedence over host aliases: a domain reserved for an
     // agent is forwarded over that agent's live connection instead of dialed.
+    // They also beat bridge routes: an agent-route entry is an exact-hostname
+    // reservation, strictly more specific than a bridge's suffix/CIDR classes.
     if let Target::Domain(host, port) = &requested
         && let Some(machine_id) = server.agent_routes.get(&host.to_ascii_lowercase())
     {
         return route_to_agent(send, recv, server, machine_id, *port).await;
+    }
+
+    // Bridge routes: a matching target is forwarded verbatim (no aliasing —
+    // the target server applies its own aliases, DNS forwards, and agent
+    // routes) over the bridge's upstream connection. A stream that itself
+    // arrived over a bridge is never re-bridged.
+    if !from_bridge && let Some(bridge) = server.bridge_for(&requested) {
+        return route_to_bridge(send, recv, bridge, &requested).await;
     }
 
     let target = apply_alias(requested, &server.host_aliases);
@@ -1157,6 +1407,50 @@ async fn route_to_agent(
     let mut client_side = tokio::io::join(client_recv, client_send);
     let mut agent_side = tokio::io::join(agent_recv, agent_send);
     let _ = tokio::io::copy_bidirectional(&mut client_side, &mut agent_side).await;
+    Ok(())
+}
+
+/// Forward a client stream over an outbound bridge: open a stream on the
+/// bridge's live upstream connection, forward the requested target **verbatim**
+/// (the target server aliases/resolves/enforces on its side), then splice the
+/// two QUIC streams so the target server's reply byte and payload flow straight
+/// back to the client. Mirrors [`route_to_agent`] minus the loopback rewrite.
+async fn route_to_bridge(
+    mut client_send: SendStream,
+    client_recv: RecvStream,
+    bridge: &Arc<BridgeUpstream>,
+    target: &Target,
+) -> io::Result<()> {
+    let name = &bridge.config.name;
+    let bridge_conn = match bridge.active_conn() {
+        Some(c) => c,
+        None => {
+            log::warn!("Bridge '{name}' is not connected; host-unreachable");
+            signaling::write_reply(&mut client_send, signaling::REP_HOST_UNREACHABLE).await?;
+            client_send.flush().await?;
+            return Ok(());
+        }
+    };
+
+    let (mut bridge_send, bridge_recv) = match bridge_conn.open_bi().await {
+        Ok(pair) => pair,
+        Err(e) => {
+            log::warn!("Failed to open stream over bridge '{name}': {e}; host-unreachable");
+            signaling::write_reply(&mut client_send, signaling::REP_HOST_UNREACHABLE).await?;
+            client_send.flush().await?;
+            return Ok(());
+        }
+    };
+
+    // The target server replies and pipes using the same wire format the client
+    // expects, so we splice raw.
+    log::debug!("Routing over bridge '{name}' -> {target:?}");
+    signaling::write_request(&mut bridge_send, target).await?;
+    bridge_send.flush().await?;
+
+    let mut client_side = tokio::io::join(client_recv, client_send);
+    let mut bridge_side = tokio::io::join(bridge_recv, bridge_send);
+    let _ = tokio::io::copy_bidirectional(&mut client_side, &mut bridge_side).await;
     Ok(())
 }
 
