@@ -648,16 +648,16 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
         "text status should show the configured host alias"
     );
     assert!(
-        body.contains("  - marker.example.com -> 10.9.9.9:5353"),
+        body.contains("  - marker.example.com (+ subdomains) -> 10.9.9.9:5353"),
         "text status should show the configured DNS forward"
     );
     assert!(
-        body.contains("  - corp.example.com -> 10.1.0.11, 10.1.0.10:5353"),
+        body.contains("  - corp.example.com (+ subdomains) -> 10.1.0.11, 10.1.0.10:5353"),
         "text status should show the multi-server forward with servers in verbatim order"
     );
     assert!(
-        body.find("  - corp.example.com -> 10.1.0.11").unwrap()
-            < body.find("  - marker.example.com -> 10.9.9.9:5353").unwrap(),
+        body.find("  - corp.example.com (+ subdomains) -> 10.1.0.11").unwrap()
+            < body.find("  - marker.example.com (+ subdomains) -> 10.9.9.9:5353").unwrap(),
         "text status should render DNS forwards sorted by suffix (corp before marker)"
     );
 
