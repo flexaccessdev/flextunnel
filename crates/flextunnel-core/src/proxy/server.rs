@@ -4,7 +4,9 @@
 
 use crate::blocklist::{self, BlockList};
 use crate::error::{ProxyError, ProxyResult};
-use crate::proxy::signaling::{self, ControlMsg, Hello, HelloResponse, PeerRole, Target};
+use crate::proxy::signaling::{
+    self, AcceptedRoutes, ControlMsg, Hello, HelloResponse, PeerRole, Target,
+};
 use crate::proxy::status_page::{self, AgentRouteStatus, ServerStatusTemplate};
 use crate::proxy::{dial, reserved, DnsForwarder, RoutedSet};
 use crate::transport::LIVENESS_WINDOW;
@@ -656,12 +658,14 @@ impl ProxyServer {
         // NOT finished — it stays open for heartbeats.
         let resp = HelloResponse::accepted(
             self.server_instance_nonce,
-            self.routed_domains.clone(),
-            self.routed_cidrs.clone(),
-            self.sorted_host_aliases(),
-            self.sorted_agent_aliases(),
-            self.connected_agent_aliases(),
-            self.dns_forwards(),
+            AcceptedRoutes {
+                routed_domains: self.routed_domains.clone(),
+                routed_cidrs: self.routed_cidrs.clone(),
+                host_aliases: self.sorted_host_aliases(),
+                agent_aliases: self.sorted_agent_aliases(),
+                connected_agents: self.connected_agent_aliases(),
+                dns_forwards: self.dns_forwards(),
+            },
         );
         signaling::write_message(&mut send, &signaling::encode_hello_response(&resp)?).await?;
         send.flush().await?;
@@ -784,15 +788,7 @@ impl ProxyServer {
         // no connected-agent list (only clients display it), and no DNS forwards
         // (server-side resolution, nothing for an agent to display). The control
         // stream stays open for heartbeats.
-        let resp = HelloResponse::accepted(
-            self.server_instance_nonce,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        );
+        let resp = HelloResponse::accepted(self.server_instance_nonce, AcceptedRoutes::default());
         signaling::write_message(&mut send, &signaling::encode_hello_response(&resp)?).await?;
         send.flush().await?;
         log::info!("Agent {machine_id} authenticated");

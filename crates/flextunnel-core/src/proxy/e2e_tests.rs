@@ -379,19 +379,29 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
     let agent_routes = HashMap::from([(agent_alias.to_string(), machine_id.to_string())]);
     let host_aliases =
         HashMap::from([("nas.internal".to_string(), "192.168.1.9".to_string())]);
-    // A conditional DNS forward we expect rendered on the status page and pushed
-    // to the client. Its suffix must be reachable through the routed set.
-    let dns_forwards = HashMap::from([(
-        "marker.example.com".to_string(),
-        vec!["10.9.9.9:5353".to_string()],
-    )]);
+    // Two conditional DNS forwards we expect rendered on the status page and
+    // pushed to the client (each suffix must be reachable through the routed
+    // set). `corp.example.com` carries two servers in a deliberate, non-sorted
+    // order; the server must emit the suffixes sorted (`corp` before `marker`)
+    // while preserving each suffix's server order verbatim — exercised through
+    // every serialization path below.
+    let dns_forwards = HashMap::from([
+        (
+            "marker.example.com".to_string(),
+            vec!["10.9.9.9:5353".to_string()],
+        ),
+        (
+            "corp.example.com".to_string(),
+            vec!["10.1.0.11".to_string(), "10.1.0.10:5353".to_string()],
+        ),
+    ]);
     spawn_server_dns(
         server_ep,
         temp_blocklist("reserved"),
         agent_tokens,
         agent_routes,
         host_aliases,
-        vec!["marker.example.com".to_string()],
+        vec!["marker.example.com".to_string(), "corp.example.com".to_string()],
         dns_forwards,
     );
 
@@ -416,11 +426,17 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
     );
     assert_eq!(
         cresp.dns_forwards,
-        vec![(
-            "marker.example.com".to_string(),
-            vec!["10.9.9.9:5353".to_string()]
-        )],
-        "handshake should push the configured DNS forwards for client status UIs"
+        vec![
+            (
+                "corp.example.com".to_string(),
+                vec!["10.1.0.11".to_string(), "10.1.0.10:5353".to_string()]
+            ),
+            (
+                "marker.example.com".to_string(),
+                vec!["10.9.9.9:5353".to_string()]
+            ),
+        ],
+        "handshake should push DNS forwards sorted by suffix, each suffix's servers verbatim"
     );
 
     // The status host: expect an HTTP 200 whose body contains the routed domain.
@@ -446,6 +462,14 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
         body.contains("10.9.9.9:5353"),
         "status page should list the configured DNS forward server"
     );
+    assert!(
+        body.contains("10.1.0.11, 10.1.0.10:5353"),
+        "status page should list the multi-server forward with servers in verbatim order"
+    );
+    assert!(
+        body.find("10.1.0.11").unwrap() < body.find("10.9.9.9:5353").unwrap(),
+        "status page should render DNS forwards sorted by suffix (corp before marker)"
+    );
 
     let body = fetch_reserved_path(&client_conn, "flextunnel.internal", "/status.txt").await;
     assert!(body.starts_with("HTTP/1.1 200"), "text status should be 200: {body:.40}");
@@ -469,6 +493,15 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
         body.contains("  - marker.example.com -> 10.9.9.9:5353"),
         "text status should show the configured DNS forward"
     );
+    assert!(
+        body.contains("  - corp.example.com -> 10.1.0.11, 10.1.0.10:5353"),
+        "text status should show the multi-server forward with servers in verbatim order"
+    );
+    assert!(
+        body.find("  - corp.example.com -> 10.1.0.11").unwrap()
+            < body.find("  - marker.example.com -> 10.9.9.9:5353").unwrap(),
+        "text status should render DNS forwards sorted by suffix (corp before marker)"
+    );
 
     let body = fetch_reserved_path(&client_conn, "flextunnel.internal", "/status.json").await;
     assert!(body.starts_with("HTTP/1.1 200"), "json status should be 200: {body:.40}");
@@ -484,8 +517,8 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
         serde_json::from_str(json_body).expect("json status body should parse");
     assert_eq!(
         status["routed_domains"],
-        serde_json::json!(["marker.example.com"]),
-        "json status should list the configured routed domain"
+        serde_json::json!(["marker.example.com", "corp.example.com"]),
+        "json status should list the configured routed domains"
     );
     assert_eq!(
         status["host_aliases"],
@@ -499,8 +532,11 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
     );
     assert_eq!(
         status["dns_forwards"],
-        serde_json::json!([{"suffix": "marker.example.com", "servers": ["10.9.9.9:5353"]}]),
-        "json status should list the configured DNS forward"
+        serde_json::json!([
+            {"suffix": "corp.example.com", "servers": ["10.1.0.11", "10.1.0.10:5353"]},
+            {"suffix": "marker.example.com", "servers": ["10.9.9.9:5353"]},
+        ]),
+        "json status should list the DNS forwards sorted by suffix, servers verbatim"
     );
 
     // Accept-header negotiation: a `/` request with `Accept: text/plain` should

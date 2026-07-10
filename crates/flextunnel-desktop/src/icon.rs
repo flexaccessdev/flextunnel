@@ -143,31 +143,36 @@ fn draw_status_dot(pixmap: &mut Pixmap, dot: Color, ring: Option<Color>, checkma
     }
 
     if checkmark {
-        // Contrast against the dot the same way the ring does: the ring's color
-        // on the full-color badge, or a transparent Clear punch on the macOS
-        // template (so the check reads as a cut-out once the OS tints the mask).
-        let mut check_paint = Paint {
-            anti_alias: true,
-            ..Paint::default()
+        draw_checkmark(pixmap, cx, cy, dot_r, ring);
+    }
+}
+
+/// Stroke a checkmark centered on the status dot at `(cx, cy)` with radius
+/// `dot_r`. It contrasts against the dot the same way the ring does: the ring's
+/// color on the full-color badge, or a transparent Clear punch on the macOS
+/// template (so the check reads as a cut-out once the OS tints the mask).
+fn draw_checkmark(pixmap: &mut Pixmap, cx: f32, cy: f32, dot_r: f32, ring: Option<Color>) {
+    let mut check_paint = Paint {
+        anti_alias: true,
+        ..Paint::default()
+    };
+    match ring {
+        Some(color) => check_paint.set_color(color),
+        None => check_paint.blend_mode = BlendMode::Clear,
+    }
+    // A check: left arm down to the low vertex, then up to the long tip.
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx - dot_r * 0.45, cy + dot_r * 0.02);
+    pb.line_to(cx - dot_r * 0.10, cy + dot_r * 0.38);
+    pb.line_to(cx + dot_r * 0.50, cy - dot_r * 0.40);
+    if let Some(path) = pb.finish() {
+        let stroke = Stroke {
+            width: dot_r * 0.30,
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
+            ..Stroke::default()
         };
-        match ring {
-            Some(color) => check_paint.set_color(color),
-            None => check_paint.blend_mode = BlendMode::Clear,
-        }
-        // A check: left arm down to the low vertex, then up to the long tip.
-        let mut pb = PathBuilder::new();
-        pb.move_to(cx - dot_r * 0.45, cy + dot_r * 0.02);
-        pb.line_to(cx - dot_r * 0.10, cy + dot_r * 0.38);
-        pb.line_to(cx + dot_r * 0.50, cy - dot_r * 0.40);
-        if let Some(path) = pb.finish() {
-            let stroke = Stroke {
-                width: dot_r * 0.30,
-                line_cap: LineCap::Round,
-                line_join: LineJoin::Round,
-                ..Stroke::default()
-            };
-            pixmap.stroke_path(&path, &check_paint, &stroke, id, None);
-        }
+        pixmap.stroke_path(&path, &check_paint, &stroke, Transform::identity(), None);
     }
 }
 

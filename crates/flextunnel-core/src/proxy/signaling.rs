@@ -188,30 +188,42 @@ impl Hello {
     }
 }
 
+/// The routing/status payload the server pushes to a peer on acceptance,
+/// grouped so the several same-typed lists can't be swapped positionally. Only
+/// the routed set (`routed_domains`/`routed_cidrs`) is enforced client-side; the
+/// rest is informational for status UIs. `Default` (all empty) is the agent
+/// case — an agent gets no routed set and no connected-agent list.
+#[derive(Debug, Clone, Default)]
+pub struct AcceptedRoutes {
+    /// Domain rules the client should tunnel (exact or `*.` wildcard).
+    pub routed_domains: Vec<String>,
+    /// CIDR / bare-IP rules the client should tunnel.
+    pub routed_cidrs: Vec<String>,
+    /// Server-side host aliases as `(alias, target)` pairs, sorted by alias.
+    pub host_aliases: Vec<(String, String)>,
+    /// Reverse-routing (agent) alias names, sorted.
+    pub agent_aliases: Vec<String>,
+    /// The subset of `agent_aliases` whose backing agent is connected right now.
+    pub connected_agents: Vec<String>,
+    /// Conditional DNS forwards as `(suffix, upstream servers)` pairs.
+    pub dns_forwards: Vec<(String, Vec<String>)>,
+}
+
 impl HelloResponse {
-    /// Accept the client and push the server's routed set (the *tunnel set*)
-    /// plus the informational host-alias and agent-alias lists.
-    #[allow(clippy::too_many_arguments)]
-    pub fn accepted(
-        server_instance_nonce: u128,
-        routed_domains: Vec<String>,
-        routed_cidrs: Vec<String>,
-        host_aliases: Vec<(String, String)>,
-        agent_aliases: Vec<String>,
-        connected_agents: Vec<String>,
-        dns_forwards: Vec<(String, Vec<String>)>,
-    ) -> Self {
+    /// Accept the peer and push its [`AcceptedRoutes`] (the *tunnel set* plus the
+    /// informational host-alias, agent-alias, and DNS-forward lists).
+    pub fn accepted(server_instance_nonce: u128, routes: AcceptedRoutes) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             accepted: true,
             reject_reason: None,
             server_instance_nonce,
-            routed_domains,
-            routed_cidrs,
-            host_aliases,
-            agent_aliases,
-            connected_agents,
-            dns_forwards,
+            routed_domains: routes.routed_domains,
+            routed_cidrs: routes.routed_cidrs,
+            host_aliases: routes.host_aliases,
+            agent_aliases: routes.agent_aliases,
+            connected_agents: routes.connected_agents,
+            dns_forwards: routes.dns_forwards,
         }
     }
 
@@ -491,12 +503,20 @@ mod tests {
     fn hello_response_roundtrip() {
         let resp = HelloResponse::accepted(
             42,
-            vec!["*.example.com".to_string(), "httpbin.org".to_string()],
-            vec!["10.0.0.0/8".to_string()],
-            vec![("nas.internal".to_string(), "192.168.1.9".to_string())],
-            vec!["elitedesk.internal".to_string(), "workstation.internal".to_string()],
-            vec!["workstation.internal".to_string()],
-            vec![("corp.example.com".to_string(), vec!["10.1.0.10:5353".to_string()])],
+            AcceptedRoutes {
+                routed_domains: vec!["*.example.com".to_string(), "httpbin.org".to_string()],
+                routed_cidrs: vec!["10.0.0.0/8".to_string()],
+                host_aliases: vec![("nas.internal".to_string(), "192.168.1.9".to_string())],
+                agent_aliases: vec![
+                    "elitedesk.internal".to_string(),
+                    "workstation.internal".to_string(),
+                ],
+                connected_agents: vec!["workstation.internal".to_string()],
+                dns_forwards: vec![(
+                    "corp.example.com".to_string(),
+                    vec!["10.1.0.10:5353".to_string()],
+                )],
+            },
         );
         let decoded = decode_hello_response(&encode_hello_response(&resp).unwrap()).unwrap();
         assert!(decoded.accepted);
