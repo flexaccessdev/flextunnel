@@ -757,7 +757,11 @@ fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
             .size(12),
         );
         for (suffix, servers) in &routes.dns_forwards {
-            col = col.push(arrow_copy_row(suffix.clone(), servers.join(", "), false));
+            col = col.push(arrow_copy_row(
+                format!("{suffix} (+ subdomains)"),
+                servers.join(", "),
+                false,
+            ));
         }
     }
     if !routes.bridges.is_empty() {

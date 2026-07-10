@@ -16,7 +16,7 @@ host_aliases:
 {% endfor %}{% endif %}
 dns_forwards:
 {% if tpl.dns_forwards.is_empty() %}  none configured
-{% else %}{% for (suffix, servers) in tpl.dns_forwards %}  - {{ suffix }} -> {{ servers|join(", ") }}
+{% else %}{% for (suffix, servers) in tpl.dns_forwards %}  - {{ suffix }} (+ subdomains) -> {{ servers|join(", ") }}
 {% endfor %}{% endif %}
 agent_routes:
 {% if tpl.agent_routes.is_empty() %}  none configured
