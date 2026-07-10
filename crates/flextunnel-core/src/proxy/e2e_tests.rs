@@ -972,12 +972,15 @@ async fn bridge_rejected_without_allowlist_or_token() {
         resp.reject_reason
     );
 
-    // Case 3: bridging not enabled (empty allowlist) — even a valid token that
-    // happens to be in the (unused) pool is rejected up front.
+    // Case 3: bridging not enabled (empty allowlist) — even a token that IS in
+    // the pool is rejected up front, proving the enabled-at-all gate runs
+    // before token validation. (The CLI refuses tokens-without-allowlist as
+    // dead config, but the server layer must still gate on the allowlist.)
     let dialer3 = loopback_endpoint(SecretKey::generate(), false).await;
     let ep3 = loopback_endpoint(SecretKey::generate(), true).await;
     let addr3 = EndpointAddr::new(ep3.id()).with_ip_addr(ep3.bound_sockets()[0]);
-    let p3 = base_params(ep3.id(), temp_blocklist("bridgerej3"));
+    let mut p3 = base_params(ep3.id(), temp_blocklist("bridgerej3"));
+    p3.bridge_valid_tokens = HashSet::from([BRIDGE_TOKEN.to_string()]);
     spawn_server_params(ep3, p3);
     let (_c, _s, _r, resp) = bridge_handshake(&dialer3, addr3, BRIDGE_TOKEN, 3).await;
     assert!(!resp.accepted, "bridging must be off with an empty allowlist");
