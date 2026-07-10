@@ -1788,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-agent"
-version = "0.0.46"
+version = "0.0.48"
 dependencies = [
  "anyhow",
  "clap",
@@ -1800,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-cli"
-version = "0.0.46"
+version = "0.0.48"
 dependencies = [
  "anyhow",
  "clap",
@@ -1812,7 +1812,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-core"
-version = "0.0.46"
+version = "0.0.48"
 dependencies = [
  "anyhow",
  "askama",
@@ -1840,7 +1840,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-desktop"
-version = "0.0.46"
+version = "0.0.48"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -1867,7 +1867,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-ffi"
-version = "0.0.46"
+version = "0.0.48"
 dependencies = [
  "flextunnel-core",
  "iroh",
@@ -3188,9 +3188,9 @@ checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
 
 [[package]]
 name = "iroh"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a2e38557969901f8b356d1ebd882253bab98cc81500d53e7bcbf33f56082303"
+checksum = "5fca9b4b462c343ff88fc0af4096c186f939b602a0bc08723536ef2c31c93971"
 dependencies = [
  "backon",
  "blake3",
@@ -3239,9 +3239,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-base"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61cdf012298adc13f5c2c821ad87214fecc9ac54c751301d45bf62b229a85da1"
+checksum = "830a582cd54410dc1aa71d4786a82c3297d7b0165accd8b6dbbb3b240b48140d"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -3258,9 +3258,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-dns"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c24b83aae5ed4eced1c3724204c083c28c84c5d225a88e277eceeccce3dc3bd"
+checksum = "516e4eedc38e33ab69a6bd325520332dc3d67b25454e2d590ebb84a25240dd9a"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -3329,9 +3329,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-relay"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f16a5505939f9250297ff2f1210b5142d13618f496eab03ce3f964fc47e2e2b"
+checksum = "8149bb6a57126225a07d6928846d82dcedfd24ea0f863ef7b2eb475e1d726354"
 dependencies = [
  "blake3",
  "bytes",
@@ -5482,7 +5482,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
