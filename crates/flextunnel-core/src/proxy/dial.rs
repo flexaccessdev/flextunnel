@@ -92,11 +92,14 @@ pub async fn connect_resolved(
     port: u16,
     forwarder: Option<&DnsForwarder>,
 ) -> io::Result<TcpStream> {
-    let mut addrs: Vec<SocketAddr> = match forwarder {
-        Some(f) => match f.resolve(host, port).await {
-            Some(res) => res?,
-            None => tokio::net::lookup_host((host, port)).await?.collect(),
-        },
+    // Forwarded resolution when a matching suffix is configured; otherwise (no
+    // forwarder, or the host matches no suffix) fall back to the system DNS.
+    let forwarded = match forwarder {
+        Some(f) => f.resolve(host, port).await,
+        None => None,
+    };
+    let mut addrs: Vec<SocketAddr> = match forwarded {
+        Some(res) => res?,
         None => tokio::net::lookup_host((host, port)).await?.collect(),
     };
     if addrs.is_empty() {
