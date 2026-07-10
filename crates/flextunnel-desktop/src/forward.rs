@@ -480,6 +480,8 @@ mod tests {
             host_aliases: Vec::new(),
             agent_routes: Vec::new(),
             dns_forwards: Vec::new(),
+            bridges: Vec::new(),
+            inbound_bridges: Vec::new(),
             blocklist_path: String::new(),
             blocked_client_count: 0,
             blocked_agent_count: 0,

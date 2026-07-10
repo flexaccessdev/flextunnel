@@ -148,6 +148,51 @@ impl RoutedSet {
         self.cidrs.iter().any(|net| net.contains(ip))
     }
 
+    /// Validate that every rule in `domains`/`cidrs` (routed-set syntax, as in
+    /// a bridge's route rules) can ever fire under this set — i.e. this set
+    /// routes at least one target the rule matches. A rule no routed target
+    /// ever reaches is dead config: the server rejects off-list targets before
+    /// they reach bridge routing (same reasoning as the DNS-forward coverage
+    /// check, [`Self::covers_suffix`]). Rules are parsed with the same syntax
+    /// as [`RoutedSet::new`]; the error names the offending rule.
+    pub fn validate_rules_reachable(&self, domains: &[String], cidrs: &[String]) -> Result<()> {
+        for raw in domains {
+            let entry = raw.trim();
+            let reachable = if entry == "*" {
+                // A `*` rule fires for any routed hostname, so it is dead only
+                // when the set routes no hostnames at all.
+                self.domains_all
+                    || !self.domains_exact.is_empty()
+                    || !self.domains_suffix.is_empty()
+            } else if let Some(suffix) = entry.strip_prefix("*.") {
+                self.covers_suffix(&suffix.to_ascii_lowercase())
+            } else {
+                // An exact rule (or an IP literal in domain form, which
+                // `allows_host` gates by the CIDRs).
+                self.allows_host(entry)
+            };
+            if !reachable {
+                bail!("domain rule {raw:?} is not covered by the routed set");
+            }
+        }
+        for raw in cidrs {
+            let entry = raw.trim();
+            let net = IpNetwork::from_str(entry)
+                .or_else(|_| IpAddr::from_str(entry).map(IpNetwork::from))
+                .with_context(|| format!("invalid CIDR rule: {raw:?}"))?;
+            // Two prefixes overlap iff one contains the other's network
+            // address; `contains` is false across address families.
+            let reachable = self
+                .cidrs
+                .iter()
+                .any(|routed| routed.contains(net.network()) || net.contains(routed.network()));
+            if !reachable {
+                bail!("CIDR rule {raw:?} does not overlap any routed CIDR");
+            }
+        }
+        Ok(())
+    }
+
     /// Whether the set routes at least one hostname at or under `suffix` — the
     /// apex `suffix` itself or any subdomain of it. Used to reject a conditional
     /// DNS-forwarding suffix (see [`crate::proxy::DnsForwarder`]) that no routed
@@ -339,6 +384,53 @@ mod tests {
         assert!(!rs(&[], &["10.0.0.0/8"]).covers_suffix(suffix));
         // Case-insensitive (rules are lowercased at build time).
         assert!(rs(&["*.LOCAL.168234.XYZ"], &[]).covers_suffix(suffix));
+    }
+
+    #[test]
+    fn rules_reachable_cidrs_require_overlap() {
+        let one = |cidr: &str| vec![cidr.to_string()];
+
+        let w = rs(&[], &["10.0.0.0/8", "fd34::/48"]);
+        // Equal, narrower, wider, or a bare IP inside → all overlap (the rule
+        // fires at least for the shared range).
+        assert!(w.validate_rules_reachable(&[], &one("10.0.0.0/8")).is_ok());
+        assert!(w.validate_rules_reachable(&[], &one("10.1.0.0/16")).is_ok());
+        assert!(w.validate_rules_reachable(&[], &one("10.0.0.0/7")).is_ok());
+        assert!(w.validate_rules_reachable(&[], &one("10.1.2.3")).is_ok());
+        assert!(w.validate_rules_reachable(&[], &one("fd34::/64")).is_ok());
+        assert!(w.validate_rules_reachable(&[], &one("fd34::/32")).is_ok());
+        // Disjoint or wrong family → dead rule.
+        assert!(w.validate_rules_reachable(&[], &one("11.0.0.0/8")).is_err());
+        assert!(w.validate_rules_reachable(&[], &one("fe80::/64")).is_err());
+
+        // A default route reaches everything of its family, nothing of the other.
+        let all4 = rs(&[], &["0.0.0.0/0"]);
+        assert!(all4.validate_rules_reachable(&[], &one("203.0.113.0/24")).is_ok());
+        assert!(all4.validate_rules_reachable(&[], &one("fd34::/64")).is_err());
+
+        // Domain-only sets reach no CIDR; malformed CIDRs error.
+        assert!(rs(&["*"], &[]).validate_rules_reachable(&[], &one("10.0.0.0/8")).is_err());
+        assert!(w.validate_rules_reachable(&[], &one("not-a-cidr")).is_err());
+    }
+
+    #[test]
+    fn rules_reachable_domains_match_routing_reach() {
+        let one = |d: &str| vec![d.to_string()];
+
+        let w = rs(&["special.svc", "*.corp.example.com"], &[]);
+        // A wildcard rule is reachable when the set routes something under it.
+        assert!(w.validate_rules_reachable(&one("*.svc"), &[]).is_ok());
+        assert!(w.validate_rules_reachable(&one("*.example.com"), &[]).is_ok());
+        // An exact rule must itself be routed.
+        assert!(w.validate_rules_reachable(&one("special.svc"), &[]).is_ok());
+        assert!(w.validate_rules_reachable(&one("api.corp.example.com"), &[]).is_ok());
+        assert!(w.validate_rules_reachable(&one("other.svc"), &[]).is_err());
+        // A `*` rule fires for any routed hostname.
+        assert!(w.validate_rules_reachable(&one("*"), &[]).is_ok());
+        assert!(rs(&[], &["10.0.0.0/8"]).validate_rules_reachable(&one("*"), &[]).is_err());
+        // Unrelated wildcard → dead rule. Case-insensitive like the matcher.
+        assert!(w.validate_rules_reachable(&one("*.other.net"), &[]).is_err());
+        assert!(w.validate_rules_reachable(&one("*.SVC"), &[]).is_ok());
     }
 
     #[test]

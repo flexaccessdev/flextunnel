@@ -15,7 +15,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// flextunnel protocol version.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 /// Maximum auth-handshake message size (64 KiB). The server's routed set rides
 /// the `HelloResponse`, so this is generous enough for a large operator list.
@@ -60,6 +60,11 @@ pub enum PeerRole {
     Client,
     /// Reverse-routing exit point; accepts server-opened streams.
     Agent,
+    /// Another flextunnel server forwarding bridged streams. Opens tunnel
+    /// streams like a client but authenticates with an `ftb` token, and its
+    /// TLS-authenticated iroh endpoint id must be on the receiving server's
+    /// bridge allowlist (see the server's `allowed_bridge_servers`).
+    Bridge,
 }
 
 /// Client/agent → server auth handshake (first bi-stream of the connection).
@@ -157,6 +162,11 @@ pub struct HelloResponse {
     /// server-side. Empty when no `[dns_forwards]` are configured.
     #[serde(default)]
     pub dns_forwards: Vec<(String, Vec<String>)>,
+    /// Outbound bridge routes (targets forwarded to another server), sorted by
+    /// name. Purely informational for client UIs — the routing decision stays
+    /// server-side and the bridged rules are already part of the routed set.
+    #[serde(default)]
+    pub bridges: Vec<BridgeSummary>,
 }
 
 impl Hello {
@@ -186,6 +196,31 @@ impl Hello {
             ..Self::new(auth_token, client_instance_nonce)
         }
     }
+
+    /// A bridge `Hello` (`role = Bridge`). No machine id — a bridge's identity
+    /// is its persistent iroh endpoint id, already TLS-authenticated by the
+    /// QUIC connection.
+    pub fn new_bridge(auth_token: impl Into<String>, client_instance_nonce: u128) -> Self {
+        Self {
+            role: PeerRole::Bridge,
+            ..Self::new(auth_token, client_instance_nonce)
+        }
+    }
+}
+
+/// One outbound bridge route, pushed to clients on acceptance. Config only —
+/// no live connected-state, which would go stale the moment the handshake
+/// snapshot is taken (the server status page shows live state instead).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeSummary {
+    /// The friendly `[bridges.<name>]` config key.
+    pub name: String,
+    /// The target server's iroh endpoint id.
+    pub endpoint_id: String,
+    /// Domain rules forwarded to the target server (routed-set syntax).
+    pub domains: Vec<String>,
+    /// CIDR / bare-IP rules forwarded to the target server.
+    pub cidrs: Vec<String>,
 }
 
 /// The routing/status payload the server pushes to a peer on acceptance,
@@ -207,6 +242,8 @@ pub struct AcceptedRoutes {
     pub connected_agents: Vec<String>,
     /// Conditional DNS forwards as `(suffix, upstream servers)` pairs.
     pub dns_forwards: Vec<(String, Vec<String>)>,
+    /// Outbound bridge routes, sorted by name.
+    pub bridges: Vec<BridgeSummary>,
 }
 
 impl HelloResponse {
@@ -224,6 +261,7 @@ impl HelloResponse {
             agent_aliases: routes.agent_aliases,
             connected_agents: routes.connected_agents,
             dns_forwards: routes.dns_forwards,
+            bridges: routes.bridges,
         }
     }
 
@@ -239,6 +277,7 @@ impl HelloResponse {
             agent_aliases: Vec::new(),
             connected_agents: Vec::new(),
             dns_forwards: Vec::new(),
+            bridges: Vec::new(),
         }
     }
 }
@@ -516,6 +555,12 @@ mod tests {
                     "corp.example.com".to_string(),
                     vec!["10.1.0.10:5353".to_string()],
                 )],
+                bridges: vec![BridgeSummary {
+                    name: "lab".to_string(),
+                    endpoint_id: "endpointid".to_string(),
+                    domains: vec!["*.svc".to_string()],
+                    cidrs: vec!["fd34::/64".to_string()],
+                }],
             },
         );
         let decoded = decode_hello_response(&encode_hello_response(&resp).unwrap()).unwrap();
@@ -537,6 +582,15 @@ mod tests {
             decoded.dns_forwards,
             vec![("corp.example.com".to_string(), vec!["10.1.0.10:5353".to_string()])]
         );
+        assert_eq!(
+            decoded.bridges,
+            vec![BridgeSummary {
+                name: "lab".to_string(),
+                endpoint_id: "endpointid".to_string(),
+                domains: vec!["*.svc".to_string()],
+                cidrs: vec!["fd34::/64".to_string()],
+            }]
+        );
 
         // A rejection carries no routed set but still carries the server nonce.
         let rej = HelloResponse::rejected(7, "nope");
@@ -550,6 +604,18 @@ mod tests {
         assert!(decoded.agent_aliases.is_empty());
         assert!(decoded.connected_agents.is_empty());
         assert!(decoded.dns_forwards.is_empty());
+        assert!(decoded.bridges.is_empty());
+    }
+
+    #[test]
+    fn hello_bridge_roundtrip() {
+        let hello = Hello::new_bridge("token", 42);
+        let decoded = decode_hello(&encode_hello(&hello).unwrap()).unwrap();
+        assert_eq!(decoded.role, PeerRole::Bridge);
+        assert_eq!(decoded.auth_token, "token");
+        assert_eq!(decoded.client_instance_nonce, 42);
+        assert_eq!(decoded.machine_id, None);
+        assert!(!decoded.duplicate_server_observed);
     }
 
     #[test]

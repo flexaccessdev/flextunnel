@@ -4,18 +4,20 @@
 //!
 //! ## Token Format
 //! - Exactly 49 characters
-//! - Starts with a 3-char role prefix: `ftc` (client) or `fta` (agent)
+//! - Starts with a 3-char role prefix: `ftc` (client), `fta` (agent), or `ftb`
+//!   (bridge — a server connecting to another server)
 //! - Remaining 46 characters are Base64URL (no padding)
 //! - Decoded payload is exactly 34 bytes:
 //!   - First 32 bytes: random entropy
 //!   - Last 2 bytes: CRC16-CCITT-FALSE checksum (big-endian) of the 32 random bytes
 //!
-//! Client and agent tokens share this format but use distinct prefixes so a
-//! client credential can never authenticate as an agent (or vice versa) — the
-//! server validates each against the prefix for the connecting peer's role.
+//! All roles share this format but use distinct prefixes so a credential for
+//! one role can never authenticate as another — the server validates each
+//! against the prefix for the connecting peer's role.
 //!
 //! Generate client tokens with `flextunnel generate-auth-token`, agent tokens
-//! with `flextunnel-agent generate-token`.
+//! with `flextunnel-agent generate-token`, bridge tokens with
+//! `flextunnel generate-bridge-token`.
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -31,6 +33,9 @@ pub const CLIENT_TOKEN_PREFIX: &str = "ftc";
 
 /// Required prefix for agent tokens.
 pub const AGENT_TOKEN_PREFIX: &str = "fta";
+
+/// Required prefix for bridge tokens (server-to-server).
+pub const BRIDGE_TOKEN_PREFIX: &str = "ftb";
 
 /// Number of random bytes in token payload.
 const RANDOM_BYTES_LEN: usize = 32;
@@ -76,6 +81,11 @@ pub fn generate_agent_token() -> String {
     generate_token_with_prefix(AGENT_TOKEN_PREFIX)
 }
 
+/// Generate a new bridge authentication token (prefix `ftb`).
+pub fn generate_bridge_token() -> String {
+    generate_token_with_prefix(BRIDGE_TOKEN_PREFIX)
+}
+
 /// Generate a new authentication token with the given 3-char role prefix.
 ///
 /// Format: `<prefix>` + base64url_no_pad(32 random bytes + 2-byte CRC16) = 49
@@ -101,6 +111,11 @@ pub fn validate_client_token(token: &str) -> Result<()> {
 /// Validate an agent token (prefix `fta`).
 pub fn validate_agent_token(token: &str) -> Result<()> {
     validate_token_with_prefix(token, AGENT_TOKEN_PREFIX)
+}
+
+/// Validate a bridge token (prefix `ftb`).
+pub fn validate_bridge_token(token: &str) -> Result<()> {
+    validate_token_with_prefix(token, BRIDGE_TOKEN_PREFIX)
 }
 
 /// Validate token format against a specific role prefix.
@@ -502,6 +517,23 @@ mod tests {
         assert!(validate_client_token(&agent).is_err());
         let client = generate_client_token();
         assert!(validate_agent_token(&client).is_err());
+    }
+
+    #[test]
+    fn test_bridge_token_format_and_prefix_isolation() {
+        // Bridge tokens are well-formed with the `ftb` prefix...
+        let bridge = generate_bridge_token();
+        assert_eq!(bridge.len(), TOKEN_LENGTH);
+        assert!(bridge.starts_with(BRIDGE_TOKEN_PREFIX));
+        assert!(validate_bridge_token(&bridge).is_ok());
+
+        // ...and the three pools are mutually exclusive: a bridge token is not
+        // a valid client or agent token, and neither of those is a valid
+        // bridge token.
+        assert!(validate_client_token(&bridge).is_err());
+        assert!(validate_agent_token(&bridge).is_err());
+        assert!(validate_bridge_token(&generate_client_token()).is_err());
+        assert!(validate_bridge_token(&generate_agent_token()).is_err());
     }
 
     #[test]

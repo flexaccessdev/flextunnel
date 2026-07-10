@@ -297,7 +297,8 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
 /// { "connected": true, "domains": ["*.example.com"], "cidrs": ["10.0.0.0/8"],
 ///   "host_aliases": [["nas.internal", "192.168.1.9"]],
 ///   "agent_aliases": [{"name": "workstation.internal", "status": "connected"}],
-///   "dns_forwards": [{"suffix": "corp.example.com", "servers": ["10.1.0.10:5353"]}] }
+///   "dns_forwards": [{"suffix": "corp.example.com", "servers": ["10.1.0.10:5353"]}],
+///   "bridges": [{"name": "lab", "endpoint_id": "…", "domains": ["*.svc"], "cidrs": ["fd34::/64"]}] }
 /// ```
 ///
 /// This is the required split-tunnel set the server pushes during the handshake
@@ -320,6 +321,12 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
 /// also informational: each entry is `{"suffix", "servers"}` where names under
 /// `suffix` are resolved via `servers` (`IP` or `IP:port`) instead of the
 /// server's system resolver. Empty when the server configures none.
+///
+/// `bridges` is the server's outbound bridge-route table (targets it forwards
+/// to another flextunnel server), also informational: each entry is
+/// `{"name", "endpoint_id", "domains", "cidrs"}`. The bridged rules are already
+/// part of the routed set, so there is nothing to enforce caller-side. Empty
+/// when the server configures none.
 ///
 /// Returns `1` on success (full JSON written), `0` if `out_buf` was too small
 /// (the JSON is truncated; retry with a larger buffer), and `-1` for a null
@@ -360,6 +367,18 @@ pub unsafe extern "C" fn flextunnel_routes(
                     serde_json::json!({ "suffix": suffix, "servers": servers })
                 })
                 .collect();
+            let bridges: Vec<_> = routes
+                .bridges
+                .iter()
+                .map(|b| {
+                    serde_json::json!({
+                        "name": b.name,
+                        "endpoint_id": b.endpoint_id,
+                        "domains": b.domains,
+                        "cidrs": b.cidrs,
+                    })
+                })
+                .collect();
             serde_json::json!({
                 "connected": routes.connected,
                 "domains": routes.domains,
@@ -367,6 +386,7 @@ pub unsafe extern "C" fn flextunnel_routes(
                 "host_aliases": routes.host_aliases,
                 "agent_aliases": agent_aliases,
                 "dns_forwards": dns_forwards,
+                "bridges": bridges,
             })
             .to_string()
         }

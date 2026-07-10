@@ -10,6 +10,11 @@
 //! (`flextunnel-cli`), the `flextunnel-agent` binary, and the iOS C FFI staticlib
 //! (`flextunnel-ffi`).
 
+// Re-exported so downstream crates (CLI, desktop) can name iroh types (e.g.
+// `EndpointId`) without declaring their own iroh dependency, which would risk
+// a version skew against the one the core is built with.
+pub use iroh;
+
 pub mod app;
 pub mod auth;
 pub mod blocklist;

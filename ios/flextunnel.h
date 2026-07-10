@@ -79,7 +79,8 @@ int flextunnel_health(const FlextunnelHandle *handle);
  *   {"connected":true,"domains":["*.example.com"],"cidrs":["10.0.0.0/8"],
  *    "host_aliases":[["nas.internal","192.168.1.9"]],
  *    "agent_aliases":[{"name":"workstation.internal","status":"connected"}],
- *    "dns_forwards":[{"suffix":"corp.example.com","servers":["10.1.0.10:5353"]}]}
+ *    "dns_forwards":[{"suffix":"corp.example.com","servers":["10.1.0.10:5353"]}],
+ *    "bridges":[{"name":"lab","endpoint_id":"…","domains":["*.svc"],"cidrs":["fd34::/64"]}]}
  * This is the required split-tunnel set the server pushes during the handshake
  * — the domains/CIDRs routed through the tunnel (off-list targets connect
  * directly). Before the first successful handshake, connected is false and the
@@ -92,7 +93,11 @@ int flextunnel_health(const FlextunnelHandle *handle);
  * while the tunnel is down, or when the view has gone stale. dns_forwards is the
  * server's conditional DNS-forwarding table, also informational: each entry is
  * {"suffix","servers"} — names under suffix resolve via servers instead of the
- * server's system resolver. Empty when none are configured.
+ * server's system resolver. Empty when none are configured. bridges is the
+ * server's outbound bridge-route table (targets it forwards to another
+ * flextunnel server), also informational: each entry is
+ * {"name","endpoint_id","domains","cidrs"}; the bridged rules are already part
+ * of the routed set. Empty when none are configured.
  *
  * Returns 1 on success (full JSON written), 0 if out_buf was too small (the JSON
  * is truncated; retry larger), and -1 for a NULL handle or if the route snapshot

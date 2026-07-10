@@ -31,6 +31,34 @@ pub struct AgentRoute {
     pub machine_id: String,
 }
 
+/// One `[bridges.<name>]` entry: a split-tunnel route forwarding matching
+/// targets to **another flextunnel server** over a persistent server-to-server
+/// connection. The map key is a friendly label used in logs and status
+/// displays. Matched targets are forwarded verbatim — the target server
+/// applies its own routed set, host aliases, agent routes, and DNS forwards,
+/// and resolves domain targets on its side. Bridge rules must be covered by
+/// this server's routed set (validated at startup), since off-list targets are
+/// rejected before routing. Single hop: a stream that arrived over a bridge is
+/// never bridged again.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeConfig {
+    /// The target server's iroh endpoint id.
+    pub endpoint_id: String,
+    /// Bridge auth token (an `ftb` token accepted by the target server's
+    /// `bridge_auth_tokens`). Exactly one of `auth_token`/`auth_token_file`.
+    pub auth_token: Option<String>,
+    /// File containing the bridge auth token.
+    pub auth_token_file: Option<PathBuf>,
+    /// Domain rules forwarded to the target server (routed-set syntax: exact,
+    /// `*.x`, or `*`).
+    #[serde(default)]
+    pub domains: Vec<String>,
+    /// CIDR / bare-IP rules forwarded to the target server.
+    #[serde(default)]
+    pub cidrs: Vec<String>,
+}
+
 /// Server config file schema. Every field is optional; CLI flags override these.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,6 +111,19 @@ pub struct ServerConfig {
     /// system resolver; everything else uses the system resolver. Keys are
     /// matched most-specific-first. See [`crate::proxy::DnsForwarder`].
     pub dns_forwards: Option<HashMap<String, Vec<String>>>,
+    /// Outbound bridge routes: targets matching a bridge's rules are forwarded
+    /// to that bridge's server instead of dialed locally. See [`BridgeConfig`].
+    pub bridges: Option<HashMap<String, BridgeConfig>>,
+    /// Endpoint ids of servers allowed to connect **to this server** as
+    /// bridges. Empty/absent = inbound bridging disabled. A connecting bridge
+    /// must present both an allowlisted (TLS-authenticated) endpoint id and a
+    /// valid `ftb` token from `bridge_auth_tokens`.
+    pub allowed_bridge_servers: Option<Vec<String>>,
+    /// Accepted bridge auth tokens (inline list) — a separate pool from client
+    /// and agent tokens, using the `ftb` prefix.
+    pub bridge_auth_tokens: Option<Vec<String>>,
+    /// File of accepted bridge auth tokens (one per line).
+    pub bridge_auth_tokens_file: Option<PathBuf>,
 }
 
 /// Client config file schema. Every field is optional; CLI flags override these.
@@ -155,6 +196,15 @@ pub struct ResolvedServer {
     /// Conditional DNS-forwarding rules, suffix keys lowercased for
     /// case-insensitive matching (parsed into a `DnsForwarder` at startup).
     pub dns_forwards: HashMap<String, Vec<String>>,
+    /// Outbound bridge routes keyed by their friendly label, shape-validated
+    /// (token source, non-empty rules, unique endpoint ids) with token-file
+    /// paths tilde-expanded. See [`BridgeConfig`].
+    pub bridges: HashMap<String, BridgeConfig>,
+    /// Endpoint ids of servers allowed to bridge into this server (parsed and
+    /// checked against `own_id` at startup).
+    pub allowed_bridge_servers: Vec<String>,
+    pub bridge_auth_tokens: Vec<String>,
+    pub bridge_auth_tokens_file: Option<PathBuf>,
     /// Path to the duplicate-id blocklist file. Always the fixed default
     /// (`~/.config/flextunnel/blocklist.json`); it is deliberately **not**
     /// configurable, since relocating this security guard rail would let it be
@@ -291,6 +341,12 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
         } else {
             (file.agent_auth_tokens, file.agent_auth_tokens_file)
         };
+    let (bridge_auth_tokens, bridge_auth_tokens_file) =
+        if cli.bridge_auth_tokens.is_some() || cli.bridge_auth_tokens_file.is_some() {
+            (cli.bridge_auth_tokens, cli.bridge_auth_tokens_file)
+        } else {
+            (file.bridge_auth_tokens, file.bridge_auth_tokens_file)
+        };
 
     // File-only (no CLI flag). Lowercase keys so matching is case-insensitive
     // against a lowercased requested host. Reject entries that collide only by
@@ -335,6 +391,35 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
         }
     }
 
+    // Bridges are file-only (no CLI flag). Shape-validate each entry here so
+    // bad bridge config fails at startup with the offending name; I/O-dependent
+    // validation (endpoint-id parsing, token loading, routed-set coverage)
+    // happens at server startup.
+    let mut bridges = cli.bridges.or(file.bridges).unwrap_or_default();
+    let mut seen_endpoint_ids: HashMap<&str, &str> = HashMap::new();
+    let mut names: Vec<&String> = bridges.keys().collect();
+    names.sort();
+    for name in names {
+        let b = &bridges[name];
+        if b.auth_token.is_some() == b.auth_token_file.is_some() {
+            anyhow::bail!(
+                "bridge '{name}' must set exactly one of auth_token / auth_token_file"
+            );
+        }
+        if b.domains.is_empty() && b.cidrs.is_empty() {
+            anyhow::bail!("bridge '{name}' has no domains and no cidrs; it would never match");
+        }
+        if let Some(other) = seen_endpoint_ids.insert(b.endpoint_id.as_str(), name) {
+            anyhow::bail!(
+                "bridges '{other}' and '{name}' target the same endpoint_id; \
+                 merge their domains/cidrs into one entry"
+            );
+        }
+    }
+    for b in bridges.values_mut() {
+        b.auth_token_file = b.auth_token_file.take().map(|p| expand_tilde(&p));
+    }
+
     // Fixed at the default (~/.config/flextunnel/blocklist.json) and NOT
     // overridable via CLI or config: the blocklist is a security guard rail, and
     // letting it be pointed elsewhere would let it be bypassed. Fail fast if the
@@ -362,6 +447,13 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
             .unwrap_or_default(),
         routed_cidrs: cli.routed_cidrs.or(file.routed_cidrs).unwrap_or_default(),
         dns_forwards,
+        bridges,
+        allowed_bridge_servers: cli
+            .allowed_bridge_servers
+            .or(file.allowed_bridge_servers)
+            .unwrap_or_default(),
+        bridge_auth_tokens: bridge_auth_tokens.unwrap_or_default(),
+        bridge_auth_tokens_file: bridge_auth_tokens_file.map(|p| expand_tilde(&p)),
         blocklist_file,
     })
 }
@@ -629,6 +721,87 @@ mod tests {
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
         assert!(err.to_string().contains("dns_forwards"), "{err}");
+    }
+
+    #[test]
+    fn bridges_parsed_and_validated() {
+        let toml = r#"
+            allowed_bridge_servers = ["endpointid_a"]
+            bridge_auth_tokens = ["ftbAAA"]
+
+            [bridges.lab]
+            endpoint_id = "endpointid_b"
+            auth_token = "ftbBBB"
+            domains = ["*.svc"]
+            cidrs = ["fd34::/64"]
+
+            [bridges.other]
+            endpoint_id = "endpointid_c"
+            auth_token_file = "~/bridge.token"
+            cidrs = ["10.9.0.0/16"]
+        "#;
+        let file: ServerConfig = toml::from_str(toml).unwrap();
+        let r = resolve_server(ServerConfig::default(), Some(file)).unwrap();
+        let lab = &r.bridges["lab"];
+        assert_eq!(lab.endpoint_id, "endpointid_b");
+        assert_eq!(lab.auth_token.as_deref(), Some("ftbBBB"));
+        assert_eq!(lab.domains, vec!["*.svc"]);
+        assert_eq!(lab.cidrs, vec!["fd34::/64"]);
+        // Token-file paths are tilde-expanded.
+        let other = &r.bridges["other"];
+        assert_eq!(other.auth_token_file, Some(expand_tilde(Path::new("~/bridge.token"))));
+        assert_eq!(r.allowed_bridge_servers, vec!["endpointid_a".to_string()]);
+        assert_eq!(r.bridge_auth_tokens, vec!["ftbAAA".to_string()]);
+        // Defaults to empty when unset.
+        let empty = resolve_server(ServerConfig::default(), None).unwrap();
+        assert!(empty.bridges.is_empty());
+        assert!(empty.allowed_bridge_servers.is_empty());
+        assert!(empty.bridge_auth_tokens.is_empty());
+    }
+
+    #[test]
+    fn bridge_requires_exactly_one_token_source() {
+        for body in [
+            // Neither source.
+            "endpoint_id = \"e\"\ndomains = [\"*.svc\"]",
+            // Both sources.
+            "endpoint_id = \"e\"\nauth_token = \"ftbAAA\"\nauth_token_file = \"t\"\ndomains = [\"*.svc\"]",
+        ] {
+            let toml = format!("[bridges.lab]\n{body}\n");
+            let file: ServerConfig = toml::from_str(&toml).unwrap();
+            let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
+            assert!(err.to_string().contains("exactly one of auth_token"), "{err}");
+        }
+    }
+
+    #[test]
+    fn bridge_with_no_rules_is_rejected() {
+        let toml = r#"
+            [bridges.lab]
+            endpoint_id = "e"
+            auth_token = "ftbAAA"
+        "#;
+        let file: ServerConfig = toml::from_str(toml).unwrap();
+        let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
+        assert!(err.to_string().contains("never match"), "{err}");
+    }
+
+    #[test]
+    fn bridges_with_duplicate_endpoint_id_are_rejected() {
+        let toml = r#"
+            [bridges.a]
+            endpoint_id = "same"
+            auth_token = "ftbAAA"
+            domains = ["*.svc"]
+
+            [bridges.b]
+            endpoint_id = "same"
+            auth_token = "ftbBBB"
+            cidrs = ["10.0.0.0/8"]
+        "#;
+        let file: ServerConfig = toml::from_str(toml).unwrap();
+        let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
+        assert!(err.to_string().contains("same endpoint_id"), "{err}");
     }
 
     #[test]

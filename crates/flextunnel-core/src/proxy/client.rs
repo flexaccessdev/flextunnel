@@ -159,6 +159,11 @@ pub struct TunnelRoutes {
     /// resolution; shown in client status UIs like the server status page shows
     /// them. Empty when the server configures no `[dns_forwards]`.
     pub dns_forwards: Vec<(String, Vec<String>)>,
+    /// Server-side outbound bridge routes (targets forwarded to another
+    /// server), sorted by name. Informational only — the server does the
+    /// forwarding; shown in client status UIs like the server status page shows
+    /// them. Empty when the server configures no `[bridges]`.
+    pub bridges: Vec<signaling::BridgeSummary>,
 }
 
 /// How long the client's connected-agent view stays trustworthy after the last
@@ -712,6 +717,7 @@ impl ProxyClient {
                 .collect();
             routes.agent_status_updated = Some(Instant::now());
             routes.dns_forwards = response.dns_forwards.clone();
+            routes.bridges = response.bridges.clone();
         }
         Ok((routed_set, send, recv))
     }

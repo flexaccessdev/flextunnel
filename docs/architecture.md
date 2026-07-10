@@ -39,7 +39,7 @@ server.
 |---|---|
 | `main.rs` | clap CLI, command dispatch, logger/runtime, graceful `endpoint.close()`, shutdown signal |
 | `config.rs` | TOML config files (`-c`/`--default-config`), `deny_unknown_fields`, CLI>file>default merge, `~` expansion |
-| `auth.rs` | auth-token generation/validation/file-loading (CRC16-checksummed Base64URL tokens); separate client (`ftc`) and agent (`fta`) prefixes |
+| `auth.rs` | auth-token generation/validation/file-loading (CRC16-checksummed Base64URL tokens); separate client (`ftc`), agent (`fta`), and bridge (`ftb`) prefixes |
 | `blocklist.rs` | persisted duplicate-id blocklist (JSON): confirmed duplicate client ids, duplicate agent machine ids, + the server's own conflicted id |
 | `secret.rs` | server secret-key (iroh identity) generation and loading; prints the `EndpointId` |
 | `error.rs` | `ProxyError` (`Network`/`Config`/`Signaling`/`AuthenticationFailed`/`ConnectionLost`) + `is_recoverable()` |
@@ -52,7 +52,20 @@ server.
 | `proxy/routed_set.rs` | parsed tunnel set: client split-tunnel decision + server whitelist enforcement |
 | `proxy/server.rs` | accept + auth + routed-set whitelist + per-stream DNS/connect/pipe; status page; agent registry + reverse routing |
 | `proxy/agent.rs` | reverse-routing exit point: dial + auth (`role=Agent`, derived network id) + accept server-opened streams + dial loopback |
+| `proxy/bridge.rs` | outbound server-to-server bridge: persistent upstream connection (`role=Bridge`, `ftb` token) with retry-forever reconnect; matching streams splice over it |
 | `proxy/dial.rs` | `Target` → TCP dial + `connect_and_pipe` (the shared server/agent exit-point body) |
+
+**Bridges** split-tunnel *across servers*: a `[bridges.<name>]` entry on server A
+forwards targets matching its domain/CIDR rules verbatim over a persistent
+connection to server B, which re-enforces its own routed set, applies its own
+aliases/agent routes/DNS forwards, and dials from its network. A dials out on its
+own server endpoint, so the TLS-authenticated id it presents is its persistent
+server id — which B must list in `allowed_bridge_servers` in addition to
+validating the `ftb` token (both gates required; empty allowlist = inbound
+bridging disabled). Bridged-in streams are served like client streams but are
+never re-bridged (single hop, so mutual bridges cannot loop). Bridge rules must
+be reachable through A's routed set (validated at startup, like `dns_forwards`
+coverage).
 
 The reverse-routing agent ships as a **separate binary crate** (`flextunnel-agent`,
 Linux/macOS/Windows, not in the module map above): it reads the OS-native machine
@@ -78,17 +91,19 @@ secret: both peers must offer the same ALPN or negotiation fails. Access control
 is enforced by the auth handshake below, not by the ALPN.
 
 ### 2. Auth handshake (control stream)
-The protocol version is `PROTOCOL_VERSION = 6`. On the first bi-stream the
+The protocol version is `PROTOCOL_VERSION = 8`. On the first bi-stream the
 connecting peer sends
 `Hello { version, auth_token, client_instance_nonce, duplicate_server_observed, role, machine_id }`
 and the server replies
-`HelloResponse { version, accepted, reject_reason, server_instance_nonce, routed_*, host_aliases, agent_aliases, connected_agents }`,
+`HelloResponse { version, accepted, reject_reason, server_instance_nonce, routed_*, host_aliases, agent_aliases, connected_agents, dns_forwards, bridges }`,
 both length-prefixed JSON via `signaling::write_message` / `read_message` (4-byte
 big-endian length + payload, capped at `MAX_HANDSHAKE_SIZE` = 64 KiB). The server
-checks the token against the role's accepted set (`ftc` client tokens or `fta`
-agent tokens). Clients send `role = Client` with no machine id; agents send
+checks the token against the role's accepted set (`ftc` client, `fta` agent, or
+`ftb` bridge tokens). Clients send `role = Client` with no machine id; agents send
 `role = Agent` plus their derived network id (`ftm1…`, the hashed machine id — the
-raw id never goes on the wire). On rejection it closes the
+raw id never goes on the wire); bridging servers send `role = Bridge` with no
+machine id (their persistent iroh id is TLS-authenticated and checked against the
+`allowed_bridge_servers` allowlist). On rejection it closes the
 connection gracefully (with a short drain) carrying the reason. `Hello`'s
 `Debug` impl redacts `auth_token`.
 
