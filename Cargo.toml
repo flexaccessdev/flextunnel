@@ -23,6 +23,7 @@ clap = { version = "4", features = ["derive"] }
 dirs = "6"
 env_logger = "0.11"
 ipnetwork = "0.21"
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio"] }
 iroh = "1.0.1"
 iroh-mdns-address-lookup = "0.4.0"
 libc = "0.2"

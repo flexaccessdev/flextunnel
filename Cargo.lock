@@ -1819,6 +1819,7 @@ dependencies = [
  "base64",
  "dirs",
  "env_logger",
+ "hickory-resolver",
  "ipnetwork",
  "iroh",
  "iroh-mdns-address-lookup",

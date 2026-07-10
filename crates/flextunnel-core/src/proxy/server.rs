@@ -6,7 +6,7 @@ use crate::blocklist::{self, BlockList};
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::signaling::{self, ControlMsg, Hello, HelloResponse, PeerRole, Target};
 use crate::proxy::status_page::{self, AgentRouteStatus, ServerStatusTemplate};
-use crate::proxy::{dial, reserved, RoutedSet};
+use crate::proxy::{dial, reserved, DnsForwarder, RoutedSet};
 use crate::transport::LIVENESS_WINDOW;
 use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointId};
@@ -176,6 +176,11 @@ pub struct ProxyServer {
     /// learn the tunnel set from the server (the single source of truth).
     routed_domains: Vec<String>,
     routed_cidrs: Vec<String>,
+    /// Conditional DNS forwarding (split-DNS): names under a configured suffix
+    /// are resolved via that suffix's upstream server instead of the system
+    /// resolver. `None` when no `[dns_forwards]` are configured. See
+    /// [`DnsForwarder`].
+    dns_forwarder: Option<DnsForwarder>,
     /// Live-connection registry for duplicate-client detection.
     registry: Arc<Mutex<Registry>>,
     /// Live agent registry (one connection per machine id) for reverse routing +
@@ -199,6 +204,7 @@ impl ProxyServer {
         routed_set: RoutedSet,
         routed_domains: Vec<String>,
         routed_cidrs: Vec<String>,
+        dns_forwarder: Option<DnsForwarder>,
         blocklist: BlockList,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -211,6 +217,7 @@ impl ProxyServer {
             routed_set,
             routed_domains,
             routed_cidrs,
+            dns_forwarder,
             registry: Arc::new(Mutex::new(Registry::new())),
             agent_registry: Arc::new(Mutex::new(AgentRegistry::new())),
             blocklist: Arc::new(Mutex::new(blocklist)),
@@ -966,7 +973,7 @@ async fn handle_socks_stream(
 
     let target = apply_alias(requested, &server.host_aliases);
     log::debug!("Stream target: {target:?}");
-    dial::connect_and_pipe(send, recv, &target).await
+    dial::connect_and_pipe(send, recv, &target, server.dns_forwarder.as_ref()).await
 }
 
 /// Serve a reserved `flextunnel.internal` request: the status page for the exact

@@ -109,3 +109,24 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 # filtering happens on the requested hostname first.
 # [agent_routes]
 # "web.internal" = { machine_id = "ftm1…" }   # from `flextunnel-agent machine-id`
+
+# Optional conditional DNS forwarding (split-DNS), applied server-side when the
+# server resolves a tunneled hostname. By default the server uses its own system
+# resolver for every name; a [dns_forwards] entry overrides that for names under
+# a given suffix, sending them to a specific upstream DNS server instead. This
+# lets clients reach internal names that only a particular (e.g. internal) DNS
+# server knows how to resolve.
+#
+# Each key is a BARE domain suffix and each value a list of DNS servers (`IP` or
+# `IP:port`, default port 53). A hostname that equals the suffix or is a
+# subdomain of it (on a label boundary) is resolved via that suffix's server(s);
+# everything else keeps using the system resolver. Matching is case-insensitive
+# and most-specific-first (a longer suffix wins over a shorter one). List
+# multiple servers for redundancy; TCP fallback is used automatically.
+#
+# The suffix must still be reachable through the routed set above — add it (or a
+# `*.suffix` wildcard) to routed_domains, since the whitelist is enforced on the
+# requested hostname before resolution.
+# [dns_forwards]
+# "local.168234.xyz" = ["10.0.0.53"]              # -> internal resolver on :53
+# "corp.example.com" = ["10.1.0.10:5353", "10.1.0.11"]  # custom port + failover

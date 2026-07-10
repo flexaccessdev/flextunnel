@@ -16,7 +16,7 @@ mod lock;
 
 use flextunnel_core::app;
 use flextunnel_core::blocklist::BlockList;
-use flextunnel_core::proxy::{ClientConfig, ProxyClient, ProxyServer, RoutedSet};
+use flextunnel_core::proxy::{ClientConfig, DnsForwarder, ProxyClient, ProxyServer, RoutedSet};
 use flextunnel_core::transport::endpoint::{
     create_client_endpoint, create_server_endpoint, secret_to_endpoint_id,
 };
@@ -204,6 +204,7 @@ async fn run_async(command: Command) -> Result<()> {
                 host_aliases: None, // config-file only; no CLI flag
                 routed_domains: None, // config-file only; no CLI flag
                 routed_cidrs: None,   // config-file only; no CLI flag
+                dns_forwards: None,   // config-file only; no CLI flag
             };
             let file = config::load_server_config(config_path.as_deref(), default_config)?;
             run_server(config::resolve_server(cli, file)?).await
@@ -331,6 +332,11 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
         );
     }
 
+    // Build the conditional DNS-forwarding table before creating the endpoint so
+    // a bad server spec fails fast (same reasoning as the routed set above).
+    let dns_forwarder = DnsForwarder::new(&r.dns_forwards)
+        .context("Invalid dns_forwards configuration")?;
+
     let endpoint = create_server_endpoint(&r.relay_urls, secret_key, r.dns_server.as_deref())
         .await
         .context("Failed to create iroh endpoint")?;
@@ -343,6 +349,12 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
 
     if !r.host_aliases.is_empty() {
         log::info!("Loaded {} host alias(es)", r.host_aliases.len());
+    }
+    if !r.dns_forwards.is_empty() {
+        log::info!(
+            "Loaded {} conditional DNS-forwarding rule(s)",
+            r.dns_forwards.len()
+        );
     }
     log::info!(
         "Tunnel set: {} domain rule(s), {} CIDR(s) — off-list tunnel requests are rejected; pushed to clients on connect",
@@ -358,6 +370,7 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
         routed_set,
         r.routed_domains,
         r.routed_cidrs,
+        dns_forwarder,
         blocklist,
     );
     let run = async {
