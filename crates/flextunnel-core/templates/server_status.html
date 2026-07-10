@@ -36,6 +36,11 @@
   td { padding: 0.2rem 0.5rem 0.2rem 0; vertical-align: top; }
   td:first-child { white-space: nowrap; color: #444d56; }
   .counts td:first-child { white-space: normal; }
+  .bridge { margin-top: 0.75rem; }
+  .bridge:first-child { margin-top: 0; }
+  .bridge-name { font-weight: 600; margin-bottom: 0.15rem; }
+  .bridge table { margin-left: 1rem; }
+  .bridge td:first-child { padding-right: 0.75rem; }
   @media (prefers-color-scheme: dark) {
     body { background: #0d1117; color: #c9d1d9; }
     section { background: #161b22; border-color: #30363d; }
@@ -127,15 +132,20 @@
     {% if bridges.is_empty() %}
       <p class="empty">none configured</p>
     {% else %}
-      <table>
       {% for bridge in bridges %}
-        <tr>
-          <td class="mono">{{ bridge.name }}</td>
-          <td class="mono">&rarr; {{ bridge.endpoint_id }}<br>[{{ bridge.domains|join(", ") }}{% if !bridge.domains.is_empty() && !bridge.cidrs.is_empty() %}, {% endif %}{{ bridge.cidrs|join(", ") }}]</td>
-          <td>{% if bridge.connected %}<span class="ok">connected</span>{% else %}<span class="warn">disconnected</span>{% endif %}</td>
-        </tr>
+        <div class="bridge">
+          <div class="bridge-name mono">{{ bridge.name }} {% if bridge.connected %}<span class="ok">connected</span>{% else %}<span class="warn">disconnected</span>{% endif %}</div>
+          <table>
+            <tr><td>endpoint id</td><td class="mono">{{ bridge.endpoint_id }}</td></tr>
+            {% if !bridge.domains.is_empty() %}
+            <tr><td>routed domains</td><td><ul>{% for d in bridge.domains %}<li class="mono">{{ d }}</li>{% endfor %}</ul></td></tr>
+            {% endif %}
+            {% if !bridge.cidrs.is_empty() %}
+            <tr><td>routed CIDRs</td><td><ul>{% for c in bridge.cidrs %}<li class="mono">{{ c }}</li>{% endfor %}</ul></td></tr>
+            {% endif %}
+          </table>
+        </div>
       {% endfor %}
-      </table>
     {% endif %}
   </section>
 

@@ -774,17 +774,30 @@ fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
             .size(12),
         );
         for bridge in &routes.bridges {
-            let rules: Vec<String> = bridge
-                .domains
-                .iter()
-                .chain(bridge.cidrs.iter())
-                .cloned()
-                .collect();
-            col = col.push(arrow_copy_row(
-                format!("{} [{}]", bridge.name, rules.join(", ")),
-                bridge.endpoint_id.clone(),
-                false,
-            ));
+            col = col.push(space().height(4));
+            col = col.push(mono(format!("{}:", bridge.name)));
+            col = col.push(
+                row![
+                    space().width(16),
+                    text("endpoint id:").size(12).style(style::dim_text),
+                    mono(bridge.endpoint_id.clone()),
+                    copy_button(bridge.endpoint_id.clone()),
+                ]
+                .spacing(6)
+                .align_y(Center),
+            );
+            if !bridge.domains.is_empty() {
+                col = col.push(indented_label("routed domains:"));
+                for d in &bridge.domains {
+                    col = col.push(indented_item(d));
+                }
+            }
+            if !bridge.cidrs.is_empty() {
+                col = col.push(indented_label("routed CIDRs:"));
+                for c in &bridge.cidrs {
+                    col = col.push(indented_item(c));
+                }
+            }
         }
     }
     if !routes.agent_aliases.is_empty() {
@@ -997,6 +1010,22 @@ fn arrow_copy_row<'a>(left: String, right: String, dim: bool) -> Element<'a, Mes
     .spacing(8)
     .align_y(Center)
     .into()
+}
+
+/// A dimmed sub-label indented under a route entry (e.g. "routed domains:").
+fn indented_label<'a>(label: &'static str) -> Element<'a, Message> {
+    row![space().width(16), text(label).size(12).style(style::dim_text)]
+        .spacing(6)
+        .align_y(Center)
+        .into()
+}
+
+/// A monospace list item indented under a sub-label (rendered as "- value").
+fn indented_item<'a>(value: &str) -> Element<'a, Message> {
+    row![space().width(32), mono(format!("- {value}"))]
+        .spacing(6)
+        .align_y(Center)
+        .into()
 }
 
 /// A monospace routing entry with a right-aligned Copy button. `trailing` is an
