@@ -16,7 +16,7 @@ mod lock;
 
 use flextunnel_core::app;
 use flextunnel_core::blocklist::BlockList;
-use flextunnel_core::proxy::{ClientConfig, ProxyClient, ProxyServer, RoutedSet};
+use flextunnel_core::proxy::{ClientConfig, DnsForwarder, ProxyClient, ProxyServer, RoutedSet};
 use flextunnel_core::transport::endpoint::{
     create_client_endpoint, create_server_endpoint, secret_to_endpoint_id,
 };
@@ -204,6 +204,7 @@ async fn run_async(command: Command) -> Result<()> {
                 host_aliases: None, // config-file only; no CLI flag
                 routed_domains: None, // config-file only; no CLI flag
                 routed_cidrs: None,   // config-file only; no CLI flag
+                dns_forwards: None,   // config-file only; no CLI flag
             };
             let file = config::load_server_config(config_path.as_deref(), default_config)?;
             run_server(config::resolve_server(cli, file)?).await
@@ -249,6 +250,23 @@ async fn run_async(command: Command) -> Result<()> {
         }
         _ => unreachable!("synchronous commands handled in main()"),
     }
+}
+
+/// Reject any conditional DNS-forwarding suffix the routed set does not cover.
+/// Such a forward is dead config: the server rejects off-list targets before
+/// resolution, so a suffix no routed rule reaches would never fire.
+fn validate_dns_forwards_coverage(forwarder: &DnsForwarder, routed_set: &RoutedSet) -> Result<()> {
+    for suffix in forwarder.suffixes() {
+        if !routed_set.covers_suffix(suffix) {
+            anyhow::bail!(
+                "[dns_forwards] suffix {suffix:?} is not covered by the routed set, so it \
+                 would never be used: the server rejects off-list targets before resolving \
+                 them. Add \"*.{suffix}\" (and/or \"{suffix}\") to routed_domains, or remove \
+                 the forward."
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn run_server(r: config::ResolvedServer) -> Result<()> {
@@ -331,6 +349,14 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
         );
     }
 
+    // Build the conditional DNS-forwarding table before creating the endpoint so
+    // a bad server spec fails fast (same reasoning as the routed set above).
+    let dns_forwarder = DnsForwarder::new(&r.dns_forwards)
+        .context("Invalid dns_forwards configuration")?;
+    if let Some(forwarder) = &dns_forwarder {
+        validate_dns_forwards_coverage(forwarder, &routed_set)?;
+    }
+
     let endpoint = create_server_endpoint(&r.relay_urls, secret_key, r.dns_server.as_deref())
         .await
         .context("Failed to create iroh endpoint")?;
@@ -343,6 +369,12 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
 
     if !r.host_aliases.is_empty() {
         log::info!("Loaded {} host alias(es)", r.host_aliases.len());
+    }
+    if !r.dns_forwards.is_empty() {
+        log::info!(
+            "Loaded {} conditional DNS-forwarding rule(s)",
+            r.dns_forwards.len()
+        );
     }
     log::info!(
         "Tunnel set: {} domain rule(s), {} CIDR(s) — off-list tunnel requests are rejected; pushed to clients on connect",
@@ -358,6 +390,7 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
         routed_set,
         r.routed_domains,
         r.routed_cidrs,
+        dns_forwarder,
         blocklist,
     );
     let run = async {
@@ -442,4 +475,38 @@ async fn run_client(r: config::ResolvedClient) -> Result<()> {
     // Close the endpoint gracefully before it is dropped (see run_server).
     endpoint.close().await;
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn forwarder(suffix: &str) -> DnsForwarder {
+        let mut m = HashMap::new();
+        m.insert(suffix.to_string(), vec!["10.0.0.53".to_string()]);
+        DnsForwarder::new(&m).unwrap().expect("one forward configured")
+    }
+
+    fn routed(domains: &[&str]) -> RoutedSet {
+        let d: Vec<String> = domains.iter().map(|s| s.to_string()).collect();
+        RoutedSet::new(&d, &[]).unwrap()
+    }
+
+    #[test]
+    fn dns_forwards_coverage_accepts_covered_suffix() {
+        let f = forwarder("local.168234.xyz");
+        // A wildcard whose zone reaches the suffix makes the forward live.
+        assert!(validate_dns_forwards_coverage(&f, &routed(&["*.local.168234.xyz"])).is_ok());
+        assert!(validate_dns_forwards_coverage(&f, &routed(&["*"])).is_ok());
+    }
+
+    #[test]
+    fn dns_forwards_coverage_rejects_uncovered_suffix() {
+        let f = forwarder("local.168234.xyz");
+        let err = validate_dns_forwards_coverage(&f, &routed(&["*.example.com"])).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("local.168234.xyz"), "{msg}");
+        assert!(msg.contains("not covered"), "{msg}");
+    }
 }

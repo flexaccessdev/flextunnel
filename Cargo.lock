@@ -1788,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-agent"
-version = "0.0.42"
+version = "0.0.43"
 dependencies = [
  "anyhow",
  "clap",
@@ -1800,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-cli"
-version = "0.0.42"
+version = "0.0.43"
 dependencies = [
  "anyhow",
  "clap",
@@ -1812,13 +1812,14 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-core"
-version = "0.0.42"
+version = "0.0.43"
 dependencies = [
  "anyhow",
  "askama",
  "base64",
  "dirs",
  "env_logger",
+ "hickory-resolver",
  "ipnetwork",
  "iroh",
  "iroh-mdns-address-lookup",
@@ -1839,7 +1840,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-desktop"
-version = "0.0.42"
+version = "0.0.43"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -1866,7 +1867,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-ffi"
-version = "0.0.42"
+version = "0.0.43"
 dependencies = [
  "flextunnel-core",
  "iroh",

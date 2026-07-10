@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod client;
 pub mod dial;
+pub mod dns_forward;
 pub mod http;
 pub mod reserved;
 pub mod server;
@@ -17,5 +18,6 @@ mod e2e_tests;
 
 pub use agent::{AgentConfig, ProxyAgent};
 pub use client::{AgentAlias, AgentConnState, ClientConfig, ProxyClient, TunnelRoutes};
+pub use dns_forward::DnsForwarder;
 pub use routed_set::RoutedSet;
 pub use server::ProxyServer;

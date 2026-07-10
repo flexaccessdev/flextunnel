@@ -1218,7 +1218,9 @@ async fn direct_connect<P: LocalProto, S: LocalStream>(
     target: &signaling::Target,
     upstream_preamble: Option<Vec<u8>>,
 ) -> Result<()> {
-    let dialed = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, dial::dial_target(target)).await;
+    // Split-tunnel direct connections resolve on the device via its own DNS;
+    // server-side conditional forwarding does not apply here.
+    let dialed = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, dial::dial_target(target, None)).await;
     let mut upstream = match dialed {
         Ok(Ok(mut s)) => {
             match &upstream_preamble {

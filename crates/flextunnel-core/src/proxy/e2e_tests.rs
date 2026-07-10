@@ -95,6 +95,7 @@ fn spawn_server_full(
         RoutedSet::new(&routed_domains, &no_cidrs).unwrap(),
         routed_domains,
         no_cidrs,
+        None,
         BlockList::load(blocklist_path).unwrap(),
     );
     tokio::spawn(async move {
@@ -306,7 +307,7 @@ async fn agent_reverse_route_pipes_to_agent_loopback() {
         while let Ok((send, mut recv)) = serve_conn.accept_bi().await {
             tokio::spawn(async move {
                 if let Ok(target) = signaling::read_request(&mut recv).await {
-                    let _ = dial::connect_and_pipe(send, recv, &target).await;
+                    let _ = dial::connect_and_pipe(send, recv, &target, None).await;
                 }
             });
         }

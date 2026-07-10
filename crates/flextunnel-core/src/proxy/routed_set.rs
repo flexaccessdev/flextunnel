@@ -147,6 +147,35 @@ impl RoutedSet {
     fn allows_ip(&self, ip: IpAddr) -> bool {
         self.cidrs.iter().any(|net| net.contains(ip))
     }
+
+    /// Whether the set routes at least one hostname at or under `suffix` — the
+    /// apex `suffix` itself or any subdomain of it. Used to reject a conditional
+    /// DNS-forwarding suffix (see [`crate::proxy::DnsForwarder`]) that no routed
+    /// rule would ever exercise, since such a forward is dead config: the server
+    /// rejects the off-list request before it ever reaches resolution. `suffix`
+    /// must be lowercased and dot-trimmed (a bare domain like `local.168234.xyz`).
+    pub fn covers_suffix(&self, suffix: &str) -> bool {
+        if self.domains_all {
+            return true;
+        }
+        let dot_suffix = format!(".{suffix}");
+        // An exact rule at the apex, or on any subdomain of it.
+        if self.domains_exact.contains(suffix)
+            || self.domains_exact.iter().any(|e| e.ends_with(&dot_suffix))
+        {
+            return true;
+        }
+        // A wildcard rule whose zone overlaps the suffix's subtree: the wildcard
+        // base is the suffix itself (routes its subdomains), an ancestor of it
+        // (routes the apex and everything under it), or a descendant (routes some
+        // inner subtree). `t` is the wildcard base (stored as `.t`).
+        self.domains_suffix.iter().any(|dot_t| {
+            let t = &dot_t[1..];
+            t == suffix                             // `*.suffix`: subdomains of the apex
+                || suffix.ends_with(dot_t.as_str()) // `*.ancestor`: apex + all under it
+                || t.ends_with(dot_suffix.as_str()) // `*.child.suffix`: an inner subtree
+        })
+    }
 }
 
 /// Parse a host string as an IP literal, tolerating a single bracketed IPv6 form
@@ -285,6 +314,31 @@ mod tests {
         let w_dom_only = rs(&["*"], &[]);
         assert!(!w_dom_only.allows(&domain("10.0.0.1")));
         assert!(w_dom_only.allows(&domain("real.hostname")));
+    }
+
+    #[test]
+    fn covers_suffix_matches_routing_reach() {
+        let suffix = "local.168234.xyz";
+
+        // Catch-all and the exact apex both route names under the suffix.
+        assert!(rs(&["*"], &[]).covers_suffix(suffix));
+        assert!(rs(&["local.168234.xyz"], &[]).covers_suffix(suffix));
+        // An exact rule on a subdomain routes at least that host.
+        assert!(rs(&["api.local.168234.xyz"], &[]).covers_suffix(suffix));
+
+        // Wildcards: the suffix itself, an ancestor, or an inner subtree.
+        assert!(rs(&["*.local.168234.xyz"], &[]).covers_suffix(suffix));
+        assert!(rs(&["*.168234.xyz"], &[]).covers_suffix(suffix));
+        assert!(rs(&["*.xyz"], &[]).covers_suffix(suffix));
+        assert!(rs(&["*.db.local.168234.xyz"], &[]).covers_suffix(suffix));
+
+        // No overlap: unrelated domains, a sibling, or a CIDR-only set.
+        assert!(!rs(&["example.com", "*.other.net"], &[]).covers_suffix(suffix));
+        assert!(!rs(&["notlocal.168234.xyz"], &[]).covers_suffix(suffix));
+        assert!(!rs(&["*.notlocal.168234.xyz"], &[]).covers_suffix(suffix));
+        assert!(!rs(&[], &["10.0.0.0/8"]).covers_suffix(suffix));
+        // Case-insensitive (rules are lowercased at build time).
+        assert!(rs(&["*.LOCAL.168234.XYZ"], &[]).covers_suffix(suffix));
     }
 
     #[test]

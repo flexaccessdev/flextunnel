@@ -40,6 +40,18 @@ that set is direct-connected from the client, so add every internal hostname or
 alias you intend to route to `routed_domains`; add literal IP destinations to
 `routed_cidrs` only when you really want those IPs tunneled.
 
+By default the server resolves those names through its own system resolver. If
+some internal names are only known to a specific (e.g. internal) DNS server, add
+a `[dns_forwards]` entry: names under a configured suffix are then resolved via
+that suffix's upstream DNS server instead of the system resolver, with everything
+else unchanged. For example, `"local.168234.xyz" = ["10.0.0.53"]` sends
+`local.168234.xyz` and its subdomains to `10.0.0.53:53`. This is server-side
+only — the client still just sends the hostname (`socks5h` / HTTP proxy). The
+suffix must be on the tunnel set (`routed_domains`), since the whitelist is
+enforced on the requested hostname before resolution — the server refuses to
+start if a forward suffix is not covered (it would be a no-op). See
+`server.toml.example`.
+
 So whatever you use must send the target **hostname** to the proxy and let
 flextunnel resolve it. The two front-ends reach this differently:
 

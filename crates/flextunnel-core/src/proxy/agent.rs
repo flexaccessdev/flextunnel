@@ -265,7 +265,9 @@ async fn handle_routed_stream(send: SendStream, mut recv: RecvStream) -> std::io
         ));
     }
     log::debug!("Agent dialing routed target: {target:?}");
-    dial::connect_and_pipe(send, recv, &target).await
+    // Conditional DNS forwarding is a server-side concern; the agent resolves on
+    // its own network via the system resolver.
+    dial::connect_and_pipe(send, recv, &target, None).await
 }
 
 /// Whether a server-forwarded target is loopback, enforcing the v1 loopback-only
