@@ -36,12 +36,22 @@ fn profile_phase(snapshots: &HashMap<String, Snapshot>, id: &str) -> Phase {
 }
 
 /// The icon reflects the worst/most-notable state across profiles: a failure
-/// beats connected beats in-progress beats idle.
+/// beats connected beats in-progress beats idle. When at least one profile is
+/// connected, the icon distinguishes "everything settled" ([`TrayState::AllConnected`],
+/// checkmark) from "still working" ([`TrayState::Connected`], dot): the checkmark
+/// shows only once no profile is still connecting or reconnecting.
 fn aggregate_state(phases: &[Phase]) -> TrayState {
     if phases.contains(&Phase::Failed) {
         TrayState::Failed
     } else if phases.contains(&Phase::Connected) {
-        TrayState::Connected
+        let in_progress = phases
+            .iter()
+            .any(|p| matches!(p, Phase::Connecting | Phase::Reconnecting));
+        if in_progress {
+            TrayState::Connected
+        } else {
+            TrayState::AllConnected
+        }
     } else if phases.contains(&Phase::Reconnecting) {
         TrayState::Reconnecting
     } else if phases.contains(&Phase::Connecting) {
@@ -258,5 +268,45 @@ impl Tray {
                 .set_icon_with_as_template(Some(icon), icon::is_template());
         }
         let _ = self.tray.set_tooltip(Some(format!("flextunnel — {line}")));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_connected_only_without_in_progress_profiles() {
+        // No profiles / none connected: never the connected states.
+        assert_eq!(aggregate_state(&[]), TrayState::Idle);
+        assert_eq!(aggregate_state(&[Phase::Connecting]), TrayState::Connecting);
+
+        // Every connecting profile has connected → checkmark. Idle profiles
+        // aren't "connecting", so they don't hold back the checkmark.
+        assert_eq!(aggregate_state(&[Phase::Connected]), TrayState::AllConnected);
+        assert_eq!(
+            aggregate_state(&[Phase::Connected, Phase::Connected]),
+            TrayState::AllConnected
+        );
+        assert_eq!(
+            aggregate_state(&[Phase::Connected, Phase::Idle]),
+            TrayState::AllConnected
+        );
+
+        // A profile still in progress keeps the plain dot.
+        assert_eq!(
+            aggregate_state(&[Phase::Connected, Phase::Connecting]),
+            TrayState::Connected
+        );
+        assert_eq!(
+            aggregate_state(&[Phase::Connected, Phase::Reconnecting]),
+            TrayState::Connected
+        );
+
+        // A failure still dominates over connected profiles.
+        assert_eq!(
+            aggregate_state(&[Phase::Connected, Phase::Failed]),
+            TrayState::Failed
+        );
     }
 }

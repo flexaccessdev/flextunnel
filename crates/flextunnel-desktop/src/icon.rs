@@ -3,21 +3,28 @@
 //! ellipses, and an outer circle, white on a blue gradient. macOS renders the
 //! bare glyph as a template image — the OS adapts it to light/dark menu bars,
 //! matching the iOS "tinted" appearance — with the connection state shown by
-//! opacity plus a corner status dot when connected. The dot stays monochrome on
-//! macOS so the icon remains a crisp template (a colored icon renders as a
-//! blurry non-template image in the menu bar); on Windows it is green on the
-//! full-color badge (grayscale while disconnected).
+//! opacity plus a corner status badge when connected: a plain dot while some
+//! profiles are still connecting, upgrading to a checkmark once every connecting
+//! profile has connected successfully. The badge stays monochrome on macOS so
+//! the icon remains a crisp template (a colored icon renders as a blurry
+//! non-template image in the menu bar); on Windows it is green on the full-color
+//! badge (grayscale while disconnected).
 
 use tiny_skia::{
-    BlendMode, Color, FillRule, GradientStop, LineCap, LinearGradient, Paint, PathBuilder, Pixmap,
-    Point, PremultipliedColorU8, Rect, SpreadMode, Stroke, Transform,
+    BlendMode, Color, FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Paint, PathBuilder,
+    Pixmap, Point, PremultipliedColorU8, Rect, SpreadMode, Stroke, Transform,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrayState {
     Idle,
     Connecting,
+    /// At least one profile is connected, but others are still connecting or
+    /// reconnecting — rendered with a plain status dot.
     Connected,
+    /// Every profile that was connecting has connected successfully (none still
+    /// in progress) — rendered with a status checkmark instead of the dot.
+    AllConnected,
     Reconnecting,
     Failed,
 }
@@ -99,8 +106,11 @@ fn draw_glyph(pixmap: &mut Pixmap, paint: &Paint, fill: f32) {
 /// Overlay a "connected" status badge: a filled dot in the bottom-right,
 /// separated from the glyph behind it by a ring. `ring` is the ring's fill
 /// color, or `None` to punch a transparent gap (used by the macOS template,
-/// where only alpha matters). Drawn last, so it sits on top.
-fn draw_status_dot(pixmap: &mut Pixmap, dot: Color, ring: Option<Color>) {
+/// where only alpha matters). When `checkmark` is set, a check is stroked over
+/// the dot in the ring's treatment (the ring color, or a transparent punch on
+/// the template) to signal that every connecting profile has connected. Drawn
+/// last, so it sits on top.
+fn draw_status_dot(pixmap: &mut Pixmap, dot: Color, ring: Option<Color>, checkmark: bool) {
     let s = pixmap.width() as f32;
     let (cx, cy) = (s * 0.70, s * 0.70);
     let dot_r = s * 0.24;
@@ -130,6 +140,34 @@ fn draw_status_dot(pixmap: &mut Pixmap, dot: Color, ring: Option<Color>) {
     pb.push_circle(cx, cy, dot_r);
     if let Some(path) = pb.finish() {
         pixmap.fill_path(&path, &dot_paint, FillRule::Winding, id, None);
+    }
+
+    if checkmark {
+        // Contrast against the dot the same way the ring does: the ring's color
+        // on the full-color badge, or a transparent Clear punch on the macOS
+        // template (so the check reads as a cut-out once the OS tints the mask).
+        let mut check_paint = Paint {
+            anti_alias: true,
+            ..Paint::default()
+        };
+        match ring {
+            Some(color) => check_paint.set_color(color),
+            None => check_paint.blend_mode = BlendMode::Clear,
+        }
+        // A check: left arm down to the low vertex, then up to the long tip.
+        let mut pb = PathBuilder::new();
+        pb.move_to(cx - dot_r * 0.45, cy + dot_r * 0.02);
+        pb.line_to(cx - dot_r * 0.10, cy + dot_r * 0.38);
+        pb.line_to(cx + dot_r * 0.50, cy - dot_r * 0.40);
+        if let Some(path) = pb.finish() {
+            let stroke = Stroke {
+                width: dot_r * 0.30,
+                line_cap: LineCap::Round,
+                line_join: LineJoin::Round,
+                ..Stroke::default()
+            };
+            pixmap.stroke_path(&path, &check_paint, &stroke, id, None);
+        }
     }
 }
 
@@ -234,32 +272,39 @@ pub fn tray_rgba(state: TrayState) -> (Vec<u8>, u32, u32) {
     {
         // tray-icon scales the NSImage to 18pt itself; 44px stays crisp on retina.
         let alpha = match state {
-            TrayState::Connected => 1.0,
+            TrayState::Connected | TrayState::AllConnected => 1.0,
             TrayState::Connecting | TrayState::Reconnecting => 0.6,
             TrayState::Idle | TrayState::Failed => 0.35,
         };
         let mut pixmap = glyph_only(44, alpha);
-        if state == TrayState::Connected {
+        if matches!(state, TrayState::Connected | TrayState::AllConnected) {
             // Monochrome so the icon stays a crisp template; the transparent
-            // ring reads as a gap once the OS tints the mask.
-            draw_status_dot(&mut pixmap, Color::from_rgba8(0, 0, 0, 255), None);
+            // ring/check reads as a gap once the OS tints the mask.
+            draw_status_dot(
+                &mut pixmap,
+                Color::from_rgba8(0, 0, 0, 255),
+                None,
+                state == TrayState::AllConnected,
+            );
         }
         (to_rgba(pixmap), 44, 44)
     }
     #[cfg(not(target_os = "macos"))]
     {
         let (blue, alpha) = match state {
-            TrayState::Connected => (true, 1.0),
+            TrayState::Connected | TrayState::AllConnected => (true, 1.0),
             TrayState::Connecting | TrayState::Reconnecting => (true, 0.6),
             TrayState::Idle | TrayState::Failed => (false, 1.0),
         };
         let mut pixmap = badge(32, blue, alpha);
-        if state == TrayState::Connected {
-            // Green dot with a white ring to stand out against the blue badge.
+        if matches!(state, TrayState::Connected | TrayState::AllConnected) {
+            // Green dot with a white ring to stand out against the blue badge;
+            // a white check on top once every connecting profile is connected.
             draw_status_dot(
                 &mut pixmap,
                 Color::from_rgba8(52, 199, 89, 255),
                 Some(Color::from_rgba8(255, 255, 255, 255)),
+                state == TrayState::AllConnected,
             );
         }
         (to_rgba(pixmap), 32, 32)
@@ -287,6 +332,15 @@ mod tests {
         let (connected, ..) = tray_rgba(TrayState::Connected);
         let (idle, ..) = tray_rgba(TrayState::Idle);
         assert_ne!(connected, idle);
+    }
+
+    #[test]
+    fn all_connected_checkmark_differs_from_plain_dot() {
+        // The checkmark badge must be visually distinct from the plain dot so
+        // "all connected" reads differently from "partially connected".
+        let (all_connected, ..) = tray_rgba(TrayState::AllConnected);
+        let (connected, ..) = tray_rgba(TrayState::Connected);
+        assert_ne!(all_connected, connected);
     }
 
     #[test]
