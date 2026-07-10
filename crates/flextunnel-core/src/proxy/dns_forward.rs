@@ -103,6 +103,13 @@ impl DnsForwarder {
         Ok(Some(Self { forwards: entries }))
     }
 
+    /// The configured suffixes, normalized (lowercased, dot-trimmed) exactly as
+    /// they are matched at runtime. Used to cross-check that each is reachable
+    /// through the routed set (an unreachable forward is a no-op).
+    pub fn suffixes(&self) -> impl Iterator<Item = &str> {
+        self.forwards.iter().map(|f| f.suffix.as_str())
+    }
+
     /// The upstream resolver for `host`, if it equals or is a subdomain of a
     /// configured suffix; `None` means "not forwarded — use the system
     /// resolver". A subdomain match requires a label boundary, so

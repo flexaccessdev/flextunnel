@@ -336,6 +336,22 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
     // a bad server spec fails fast (same reasoning as the routed set above).
     let dns_forwarder = DnsForwarder::new(&r.dns_forwards)
         .context("Invalid dns_forwards configuration")?;
+    // A dns_forwards suffix only ever fires for a hostname the routed set tunnels
+    // (off-list requests are rejected by the whitelist before resolution). If no
+    // routed rule covers a suffix, the forward is dead config — reject it rather
+    // than let it silently no-op.
+    if let Some(forwarder) = &dns_forwarder {
+        for suffix in forwarder.suffixes() {
+            if !routed_set.covers_suffix(suffix) {
+                anyhow::bail!(
+                    "[dns_forwards] suffix {suffix:?} is not covered by the routed set, so it \
+                     would never be used: the server rejects off-list targets before resolving \
+                     them. Add \"*.{suffix}\" (and/or \"{suffix}\") to routed_domains, or remove \
+                     the forward."
+                );
+            }
+        }
+    }
 
     let endpoint = create_server_endpoint(&r.relay_urls, secret_key, r.dns_server.as_deref())
         .await

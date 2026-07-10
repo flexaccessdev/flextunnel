@@ -124,9 +124,10 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 # and most-specific-first (a longer suffix wins over a shorter one). List
 # multiple servers for redundancy; TCP fallback is used automatically.
 #
-# The suffix must still be reachable through the routed set above — add it (or a
+# The suffix must be reachable through the routed set above — add it (or a
 # `*.suffix` wildcard) to routed_domains, since the whitelist is enforced on the
-# requested hostname before resolution.
+# requested hostname before resolution. The server REFUSES TO START if a
+# [dns_forwards] suffix is not covered by routed_domains (it would be a no-op).
 # [dns_forwards]
 # "local.168234.xyz" = ["10.0.0.53"]              # -> internal resolver on :53
 # "corp.example.com" = ["10.1.0.10:5353", "10.1.0.11"]  # custom port + failover
