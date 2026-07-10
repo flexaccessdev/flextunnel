@@ -7,9 +7,11 @@
 //! server(s) instead. Anything not matching a suffix still uses the system
 //! resolver.
 //!
-//! This is purely a server-side resolution concern — it changes only which
-//! nameserver answers a name, not the wire protocol — so it needs no client,
-//! agent, or FFI changes.
+//! Resolution itself is purely server-side — it changes only which nameserver
+//! answers a name, not the wire protocol. The configured suffix→servers table is
+//! additionally pushed to clients (informationally) in the handshake so their
+//! status UIs can show it, exactly like host aliases and agent routes; see
+//! [`DnsForwarder::forwards`].
 //!
 //! Config shape (`[dns_forwards]` in the server file): each key is a bare domain
 //! suffix and each value is a list of DNS servers (`IP` or `IP:port`, default
@@ -41,6 +43,10 @@ const DEFAULT_DNS_PORT: u16 = 53;
 struct Forward {
     /// Lowercased, dot-trimmed suffix (e.g. `local.168234.xyz`).
     suffix: String,
+    /// The configured upstream server specs (trimmed, as written in config),
+    /// retained only for display — the live [`Self::resolver`] is what actually
+    /// resolves. Pushed to clients and shown on the status page.
+    servers: Vec<String>,
     /// Resolver pointed at this suffix's configured upstream server(s).
     resolver: TokioResolver,
 }
@@ -73,10 +79,12 @@ impl DnsForwarder {
                 bail!("[dns_forwards] entry {suffix:?} lists no DNS servers");
             }
             let mut name_servers = Vec::with_capacity(servers.len());
+            let mut server_specs = Vec::with_capacity(servers.len());
             for spec in servers {
                 let (ip, port) = parse_server(spec).with_context(|| {
                     format!("invalid [dns_forwards] server {spec:?} for suffix {suffix:?}")
                 })?;
+                server_specs.push(spec.trim().to_string());
                 // UDP with a TCP fallback (for truncated answers), both on the
                 // configured port — the `udp_and_tcp` helper is hardwired to 53.
                 let mut udp = ConnectionConfig::udp();
@@ -90,7 +98,11 @@ impl DnsForwarder {
                 TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
                     .build()
                     .with_context(|| format!("building resolver for [dns_forwards] {suffix:?}"))?;
-            entries.push(Forward { suffix, resolver });
+            entries.push(Forward {
+                suffix,
+                servers: server_specs,
+                resolver,
+            });
         }
         // Longest suffix first so a subdomain matches its most specific zone;
         // suffix as tiebreaker keeps ordering deterministic.
@@ -108,6 +120,20 @@ impl DnsForwarder {
     /// through the routed set (an unreachable forward is a no-op).
     pub fn suffixes(&self) -> impl Iterator<Item = &str> {
         self.forwards.iter().map(|f| f.suffix.as_str())
+    }
+
+    /// The configured forwards as `(suffix, upstream servers)` pairs, sorted by
+    /// suffix for stable output. Purely informational: pushed to clients in the
+    /// handshake and rendered on the server status page. The servers are the
+    /// specs as configured (trimmed), not the resolved socket addresses.
+    pub fn forwards(&self) -> Vec<(String, Vec<String>)> {
+        let mut out: Vec<(String, Vec<String>)> = self
+            .forwards
+            .iter()
+            .map(|f| (f.suffix.clone(), f.servers.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// The upstream resolver for `host`, if it equals or is a subdomain of a
@@ -208,6 +234,24 @@ mod tests {
         assert!(f.resolver_for("db.corp.example.com").is_some());
         assert!(f.resolver_for("www.example.com").is_some());
         assert!(f.resolver_for("elsewhere.net").is_none());
+    }
+
+    #[test]
+    fn forwards_lists_suffixes_and_servers_sorted() {
+        let f = forwarder(&[
+            ("corp.example.com", &["10.1.0.10:5353", "10.1.0.11"]),
+            ("local.168234.xyz", &["10.0.0.53"]),
+        ]);
+        assert_eq!(
+            f.forwards(),
+            vec![
+                (
+                    "corp.example.com".to_string(),
+                    vec!["10.1.0.10:5353".to_string(), "10.1.0.11".to_string()]
+                ),
+                ("local.168234.xyz".to_string(), vec!["10.0.0.53".to_string()]),
+            ]
+        );
     }
 
     #[test]

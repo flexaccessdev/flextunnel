@@ -296,7 +296,8 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
 /// ```json
 /// { "connected": true, "domains": ["*.example.com"], "cidrs": ["10.0.0.0/8"],
 ///   "host_aliases": [["nas.internal", "192.168.1.9"]],
-///   "agent_aliases": [{"name": "workstation.internal", "status": "connected"}] }
+///   "agent_aliases": [{"name": "workstation.internal", "status": "connected"}],
+///   "dns_forwards": [{"suffix": "corp.example.com", "servers": ["10.1.0.10:5353"]}] }
 /// ```
 ///
 /// This is the required split-tunnel set the server pushes during the handshake
@@ -314,6 +315,11 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
 /// `"disconnected"`, or `"unknown"`. The status rides the heartbeat control
 /// stream (refreshed every ~10s); it reads `"unknown"` before the first update,
 /// while the tunnel is down, or when that view has gone stale.
+///
+/// `dns_forwards` is the server's conditional DNS-forwarding table (split-DNS),
+/// also informational: each entry is `{"suffix", "servers"}` where names under
+/// `suffix` are resolved via `servers` (`IP` or `IP:port`) instead of the
+/// server's system resolver. Empty when the server configures none.
 ///
 /// Returns `1` on success (full JSON written), `0` if `out_buf` was too small
 /// (the JSON is truncated; retry with a larger buffer), and `-1` for a null
@@ -347,12 +353,20 @@ pub unsafe extern "C" fn flextunnel_routes(
                     serde_json::json!({ "name": name, "status": state.as_str() })
                 })
                 .collect();
+            let dns_forwards: Vec<_> = routes
+                .dns_forwards
+                .iter()
+                .map(|(suffix, servers)| {
+                    serde_json::json!({ "suffix": suffix, "servers": servers })
+                })
+                .collect();
             serde_json::json!({
                 "connected": routes.connected,
                 "domains": routes.domains,
                 "cidrs": routes.cidrs,
                 "host_aliases": routes.host_aliases,
                 "agent_aliases": agent_aliases,
+                "dns_forwards": dns_forwards,
             })
             .to_string()
         }
