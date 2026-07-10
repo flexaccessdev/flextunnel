@@ -247,6 +247,17 @@ impl ProxyServer {
         agent_aliases
     }
 
+    /// The configured conditional DNS forwards as `(suffix, servers)` pairs,
+    /// sorted by suffix. Empty when no `[dns_forwards]` are configured. Shown on
+    /// the status page and pushed to clients in the `HelloResponse` for their
+    /// status UIs (the resolution itself stays server-side).
+    fn dns_forwards(&self) -> Vec<(String, Vec<String>)> {
+        self.dns_forwarder
+            .as_ref()
+            .map(DnsForwarder::forwards)
+            .unwrap_or_default()
+    }
+
     /// The machine ids of all agents connected right now. A passive read of the
     /// agent registry (membership == connected) — no probing. The single
     /// definition of "connected", shared by every caller that filters
@@ -301,6 +312,7 @@ impl ProxyServer {
             routed_cidrs: self.routed_cidrs.clone(),
             host_aliases,
             agent_routes,
+            dns_forwards: self.dns_forwards(),
             blocklist_path: bl.path().display().to_string(),
             blocked_client_count: bl.blocked_client_count(),
             blocked_agent_count: bl.blocked_agent_count(),
@@ -649,6 +661,7 @@ impl ProxyServer {
             self.sorted_host_aliases(),
             self.sorted_agent_aliases(),
             self.connected_agent_aliases(),
+            self.dns_forwards(),
         );
         signaling::write_message(&mut send, &signaling::encode_hello_response(&resp)?).await?;
         send.flush().await?;
@@ -767,11 +780,13 @@ impl ProxyServer {
             );
         }
 
-        // Accept: agents get no routed set (the server decides their targets) and
-        // no connected-agent list (only clients display it). The control stream
-        // stays open for heartbeats.
+        // Accept: agents get no routed set (the server decides their targets),
+        // no connected-agent list (only clients display it), and no DNS forwards
+        // (server-side resolution, nothing for an agent to display). The control
+        // stream stays open for heartbeats.
         let resp = HelloResponse::accepted(
             self.server_instance_nonce,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),

@@ -14,6 +14,10 @@ host_aliases:
 {% if tpl.host_aliases.is_empty() %}  none configured
 {% else %}{% for (name, target) in tpl.host_aliases %}  - {{ name }} -> {{ target }}
 {% endfor %}{% endif %}
+dns_forwards:
+{% if tpl.dns_forwards.is_empty() %}  none configured
+{% else %}{% for (suffix, servers) in tpl.dns_forwards %}  - {{ suffix }} -> {{ servers|join(", ") }}
+{% endfor %}{% endif %}
 agent_routes:
 {% if tpl.agent_routes.is_empty() %}  none configured
 {% else %}{% for route in tpl.agent_routes %}  - {{ route.name }} -> {{ route.machine_id }} ({% if route.connected %}connected{% else %}disconnected{% endif %})

@@ -479,6 +479,7 @@ mod tests {
             routed_cidrs: Vec::new(),
             host_aliases: Vec::new(),
             agent_routes: Vec::new(),
+            dns_forwards: Vec::new(),
             blocklist_path: String::new(),
             blocked_client_count: 0,
             blocked_agent_count: 0,

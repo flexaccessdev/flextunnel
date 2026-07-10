@@ -747,6 +747,19 @@ fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
             col = col.push(arrow_copy_row(alias.clone(), target.clone(), false));
         }
     }
+    if !routes.dns_forwards.is_empty() {
+        col = col.push(space().height(8));
+        col = col.push(
+            text(format!(
+                "DNS forwards — {} resolved via upstream server(s):",
+                routes.dns_forwards.len()
+            ))
+            .size(12),
+        );
+        for (suffix, servers) in &routes.dns_forwards {
+            col = col.push(arrow_copy_row(suffix.clone(), servers.join(", "), false));
+        }
+    }
     if !routes.agent_aliases.is_empty() {
         col = col.push(space().height(8));
         col = col.push(

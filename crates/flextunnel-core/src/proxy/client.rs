@@ -154,6 +154,11 @@ pub struct TunnelRoutes {
     /// seeded at handshake). `None` before the first refresh. Used to detect a
     /// stale view — see [`TunnelRoutes::agent_states`].
     pub agent_status_updated: Option<Instant>,
+    /// Server-side conditional DNS forwards as `(suffix, upstream servers)`
+    /// pairs, sorted by suffix. Informational only — the server does the
+    /// resolution; shown in client status UIs like the server status page shows
+    /// them. Empty when the server configures no `[dns_forwards]`.
+    pub dns_forwards: Vec<(String, Vec<String>)>,
 }
 
 /// How long the client's connected-agent view stays trustworthy after the last
@@ -706,6 +711,7 @@ impl ProxyClient {
                 })
                 .collect();
             routes.agent_status_updated = Some(Instant::now());
+            routes.dns_forwards = response.dns_forwards.clone();
         }
         Ok((routed_set, send, recv))
     }
