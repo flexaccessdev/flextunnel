@@ -47,7 +47,7 @@ pub const REP_CONN_REFUSED: u8 = 0x05;
 pub const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 pub const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 
-/// Which kind of peer is connecting. A **client** runs a local SOCKS5 listener
+/// Which kind of peer is connecting. A **client** runs local proxy listener(s)
 /// and *opens* tunnel streams to the server; an **agent** dials the server with
 /// an ephemeral identity, is identified by its `machine_id`, and *accepts* the
 /// streams the server opens back to it, connecting each to a target on the
@@ -55,7 +55,7 @@ pub const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 /// `agent_routes`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PeerRole {
-    /// Local SOCKS5 listener; opens tunnel streams to the server.
+    /// Local proxy listener(s); opens tunnel streams to the server.
     #[default]
     Client,
     /// Reverse-routing exit point; accepts server-opened streams.
@@ -86,9 +86,9 @@ pub struct Hello {
     /// not a command; the server decides whether to self-block on it.
     #[serde(default)]
     pub duplicate_server_observed: bool,
-    /// Whether this peer is a client (SOCKS5 listener) or an agent (reverse exit
-    /// point). Drives the server's post-handshake handling and which auth-token
-    /// pool the token is checked against.
+    /// Whether this peer is a client (local proxy listener), an agent (reverse
+    /// exit point), or a bridge. Drives the server's post-handshake handling and
+    /// which auth-token pool the token is checked against.
     #[serde(default)]
     pub role: PeerRole,
     /// The agent's **derived network id** (`ftm1…`, see [`crate::machine_id`]),
@@ -117,8 +117,9 @@ impl std::fmt::Debug for Hello {
 ///
 /// On acceptance the server pushes its resolved routed set (the *tunnel set*) so
 /// the client can make the split-tunnel decision without configuring its own
-/// list — the server is the single source of truth. Empty lists mean an
-/// inactive routed set (the client tunnels everything).
+/// list — the server is the single source of truth. Clients reject an empty
+/// routed set; agents and bridges receive empty informational route lists
+/// because they do not make local split-tunnel decisions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloResponse {
     pub version: u16,

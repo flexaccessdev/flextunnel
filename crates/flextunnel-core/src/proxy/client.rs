@@ -1,5 +1,6 @@
-//! flextunnel client: a local SOCKS5 listener whose CONNECTs are tunneled over
-//! a single iroh QUIC connection to the server, one bi-stream per CONNECT.
+//! flextunnel client: local SOCKS5 and optional HTTP proxy listeners whose
+//! routed requests are tunneled over a single iroh QUIC connection to the
+//! server, one bi-stream per proxied connection.
 
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::signaling::{self, ControlMsg, Hello, Target};

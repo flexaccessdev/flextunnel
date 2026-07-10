@@ -30,9 +30,12 @@ local app ──SOCKS5/HTTP──► flextunnel client (127.0.0.1:1080 / optiona
 
 ## Scope
 
-- **TCP `CONNECT` only.** No UDP `ASSOCIATE`, no `BIND`.
-- The local SOCKS5 listener is **no-auth** and binds to loopback by default;
-  access control is enforced by the QUIC layer (auth token), not by SOCKS5.
+- **SOCKS5 `CONNECT` only.** No UDP `ASSOCIATE`, no `BIND`. The optional HTTP
+  proxy supports HTTP `CONNECT` plus absolute-URI plain-HTTP forwarding.
+- The local SOCKS5 and optional HTTP proxy listeners are **no-auth**; the SOCKS5
+  listener binds to loopback by default, and the HTTP listener is disabled unless
+  explicitly configured. Access control is enforced by the QUIC layer (auth
+  token), not by the local proxy front-ends.
 
 ## Security model
 
@@ -278,8 +281,9 @@ curl -sS -x http://127.0.0.1:8081 http://flextunnel.internal/status.json
 ```
 
 The JSON response includes `version`, `server_node_id`, `routed_domains`,
-`routed_cidrs`, `host_aliases`, `agent_routes`, and duplicate-id blocklist
-counts under `duplicate_id_blocklist`.
+`routed_cidrs`, `host_aliases`, `dns_forwards`, `agent_routes`, `bridges`,
+`inbound_bridges`, and duplicate-id blocklist counts under
+`duplicate_id_blocklist`.
 
 For more ways to use the proxy — `curl`/`git`/browser recipes, `ssh` through the
 tunnel, and putting a plain local TCP port in front of it for apps that can't
@@ -314,13 +318,14 @@ analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 | Command | Description |
 |---|---|
 | `server` | Run the proxy server. |
-| `client` | Run the proxy client (local SOCKS5 listener). |
+| `client` | Run the proxy client (local SOCKS5 listener, optional HTTP proxy). |
 | `generate-server-key -o <FILE> [--force]` | Generate the server identity key. |
 | `show-server-id --secret-file <FILE>` | Print the EndpointId for a key. |
 | `generate-auth-token [-c N]` | Generate N client auth tokens (prefix `ftc`). |
+| `generate-bridge-token [-c N]` | Generate N bridge auth tokens (prefix `ftb`). |
 
 The reverse-routing **agent** is a separate binary, `flextunnel-agent`
-(subcommands `run` and `generate-token`) — see
+(subcommands `run`, `generate-token`, and `machine-id`) — see
 [Reverse-routing agent](#reverse-routing-agent) below.
 
 ### `server`
@@ -382,6 +387,11 @@ auth_token     = "ftc…"        # or: auth_token_file = "~/.config/flextunnel/t
 
 Secrets may be inline (as above) or kept in separate files via the `*_file`
 keys. CLI flags still work and override any of these.
+
+Server-only routing keys include `host_aliases`, `agent_routes`,
+`dns_forwards`, outbound `[bridges.<name>]`, inbound `allowed_bridge_servers`,
+and `bridge_auth_tokens` / `bridge_auth_tokens_file`; these are config-file only
+because they describe the server's routing policy.
 
 ## Host aliases (server-side)
 
@@ -546,7 +556,7 @@ Auto-reconnect is **enabled by default** (`auto_reconnect = true`); pass
   **exponential backoff + jitter** (1s → 60s), indefinitely, unless
   `--max-reconnect-attempts` caps it or auto-reconnect is disabled.
 - A permanent error (auth/config) never retries.
-- The local SOCKS5 listener stays bound across reconnects, so local apps queue
+- The local proxy listeners stay bound across reconnects, so local apps queue
   briefly instead of seeing connection-refused during the gap.
 
 ## Logging
@@ -574,5 +584,5 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
 flextunnel is modeled on the sibling project **ezvpn** (an IP-over-QUIC VPN),
 reusing its iroh transport, auth-token scheme, and secret-key
 identity. The difference: ezvpn creates a TUN device and ships IP packets over
-unreliable QUIC datagrams (and needs root); flextunnel exposes a SOCKS5 listener
-and tunnels TCP over reliable QUIC streams (and needs no root).
+unreliable QUIC datagrams (and needs root); flextunnel exposes SOCKS5/HTTP proxy
+listeners and tunnels TCP over reliable QUIC streams (and needs no root).

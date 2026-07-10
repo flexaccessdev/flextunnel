@@ -1,9 +1,10 @@
 //! flextunnel
 //!
-//! A SOCKS5-over-QUIC proxy via iroh P2P connections. The client runs a local
-//! SOCKS5 listener; each CONNECT is tunneled as a reliable QUIC bi-stream to the
-//! server, which resolves DNS and connects to the target from its own network.
-//! Uses a fixed ALPN for protocol selection, auth tokens for access control, and TLS 1.3/QUIC for
+//! A SOCKS5/HTTP-proxy-over-QUIC split tunnel via iroh P2P connections. The
+//! client runs a local SOCKS5 listener and, optionally, an HTTP proxy listener;
+//! routed targets are tunneled as reliable QUIC bi-streams to the server, which
+//! resolves DNS and connects from its own network. Uses a fixed ALPN for
+//! protocol selection, auth tokens for access control, and TLS 1.3/QUIC for
 //! encryption. Neither side needs admin/root (no TUN device).
 
 use anyhow::{Context, Result};
@@ -29,7 +30,7 @@ use flextunnel_core::{auth, config, secret};
 #[derive(Parser)]
 #[command(name = "flextunnel")]
 #[command(version)]
-#[command(about = "SOCKS5-over-QUIC proxy via iroh P2P")]
+#[command(about = "SOCKS5/HTTP-proxy-over-QUIC split tunnel via iroh P2P")]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -68,7 +69,7 @@ enum Command {
         #[arg(long)]
         dns_server: Option<String>,
     },
-    /// Start the proxy client (local SOCKS5 listener).
+    /// Start the proxy client (local SOCKS5 listener, optional HTTP proxy).
     #[command(arg_required_else_help = true)]
     Client {
         /// Config file path (TOML). CLI flags override file values.

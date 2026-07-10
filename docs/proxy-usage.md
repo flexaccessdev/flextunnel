@@ -74,7 +74,7 @@ to prefer it for tools whose SOCKS5 support is client-DNS-only (see below).
 | Your tool… | Use |
 |---|---|
 | speaks SOCKS5 with remote DNS (`socks5h`) — curl, ssh, browsers, apt | **SOCKS5** `127.0.0.1:1080` |
-| needs raw TCP — databases, RDP, native JDBC | **SOCKS5** (or a `socat` forward, section 6) |
+| needs raw TCP — databases, RDP, native JDBC | **SOCKS5** (or a `socat` forward; see "Adapters for programs that don't speak either proxy") |
 | only speaks an HTTP proxy — `wget`, Docker pulls, older .NET | **HTTP proxy** `127.0.0.1:8081` |
 | speaks SOCKS5 but only with **client-side** DNS — JVM `socksProxyHost`, .NET 6+ | **HTTP proxy** (client DNS can't resolve routed names) |
 
@@ -94,7 +94,7 @@ flextunnel client \
     --http-listen    127.0.0.1:8081
 ```
 
-## 1. Programs that speak SOCKS5 natively
+## Programs that speak SOCKS5 natively
 
 ### `curl`
 
@@ -123,11 +123,12 @@ curl https://example.com
 `http://flextunnel.internal/` is the HTML status page; `/status.txt` is the
 script-friendly text form; `/status.json` is the structured JSON form. The JSON
 response includes `version`, `server_node_id`, `routed_domains`,
-`routed_cidrs`, `host_aliases`, `agent_routes`, and duplicate-id blocklist
-counts under `duplicate_id_blocklist`. These names are reserved by flextunnel
-and are always tunneled, even when they are not in the server's routed set. If
-the client is also running the HTTP proxy front-end, query the same endpoints
-through it instead:
+`routed_cidrs`, `host_aliases`, `dns_forwards`, `agent_routes`, `bridges`,
+`inbound_bridges`, and duplicate-id blocklist counts under
+`duplicate_id_blocklist`. These names are reserved by flextunnel and are always
+tunneled, even when they are not in the server's routed set. If the client is
+also running the HTTP proxy front-end, query the same endpoints through it
+instead:
 
 ```sh
 curl -sS -x http://127.0.0.1:8081 http://flextunnel.internal/status.txt
@@ -165,7 +166,7 @@ GIT_SSH_COMMAND='ssh -o "ProxyCommand=nc -X 5 -x 127.0.0.1:1080 %h %p"' \
   git clone ssh://networking.internal/repo.git
 ```
 
-Or make it permanent in `~/.ssh/config` (see section 5) so plain
+Or make it permanent in `~/.ssh/config` (see "`ssh` through the proxy") so plain
 `git clone ssh://networking.internal/repo.git` just works:
 
 ```
@@ -253,10 +254,10 @@ FoxyProxy lets you route only the internal domains through the proxy.
 - **Package managers / language toolchains** (`pip`, `npm`, `cargo`, `apt`)
   generally honor the `ALL_PROXY` / `https_proxy` environment variables. `apt`
   understands `socks5h://` directly; for the others, if the SOCKS path needs an
-  extra plugin (see section 2 for `pip`), the HTTP proxy is the simpler route.
+  extra plugin (see the `pip` note below), the HTTP proxy is the simpler route.
   (Not tested here — consult each tool's proxy docs.)
 
-## 2. Programs that need the HTTP proxy
+## Programs that need the HTTP proxy
 
 These are the cases the SOCKS5 listener alone cannot serve — either the tool has
 no SOCKS5 support, or its SOCKS5 support resolves DNS on the client, which can't
@@ -308,7 +309,8 @@ java -Dhttp.proxyHost=127.0.0.1  -Dhttp.proxyPort=8081 \
 ```
 
 (A JDBC *native* wire protocol is not HTTP and cannot use either the JVM HTTP
-proxy or CONNECT — route those through `socat`, section 6.)
+proxy or CONNECT — route those through `socat`; see "Adapters for programs that
+don't speak either proxy.")
 
 ### .NET
 
@@ -339,7 +341,7 @@ connection churn under high plain-HTTP request rates. HTTPS (`CONNECT`) tunnels
 are unaffected — they carry a single long-lived stream. `https://` URLs always
 go over `CONNECT` automatically; you never send them as absolute-URI forwards.
 
-## 3. `ssh` through the proxy
+## `ssh` through the proxy
 
 SSH is a raw-TCP protocol — it does not speak HTTP `CONNECT`, so route it
 through **SOCKS5**, not the HTTP proxy. To reach an SSH server that only listens
@@ -382,7 +384,7 @@ Here `db.internal` is resolved by `workstation.internal`, not by flextunnel —
 useful for reaching hosts that the flextunnel server itself can't see but the
 SSH box can.
 
-## 4. Adapters for programs that don't speak either proxy
+## Adapters for programs that don't speak either proxy
 
 Database clients, RDP, JDBC native drivers, `psql`, and many GUI apps have no
 SOCKS5 option and don't speak HTTP `CONNECT` either. Put `socat` in front of the
