@@ -240,6 +240,51 @@ hostname either way, so DNS still happens server-side for on-list targets. For
 per-site control instead of a system-wide switch, a browser extension like
 FoxyProxy lets you route only the internal domains through the proxy.
 
+#### FoxyProxy (per-site routing)
+
+FoxyProxy (Firefox / Chrome extension) routes only the domains you list through
+flextunnel and leaves everything else on your normal connection. Add a proxy
+entry:
+
+- **Type**: `SOCKS5`
+- **Hostname / Port**: `127.0.0.1` / `1080` (or whatever `--listen` you run the
+  client with)
+- **Proxy DNS**: **on** — this is the `socks5h` equivalent; without it the
+  browser resolves the routed names locally and fails. Per-proxy and
+  per-request: it only applies to requests matched to this proxy entry —
+  DNS for everything else is untouched. Firefox-only; in Chrome the toggle is
+  grayed out because Chrome always sends the hostname to a SOCKS5 proxy
+  (i.e. it's permanently "on")
+- **Username / Password**: leave empty (the listener is unauthenticated)
+
+Then add one **Include** pattern per routed name, e.g.:
+
+| Include | Type | Pattern |
+|---|---|---|
+| Include | Wildcard | `*.proxkube.internal` |
+| Include | Wildcard | `flextunnel.internal` |
+
+Finally, **enable pattern mode**: click the FoxyProxy toolbar icon and select
+**Proxy by Patterns**. The extension starts out disabled — with it set to
+Disable (or pinned to a single proxy), the patterns you just saved are not
+consulted at all.
+
+`*.example.internal` matches the subdomains; add a second bare
+`example.internal` pattern if you also browse the apex name. A
+`flextunnel.internal` pattern is handy to keep the server status page
+(`http://flextunnel.internal/`) reachable. Requests that match no pattern
+bypass the proxy entirely, so off-list browsing is untouched even before
+flextunnel's own routing decision.
+
+An HTTP-proxy entry (`Type: HTTP`, `127.0.0.1:8081`) works with the same
+patterns too — no Proxy DNS toggle needed there, since an HTTP proxy always
+receives the hostname.
+
+> Firefox with DNS-over-HTTPS enabled may resolve names via DoH even when
+> Proxy DNS is on; routed internal names then fail to resolve (they don't
+> exist in public DNS). If that bites, exempt the internal suffixes from DoH
+> or lower the DoH protection level.
+
 > These browser paths were not tested here; verify the exact settings in your
 > browser version.
 
