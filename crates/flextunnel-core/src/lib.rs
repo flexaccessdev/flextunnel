@@ -1,8 +1,8 @@
 //! flextunnel
 //!
 //! A SOCKS5/HTTP-proxy-over-QUIC split tunnel via iroh P2P connections. The
-//! client runs a local SOCKS5 listener and, optionally, an HTTP proxy listener;
-//! routed targets are tunneled as reliable QUIC bi-streams to the server, which
+//! clients may run local SOCKS5/HTTP proxy listeners or server-direct loopback
+//! forwards; routed targets are reliable QUIC bi-streams to the server, which
 //! resolves DNS and connects from its own network. Uses a fixed ALPN for
 //! protocol selection, auth tokens for access control, and TLS 1.3/QUIC for
 //! encryption. Neither side needs admin/root (no TUN device).

@@ -1,6 +1,7 @@
 //! The iced daemon state machine: a sidebar of connection profiles plus a
 //! detail pane, driven alongside the system tray. Each profile can run its own
-//! tunnel session concurrently (its own SOCKS5 port and forwards). The daemon
+//! tunnel session concurrently (its optional proxy ports and direct forwards).
+//! The daemon
 //! owns all state, so closing the window (which destroys it) loses nothing —
 //! the tray re-opens it on demand. Tray/menu events are forwarded from
 //! tray-icon's handlers into a channel drained by a [`Subscription`], so a
@@ -58,6 +59,7 @@ pub enum Message {
     ProfileNameChanged(String),
     ServerNodeIdChanged(String),
     AuthTokenChanged(String),
+    SocksEnabledToggled(bool),
     SocksPortChanged(String),
     HttpEnabledToggled(bool),
     HttpPortChanged(String),
@@ -97,7 +99,7 @@ fn port_owner(
 ) -> Option<String> {
     for profile in profiles {
         if Some(profile.id.as_str()) != exclude_profile {
-            if profile.socks_port == port {
+            if profile.socks_port == Some(port) {
                 return Some(format!("the SOCKS5 port of profile \"{}\"", profile.name));
             }
             if profile.http_port == Some(port) {
@@ -202,6 +204,7 @@ pub struct ProfileForm {
     pub name: String,
     pub server_node_id: String,
     pub auth_token: String,
+    pub socks_enabled: bool,
     pub socks_port: String,
     pub http_enabled: bool,
     pub http_port: String,
@@ -215,6 +218,7 @@ impl ProfileForm {
 
     fn add(profiles: &[Profile]) -> Self {
         Self {
+            socks_enabled: true,
             socks_port: next_free_port(profiles).to_string(),
             http_port: DEFAULT_HTTP_PORT.to_string(),
             ..Self::default()
@@ -227,7 +231,11 @@ impl ProfileForm {
             name: profile.name.clone(),
             server_node_id: profile.server_node_id.clone(),
             auth_token: profile.auth_token.clone(),
-            socks_port: profile.socks_port.to_string(),
+            socks_enabled: profile.socks_port.is_some(),
+            socks_port: profile
+                .socks_port
+                .map(|port| port.to_string())
+                .unwrap_or_else(|| DEFAULT_SOCKS_PORT.to_string()),
             http_enabled: profile.http_port.is_some(),
             http_port: profile
                 .http_port
@@ -277,13 +285,18 @@ impl ProfileForm {
         flextunnel_core::auth::validate_client_token(auth_token)
             .map_err(|e| format!("Invalid auth token: {e}"))?;
         let editing = self.editing_id.as_deref();
-        let socks_port = parse_port(&self.socks_port, "SOCKS5 port")?;
-        if let Some(owner) = port_owner(profiles, socks_port, editing, None) {
-            return Err(format!("SOCKS5 port {socks_port} is already used by {owner}"));
-        }
+        let socks_port = if self.socks_enabled {
+            let port = parse_port(&self.socks_port, "SOCKS5 port")?;
+            if let Some(owner) = port_owner(profiles, port, editing, None) {
+                return Err(format!("SOCKS5 port {port} is already used by {owner}"));
+            }
+            Some(port)
+        } else {
+            None
+        };
         let http_port = if self.http_enabled {
             let port = parse_port(&self.http_port, "HTTP port")?;
-            if port == socks_port {
+            if socks_port == Some(port) {
                 return Err("HTTP port must differ from the SOCKS5 port".into());
             }
             if let Some(owner) = port_owner(profiles, port, editing, None) {
@@ -790,6 +803,12 @@ impl App {
                 }
                 Task::none()
             }
+            Message::SocksEnabledToggled(enabled) => {
+                if let Some(form) = &mut self.profile_form {
+                    form.socks_enabled = enabled;
+                }
+                Task::none()
+            }
             Message::SocksPortChanged(value) => {
                 if let Some(form) = &mut self.profile_form {
                     form.socks_port = value;
@@ -1253,6 +1272,7 @@ mod tests {
             name: " prod ".into(),
             server_node_id: " node-id ".into(),
             auth_token: flextunnel_core::auth::generate_client_token(),
+            socks_enabled: true,
             socks_port: "1080".into(),
             http_enabled: false,
             http_port: "8080".into(),
@@ -1288,7 +1308,7 @@ mod tests {
             name: format!("profile-{id}"),
             server_node_id: "node".into(),
             auth_token: "token".into(),
-            socks_port,
+            socks_port: Some(socks_port),
             http_port: None,
             relay_urls: Vec::new(),
             forwards,
@@ -1433,7 +1453,7 @@ mod tests {
         assert_eq!(p1.id, "p1", "id kept");
         assert_eq!(p1.auth_token, "secret", "token kept");
         assert_eq!(p1.name, "renamed");
-        assert_eq!(p1.socks_port, 2080);
+        assert_eq!(p1.socks_port, Some(2080));
         assert_eq!(p1.forwards.len(), 1);
         assert_ne!(p1.forwards[0].id, "f2", "imported forward ids are fresh");
 
@@ -1485,7 +1505,7 @@ mod tests {
         let profile = valid_form().validate(&[]).expect("valid");
         assert_eq!(profile.name, "prod");
         assert_eq!(profile.server_node_id, "node-id");
-        assert_eq!(profile.socks_port, 1080);
+        assert_eq!(profile.socks_port, Some(1080));
         assert_eq!(profile.http_port, None);
         assert_eq!(
             profile.relay_urls,

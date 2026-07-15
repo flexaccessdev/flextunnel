@@ -18,7 +18,10 @@
 use crate::blocklist::BlockList;
 use crate::proxy::signaling::{self, Hello, HelloResponse, Target};
 use crate::proxy::dns_forward::DnsForwarder;
-use crate::proxy::{dial, BridgeUpstream, BridgeUpstreamConfig, ProxyServer, ProxyServerParams, RoutedSet};
+use crate::proxy::{
+    dial, BridgeUpstream, BridgeUpstreamConfig, ForwardManager, ForwardSpec, ProxyServer,
+    ProxyServerParams, RoutedSet, ServerForwarder,
+};
 use crate::transport::{ALPN, build_quic_transport_config};
 use iroh::address_lookup::MemoryLookup;
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
@@ -342,6 +345,75 @@ async fn assert_echo_roundtrip(conn: &Connection, port: u16) {
     let mut buf = [0u8; 9]; // "HELLO" + "ping"
     with_timeout(recv.read_exact(&mut buf)).await.unwrap();
     assert_eq!(&buf, b"HELLOping");
+}
+
+/// Port forwards bypass the local proxy front-ends: the listener hands an
+/// accepted TCP stream straight to a QUIC data stream. The same server rejects
+/// a target outside its routed-set whitelist before attempting to dial it.
+#[tokio::test]
+async fn server_direct_forward_relays_and_server_rejects_off_list_target() {
+    let bl_path = temp_blocklist("server-direct-forward");
+    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
+    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
+    let (routed_set, routed_cidrs) = loopback_cidr_set();
+    let params = ProxyServerParams {
+        routed_set,
+        routed_cidrs,
+        ..base_params(server_ep.id(), bl_path.clone())
+    };
+    spawn_server_params(server_ep, params);
+
+    let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
+    let (conn, _ctrl_send, _ctrl_recv, response) =
+        client_handshake(&client_ep, server_addr, 41, false).await;
+    assert!(response.accepted);
+    let forwarder = ServerForwarder::connected(conn);
+
+    let rejected = forwarder
+        .connect(&Target::Domain("off-list.invalid".into(), 443))
+        .await
+        .unwrap_err();
+    assert!(
+        rejected.to_string().contains("not allowed"),
+        "unexpected rejection: {rejected:#}"
+    );
+
+    let echo_port = spawn_echo().await;
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let manager = ForwardManager::new(
+        tokio::runtime::Handle::current(),
+        forwarder,
+        &[ForwardSpec {
+            id: "echo".into(),
+            local_port,
+            target: Target::Ip(format!("127.0.0.1:{echo_port}").parse().unwrap()),
+        }],
+    );
+
+    let mut local = None;
+    for _ in 0..50 {
+        match tokio::net::TcpStream::connect(("127.0.0.1", local_port)).await {
+            Ok(stream) => {
+                local = Some(stream);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    let mut local = local.expect("direct forward listener reachable");
+    let mut greeting = [0u8; 5];
+    with_timeout(local.read_exact(&mut greeting)).await.unwrap();
+    assert_eq!(&greeting, b"HELLO");
+    local.write_all(b"ping").await.unwrap();
+    let mut echoed = [0u8; 4];
+    with_timeout(local.read_exact(&mut echoed)).await.unwrap();
+    assert_eq!(&echoed, b"ping");
+    assert_eq!(manager.statuses()[0].active, 1);
+
+    drop(manager);
+    let _ = std::fs::remove_file(bl_path);
 }
 
 fn temp_blocklist(tag: &str) -> std::path::PathBuf {

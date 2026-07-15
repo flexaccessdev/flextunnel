@@ -40,8 +40,8 @@ enum Backend {
 static BACKEND: OnceLock<Backend> = OnceLock::new();
 
 /// One connection profile — the desktop equivalent of a `client.toml`. Each
-/// active profile runs its own tunnel session with its own SOCKS5 proxy port
-/// and its own port forwards.
+/// active profile runs its own tunnel session with optional local proxy
+/// front-ends and its own server-direct port forwards.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
     pub id: String,
@@ -52,8 +52,9 @@ pub struct Profile {
     /// [`StoredProfile`].
     #[serde(skip)]
     pub auth_token: String,
-    #[serde(default = "default_socks_port")]
-    pub socks_port: u16,
+    /// Local SOCKS5 proxy port; `None` leaves that front-end disabled.
+    #[serde(default)]
+    pub socks_port: Option<u16>,
     /// Local HTTP proxy port; `None` leaves the HTTP front-end disabled.
     #[serde(default)]
     pub http_port: Option<u16>,
@@ -86,10 +87,6 @@ impl Profile {
     pub fn is_ready(&self) -> bool {
         !self.server_node_id.is_empty() && !self.auth_token.is_empty()
     }
-}
-
-fn default_socks_port() -> u16 {
-    DEFAULT_SOCKS_PORT
 }
 
 /// Serialization wrapper for the dev file backend only: the token rides along
@@ -387,7 +384,7 @@ mod tests {
             name: "prod".into(),
             server_node_id: "node".into(),
             auth_token: "token".into(),
-            socks_port: 1085,
+            socks_port: Some(1085),
             http_port: Some(8081),
             relay_urls: vec!["https://relay.example".into()],
             forwards: vec![PortForward {
@@ -407,7 +404,7 @@ mod tests {
             r#"{"id":"1","name":"n","server_node_id":"abc"}"#,
         )
         .unwrap();
-        assert_eq!(p.socks_port, DEFAULT_SOCKS_PORT);
+        assert_eq!(p.socks_port, None);
         assert_eq!(p.http_port, None);
         assert!(p.relay_urls.is_empty());
         assert!(p.forwards.is_empty());

@@ -62,7 +62,7 @@ Two additional caveats at this layer:
   `setcap cap_net_bind_service=+ep` on the binary or
   `sysctl net.ipv4.ip_unprivileged_port_start`).
 - flextunnel's forward listeners currently bind loopback only
-  (`crates/flextunnel-desktop/src/forward.rs` hardcodes `127.0.0.1`/`::1`),
+  (`crates/flextunnel-core/src/proxy/forward.rs` hardcodes `127.0.0.1`/`::1`),
   so using layer 1 with flextunnel would require per-forward bind-address
   support — **not implemented**. Layer 2 needs no app changes.
 
