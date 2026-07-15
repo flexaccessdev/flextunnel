@@ -291,8 +291,10 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
 /// Returns 1 on success, 0 for invalid input, and -1 for a null handle.
 ///
 /// # Safety
-/// Pointers must be valid for the supplied lengths and the handle must still be
-/// owned by the caller.
+/// - `forwards_json` must be a valid, NUL-terminated JSON C string (required by
+///   `CStr::from_ptr`); it may be null, which is treated as invalid input.
+/// - `out_buf` must be valid for `out_len` bytes when non-null, and the handle
+///   must still be owned by the caller.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn flextunnel_set_forwards(
     handle: *const FlextunnelHandle,
@@ -300,9 +302,13 @@ pub unsafe extern "C" fn flextunnel_set_forwards(
     out_buf: *mut c_char,
     out_len: usize,
 ) -> c_int {
-    if handle.is_null() || forwards_json.is_null() {
+    if handle.is_null() {
         write_cstr(out_buf, out_len, "null handle or forwards_json");
         return -1;
+    }
+    if forwards_json.is_null() {
+        write_cstr(out_buf, out_len, "null handle or forwards_json");
+        return 0;
     }
     let json = match unsafe { CStr::from_ptr(forwards_json) }.to_str() {
         Ok(json) => json,
@@ -330,14 +336,15 @@ pub unsafe extern "C" fn flextunnel_set_forwards(
             write_cstr(out_buf, out_len, "enabled forward local ports must be nonzero and unique");
             return 0;
         }
-        if forward.remote_host.trim().is_empty() || forward.remote_port == 0 {
+        let remote_host = forward.remote_host.trim();
+        if remote_host.is_empty() || forward.remote_port == 0 {
             write_cstr(out_buf, out_len, "forward targets require a host and nonzero port");
             return 0;
         }
         specs.push(ForwardSpec {
             id: forward.id,
             local_port: forward.local_port,
-            target: Target::Domain(forward.remote_host, forward.remote_port),
+            target: Target::Domain(remote_host.to_string(), forward.remote_port),
         });
     }
     let handle = unsafe { &*handle };

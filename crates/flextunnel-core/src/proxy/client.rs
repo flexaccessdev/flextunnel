@@ -158,7 +158,7 @@ impl ServerForwarder {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let mut tunnel = self.connect(target).await?;
-        let _ = tokio::io::copy_bidirectional(&mut local, &mut tunnel).await;
+        tokio::io::copy_bidirectional(&mut local, &mut tunnel).await?;
         Ok(())
     }
 
@@ -1018,7 +1018,7 @@ fn classify_accept_error(e: &io::Error) -> AcceptFailure {
 /// fatal — the port is genuinely gone (taken by another process), so ending
 /// the client (and with it the embedder's health probe) beats serving nothing
 /// while looking alive.
-async fn rebind_listener(addr: SocketAddr) -> ProxyResult<TcpListener> {
+pub(crate) async fn rebind_listener(addr: SocketAddr) -> ProxyResult<TcpListener> {
     if let Ok(listener) = TcpListener::bind(addr).await {
         return Ok(listener);
     }
@@ -1028,7 +1028,7 @@ async fn rebind_listener(addr: SocketAddr) -> ProxyResult<TcpListener> {
 
 /// What an accept error means for the loop after the failure state machine has
 /// digested it.
-enum AcceptOutcome {
+pub(crate) enum AcceptOutcome {
     /// The listener is dead (broken, or an abort burst): rebind it in place.
     Rebind,
     /// A transient failure: back off and retry the same listener.
@@ -1041,14 +1041,14 @@ enum AcceptOutcome {
 /// [`accept_loop_unix`] carry only their transport-specific accept, rebind, and
 /// log-label differences. `label` prefixes the recovery/retry log lines
 /// (e.g. "Local proxy" / "Unix SOCKS5").
-struct AcceptRetry {
+pub(crate) struct AcceptRetry {
     label: &'static str,
     consecutive_failures: u64,
     consecutive_aborts: u64,
 }
 
 impl AcceptRetry {
-    fn new(label: &'static str) -> Self {
+    pub(crate) fn new(label: &'static str) -> Self {
         Self {
             label,
             consecutive_failures: 0,
@@ -1057,7 +1057,7 @@ impl AcceptRetry {
     }
 
     /// Record a successful accept, logging recovery if we had been failing.
-    fn record_success(&mut self) {
+    pub(crate) fn record_success(&mut self) {
         if self.consecutive_failures > 0 {
             log::info!(
                 "{} accepting again after {} failed attempt(s)",
@@ -1070,7 +1070,7 @@ impl AcceptRetry {
     }
 
     /// Record an accept error and decide whether to rebind or retry.
-    fn record_error(&mut self, e: &io::Error) -> AcceptOutcome {
+    pub(crate) fn record_error(&mut self, e: &io::Error) -> AcceptOutcome {
         let failure = classify_accept_error(e);
         self.consecutive_aborts = match failure {
             AcceptFailure::Aborted => self.consecutive_aborts + 1,
@@ -1086,13 +1086,13 @@ impl AcceptRetry {
     }
 
     /// Reset the counters after a successful rebind.
-    fn record_rebind(&mut self) {
+    pub(crate) fn record_rebind(&mut self) {
         self.consecutive_failures = 0;
         self.consecutive_aborts = 0;
     }
 
     /// Log the retry (warn periodically, debug otherwise) and back off.
-    async fn wait_retry(&mut self, e: &io::Error) {
+    pub(crate) async fn wait_retry(&mut self, e: &io::Error) {
         if self.consecutive_failures.is_multiple_of(ACCEPT_RETRY_WARN_EVERY) {
             log::warn!(
                 "{} accept failed ({e}); retrying every {}ms",

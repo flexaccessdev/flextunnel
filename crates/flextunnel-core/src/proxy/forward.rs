@@ -5,19 +5,16 @@
 //! No local SOCKS5 listener or handshake is involved. The server remains the
 //! authority: it enforces its routed set before resolving or dialing the target.
 
-use super::client::ServerForwarder;
+use super::client::{AcceptOutcome, AcceptRetry, ServerForwarder, rebind_listener};
 use super::signaling::Target;
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Handle;
 use tokio::task::{JoinHandle, JoinSet};
-
-const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// One server-direct local forward.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,15 +157,55 @@ async fn accept_on(listener: Option<&TcpListener>) -> io::Result<(TcpStream, Soc
     }
 }
 
+/// Handle a failed `accept()` on one of the forward's loopback listeners.
+///
+/// Classifies the error like the client's front-end loops: a broken listener
+/// (or an abort burst — the signature of a socket the OS defuncted underneath
+/// us, as iOS does on suspend) is rebound in place; transient failures back off
+/// and retry. A rebind failure leaves that listener dead and marks the forward
+/// [`ForwardState::Failed`]; a successful rebind restores [`ForwardState::Listening`].
+async fn handle_accept_error(
+    listener: &mut Option<TcpListener>,
+    addr: SocketAddr,
+    retry: &mut AcceptRetry,
+    e: &io::Error,
+    port: u16,
+    shared: &ForwardShared,
+) {
+    match retry.record_error(e) {
+        AcceptOutcome::Rebind => {
+            log::warn!("Forward localhost:{port} listener on {addr} is dead ({e}); rebinding");
+            // Drop the dead socket first; it still owns the port.
+            *listener = None;
+            match rebind_listener(addr).await {
+                Ok(rebound) => {
+                    *listener = Some(rebound);
+                    retry.record_rebind();
+                    log::info!("Forward localhost:{port} listener rebound on {addr}");
+                    *lock(&shared.state) = ForwardState::Listening;
+                }
+                Err(err) => {
+                    let reason = format!("listener on {addr} died and could not rebind: {err}");
+                    log::error!("Forward localhost:{port} {reason}");
+                    *lock(&shared.state) = ForwardState::Failed(reason);
+                }
+            }
+        }
+        AcceptOutcome::Retry => retry.wait_retry(e).await,
+    }
+}
+
 async fn run_forward(
     spec: ForwardSpec,
     forwarder: ServerForwarder,
     shared: Arc<ForwardShared>,
 ) {
     let port = spec.local_port;
-    let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await;
-    let v6 = TcpListener::bind((Ipv6Addr::LOCALHOST, port)).await;
-    let (v4, v6) = match (v4, v6) {
+    let v4_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let v6_addr = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+    let v4 = TcpListener::bind(v4_addr).await;
+    let v6 = TcpListener::bind(v6_addr).await;
+    let (mut v4, mut v6) = match (v4, v6) {
         (Err(e4), Err(e6)) => {
             let reason = if e4.kind() == io::ErrorKind::AddrInUse
                 || e6.kind() == io::ErrorKind::AddrInUse
@@ -195,18 +232,27 @@ async fn run_forward(
         }
     );
 
+    let mut v4_retry = AcceptRetry::new("Forward IPv4");
+    let mut v6_retry = AcceptRetry::new("Forward IPv6");
     let mut relays = JoinSet::new();
     loop {
-        let accepted = tokio::select! {
-            accepted = accept_on(v4.as_ref()) => accepted,
-            accepted = accept_on(v6.as_ref()) => accepted,
+        let (is_v4, accepted) = tokio::select! {
+            accepted = accept_on(v4.as_ref()) => (true, accepted),
+            accepted = accept_on(v6.as_ref()) => (false, accepted),
             Some(_) = relays.join_next(), if !relays.is_empty() => continue,
         };
         let inbound = match accepted {
-            Ok((inbound, _)) => inbound,
+            Ok((inbound, _)) => {
+                if is_v4 { v4_retry.record_success() } else { v6_retry.record_success() }
+                inbound
+            }
             Err(e) => {
-                log::warn!("Forward localhost:{port} accept failed ({e}); retrying");
-                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                let (listener, addr, retry) = if is_v4 {
+                    (&mut v4, v4_addr, &mut v4_retry)
+                } else {
+                    (&mut v6, v6_addr, &mut v6_retry)
+                };
+                handle_accept_error(listener, addr, retry, &e, port, &shared).await;
                 continue;
             }
         };

@@ -53,7 +53,7 @@ void flextunnel_init_logging(void);
  *    "socks_port":0,"relay_urls":[],"dns_server":null}
  *   socks_port is optional; null/omitted disables SOCKS5, while 0 requests an
  *   OS-assigned port (read it from the result JSON). The routed set
- *   set) is configured on the server and pushed to the client during the
+ *   is configured on the server and pushed to the client during the
  *   handshake, so the app sends no routed set of its own.
  * out_buf/out_len : caller buffer. On success receives {"socks_port":N|null};
  *   on failure receives an error message. Always NUL-terminated. If out_buf is
@@ -66,8 +66,8 @@ void flextunnel_init_logging(void);
 FlextunnelHandle *flextunnel_start(const char *config_json, char *out_buf, size_t out_len);
 
 /*
- * Replace the complete server-direct local-forward set. forwards_json is an
- * array of objects:
+ * Replace the complete server-direct local-forward set. forwards_json must be a
+ * valid NUL-terminated JSON string holding an array of objects:
  *   [{"id":"uuid","local_port":8080,"remote_host":"db.internal",
  *     "remote_port":5432,"enabled":true}]
  *
