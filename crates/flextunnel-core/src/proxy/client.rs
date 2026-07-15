@@ -106,11 +106,12 @@ pub struct ClientConfig {
     pub server_node_id: String,
     /// Authentication token sent in the connection handshake.
     pub auth_token: String,
-    /// Local address the SOCKS5 listener binds to.
-    pub socks_listen: SocketAddr,
+    /// Local address the optional SOCKS5 listener binds to. CLI clients always
+    /// set this; GUI forwarding-only sessions may leave it disabled.
+    pub socks_listen: Option<SocketAddr>,
     /// Local address for the optional HTTP proxy listener (CONNECT tunneling +
     /// absolute-URI plain-HTTP forwarding). `None` leaves the HTTP front-end
-    /// disabled; the SOCKS5 listener is always on.
+    /// disabled.
     pub http_listen: Option<SocketAddr>,
     /// Relay URL hints (optional).
     pub relay_urls: Vec<String>,
@@ -118,6 +119,55 @@ pub struct ClientConfig {
     pub auto_reconnect: bool,
     /// Cap on reconnect attempts between successful connections (unlimited if None).
     pub max_reconnect_attempts: Option<NonZeroU32>,
+}
+
+/// Cloneable handle for opening a target directly on the client's live,
+/// authenticated server connection. It deliberately bypasses all local proxy
+/// front-ends and always asks the server to connect; the server's routed-set
+/// whitelist remains authoritative and rejects off-list targets.
+#[derive(Clone)]
+pub struct ServerForwarder {
+    current: SharedConn,
+}
+
+impl ServerForwarder {
+    /// Open one server-side target and return its raw bidirectional byte stream.
+    pub async fn connect(
+        &self,
+        target: &signaling::Target,
+    ) -> Result<tokio::io::Join<RecvStream, SendStream>> {
+        let conn = self
+            .current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("tunnel is not connected"))?;
+        let opened = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, open_tunnel(&conn, target))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out opening server-direct forward"))??;
+        let (send, recv, rep) = opened;
+        if rep != signaling::REP_SUCCESS {
+            anyhow::bail!("server rejected target: {}", socks5::describe_reply(rep));
+        }
+        Ok(tokio::io::join(recv, send))
+    }
+
+    /// Open `target` and splice it with one accepted local connection.
+    pub async fn relay<S>(&self, mut local: S, target: &signaling::Target) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut tunnel = self.connect(target).await?;
+        let _ = tokio::io::copy_bidirectional(&mut local, &mut tunnel).await;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connected(connection: Connection) -> Self {
+        Self {
+            current: Arc::new(Mutex::new(Some(connection))),
+        }
+    }
 }
 
 /// Exponential backoff with jitter for the Nth (1-based) reconnect attempt.
@@ -333,6 +383,14 @@ impl ProxyClient {
         }
     }
 
+    /// A cloneable server-direct forwarding handle sharing this client's live
+    /// connection and reconnect lifecycle.
+    pub fn server_forwarder(&self) -> ServerForwarder {
+        ServerForwarder {
+            current: self.current.clone(),
+        }
+    }
+
     /// Flip the connected flag without disturbing the last-known route set.
     fn set_connected(&self, connected: bool) {
         if let Ok(mut routes) = self.routes.lock() {
@@ -349,12 +407,15 @@ impl ProxyClient {
     /// `--no-auto-reconnect` is set). The listeners stay bound across reconnects
     /// so local apps queue rather than see connection-refused during the gap.
     pub async fn run(&self, endpoint: &Endpoint) -> ProxyResult<()> {
-        let socks = TcpListener::bind(self.config.socks_listen).await?;
+        let socks = match self.config.socks_listen {
+            Some(addr) => Some(TcpListener::bind(addr).await?),
+            None => None,
+        };
         let http = match self.config.http_listen {
             Some(addr) => Some(TcpListener::bind(addr).await?),
             None => None,
         };
-        self.run_with_listeners(endpoint, socks, http).await
+        self.run_with_optional_listeners(endpoint, socks, http).await
     }
 
     /// Serve on an already-bound SOCKS5 listener (see [`run`](Self::run) for the
@@ -374,18 +435,32 @@ impl ProxyClient {
     /// Serve the SOCKS5 listener and, when present, the HTTP CONNECT listener,
     /// both multiplexed over the same reconnecting server connection.
     ///
-    /// Public for callers that must own the local ports before starting work
-    /// that depends on them — the desktop binds both itself so its port
-    /// forwarders only ever come up once the SOCKS port is held by this
-    /// process (their first line of defense against relaying into some other
-    /// server squatting the port).
+    /// Public for callers that must own the enabled proxy ports before starting
+    /// the reconnecting session. Server-direct port forwards do not use either
+    /// proxy listener.
     pub async fn run_with_listeners(
         &self,
         endpoint: &Endpoint,
         socks_listener: TcpListener,
         http_listener: Option<TcpListener>,
     ) -> ProxyResult<()> {
-        self.run_with_listeners_ext(
+        self.run_with_optional_listeners(
+            endpoint,
+            Some(socks_listener),
+            http_listener,
+        )
+        .await
+    }
+
+    /// Serve any enabled local proxy front-ends while maintaining the server
+    /// connection. Both may be absent for a forwarding-only GUI session.
+    pub async fn run_with_optional_listeners(
+        &self,
+        endpoint: &Endpoint,
+        socks_listener: Option<TcpListener>,
+        http_listener: Option<TcpListener>,
+    ) -> ProxyResult<()> {
+        self.run_with_optional_listeners_ext(
             endpoint,
             socks_listener,
             http_listener,
@@ -413,10 +488,29 @@ impl ProxyClient {
         http_listener: Option<TcpListener>,
         #[cfg(unix)] unix_listener: Option<UnixListener>,
     ) -> ProxyResult<()> {
-        log::info!(
-            "SOCKS5 proxy listening on {} (TCP CONNECT only)",
-            socks_listener.local_addr()?
-        );
+        self.run_with_optional_listeners_ext(
+            endpoint,
+            Some(socks_listener),
+            http_listener,
+            #[cfg(unix)]
+            unix_listener,
+        )
+        .await
+    }
+
+    async fn run_with_optional_listeners_ext(
+        &self,
+        endpoint: &Endpoint,
+        socks_listener: Option<TcpListener>,
+        http_listener: Option<TcpListener>,
+        #[cfg(unix)] unix_listener: Option<UnixListener>,
+    ) -> ProxyResult<()> {
+        if let Some(l) = &socks_listener {
+            log::info!(
+                "SOCKS5 proxy listening on {} (TCP CONNECT only)",
+                l.local_addr()?
+            );
+        }
         if let Some(l) = &http_listener {
             log::info!(
                 "HTTP proxy listening on {} (CONNECT tunneling + plain-HTTP forwarding)",
@@ -448,6 +542,13 @@ impl ProxyClient {
             }
         };
 
+        let socks_accept = async {
+            match socks_listener {
+                Some(l) => accept_loop(l, &current, &routed_set, Socks5Proto).await,
+                None => std::future::pending::<ProxyResult<()>>().await,
+            }
+        };
+
         // Same for the optional Unix-domain SOCKS5 front-end. Unix only: on other
         // platforms this branch is inert (there is no Unix-domain listener), so
         // the `select!` shape stays identical.
@@ -465,7 +566,7 @@ impl ProxyClient {
         // orphaned accept task.
         tokio::select! {
             r = self.manage_connection(endpoint, &current, &routed_set) => r,
-            r = accept_loop(socks_listener, &current, &routed_set, Socks5Proto) => r,
+            r = socks_accept => r,
             r = http_accept => r,
             r = unix_accept => r,
         }
@@ -1281,7 +1382,7 @@ mod tests {
         ProxyClient::new(ClientConfig {
             server_node_id: "server".to_string(),
             auth_token: "token".to_string(),
-            socks_listen: "127.0.0.1:0".parse().unwrap(),
+            socks_listen: Some("127.0.0.1:0".parse().unwrap()),
             http_listen: None,
             relay_urls: Vec::new(),
             auto_reconnect: true,

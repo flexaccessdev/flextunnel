@@ -1,25 +1,26 @@
 //! C FFI surface for the iOS app (`aarch64-apple-ios`).
 //!
 //! The app links `libflextunnel.xcframework` (containing `libflextunnel.a`
-//! slices) and drives the in-process SOCKS5 proxy primarily with these calls:
+//! slices) and drives the in-process tunnel primarily with these calls:
 //!
 //! 1. [`flextunnel_start`] — parse the JSON config, create an iroh endpoint,
-//!    bind a loopback SOCKS5 listener (an OS-assigned **ephemeral** port by
-//!    default), and spawn the connect/auth/serve loop on an embedded runtime.
-//!    Returns an opaque handle and writes `{"socks_port": N}` (the actual bound
-//!    port) to the caller's buffer so the app can point
+//!    optionally bind a loopback SOCKS5 listener, and spawn the
+//!    connect/auth/serve loop on an embedded runtime. Returns an opaque handle
+//!    and writes `{"socks_port": N|null}` to the caller's buffer so the app can point
 //!    `WKWebsiteDataStore.proxyConfigurations` at `127.0.0.1:N`. At most **one**
 //!    instance may run at a time (a process-global guard rejects a second).
-//! 2. [`flextunnel_health`] — cheap liveness probe: is the serve loop still
+//! 2. [`flextunnel_set_forwards`] — reconcile server-direct local forwards.
+//! 3. [`flextunnel_health`] — cheap liveness probe: is the serve loop still
 //!    running, or did it give up (bad node id / auth / unreachable server)?
-//! 3. [`flextunnel_routes`] — snapshot the server-pushed split-tunnel set for UI.
-//! 4. [`flextunnel_conn_path`] — snapshot the live iroh path(s) (relay/direct)
+//! 4. [`flextunnel_routes`] — snapshot the server-pushed split-tunnel set for UI.
+//! 5. [`flextunnel_conn_path`] — snapshot the live iroh path(s) (relay/direct)
 //!    for an on-demand "connection path" status readout.
-//! 5. [`flextunnel_stop`] — abort the loop, close the endpoint, free the handle.
+//! 6. [`flextunnel_stop`] — abort the loop, close the endpoint, free the handle.
 //!
 //! Unlike the ezvpn FFI there is **no VPN / Network Extension and no `utun` fd**:
-//! flextunnel is pure-userspace SOCKS5-over-QUIC, so the listener runs entirely
-//! inside the app process. The app is expected to work only in the foreground —
+//! flextunnel is pure-userspace proxying and server-direct forwarding over QUIC,
+//! so its optional proxy and forwarding listeners run entirely inside the app
+//! process. The app is expected to work only in the foreground —
 //! when iOS suspends it the runtime freezes and the QUIC connection idle-times
 //! out; the reconnect loop re-establishes on return to the foreground.
 //!
@@ -38,7 +39,7 @@
 //! {
 //!   "server_node_id": "<iroh endpoint id>",
 //!   "auth_token": "<flextunnel auth token>",
-//!   "socks_port": 0,
+//!   "socks_port": null,
 //!   "relay_urls": ["https://relay.example/"],
 //!   "dns_server": null
 //! }
@@ -47,10 +48,11 @@
 //! ## Result JSON (output of `flextunnel_start` on success)
 //!
 //! ```json
-//! { "socks_port": 49152 }
+//! { "socks_port": null }
 //! ```
 
 use std::ffi::{CStr, c_char, c_int};
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,7 +63,10 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 
 use flextunnel_core::error::ProxyResult;
-use flextunnel_core::proxy::{ClientConfig, ProxyClient, TunnelRoutes};
+use flextunnel_core::proxy::signaling::Target;
+use flextunnel_core::proxy::{
+    ClientConfig, ForwardManager, ForwardSpec, ForwardState, ProxyClient, TunnelRoutes,
+};
 use flextunnel_core::transport::endpoint::{ConnPathKind, create_client_endpoint};
 
 /// Process-global guard enforcing **at most one** running proxy instance. A
@@ -85,20 +90,31 @@ pub struct FlextunnelHandle {
     /// Live tunnel set (split-tunnel domains/CIDRs the server pushed), refreshed
     /// by the serve loop on each (re)connect. Read by [`flextunnel_routes`].
     routes: Arc<Mutex<TunnelRoutes>>,
+    /// Server-direct local forward listeners, reconciled from Swift.
+    forwards: Mutex<ForwardManager>,
 }
 
 #[derive(Deserialize)]
 struct FfiConfig {
     server_node_id: String,
     auth_token: String,
-    /// Loopback port to bind. Omitted or `0` binds an OS-assigned ephemeral port
-    /// (the actual port is returned in the result JSON).
+    /// Loopback SOCKS5 port to bind. `None` disables the SOCKS5 front-end;
+    /// `Some(0)` binds an OS-assigned ephemeral port.
     #[serde(default)]
     socks_port: Option<u16>,
     #[serde(default)]
     relay_urls: Vec<String>,
     #[serde(default)]
     dns_server: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FfiForward {
+    id: String,
+    local_port: u16,
+    remote_host: String,
+    remote_port: u16,
+    enabled: bool,
 }
 
 /// Initialize logging (stderr -> unified log / Console). Honors `RUST_LOG`,
@@ -115,9 +131,9 @@ pub extern "C" fn flextunnel_init_logging() {
     );
 }
 
-/// Start the in-process SOCKS5 proxy.
+/// Start the in-process tunnel, optionally with a SOCKS5 front-end.
 ///
-/// Returns a non-null handle on success and writes `{"socks_port": N}` to
+/// Returns a non-null handle on success and writes `{"socks_port": N|null}` to
 /// `out_buf`. On failure returns null and writes an error message to `out_buf`.
 /// If `out_buf` is too small for the result JSON, that is treated as a failure
 /// (null returned, no handle leaked) — retry with a larger buffer.
@@ -192,28 +208,27 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
     let runtime = flextunnel_core::app::build_runtime()
         .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
 
-    // Bind the loopback listener. The default (socks_port 0 / omitted) is an
-    // OS-assigned ephemeral port — unpredictable, so it isn't a fixed target for
-    // other local processes — reported back to the app via the result JSON. A
-    // caller may still pin a specific port. The listener backlog queues the
-    // WKWebView's first connections until the connect/auth handshake completes
-    // and the serve loop starts accepting.
-    let requested = cfg.socks_port.unwrap_or(0);
-    let listener = runtime
-        .block_on(TcpListener::bind((Ipv4Addr::LOCALHOST, requested)))
-        .map_err(|e| {
-            if requested == 0 {
-                format!("failed to bind an ephemeral loopback SOCKS port: {e}")
-            } else {
-                format!("failed to bind 127.0.0.1:{requested} (already in use?): {e}")
-            }
-        })?;
-    // Read the actually-bound port (matters for the ephemeral case, where
-    // `requested` is 0 and the OS picked the real port).
-    let port = listener
-        .local_addr()
-        .map_err(|e| format!("failed to read bound SOCKS port: {e}"))?
-        .port();
+    // Browser sessions bind a SOCKS listener; forwarding-only sessions pass
+    // null and have no local proxy front-end at all.
+    let (listener, port) = match cfg.socks_port {
+        Some(requested) => {
+            let listener = runtime
+                .block_on(TcpListener::bind((Ipv4Addr::LOCALHOST, requested)))
+                .map_err(|e| {
+                    if requested == 0 {
+                        format!("failed to bind an ephemeral loopback SOCKS port: {e}")
+                    } else {
+                        format!("failed to bind 127.0.0.1:{requested} (already in use?): {e}")
+                    }
+                })?;
+            let port = listener
+                .local_addr()
+                .map_err(|e| format!("failed to read bound SOCKS port: {e}"))?
+                .port();
+            (Some(listener), Some(port))
+        }
+        None => (None, None),
+    };
 
     let endpoint = runtime
         .block_on(create_client_endpoint(&cfg.relay_urls, cfg.dns_server.as_deref()))
@@ -222,9 +237,9 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
     let client = Arc::new(ProxyClient::new(ClientConfig {
         server_node_id: cfg.server_node_id,
         auth_token: cfg.auth_token,
-        // Unused: the listener is already bound above and passed in directly.
-        socks_listen: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-        // iOS uses run_with_listener (SOCKS5 only); no HTTP front-end exposed.
+        // Unused: any listener is already bound above and passed in directly.
+        socks_listen: port.map(|p| SocketAddr::from((Ipv4Addr::LOCALHOST, p))),
+        // iOS exposes no HTTP front-end.
         http_listen: None,
         relay_urls: cfg.relay_urls,
         auto_reconnect: true,
@@ -234,6 +249,11 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
     // Share the live tunnel set out of the client, so `flextunnel_routes` can
     // read what the server pushes on connect.
     let routes = client.routes();
+    let forwards = Mutex::new(ForwardManager::new(
+        runtime.handle().clone(),
+        client.server_forwarder(),
+        &[],
+    ));
 
     // Clone the endpoint into the task; the original stays in the handle so
     // `flextunnel_stop` can close it after aborting the task. The client is
@@ -241,7 +261,11 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
     // the task drives the serve loop.
     let ep = endpoint.clone();
     let client_task = client.clone();
-    let task = runtime.spawn(async move { client_task.run_with_listener(&ep, listener).await });
+    let task = runtime.spawn(async move {
+        client_task
+            .run_with_optional_listeners(&ep, listener, None)
+            .await
+    });
 
     let result_json = serde_json::json!({ "socks_port": port }).to_string();
     Ok((
@@ -251,9 +275,128 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
             client,
             task,
             routes,
+            forwards,
         },
         result_json,
     ))
+}
+
+/// Replace the complete desired server-direct forward set.
+///
+/// `forwards_json` is a JSON array of
+/// `{id,local_port,remote_host,remote_port,enabled}` objects. Enabled forwards
+/// bind `127.0.0.1` and `::1`; every accepted connection is sent directly over
+/// the authenticated server connection. The server rejects off-list targets.
+///
+/// Returns 1 on success, 0 for invalid input, and -1 for a null handle.
+///
+/// # Safety
+/// Pointers must be valid for the supplied lengths and the handle must still be
+/// owned by the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flextunnel_set_forwards(
+    handle: *const FlextunnelHandle,
+    forwards_json: *const c_char,
+    out_buf: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    if handle.is_null() || forwards_json.is_null() {
+        write_cstr(out_buf, out_len, "null handle or forwards_json");
+        return -1;
+    }
+    let json = match unsafe { CStr::from_ptr(forwards_json) }.to_str() {
+        Ok(json) => json,
+        Err(_) => {
+            write_cstr(out_buf, out_len, "forwards_json is not valid UTF-8");
+            return 0;
+        }
+    };
+    let configured: Vec<FfiForward> = match serde_json::from_str(json) {
+        Ok(configured) => configured,
+        Err(e) => {
+            write_cstr(out_buf, out_len, &format!("invalid forwards JSON: {e}"));
+            return 0;
+        }
+    };
+    let mut ids = HashSet::new();
+    let mut ports = HashSet::new();
+    let mut specs = Vec::new();
+    for forward in configured.into_iter().filter(|forward| forward.enabled) {
+        if forward.id.is_empty() || !ids.insert(forward.id.clone()) {
+            write_cstr(out_buf, out_len, "forward ids must be non-empty and unique");
+            return 0;
+        }
+        if forward.local_port == 0 || !ports.insert(forward.local_port) {
+            write_cstr(out_buf, out_len, "enabled forward local ports must be nonzero and unique");
+            return 0;
+        }
+        if forward.remote_host.trim().is_empty() || forward.remote_port == 0 {
+            write_cstr(out_buf, out_len, "forward targets require a host and nonzero port");
+            return 0;
+        }
+        specs.push(ForwardSpec {
+            id: forward.id,
+            local_port: forward.local_port,
+            target: Target::Domain(forward.remote_host, forward.remote_port),
+        });
+    }
+    let handle = unsafe { &*handle };
+    match handle.forwards.lock() {
+        Ok(mut manager) => manager.apply(&specs),
+        Err(_) => {
+            write_cstr(out_buf, out_len, "forward manager lock failed");
+            return 0;
+        }
+    }
+    write_cstr(out_buf, out_len, "");
+    1
+}
+
+/// Snapshot server-direct forward states as JSON.
+///
+/// Returns 1 on success, 0 when the output buffer is too small, and -1 for a
+/// null handle or internal lock failure.
+///
+/// # Safety
+/// The handle must still be owned by the caller, and `out_buf` must be valid
+/// for `out_len` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flextunnel_forward_statuses(
+    handle: *const FlextunnelHandle,
+    out_buf: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    if handle.is_null() {
+        write_cstr(out_buf, out_len, "");
+        return -1;
+    }
+    let handle = unsafe { &*handle };
+    let statuses = match handle.forwards.lock() {
+        Ok(manager) => manager.statuses(),
+        Err(_) => {
+            write_cstr(out_buf, out_len, "");
+            return -1;
+        }
+    };
+    let statuses: Vec<_> = statuses
+        .into_iter()
+        .map(|status| {
+            let (state, error) = match status.state {
+                ForwardState::Starting => ("starting", None),
+                ForwardState::Listening => ("listening", None),
+                ForwardState::Failed(error) => ("failed", Some(error)),
+            };
+            serde_json::json!({
+                "id": status.id,
+                "state": state,
+                "error": error,
+                "active": status.active,
+                "last_conn_error": status.last_conn_error,
+            })
+        })
+        .collect();
+    let json = serde_json::json!({ "forwards": statuses }).to_string();
+    if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
 }
 
 /// Stop the proxy and free the handle. After this call `handle` is invalid and
@@ -456,12 +599,21 @@ pub unsafe extern "C" fn flextunnel_conn_path(
 /// down. Factored out so [`flextunnel_start`] can also use it on the
 /// buffer-too-small path without going through a raw pointer.
 fn stop_handle(handle: FlextunnelHandle) {
-    handle.task.abort();
+    let FlextunnelHandle {
+        runtime,
+        endpoint,
+        client: _,
+        task,
+        routes: _,
+        forwards,
+    } = handle;
+    drop(forwards);
+    task.abort();
     // Close the endpoint before it drops. Skipping this makes iroh tear down its
     // relay tasks ungracefully (a JoinSet abort that panics — fatal under
     // panic=abort). `block_on` is safe here: the task is already aborted.
-    handle.runtime.block_on(handle.endpoint.close());
-    handle.runtime.shutdown_background();
+    runtime.block_on(endpoint.close());
+    runtime.shutdown_background();
 }
 
 /// Write `s` (always NUL-terminated) into the caller buffer. Returns `true` if

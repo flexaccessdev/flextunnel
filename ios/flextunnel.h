@@ -4,15 +4,15 @@
  * Build the static library slices with ./build-ios.sh (produces
  * dist/ios/libflextunnel.xcframework alongside a copy of this header).
  *
- * Unlike a VPN, there is no Network Extension and no utun fd: flextunnel runs a
- * SOCKS5 listener entirely inside the app process. Point a WKWebView at it via
- * WKWebsiteDataStore.proxyConfigurations (iOS 17+).
+ * Unlike a VPN, there is no Network Extension and no utun fd. Browser sessions
+ * may run a SOCKS5 listener for WKWebView; forwarding-only sessions omit it and
+ * use server-direct local forward listeners owned by the Rust core.
  *
  * Lifecycle:
  *
  *   1. flextunnel_init_logging()                          (once, optional)
  *   2. flextunnel_start(configJson, buf, len) -> handle   (or NULL on error)
- *        On success `buf` holds {"socks_port": N} (the ACTUAL bound port);
+ *        On success `buf` holds {"socks_port": N|null};
  *        configure the WKWebView proxy with NWEndpoint host 127.0.0.1, port N.
  *        On error `buf` holds the error message. At most ONE instance may run
  *        at a time; a second start while one is live returns NULL.
@@ -20,10 +20,9 @@
  *   -  flextunnel_conn_path(handle, buf, len)             (on-demand path readout)
  *   4. flextunnel_stop(handle)                            (on teardown)
  *
- * The SOCKS5 listener binds an OS-assigned EPHEMERAL loopback port by default
- * (omit "socks_port" or pass 0) — unpredictable, so it isn't a fixed target for
- * other local processes. Read the chosen port from the result JSON. A caller
- * may still pin a specific port via "socks_port".
+ * Pass a numeric "socks_port" to bind the browser's loopback SOCKS5 listener
+ * (0 requests an OS-assigned port). Pass null or omit it for a forwarding-only
+ * session with no SOCKS5 listener.
  *
  * All functions are NULL-safe and never unwind into Swift.
  */
@@ -46,18 +45,17 @@ typedef struct FlextunnelHandle FlextunnelHandle;
 void flextunnel_init_logging(void);
 
 /*
- * Start the in-process SOCKS5 proxy: create the iroh endpoint, bind a loopback
- * listener on a FIXED port (default 18080, or "socks_port" in the config), and
- * spawn the connect/auth/serve loop.
+ * Start the in-process tunnel: create the iroh endpoint, optionally bind a
+ * loopback SOCKS5 listener, and spawn the connect/auth/serve loop.
  *
  * config_json : NUL-terminated UTF-8 JSON, e.g.
  *   {"server_node_id":"<id>","auth_token":"<token>",
  *    "socks_port":0,"relay_urls":[],"dns_server":null}
- *   socks_port is optional; omit or 0 for an OS-assigned ephemeral port (read the
- *   actual port from the result JSON). The split-tunnel routed set (the tunnel
+ *   socks_port is optional; null/omitted disables SOCKS5, while 0 requests an
+ *   OS-assigned port (read it from the result JSON). The routed set
  *   set) is configured on the server and pushed to the client during the
  *   handshake, so the app sends no routed set of its own.
- * out_buf/out_len : caller buffer. On success receives {"socks_port":N};
+ * out_buf/out_len : caller buffer. On success receives {"socks_port":N|null};
  *   on failure receives an error message. Always NUL-terminated. If out_buf is
  *   too small for the success JSON, this is treated as a failure (returns NULL,
  *   no handle leaked) — retry with a larger buffer.
@@ -66,6 +64,32 @@ void flextunnel_init_logging(void);
  * instance is already running).
  */
 FlextunnelHandle *flextunnel_start(const char *config_json, char *out_buf, size_t out_len);
+
+/*
+ * Replace the complete server-direct local-forward set. forwards_json is an
+ * array of objects:
+ *   [{"id":"uuid","local_port":8080,"remote_host":"db.internal",
+ *     "remote_port":5432,"enabled":true}]
+ *
+ * Enabled listeners bind loopback only (127.0.0.1 and ::1). Each accepted TCP
+ * connection opens a QUIC data stream directly to the authenticated server;
+ * no SOCKS5 proxy is involved. The server enforces its routed-set whitelist and
+ * rejects off-list targets.
+ *
+ * Returns 1 on success, 0 for invalid input, and -1 for a NULL handle.
+ * out_buf receives an error message on failure.
+ */
+int flextunnel_set_forwards(const FlextunnelHandle *handle, const char *forwards_json,
+                           char *out_buf, size_t out_len);
+
+/*
+ * Snapshot direct-forward states:
+ *   {"forwards":[{"id":"uuid","state":"listening","error":null,
+ *     "active":1,"last_conn_error":null}]}
+ * Returns 1 on success, 0 when out_buf is too small, and -1 for NULL/lock error.
+ */
+int flextunnel_forward_statuses(const FlextunnelHandle *handle,
+                                char *out_buf, size_t out_len);
 
 /*
  * Liveness probe. Returns 1 while the connect/serve loop is running, 0 once it

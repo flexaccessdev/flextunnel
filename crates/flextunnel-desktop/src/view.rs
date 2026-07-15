@@ -80,6 +80,7 @@ fn forward_pill(
     }
     match status {
         Some(status) => match &status.state {
+            ForwardState::Starting => ("starting…".into(), AMBER),
             ForwardState::Listening if status.active > 0 => {
                 (format!("listening · {}", status.active), GREEN)
             }
@@ -402,22 +403,24 @@ fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message
     let node_id = profile.server_node_id.clone();
     let socks = snapshot
         .socks_addr
-        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], profile.socks_port)))
-        .to_string();
+        .or_else(|| profile.socks_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p))))
+        .map(|addr| addr.to_string());
     let http = snapshot
         .http_addr
         .or_else(|| profile.http_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p))))
         .map(|a| a.to_string());
 
     let copy_node = (!node_id.is_empty()).then(|| node_id.clone());
-    let copy_socks = Some(format!("socks5://{socks}"));
     let mut info = column![
         // The full id never fits (and iced has no ellipsis overflow); both
         // ends stay visible for eyeballing, Copy carries the whole thing.
         info_row("Server node id", truncate_middle(&node_id, 22), copy_node),
-        info_row("SOCKS5 proxy", socks, copy_socks),
     ]
     .spacing(8);
+    if let Some(socks) = socks {
+        let copy = Some(format!("socks5://{socks}"));
+        info = info.push(info_row("SOCKS5 proxy", socks, copy));
+    }
     if let Some(http) = http {
         let copy = Some(format!("http://{http}"));
         info = info.push(info_row("HTTP proxy", http, copy));
@@ -504,8 +507,8 @@ fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message
         }
         col = col.push(
             text(
-                "Forwards listen on localhost only (127.0.0.1 and ::1) and relay through \
-                 this profile's SOCKS5 proxy while connected.",
+                "Forwards listen on localhost only (127.0.0.1 and ::1) and open \
+                 server-direct tunnel streams. The server rejects targets outside its tunnel set.",
             )
             .size(11)
             .style(style::faint_text),
@@ -658,9 +661,9 @@ fn forward_card<'a>(
         .align_y(Center);
     if let Some(tunneled) = forward_badge(snapshot.phase, &snapshot.routes, routed_set, forward) {
         let (badge, color) = if tunneled {
-            ("tunneled", GREEN)
+            ("server-direct", GREEN)
         } else {
-            ("direct", AMBER)
+            ("not routed", AMBER)
         };
         title = title.push(pill(badge.to_string(), color));
     }
@@ -830,6 +833,17 @@ fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
 // Profile form
 
 fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Message> {
+    let mut socks = row![checkbox(form.socks_enabled)
+        .label("enable")
+        .text_size(13)
+        .on_toggle(Message::SocksEnabledToggled)
+        .style(style::check)]
+    .spacing(10)
+    .align_y(Center);
+    if form.socks_enabled {
+        socks = socks.push(text("port").size(12).style(style::dim_text));
+        socks = socks.push(input("", &form.socks_port, Message::SocksPortChanged).width(90));
+    }
     let mut http = row![checkbox(form.http_enabled)
         .label("enable")
         .text_size(13)
@@ -856,10 +870,7 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
                 .secure(true)
                 .width(240),
         ),
-        form_row(
-            "SOCKS5 port",
-            input("", &form.socks_port, Message::SocksPortChanged).width(90),
-        ),
+        form_row("SOCKS5 proxy", socks),
         form_row("HTTP proxy", http),
         form_row(
             "Relay URLs",

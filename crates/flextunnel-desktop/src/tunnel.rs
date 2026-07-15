@@ -378,12 +378,14 @@ fn refresh_forward_statuses(slot: &SnapshotSlot, fwd_mgr: &ForwardManager) {
 
 async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot: SnapshotSlot) {
     let mut forwards = profile.forwards.clone();
-    let socks_addr = SocketAddr::from(([127, 0, 0, 1], profile.socks_port));
+    let socks_addr = profile
+        .socks_port
+        .map(|port| SocketAddr::from(([127, 0, 0, 1], port)));
     let http_addr = profile.http_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p)));
     slot.update(|s| {
         *s = Snapshot {
             phase: Phase::Connecting,
-            socks_addr: Some(socks_addr),
+            socks_addr,
             http_addr,
             ..Snapshot::default()
         };
@@ -470,13 +472,13 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
     });
     let routes = client.routes();
 
-    // Bind the local listeners before any forward listener exists: holding the
-    // SOCKS port in this process is the forwarders' first line of defense
-    // against relaying into some other server squatting the port (the
-    // flextunnel.internal probe is only the secondary check). A taken port
-    // fails the session here, before a single forward comes up.
+    // Bind enabled proxy front-ends before any forward listener exists. A
+    // taken proxy port fails the session before forwards come up.
     let listeners = async {
-        let socks = bind_local(socks_addr, "SOCKS").await?;
+        let socks = match socks_addr {
+            Some(addr) => Some(bind_local(addr, "SOCKS").await?),
+            None => None,
+        };
         let http = match http_addr {
             Some(addr) => Some(bind_local(addr, "HTTP").await?),
             None => None,
@@ -500,12 +502,12 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
     // listener above stays bound); they die with the manager when the session
     // ends.
     let mut fwd_mgr = ForwardManager::new(
-        profile.socks_port,
-        profile.server_node_id.as_str().into(),
+        tokio::runtime::Handle::current(),
+        client.server_forwarder(),
         &forwards,
     );
 
-    let run = client.run_with_listeners(&endpoint, socks_listener, http_listener);
+    let run = client.run_with_optional_listeners(&endpoint, socks_listener, http_listener);
     tokio::pin!(run);
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     let mut ever_connected = false;

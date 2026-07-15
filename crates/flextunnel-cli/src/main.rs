@@ -568,7 +568,7 @@ async fn run_client(r: config::ResolvedClient) -> Result<()> {
     let client = ProxyClient::new(ClientConfig {
         server_node_id,
         auth_token: token,
-        socks_listen: r.socks_listen,
+        socks_listen: Some(r.socks_listen),
         http_listen: r.http_listen,
         relay_urls: r.relay_urls,
         auto_reconnect: r.auto_reconnect,
