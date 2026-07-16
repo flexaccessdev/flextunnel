@@ -41,17 +41,29 @@ addresses that can never leave the machine.
   `netsh interface portproxy` forwarder (both below).
 
 Prefer `127.x.y.z` addresses whenever they'll do: they behave identically for
-this purpose, can never escape the box, and can't collide with anything.
+this purpose, can never escape the box, and can't collide with anything *on the
+network*. (They can still clash *locally* — a process already holding that
+address/port, or a wildcard listener on the same port; see the collision caveat
+below.)
 
 ### `169.254.0.0/16` — link-local
 
-Useful when you *want* the address reachable on the local link (e.g. from
-another box) without picking a routable subnet, but it needs an interface alias
-on every platform, and it is the IPv4 autoconfiguration range — a real interface
-may self-assign a `169.254.x.x` address when DHCP fails and collide with yours.
-Reach for `127.x.y.z` unless you specifically need on-link reachability. On
-**Windows**, where `127.x` aliasing is awkward, a `169.254.x.x` (or spare
-private) address on the KM-TEST loopback adapter is often the *easier* choice.
+RFC 3927 link-local addresses always stay on the same link — they are never
+routed beyond it — but *how far* one reaches depends on which interface it's
+assigned to:
+
+- **host-local** — assigned to `lo` (Linux) or the KM-TEST loopback adapter
+  (Windows), a `169.254.x.x` address is reachable only from this machine, just
+  like a `127.x` one. On **Windows**, where `127.x` aliasing is awkward, this
+  (or a spare private address on KM-TEST) is often the *easier* choice than a
+  loopback alias.
+- **LAN-shared** — to make the forward reachable from *another box* on the link,
+  assign the address to the actual **LAN interface** instead of `lo`/KM-TEST
+  (e.g. `sudo ip addr add 169.254.10.10/24 dev eth0`).
+
+Either way it's the IPv4 autoconfiguration range, so a real interface may
+self-assign a `169.254.x.x` address when DHCP fails and collide with yours;
+reach for `127.x.y.z` unless you specifically need on-link reachability.
 
 ### A real LAN address
 
@@ -158,18 +170,17 @@ table:
   wildcard (`bind interfaces only = yes` + `interfaces = …` in `smb.conf`),
   which is intrusive. Picking a port the host *isn't* already serving sidesteps
   the whole issue.
-- **Windows** — no coexistence. Windows sockets bind exclusively by default
-  (its `SO_REUSEADDR` allows address *hijacking*, not the BSD-style shared bind),
-  and the SMB server binds `445` in-kernel, so you cannot put a second listener
-  on `445` at all — not even on a different local address. Use a **different
-  port** and remap it with `netsh portproxy` (above), which is why the
-  vanity-IP-on-a-fixed-port trick on Windows always routes through a high port.
+- **Windows** — no coexistence with SMB. The SMB server binds `445` in-kernel
+  (via `srv2.sys`), so you cannot put a second listener on `445` alongside it —
+  not even on a different local address. Use a **different port** and remap it
+  with `netsh portproxy` (above), which is why the vanity-IP-on-a-fixed-port
+  trick on Windows always routes through a high port.
 
 Also: on Unix, ports below 1024 are privileged, so binding `:445` needs root
 (macOS has no `setcap`; on Linux use `setcap cap_net_bind_service=+ep` on the
 binary or lower `net.ipv4.ip_unprivileged_port_start`). Windows has no such
-low-port restriction — any user can bind `445` — but you still hit the exclusive
-SMB bind above. Where the client lets you choose the port, a high port on
+low-port restriction — any user can bind `445` — but you still hit SMB's
+in-kernel bind above. Where the client lets you choose the port, a high port on
 `127.0.0.1` avoids both the collision and the privilege problem.
 
 ## Pattern: a stable IP per service
@@ -208,7 +219,7 @@ socat TCP-LISTEN:5432,bind=127.0.0.20,reuseaddr,fork \
 | Extra `127.x.y.z` | `ifconfig lo0 alias …` (not persistent) | free, no setup | unreliable — use a loopback adapter or `netsh portproxy` |
 | `169.254.x.x` | `ifconfig lo0 alias …` | `ip addr add … dev lo` | KM-TEST loopback adapter + `netsh … add address` |
 | Same fixed port, N remotes | one loopback IP per remote | same | one vanity IP per remote, each remapped via `netsh portproxy` |
-| Wildcard-port collision | clean (new socket's `SO_REUSEADDR` suffices) | needs both sockets' `SO_REUSEADDR`, or move the system service | impossible (exclusive bind) — use a different port + `portproxy` |
+| Wildcard-port collision | clean (new socket's `SO_REUSEADDR` suffices) | needs both sockets' `SO_REUSEADDR`, or move the system service | for SMB, blocked by its in-kernel `445` bind — use a different port + `portproxy` |
 | Privileged port (<1024) | needs root | root, `setcap`, or lower `ip_unprivileged_port_start` | no low-port restriction |
 | SOCKS-capable adapter | `socat`, `ssh -L` | `socat`, `ssh -L` | `ssh -L` (built-in OpenSSH); `socat` via MSYS2/Cygwin/WSL |
 
