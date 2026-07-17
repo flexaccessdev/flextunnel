@@ -243,7 +243,7 @@ It prints `flextunnel server Node ID: <ENDPOINT_ID>` — give that to clients.
 ### 3. Run the client (no root needed)
 
 ```sh
-flextunnel client \
+flextunnel client start \
     --server-node-id <ENDPOINT_ID> \
     --auth-token     <AUTH_TOKEN> \
     --socks-port     1080            # SOCKS5 on 127.0.0.1:1080 (loopback only)
@@ -304,7 +304,7 @@ absolute-URI forwarding; either way the hostname goes to the proxy, so DNS
 still happens on the server.
 
 ```sh
-flextunnel client \
+flextunnel client start \
     --server-node-id <ENDPOINT_ID> \
     --auth-token     <AUTH_TOKEN> \
     --socks-port     1080 \
@@ -323,7 +323,9 @@ analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 | Command | Description |
 |---|---|
 | `server` | Run the proxy server. |
-| `client` | Run the proxy client (optional SOCKS5 and HTTP proxy listeners, port forwards). |
+| `client start` | Run the proxy client (optional SOCKS5 and HTTP proxy listeners, port forwards). |
+| `client control` | Attach the terminal control panel to a running client. |
+| `client help` | Show the client subcommands and their help. |
 | `generate-server-key -o <FILE> [--force]` | Generate the server identity key. |
 | `show-server-id --secret-file <FILE>` | Print the EndpointId for a key. |
 | `generate-auth-token [-c N]` | Generate N client auth tokens (prefix `ftc`). |
@@ -347,7 +349,7 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). |
 | `--dns-server <URL>` | Custom discovery DNS server, or `none` to disable. |
 
-### `client`
+### `client start`
 
 | Flag | Description |
 |---|---|
@@ -402,11 +404,11 @@ Detaching (`q`) never affects the tunnel; several panels can attach at once.
 ## Configuration files
 
 Instead of passing everything on the command line, `server` and
-`client` can read a TOML file:
+`client start` can read a TOML file:
 
 ```sh
 flextunnel server -c server.toml
-flextunnel client --default-config   # ~/.config/flextunnel/client.toml
+flextunnel client start --default-config   # ~/.config/flextunnel/client.toml
 ```
 
 Precedence is **CLI flag > config file > built-in default**, so you can keep a
