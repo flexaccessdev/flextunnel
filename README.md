@@ -17,7 +17,7 @@ Transport, NAT traversal, relay fallback, and TLS 1.3 encryption are provided by
 `EndpointId`, so the server needs no public inbound port or port forwarding.
 
 ```
-local app ──SOCKS5/HTTP──► flextunnel client (127.0.0.1:1080 / optional :8081)
+local app ──SOCKS5/HTTP──► flextunnel client (optional listeners, e.g. 127.0.0.1:1080 / :8081)
                           │  one iroh QUIC connection (fixed ALPN + auth handshake)
                           │  ├─ control stream:  Hello / HelloResponse
                           │  └─ N data streams:  [target header][reply][raw bytes]
@@ -34,7 +34,10 @@ local app ──SOCKS5/HTTP──► flextunnel client (127.0.0.1:1080 / optiona
   proxy supports HTTP `CONNECT` plus absolute-URI plain-HTTP forwarding.
 - The local SOCKS5 and HTTP proxy listeners are **no-auth**, and each is
   disabled unless explicitly configured. Access control is enforced by the QUIC
-  layer (auth token), not by the local proxy front-ends.
+  layer (auth token), not by the local proxy front-ends — so **bind them to
+  loopback** (`127.0.0.1:…`), as every example here does. Binding to `0.0.0.0`
+  or a LAN address hands the authenticated tunnel to anything that can reach
+  the port; do that only when that exposure is intentional.
 
 ## Security model
 
