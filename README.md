@@ -34,10 +34,9 @@ local app ──SOCKS5/HTTP──► flextunnel client (optional listeners, e.g.
   proxy supports HTTP `CONNECT` plus absolute-URI plain-HTTP forwarding.
 - The local SOCKS5 and HTTP proxy listeners are **no-auth**, and each is
   disabled unless explicitly configured. Access control is enforced by the QUIC
-  layer (auth token), not by the local proxy front-ends — so **bind them to
-  loopback** (`127.0.0.1:…`), as every example here does. Binding to `0.0.0.0`
-  or a LAN address hands the authenticated tunnel to anything that can reach
-  the port; do that only when that exposure is intentional.
+  layer (auth token), not by the local proxy front-ends — which is why they
+  **bind `127.0.0.1` only** (you configure just the port, like the desktop
+  client); the authenticated tunnel is never exposed beyond the local machine.
 
 ## Security model
 
@@ -244,7 +243,7 @@ It prints `flextunnel server Node ID: <ENDPOINT_ID>` — give that to clients.
 flextunnel client \
     --server-node-id <ENDPOINT_ID> \
     --auth-token     <AUTH_TOKEN> \
-    --socks-listen   127.0.0.1:1080
+    --socks-port     1080            # SOCKS5 on 127.0.0.1:1080 (loopback only)
 ```
 
 ### 4. Use it
@@ -294,7 +293,7 @@ speak SOCKS5 (databases, RDP, most GUIs) — see
 
 #### HTTP proxy front-end (optional)
 
-Add `--http-listen <ADDR>` to also run an HTTP proxy alongside SOCKS5 — useful
+Add `--http-port <PORT>` to also run an HTTP proxy alongside SOCKS5 — useful
 for the many tools that only speak an HTTP proxy or whose SOCKS5 support
 resolves DNS client-side (`wget`, Docker pulls, npm/yarn, JVM/JDBC, .NET). It
 handles HTTPS (and any TCP) via `CONNECT` tunneling and plain-HTTP via
@@ -305,8 +304,8 @@ still happens on the server.
 flextunnel client \
     --server-node-id <ENDPOINT_ID> \
     --auth-token     <AUTH_TOKEN> \
-    --socks-listen   127.0.0.1:1080 \
-    --http-listen    127.0.0.1:8081
+    --socks-port     1080 \
+    --http-port      8081
 
 # HTTPS tunnels via CONNECT; plain HTTP is forwarded
 https_proxy=http://127.0.0.1:8081 curl https://example.com
@@ -352,8 +351,8 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `-c, --config <FILE>` | Load options from a TOML file (CLI flags override it). |
 | `--default-config` | Load `~/.config/flextunnel/client.toml`. |
 | `-n, --server-node-id <ID>` | Server EndpointId. |
-| `--socks-listen <ADDR>` | Optional local SOCKS5 bind address, e.g. `127.0.0.1:1080`. Disabled unless set. |
-| `--http-listen <ADDR>` | Optional HTTP proxy bind address (CONNECT + plain-HTTP forwarding). |
+| `--socks-port <PORT>` | Optional SOCKS5 listener port, e.g. `1080`. Binds `127.0.0.1` only. Disabled unless set. |
+| `--http-port <PORT>` | Optional HTTP proxy listener port (CONNECT + plain-HTTP forwarding). Binds `127.0.0.1` only. |
 | `--auth-token <TOKEN>` / `--auth-token-file <FILE>` | Client auth token (one required). |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). |
 | `--dns-server <URL>` | Custom discovery DNS server, or `none` to disable. |
@@ -361,7 +360,7 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `--no-auto-reconnect` | Exit on the first disconnection instead of reconnecting. |
 | `--max-reconnect-attempts <N>` | Cap reconnect attempts between successful connections (unlimited if unset). |
 
-With neither `--socks-listen` nor `--http-listen` (nor the config keys) the
+With neither `--socks-port` nor `--http-port` (nor the config keys) the
 client runs in **port-forward-only mode**: it holds the tunnel and serves only
 the control panel and any enabled port forwards.
 
@@ -420,7 +419,7 @@ client file:
 
 ```toml
 server_node_id = "<server endpoint id>"
-socks_listen   = "127.0.0.1:1080"
+socks_port     = 1080          # SOCKS5 on 127.0.0.1:1080 (loopback only)
 auth_token     = "ftc…"        # or: auth_token_file = "~/.config/flextunnel/token.txt"
 ```
 

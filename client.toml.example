@@ -15,14 +15,16 @@ server_node_id = "<server endpoint id>"
 # statuses. Display-only.
 # name = "aws"
 
-# Optional local SOCKS5 listen address. Unset means disabled.
-# socks_listen = "127.0.0.1:1080"
+# Optional local SOCKS5 listener port. Unset means disabled. Listeners bind
+# 127.0.0.1 only (they are unauthenticated, so they are never exposed beyond
+# this machine — same as the desktop client).
+# socks_port = 1080
 
-# Optional HTTP proxy listen address (CONNECT + absolute-URI plain-HTTP
-# forwarding). Unset means disabled. With neither socks_listen nor
-# http_listen set, the client runs in port-forward-only mode (manage
-# forwards with `flextunnel client control`).
-# http_listen = "127.0.0.1:8081"
+# Optional HTTP proxy listener port (CONNECT + absolute-URI plain-HTTP
+# forwarding). Unset means disabled. With neither socks_port nor http_port
+# set, the client runs in port-forward-only mode (manage forwards with
+# `flextunnel client control`).
+# http_port = 8081
 
 # Auth token for this client. Provide exactly one of `auth_token` or `auth_token_file`.
 auth_token = "ftcXXXXXXX"

@@ -10,7 +10,6 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
@@ -83,14 +82,15 @@ enum Command {
         /// Load config from ~/.config/flextunnel/client.toml.
         #[arg(long)]
         default_config: bool,
-        /// Local address for the optional SOCKS5 listener, e.g. 127.0.0.1:1080.
-        /// Disabled unless set here or in the config.
+        /// Loopback port for the optional SOCKS5 listener (binds 127.0.0.1
+        /// only), e.g. 1080. Disabled unless set here or in the config.
         #[arg(long)]
-        socks_listen: Option<SocketAddr>,
-        /// Local address for the optional HTTP proxy listener (CONNECT +
-        /// plain-HTTP forwarding), e.g. 127.0.0.1:8081. Disabled unless set.
+        socks_port: Option<u16>,
+        /// Loopback port for the optional HTTP proxy listener (CONNECT +
+        /// plain-HTTP forwarding; binds 127.0.0.1 only), e.g. 8081. Disabled
+        /// unless set.
         #[arg(long)]
-        http_listen: Option<SocketAddr>,
+        http_port: Option<u16>,
         /// EndpointId of the server to connect to.
         #[arg(short = 'n', long)]
         server_node_id: Option<String>,
@@ -271,8 +271,8 @@ async fn run_async(command: Command) -> Result<()> {
             action: None,
             config: config_path,
             default_config,
-            socks_listen,
-            http_listen,
+            socks_port,
+            http_port,
             server_node_id,
             auth_token,
             auth_token_file,
@@ -296,8 +296,8 @@ async fn run_async(command: Command) -> Result<()> {
             let cli = config::ClientConfig {
                 server_node_id,
                 name: None, // display name is config-file only; no CLI flag
-                socks_listen,
-                http_listen,
+                socks_port,
+                http_port,
                 auth_token,
                 auth_token_file,
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),

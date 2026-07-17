@@ -75,11 +75,16 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
         .context("Failed to create iroh endpoint")?;
     log::info!("flextunnel client Node ID: {}", endpoint.id());
 
+    // The proxy front-ends bind 127.0.0.1 only (like the desktop client):
+    // they are unauthenticated, so they are never exposed beyond this machine.
+    let socks_bind = r.socks_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p)));
+    let http_bind = r.http_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p)));
+
     let client = ProxyClient::new(ClientConfig {
         server_node_id: server_node_id.clone(),
         auth_token: token,
-        socks_listen: r.socks_listen,
-        http_listen: r.http_listen,
+        socks_listen: socks_bind,
+        http_listen: http_bind,
         relay_urls: r.relay_urls,
         auto_reconnect: r.auto_reconnect,
         max_reconnect_attempts: r.max_reconnect_attempts,
@@ -89,11 +94,11 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
     // Bind the enabled proxy front-ends before anything else can take the
     // ports; a taken port fails startup with a clear message.
     let listeners = async {
-        let socks = match r.socks_listen {
+        let socks = match socks_bind {
             Some(addr) => Some(bind_local(addr, "SOCKS").await?),
             None => None,
         };
-        let http = match r.http_listen {
+        let http = match http_bind {
             Some(addr) => Some(bind_local(addr, "HTTP").await?),
             None => None,
         };
