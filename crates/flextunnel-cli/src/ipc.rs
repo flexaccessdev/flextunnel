@@ -1,4 +1,4 @@
-//! Local control channel between a running `flextunnel client` and
+//! Local control channel between a running `flextunnel client start` and
 //! `flextunnel client control`.
 //!
 //! Transport: a Unix domain socket (`~/.config/flextunnel/client-<key>.sock`)

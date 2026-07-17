@@ -1,7 +1,7 @@
 //! Client instance identity.
 //!
-//! A client *instance* is one running `flextunnel client` process, identified
-//! by the server it connects to: since a profile's `server_node_id` never
+//! A client *instance* is one running `flextunnel client start` process,
+//! identified by the server it connects to: since a profile's `server_node_id` never
 //! changes, its prefix keys every per-instance artifact — the single-instance
 //! lock (`client-<key>.lock`), the control socket (`client-<key>.sock` /
 //! `\\.\pipe\flextunnel-client-<key>`), and the persisted port forwards

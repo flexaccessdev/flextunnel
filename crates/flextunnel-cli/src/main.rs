@@ -71,11 +71,53 @@ enum Command {
         #[arg(long)]
         dns_server: Option<String>,
     },
-    /// Start the proxy client (optional SOCKS5 + HTTP proxy listeners, port forwards).
-    #[command(arg_required_else_help = true, args_conflicts_with_subcommands = true)]
+    /// Start or control the proxy client.
+    #[command(arg_required_else_help = true)]
     Client {
         #[command(subcommand)]
-        action: Option<ClientAction>,
+        action: ClientAction,
+    },
+    /// Generate a new private key for persistent server identity.
+    GenerateServerKey {
+        /// Path where to save the private key file ("-" for stdout).
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Overwrite existing file if it exists.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show the server's public EndpointId derived from a private key.
+    #[command(arg_required_else_help = true)]
+    ShowServerId {
+        /// Config file path (TOML). CLI flags override file values.
+        #[arg(short = 'c', long)]
+        config: Option<PathBuf>,
+        /// Load config from ~/.config/flextunnel/server.toml.
+        #[arg(long)]
+        default_config: bool,
+        /// Path to the private key file (overrides secret_file/secret in the config).
+        #[arg(short, long)]
+        secret_file: Option<PathBuf>,
+    },
+    /// Generate client authentication token(s).
+    GenerateAuthToken {
+        /// Number of tokens to generate.
+        #[arg(short, long, default_value = "1")]
+        count: usize,
+    },
+    /// Generate bridge authentication token(s) (server-to-server, `ftb` prefix).
+    GenerateBridgeToken {
+        /// Number of tokens to generate.
+        #[arg(short, long, default_value = "1")]
+        count: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClientAction {
+    /// Start the proxy client (optional SOCKS5 + HTTP proxy listeners, port forwards).
+    #[command(arg_required_else_help = true)]
+    Start {
         /// Config file path (TOML). CLI flags override file values.
         #[arg(short = 'c', long)]
         config: Option<PathBuf>,
@@ -116,44 +158,6 @@ enum Command {
         #[arg(long)]
         max_reconnect_attempts: Option<NonZeroU32>,
     },
-    /// Generate a new private key for persistent server identity.
-    GenerateServerKey {
-        /// Path where to save the private key file ("-" for stdout).
-        #[arg(short, long)]
-        output: PathBuf,
-        /// Overwrite existing file if it exists.
-        #[arg(long)]
-        force: bool,
-    },
-    /// Show the server's public EndpointId derived from a private key.
-    #[command(arg_required_else_help = true)]
-    ShowServerId {
-        /// Config file path (TOML). CLI flags override file values.
-        #[arg(short = 'c', long)]
-        config: Option<PathBuf>,
-        /// Load config from ~/.config/flextunnel/server.toml.
-        #[arg(long)]
-        default_config: bool,
-        /// Path to the private key file (overrides secret_file/secret in the config).
-        #[arg(short, long)]
-        secret_file: Option<PathBuf>,
-    },
-    /// Generate client authentication token(s).
-    GenerateAuthToken {
-        /// Number of tokens to generate.
-        #[arg(short, long, default_value = "1")]
-        count: usize,
-    },
-    /// Generate bridge authentication token(s) (server-to-server, `ftb` prefix).
-    GenerateBridgeToken {
-        /// Number of tokens to generate.
-        #[arg(short, long, default_value = "1")]
-        count: usize,
-    },
-}
-
-#[derive(Subcommand)]
-enum ClientAction {
     /// Attach the control panel to the running client for a profile: live
     /// status + editable port forwards (in this terminal). The client is
     /// identified by the profile's server node id; with no flags, the default
@@ -172,6 +176,69 @@ enum ClientAction {
     },
 }
 
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn client_requires_an_action() {
+        let Err(error) = Args::try_parse_from(["flextunnel", "client"]) else {
+            panic!("client without an action must be rejected");
+        };
+        assert_eq!(
+            error.kind(),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+    }
+
+    #[test]
+    fn client_start_accepts_startup_flags() {
+        let args = Args::try_parse_from([
+            "flextunnel",
+            "client",
+            "start",
+            "--server-node-id",
+            "server-id",
+            "--auth-token",
+            "token",
+        ])
+        .unwrap_or_else(|error| panic!("client start should parse: {error}"));
+
+        assert!(matches!(
+            args.command,
+            Command::Client {
+                action: ClientAction::Start { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn client_rejects_legacy_startup_flags() {
+        let Err(error) = Args::try_parse_from([
+            "flextunnel",
+            "client",
+            "--server-node-id",
+            "server-id",
+        ]) else {
+            panic!("startup flags without the start action must be rejected");
+        };
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn client_help_lists_all_actions() {
+        let Err(error) = Args::try_parse_from(["flextunnel", "client", "help"]) else {
+            panic!("help is rendered as a clap display-help result");
+        };
+        assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+        let help = error.to_string();
+        assert!(help.contains("start"));
+        assert!(help.contains("control"));
+        assert!(help.contains("help"));
+    }
+}
+
 fn log_version() {
     app::log_version(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 }
@@ -186,12 +253,11 @@ fn main() -> Result<()> {
         // shared multi-thread runtime below.
         Command::Client {
             action:
-                Some(ClientAction::Control {
+                ClientAction::Control {
                     config,
                     default_config,
                     server_node_id,
-                }),
-            ..
+                },
         } => tui::run(config, default_config, server_node_id),
         Command::GenerateServerKey { output, force } => secret::generate_secret(output, force),
         Command::ShowServerId {
@@ -268,19 +334,21 @@ async fn run_async(command: Command) -> Result<()> {
             run_server(config::resolve_server(cli, file)?).await
         }
         Command::Client {
-            action: None,
-            config: config_path,
-            default_config,
-            socks_port,
-            http_port,
-            server_node_id,
-            auth_token,
-            auth_token_file,
-            relay_urls,
-            dns_server,
-            auto_reconnect,
-            no_auto_reconnect,
-            max_reconnect_attempts,
+            action:
+                ClientAction::Start {
+                    config: config_path,
+                    default_config,
+                    socks_port,
+                    http_port,
+                    server_node_id,
+                    auth_token,
+                    auth_token_file,
+                    relay_urls,
+                    dns_server,
+                    auto_reconnect,
+                    no_auto_reconnect,
+                    max_reconnect_attempts,
+                },
         } => {
             log_version();
             // CLI precedence: --auto-reconnect → Some(true), --no-auto-reconnect →
@@ -518,7 +586,7 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
 
     log::info!("flextunnel server Node ID: {}", endpoint.id());
     log::info!(
-        "Clients connect with: flextunnel client --server-node-id {} --auth-token <TOKEN>",
+        "Clients connect with: flextunnel client start --server-node-id {} --auth-token <TOKEN>",
         endpoint.id()
     );
 

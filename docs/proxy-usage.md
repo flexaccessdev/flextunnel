@@ -92,7 +92,7 @@ Enable the HTTP proxy by adding `--http-port` when you start the client.
 SOCKS5 is not on by default — keep `--socks-port` too if you also want it:
 
 ```sh
-flextunnel client \
+flextunnel client start \
     --server-node-id <ENDPOINT_ID> \
     --auth-token     <AUTH_TOKEN> \
     --socks-port     1080 \

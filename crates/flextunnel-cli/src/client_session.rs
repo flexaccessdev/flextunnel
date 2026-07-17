@@ -1,6 +1,6 @@
-//! The headless `flextunnel client` session: proxy front-ends (both optional),
-//! server-direct port forwards, and the control channel that `flextunnel
-//! client status` attaches to.
+//! The headless `flextunnel client start` session: proxy front-ends (both
+//! optional), server-direct port forwards, and the control channel that
+//! `flextunnel client control` attaches to.
 //!
 //! Mirrors the desktop client's per-profile session (`flextunnel-desktop`'s
 //! `tunnel.rs`): bind the enabled listeners, run the reconnecting client, poll
