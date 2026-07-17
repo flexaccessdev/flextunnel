@@ -8,7 +8,7 @@ permissions:
   packages: write
 
 env:
-  GHCR_IMAGE: ghcr.io/andrewtheguy/flextunnel
+  GHCR_IMAGE: ghcr.io/flexaccessdev/flextunnel
 
 jobs:
   setup:

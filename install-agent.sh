@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # flextunnel-agent installer for Linux and Mac
-# Downloads latest binary from: https://github.com/andrewtheguy/flextunnel/releases
+# Downloads latest binary from: https://github.com/flexaccessdev/flextunnel/releases
 #
 # Usage: ./install-agent.sh [RELEASE_TAG] [--prerelease]
 # Or set RELEASE_TAG environment variable
 
 set -e
 
-REPO_OWNER="andrewtheguy"
+REPO_OWNER="flexaccessdev"
 REPO_NAME="flextunnel"
 DOWNLOAD_ONLY=false
 PREFER_PRERELEASE=false

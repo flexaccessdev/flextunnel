@@ -69,7 +69,7 @@ All payload is end-to-end encrypted by QUIC/TLS 1.3.
 ## Install
 
 Prebuilt release assets are published on the
-[GitHub Releases](https://github.com/andrewtheguy/flextunnel/releases) page.
+[GitHub Releases](https://github.com/flexaccessdev/flextunnel/releases) page.
 Stable releases include `flextunnel` and `flextunnel-agent` for Linux
 amd64/arm64, macOS arm64, and Windows amd64, plus the iOS xcframework asset.
 Automated prereleases currently include Linux amd64/arm64, macOS arm64, and the
@@ -83,32 +83,32 @@ the installed binary afterward does not.
 **`flextunnel` (server / client) — Linux / macOS:**
 
 ```sh
-curl -sSL https://andrewtheguy.github.io/flextunnel/install.sh | bash
+curl -sSL https://flexaccessdev.github.io/flextunnel/install.sh | bash
 ```
 
 **`flextunnel` (server / client) — Windows (PowerShell):**
 
 ```powershell
-irm https://andrewtheguy.github.io/flextunnel/install.ps1 | iex
+irm https://flexaccessdev.github.io/flextunnel/install.ps1 | iex
 ```
 
 **`flextunnel-agent` (reverse-routing agent) — Linux / macOS:**
 
 ```sh
-curl -sSL https://andrewtheguy.github.io/flextunnel/install-agent.sh | bash
+curl -sSL https://flexaccessdev.github.io/flextunnel/install-agent.sh | bash
 ```
 
 **`flextunnel-agent` (reverse-routing agent) — Windows (PowerShell):**
 
 ```powershell
-irm https://andrewtheguy.github.io/flextunnel/install-agent.ps1 | iex
+irm https://flexaccessdev.github.io/flextunnel/install-agent.ps1 | iex
 ```
 
 Options: append `-s -- --prerelease` (bash) for the latest prerelease, a release
 tag to pin a version, or `--download-only` / `-DownloadOnly` to fetch the binary
 without installing. `-PreRelease` is also accepted by the Windows installer when
 the selected prerelease includes a Windows asset. A container image is also
-published to `ghcr.io/andrewtheguy/flextunnel`.
+published to `ghcr.io/flexaccessdev/flextunnel`.
 
 ### Desktop app (tray GUI, client mode)
 
@@ -148,7 +148,7 @@ set `com.apple.quarantine` on downloads, but command-line tools like `curl` and
 ```sh
 # Replace vX.Y.Z with the release tag from the Releases page.
 curl -fL -o flextunnel-desktop.dmg \
-  https://github.com/andrewtheguy/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-macos-arm64.dmg
+  https://github.com/flexaccessdev/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-macos-arm64.dmg
 ```
 
 Then in Finder: double-click the `.dmg` to open it, drag `flextunnel.app` onto
@@ -179,9 +179,9 @@ browser. Replace `vX.Y.Z` with the release tag from the Releases page:
 
 ```powershell
 curl.exe -fL -o flextunnel-desktop.msi `
-  https://github.com/andrewtheguy/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-windows-amd64.msi
+  https://github.com/flexaccessdev/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-windows-amd64.msi
 # or: Invoke-WebRequest -OutFile flextunnel-desktop.msi `
-#   https://github.com/andrewtheguy/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-windows-amd64.msi
+#   https://github.com/flexaccessdev/flextunnel/releases/download/vX.Y.Z/flextunnel-desktop-windows-amd64.msi
 ```
 
 If you already downloaded via a browser, strip the mark instead:

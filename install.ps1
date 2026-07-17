@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 
 # flextunnel installer for Windows
-# Downloads latest binary from: https://github.com/andrewtheguy/flextunnel/releases
+# Downloads latest binary from: https://github.com/flexaccessdev/flextunnel/releases
 # Installs system-wide to C:\Program Files\flextunnel — requires an elevated
 # (Administrator) PowerShell session.
 #
@@ -21,7 +21,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$REPO_OWNER = "andrewtheguy"
+$REPO_OWNER = "flexaccessdev"
 $REPO_NAME = "flextunnel"
 
 # Function to print colored messages
