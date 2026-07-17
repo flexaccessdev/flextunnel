@@ -303,7 +303,8 @@ still happens on the server.
 flextunnel client \
     --server-node-id <ENDPOINT_ID> \
     --auth-token     <AUTH_TOKEN> \
-    --http-listen    127.0.0.1:8081     # SOCKS5 on :1080 stays on
+    --socks-listen   127.0.0.1:1080 \
+    --http-listen    127.0.0.1:8081
 
 # HTTPS tunnels via CONNECT; plain HTTP is forwarded
 https_proxy=http://127.0.0.1:8081 curl https://example.com
@@ -349,14 +350,43 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `-c, --config <FILE>` | Load options from a TOML file (CLI flags override it). |
 | `--default-config` | Load `~/.config/flextunnel/client.toml`. |
 | `-n, --server-node-id <ID>` | Server EndpointId. |
-| `--socks-listen <ADDR>` | Local SOCKS5 bind address (default `127.0.0.1:1080`). |
+| `--socks-listen <ADDR>` | Optional local SOCKS5 bind address, e.g. `127.0.0.1:1080`. Disabled unless set. |
 | `--http-listen <ADDR>` | Optional HTTP proxy bind address (CONNECT + plain-HTTP forwarding). |
+| `--instance <NAME>` | Instance name (default `default`), namespacing the single-instance lock, the control socket, and the persisted port forwards, so multiple clients can run side by side. |
 | `--auth-token <TOKEN>` / `--auth-token-file <FILE>` | Client auth token (one required). |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). |
 | `--dns-server <URL>` | Custom discovery DNS server, or `none` to disable. |
 | `--auto-reconnect` | Force auto-reconnect on (overrides `auto_reconnect = false` in the config). |
 | `--no-auto-reconnect` | Exit on the first disconnection instead of reconnecting. |
 | `--max-reconnect-attempts <N>` | Cap reconnect attempts between successful connections (unlimited if unset). |
+
+With neither `--socks-listen` nor `--http-listen` (nor the config keys) the
+client runs in **port-forward-only mode**: it holds the tunnel and serves only
+the control panel and any enabled port forwards.
+
+### `client control`
+
+```sh
+flextunnel client control                     # attach to the default instance
+flextunnel client control --instance work     # or a named one
+```
+
+Attaches a terminal control panel to a **running** client over its per-instance
+control socket (`~/.config/flextunnel/client-<instance>.sock`; a named pipe on
+Windows). It shows live status — connection phase and uptime, server/client
+node ids, connection paths (direct/relay), and the server-pushed routing
+breakdown (split-tunnel rules, host aliases, DNS forwards, bridge and agent
+routes) — plus an editable **port forwards** table: add/edit/delete forwards
+and toggle them on/off (`space`), live.
+
+Forwards open server-direct streams on the authenticated connection (the
+server enforces its routed set) and listen on localhost. They persist in
+`~/.config/flextunnel/forwards-<instance>.json` — written only by the running
+client — and always load **disabled**; enabling is a per-session action, like
+the desktop app. A forward whose local port can't bind flips back off with the
+reason shown next to its row.
+
+Detaching (`q`) never affects the tunnel; several panels can attach at once.
 
 ## Configuration files
 

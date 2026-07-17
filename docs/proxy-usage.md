@@ -3,9 +3,12 @@
 The flextunnel client exposes up to two local proxy listeners, both sharing the
 same routing core:
 
-- a **SOCKS5** listener (default `127.0.0.1:1080`), always on; and
-- an optional **HTTP proxy** listener (`--http-listen 127.0.0.1:8081`), off
-  unless you enable it.
+- an optional **SOCKS5** listener (`--socks-listen 127.0.0.1:1080`); and
+- an optional **HTTP proxy** listener (`--http-listen 127.0.0.1:8081`).
+
+Each is off unless you enable it (this guide's examples assume SOCKS5 on
+`127.0.0.1:1080`); with neither enabled the client runs in port-forward-only
+mode.
 
 Which one you point a tool at depends only on what that tool can speak — the
 client applies the server-pushed tunnel set after parsing the request. On-list
