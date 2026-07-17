@@ -1,8 +1,9 @@
 //! Local control channel between a running `flextunnel client` and
-//! `flextunnel client status`.
+//! `flextunnel client control`.
 //!
-//! Transport: a Unix domain socket (`~/.config/flextunnel/client-<instance>.sock`)
-//! or a Windows named pipe (`\\.\pipe\flextunnel-client-<instance>`). Protocol:
+//! Transport: a Unix domain socket (`~/.config/flextunnel/client-<key>.sock`)
+//! or a Windows named pipe (`\\.\pipe\flextunnel-client-<key>`), where `<key>`
+//! is the server-id-prefix instance key (see `instance.rs`). Protocol:
 //! JSON Lines, strict request → response over a long-lived connection. Both
 //! ends are this one binary and the repo has a no-compatibility policy, so
 //! there is no protocol version field.
@@ -17,8 +18,8 @@
 //! own it.
 //!
 //! macOS caps `sun_path` around 104 bytes; with the socket under
-//! `~/.config/flextunnel/` and instance names capped at 64 chars, only a
-//! pathological home path overflows — that surfaces as a clear bind error.
+//! `~/.config/flextunnel/` and the 16-char key, only a pathological home path
+//! overflows — that surfaces as a clear bind error.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -99,7 +100,10 @@ impl Phase {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatusSnapshot {
+    /// The server-id-prefix instance key (see `instance.rs`).
     pub instance: String,
+    /// Friendly profile name from the config ("aws", "home network"), if set.
+    pub name: Option<String>,
     pub phase: Phase,
     /// Uptime of the current connection, if connected.
     pub connected_secs: Option<u64>,
@@ -191,13 +195,13 @@ pub enum Mutation {
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
-fn socket_path(instance: &str) -> Result<std::path::PathBuf> {
-    Ok(instance::instance_dir()?.join(format!("client-{instance}.sock")))
+fn socket_path(key: &str) -> Result<std::path::PathBuf> {
+    Ok(instance::instance_dir()?.join(format!("client-{key}.sock")))
 }
 
 #[cfg(windows)]
-fn pipe_name(instance: &str) -> String {
-    format!(r"\\.\pipe\flextunnel-client-{instance}")
+fn pipe_name(key: &str) -> String {
+    format!(r"\\.\pipe\flextunnel-client-{key}")
 }
 
 // ---------------------------------------------------------------------------
@@ -222,14 +226,14 @@ impl Drop for IpcServerGuard {
 
 /// Start serving the control channel for `instance`. The caller must already
 /// hold the instance lock (that is what makes the stale-socket removal safe).
-pub fn spawn_ipc_server(instance: &str, tx: mpsc::Sender<IpcCmd>) -> Result<IpcServerGuard> {
+pub fn spawn_ipc_server(key: &str, tx: mpsc::Sender<IpcCmd>) -> Result<IpcServerGuard> {
     #[cfg(unix)]
     {
-        spawn_unix(socket_path(instance)?, tx)
+        spawn_unix(socket_path(key)?, tx)
     }
     #[cfg(windows)]
     {
-        spawn_pipe(pipe_name(instance), tx)
+        spawn_pipe(pipe_name(key), tx)
     }
 }
 
@@ -307,7 +311,7 @@ fn spawn_pipe(name: String, tx: mpsc::Sender<IpcCmd>) -> Result<IpcServerGuard> 
     Ok(IpcServerGuard { task })
 }
 
-/// Serve one attached `client status`: read a JSON-line request, forward it to
+/// Serve one attached `client control`: read a JSON-line request, forward it to
 /// the session loop, write the JSON-line response; repeat until EOF. A
 /// malformed line gets `Response::Error` and the connection stays open; a
 /// closed session channel ends the connection.
@@ -403,7 +407,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Client side (used by `flextunnel client status`)
+// Client side (used by `flextunnel client control`)
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
@@ -416,10 +420,10 @@ pub struct IpcClient {
 }
 
 impl IpcClient {
-    /// Connect to the running client for `instance`. `Ok(None)` means nothing
-    /// is listening — the instance is not running.
-    pub async fn connect(instance: &str) -> Result<Option<Self>> {
-        match tokio::time::timeout(REQUEST_TIMEOUT, Self::open(instance)).await {
+    /// Connect to the running client for the given instance key. `Ok(None)`
+    /// means nothing is listening — the client is not running.
+    pub async fn connect(key: &str) -> Result<Option<Self>> {
+        match tokio::time::timeout(REQUEST_TIMEOUT, Self::open(key)).await {
             Ok(Ok(stream)) => Ok(Some(Self {
                 stream: BufReader::new(stream),
             })),
@@ -430,18 +434,18 @@ impl IpcClient {
     }
 
     #[cfg(unix)]
-    async fn open(instance: &str) -> std::io::Result<ClientStream> {
-        let path = socket_path(instance)
+    async fn open(key: &str) -> std::io::Result<ClientStream> {
+        let path = socket_path(key)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         tokio::net::UnixStream::connect(path).await
     }
 
     #[cfg(windows)]
-    async fn open(instance: &str) -> std::io::Result<ClientStream> {
+    async fn open(key: &str) -> std::io::Result<ClientStream> {
         use tokio::net::windows::named_pipe::ClientOptions;
 
         const ERROR_PIPE_BUSY: i32 = 231;
-        let name = pipe_name(instance);
+        let name = pipe_name(key);
         // All pipe instances can be momentarily busy between one attacher
         // connecting and the server pre-creating the next instance; retry
         // briefly (the outer connect() timeout still bounds the wait).
@@ -505,7 +509,8 @@ mod tests {
 
     fn snapshot() -> StatusSnapshot {
         StatusSnapshot {
-            instance: "default".into(),
+            instance: "62e463a6d67fdeac".into(),
+            name: Some("aws".into()),
             phase: Phase::Connected,
             connected_secs: Some(61),
             server_node_id: "server".into(),
@@ -630,7 +635,10 @@ mod tests {
 
         // Status.
         match client.request(&Request::Status).await.unwrap() {
-            Response::Status(s) => assert_eq!(s.instance, "default"),
+            Response::Status(s) => {
+                assert_eq!(s.instance, "62e463a6d67fdeac");
+                assert_eq!(s.name.as_deref(), Some("aws"));
+            }
             other => panic!("expected Status, got {other:?}"),
         }
 

@@ -1,5 +1,7 @@
 //! Per-user single-instance locks: one `flextunnel` server per user, and one
-//! client per (user, instance name).
+//! client per (user, target server) — the client lock is keyed by the
+//! server-id prefix (see `instance.rs`), so two clients for the same server
+//! cannot run at once, while clients for different servers coexist.
 //!
 //! The lock files live under the user's own config dir
 //! (`~/.config/flextunnel/`), so each user gets independent locks — two
@@ -45,19 +47,19 @@ pub fn acquire() -> Result<InstanceLock> {
     )
 }
 
-/// Acquire the per-(user, instance) client lock
-/// (`~/.config/flextunnel/client-<instance>.lock`), held for the process
-/// lifetime. Holding it is also what makes removing a stale control socket
-/// before bind safe (see `ipc.rs`).
-pub fn acquire_client(instance: &str) -> Result<InstanceLock> {
+/// Acquire the per-(user, server) client lock
+/// (`~/.config/flextunnel/client-<key>.lock`, keyed by the server-id prefix),
+/// held for the process lifetime. Holding it is also what makes removing a
+/// stale control socket before bind safe (see `ipc.rs`).
+pub fn acquire_client(key: &str) -> Result<InstanceLock> {
     let path = instance::instance_dir()
         .context("The client single-instance lock cannot be enforced")?
-        .join(format!("client-{instance}.lock"));
+        .join(format!("client-{key}.lock"));
     InstanceLock::acquire(
         &path,
         &format!(
-            "Another flextunnel client is already running for instance \
-             {instance:?}. Use --instance <name> to run a second client."
+            "Another flextunnel client is already running for this server \
+             (id prefix {key}). Only one client per server is allowed."
         ),
     )
 }

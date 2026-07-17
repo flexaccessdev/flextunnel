@@ -77,11 +77,6 @@ enum Command {
     Client {
         #[command(subcommand)]
         action: Option<ClientAction>,
-        /// Instance name, namespacing the single-instance lock, the control
-        /// socket, and the persisted port forwards, so multiple clients can
-        /// run side by side.
-        #[arg(long, default_value = instance::DEFAULT_INSTANCE)]
-        instance: String,
         /// Config file path (TOML). CLI flags override file values.
         #[arg(short = 'c', long)]
         config: Option<PathBuf>,
@@ -159,12 +154,21 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ClientAction {
-    /// Attach the control panel to a running client instance: live status +
-    /// editable port forwards (in this terminal).
+    /// Attach the control panel to the running client for a profile: live
+    /// status + editable port forwards (in this terminal). The client is
+    /// identified by the profile's server node id; with no flags, the default
+    /// config (~/.config/flextunnel/client.toml) selects it.
     Control {
-        /// Instance name of the client to attach to.
-        #[arg(long, default_value = instance::DEFAULT_INSTANCE)]
-        instance: String,
+        /// Config file path (TOML) of the profile to attach to.
+        #[arg(short = 'c', long)]
+        config: Option<PathBuf>,
+        /// Use ~/.config/flextunnel/client.toml (the default when no other
+        /// selector is given).
+        #[arg(long)]
+        default_config: bool,
+        /// Attach by server EndpointId directly (overrides the config file).
+        #[arg(short = 'n', long)]
+        server_node_id: Option<String>,
     },
 }
 
@@ -181,9 +185,14 @@ fn main() -> Result<()> {
         // loop (and a small runtime for the IPC calls), so it never enters the
         // shared multi-thread runtime below.
         Command::Client {
-            action: Some(ClientAction::Control { instance }),
+            action:
+                Some(ClientAction::Control {
+                    config,
+                    default_config,
+                    server_node_id,
+                }),
             ..
-        } => tui::run(&instance),
+        } => tui::run(config, default_config, server_node_id),
         Command::GenerateServerKey { output, force } => secret::generate_secret(output, force),
         Command::ShowServerId {
             config,
@@ -260,7 +269,6 @@ async fn run_async(command: Command) -> Result<()> {
         }
         Command::Client {
             action: None,
-            instance,
             config: config_path,
             default_config,
             socks_listen,
@@ -287,6 +295,7 @@ async fn run_async(command: Command) -> Result<()> {
             };
             let cli = config::ClientConfig {
                 server_node_id,
+                name: None, // display name is config-file only; no CLI flag
                 socks_listen,
                 http_listen,
                 auth_token,
@@ -297,7 +306,7 @@ async fn run_async(command: Command) -> Result<()> {
                 max_reconnect_attempts,
             };
             let file = config::load_client_config(config_path.as_deref(), default_config)?;
-            client_session::run(instance, config::resolve_client(cli, file)).await
+            client_session::run(config::resolve_client(cli, file)).await
         }
         _ => unreachable!("synchronous commands handled in main()"),
     }

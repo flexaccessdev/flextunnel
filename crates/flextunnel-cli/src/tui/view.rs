@@ -101,11 +101,14 @@ fn format_uptime(secs: u64) -> String {
 }
 
 fn header_lines(s: &StatusSnapshot) -> Vec<Line<'static>> {
+    // Friendly profile name when the config sets one; the server-id prefix
+    // otherwise.
+    let title = s
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("server {}…", s.instance));
     let mut first = vec![
-        Span::styled(
-            s.instance.clone(),
-            Style::new().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(title, Style::new().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(format!("● {}", s.phase.label()), phase_style(s.phase)),
     ];

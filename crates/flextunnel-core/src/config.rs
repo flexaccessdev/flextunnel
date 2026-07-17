@@ -132,6 +132,10 @@ pub struct ServerConfig {
 pub struct ClientConfig {
     /// EndpointId of the server to connect to.
     pub server_node_id: Option<String>,
+    /// Friendly display name for this profile (e.g. "aws", "home network"),
+    /// shown in status UIs. Purely cosmetic — the client's on-disk identity
+    /// (lock, control socket, forwards file) is keyed by `server_node_id`.
+    pub name: Option<String>,
     /// Local address for the optional SOCKS5 listener. Unset = SOCKS
     /// front-end disabled; with neither `socks_listen` nor `http_listen` the
     /// client runs in port-forward/control-panel-only mode.
@@ -216,6 +220,7 @@ pub struct ResolvedServer {
 /// Fully-resolved client settings (CLI > file > default), paths tilde-expanded.
 pub struct ResolvedClient {
     pub server_node_id: Option<String>,
+    pub name: Option<String>,
     pub socks_listen: Option<SocketAddr>,
     pub http_listen: Option<SocketAddr>,
     pub auth_token: Option<String>,
@@ -491,6 +496,7 @@ pub fn resolve_client(cli: ClientConfig, file: Option<ClientConfig>) -> Resolved
 
     ResolvedClient {
         server_node_id: cli.server_node_id.or(file.server_node_id),
+        name: cli.name.or(file.name),
         // No defaults: each proxy front-end is off unless explicitly configured.
         socks_listen: cli.socks_listen.or(file.socks_listen),
         http_listen: cli.http_listen.or(file.http_listen),

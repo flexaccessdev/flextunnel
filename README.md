@@ -351,7 +351,6 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `-n, --server-node-id <ID>` | Server EndpointId. |
 | `--socks-listen <ADDR>` | Optional local SOCKS5 bind address, e.g. `127.0.0.1:1080`. Disabled unless set. |
 | `--http-listen <ADDR>` | Optional HTTP proxy bind address (CONNECT + plain-HTTP forwarding). |
-| `--instance <NAME>` | Instance name (default `default`), namespacing the single-instance lock, the control socket, and the persisted port forwards, so multiple clients can run side by side. |
 | `--auth-token <TOKEN>` / `--auth-token-file <FILE>` | Client auth token (one required). |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). |
 | `--dns-server <URL>` | Custom discovery DNS server, or `none` to disable. |
@@ -363,27 +362,35 @@ With neither `--socks-listen` nor `--http-listen` (nor the config keys) the
 client runs in **port-forward-only mode**: it holds the tunnel and serves only
 the control panel and any enabled port forwards.
 
+A client's on-disk identity — the single-instance lock, the control socket,
+and the persisted port forwards — is keyed by the prefix of its
+`server_node_id` (which never changes for a profile). So one client runs per
+server per user, and clients for different servers coexist without any extra
+configuration. The optional `name` key in the config ("aws", "home network")
+is a display-only label shown in the control panel.
+
 ### `client control`
 
 ```sh
-flextunnel client control                     # attach to the default instance
-flextunnel client control --instance work     # or a named one
+flextunnel client control                # profile from ~/.config/flextunnel/client.toml
+flextunnel client control -c aws.toml    # profile from a specific config
+flextunnel client control -n <ENDPOINT_ID>   # or by server id directly
 ```
 
-Attaches a terminal control panel to a **running** client over its per-instance
-control socket (`~/.config/flextunnel/client-<instance>.sock`; a named pipe on
-Windows). It shows live status — connection phase and uptime, server/client
-node ids, connection paths (direct/relay), and the server-pushed routing
-breakdown (split-tunnel rules, host aliases, DNS forwards, bridge and agent
-routes) — plus an editable **port forwards** table: add/edit/delete forwards
-and toggle them on/off (`space`), live.
+Attaches a terminal control panel to the **running** client for a profile,
+over its control socket (`~/.config/flextunnel/client-<server id prefix>.sock`;
+a named pipe on Windows). It shows live status — connection phase and uptime,
+server/client node ids, connection paths (direct/relay), and the server-pushed
+routing breakdown (split-tunnel rules, host aliases, DNS forwards, bridge and
+agent routes) — plus an editable **port forwards** table: add/edit/delete
+forwards and toggle them on/off (`space`), live.
 
 Forwards open server-direct streams on the authenticated connection (the
 server enforces its routed set) and listen on localhost. They persist in
-`~/.config/flextunnel/forwards-<instance>.json` — written only by the running
-client — and always load **disabled**; enabling is a per-session action, like
-the desktop app. A forward whose local port can't bind flips back off with the
-reason shown next to its row.
+`~/.config/flextunnel/forwards-<server id prefix>.json` — written only by the
+running client — and always load **disabled**; enabling is a per-session
+action, like the desktop app. A forward whose local port can't bind flips back
+off with the reason shown next to its row.
 
 Detaching (`q`) never affects the tunnel; several panels can attach at once.
 

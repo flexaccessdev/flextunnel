@@ -15,8 +15,10 @@ mod form;
 mod view;
 
 use anyhow::{Context, Result};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use flextunnel_core::config;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use crate::instance;
@@ -42,14 +44,35 @@ struct App {
     notice: Option<String>,
 }
 
-pub fn run(instance_name: &str) -> Result<()> {
-    instance::validate_instance_name(instance_name)?;
+pub fn run(
+    config_path: Option<PathBuf>,
+    default_config: bool,
+    server_node_id: Option<String>,
+) -> Result<()> {
+    // The running client is identified by the profile's server node id
+    // (-n wins over the config file; bare `client control` reads the default
+    // config), from which the same instance key as the client's is derived.
+    let use_default =
+        default_config || (config_path.is_none() && server_node_id.is_none());
+    let file = config::load_client_config(config_path.as_deref(), use_default)
+        .context("client control needs a profile: -c <file>, --default-config, or -n <server id>")?;
+    let cli = config::ClientConfig {
+        server_node_id,
+        ..Default::default()
+    };
+    let r = config::resolve_client(cli, file);
+    let server_id = r.server_node_id.context(
+        "The profile has no server node id (set server_node_id in the config or pass -n).",
+    )?;
+    let key = instance::instance_key(&server_id)?;
+    let profile = r.name.unwrap_or_else(|| format!("server {key}…"));
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
 
-    let Some(mut client) = rt.block_on(IpcClient::connect(instance_name))? else {
-        eprintln!("flextunnel client instance {instance_name:?} is not running.");
+    let Some(mut client) = rt.block_on(IpcClient::connect(&key))? else {
+        eprintln!("The flextunnel client for {profile} is not running.");
         std::process::exit(1);
     };
     // First snapshot before touching terminal modes, so early failures print

@@ -1,12 +1,13 @@
 //! Per-instance port-forward persistence.
 //!
-//! Forwards live in `~/.config/flextunnel/forwards-<instance>.json` — a
-//! separate file from the client TOML, because the TOML is the hand-edited
-//! profile while this file is program-written (from `flextunnel client
-//! status` edits, applied by the running client). Only the running client
-//! process writes it. The `enabled` flag is `#[serde(skip)]` on
-//! [`PortForward`], so every forward loads disabled — enabling is an explicit
-//! per-session action, exactly like the desktop client.
+//! Forwards live in `~/.config/flextunnel/forwards-<key>.json` (keyed by the
+//! server-id prefix, see `instance.rs`) — a separate file from the client
+//! TOML, because the TOML is the hand-edited profile while this file is
+//! program-written (from `flextunnel client control` edits, applied by the
+//! running client). Only the running client process writes it. The `enabled`
+//! flag is `#[serde(skip)]` on [`PortForward`], so every forward loads
+//! disabled — enabling is an explicit per-session action, exactly like the
+//! desktop client.
 
 use anyhow::{Context, Result};
 use flextunnel_core::forwards::PortForward;
@@ -22,20 +23,20 @@ struct ForwardsFile {
     forwards: Vec<PortForward>,
 }
 
-/// `~/.config/flextunnel/forwards-<instance>.json`.
-pub fn forwards_path(instance: &str) -> Result<PathBuf> {
-    Ok(instance::instance_dir()?.join(format!("forwards-{instance}.json")))
+/// `~/.config/flextunnel/forwards-<key>.json`.
+pub fn forwards_path(key: &str) -> Result<PathBuf> {
+    Ok(instance::instance_dir()?.join(format!("forwards-{key}.json")))
 }
 
 /// Load the instance's forwards; a missing file is an empty list, a corrupt
 /// file is a startup error (matching the strict TOML config philosophy).
-pub fn load(instance: &str) -> Result<Vec<PortForward>> {
-    load_path(&forwards_path(instance)?)
+pub fn load(key: &str) -> Result<Vec<PortForward>> {
+    load_path(&forwards_path(key)?)
 }
 
 /// Persist the instance's forwards (atomic temp + rename).
-pub fn save(instance: &str, forwards: &[PortForward]) -> Result<()> {
-    save_path(&forwards_path(instance)?, forwards)
+pub fn save(key: &str, forwards: &[PortForward]) -> Result<()> {
+    save_path(&forwards_path(key)?, forwards)
 }
 
 fn load_path(path: &Path) -> Result<Vec<PortForward>> {

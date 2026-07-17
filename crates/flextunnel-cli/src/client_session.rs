@@ -27,12 +27,13 @@ use crate::ipc::{
 };
 use crate::{forwards as store, instance, lock};
 
-pub async fn run(instance_name: String, r: config::ResolvedClient) -> Result<()> {
-    instance::validate_instance_name(&instance_name)?;
-
+pub async fn run(r: config::ResolvedClient) -> Result<()> {
     let server_node_id = r.server_node_id.context(
         "The client requires a server node id (--server-node-id or server_node_id in the config).",
     )?;
+    // A profile's server id never changes, so its prefix is the client's
+    // on-disk identity: lock, control socket, and forwards file.
+    let key = instance::instance_key(&server_node_id)?;
 
     if r.auth_token.is_some() && r.auth_token_file.is_some() {
         anyhow::bail!("Provide only one of auth_token or auth_token_file, not both");
@@ -53,16 +54,16 @@ pub async fn run(instance_name: String, r: config::ResolvedClient) -> Result<()>
 
     // Held for the process lifetime; also what makes removing a stale control
     // socket safe (see ipc.rs).
-    let _lock = lock::acquire_client(&instance_name)?;
+    let _lock = lock::acquire_client(&key)?;
 
     // All forwards load disabled (`enabled` is never persisted) — enabling is
     // an explicit per-session action, like the desktop.
-    let mut forwards = store::load(&instance_name)?;
+    let mut forwards = store::load(&key)?;
     if !forwards.is_empty() {
         log::info!(
             "Loaded {} port forward(s) (disabled) from {}",
             forwards.len(),
-            store::forwards_path(&instance_name)?.display()
+            store::forwards_path(&key)?.display()
         );
     }
 
@@ -122,7 +123,7 @@ pub async fn run(instance_name: String, r: config::ResolvedClient) -> Result<()>
     let (ipc_tx, mut ipc_rx) = mpsc::channel(8);
     // Like the listener binds above: any failure past endpoint creation must
     // still close the endpoint gracefully (fatal under panic=abort otherwise).
-    let ipc_guard = match ipc::spawn_ipc_server(&instance_name, ipc_tx) {
+    let ipc_guard = match ipc::spawn_ipc_server(&key, ipc_tx) {
         Ok(guard) => guard,
         Err(e) => {
             drop(fwd_mgr);
@@ -132,7 +133,8 @@ pub async fn run(instance_name: String, r: config::ResolvedClient) -> Result<()>
     };
 
     let mut state = SessionState {
-        instance: instance_name.clone(),
+        instance: key,
+        name: r.name,
         server_node_id,
         client_node_id: endpoint.id().to_string(),
         socks_addr,
@@ -219,7 +221,10 @@ fn local_addr(listener: &Option<tokio::net::TcpListener>) -> Option<SocketAddr> 
 
 /// Session-scoped status/mutation state shared by the ticker and the IPC arms.
 struct SessionState {
+    /// The server-id-prefix instance key (see `instance.rs`).
     instance: String,
+    /// Friendly profile name from the config, display-only.
+    name: Option<String>,
     server_node_id: String,
     client_node_id: String,
     socks_addr: Option<SocketAddr>,
@@ -265,6 +270,7 @@ impl SessionState {
         let statuses = fwd_mgr.statuses();
         StatusSnapshot {
             instance: self.instance.clone(),
+            name: self.name.clone(),
             phase: self.phase(routes.connected),
             connected_secs: self.connected_since.map(|t| t.elapsed().as_secs()),
             server_node_id: self.server_node_id.clone(),
