@@ -4,6 +4,7 @@ name: Test (Manual)
 # jobs' Rust caches (same rust-cache shared-key per target), so it can verify
 # platforms without cutting a release — notably flextunnel-desktop on Windows,
 # which release only builds for stable releases and never tests on its own.
+# Tests only: installer packaging (.app/.msi) belongs to the release workflow.
 on:
   workflow_dispatch:
 
@@ -39,31 +40,3 @@ jobs:
       - name: Test Release
         run: |
           cargo test --release ${{ matrix.packages }} --target ${{ matrix.target }}
-
-      # Desktop installer packaging — same commands as the release workflow, so
-      # the .app/.msi build is verifiable without cutting a release. The
-      # resulting installers are uploaded as plain workflow artifacts.
-      - uses: cargo-bins/cargo-binstall@main
-        if: runner.os == 'macOS' || runner.os == 'Windows'
-
-      - name: Package desktop app (.app, unsigned)
-        if: runner.os == 'macOS'
-        run: |
-          cargo binstall -y --force cargo-packager@0.11.8
-          cargo build --release -p flextunnel-desktop --target ${{ matrix.target }}
-          cargo packager --release -p flextunnel-desktop --formats app --target ${{ matrix.target }}
-          ditto -c -k --keepParent target/${{ matrix.target }}/release/flextunnel.app flextunnel-desktop-macos-arm64.app.zip
-
-      - name: Package desktop installer (.msi, unsigned)
-        if: runner.os == 'Windows'
-        run: |
-          cargo binstall -y --force cargo-packager@0.11.8
-          cargo build --release -p flextunnel-desktop --target ${{ matrix.target }}
-          cargo packager --release -p flextunnel-desktop --formats wix --target ${{ matrix.target }}
-          Move-Item target/${{ matrix.target }}/release/*.msi flextunnel-desktop-windows-amd64.msi
-
-      - uses: actions/upload-artifact@v4
-        if: runner.os == 'macOS' || runner.os == 'Windows'
-        with:
-          name: desktop-${{ matrix.target }}
-          path: flextunnel-desktop-*
