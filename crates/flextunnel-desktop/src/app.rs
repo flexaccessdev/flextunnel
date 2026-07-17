@@ -9,7 +9,9 @@
 //! keeps the snapshots and the tray state fresh the rest of the time.
 
 use crate::config::{self, Profile, DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT};
-use crate::forward::{ForwardState, ForwardStatus, PortForward};
+use flextunnel_core::forwards::{
+    PortForward, disable_failed_forwards, parse_port, validate_label, validate_remote_host,
+};
 use crate::icon;
 use crate::logging;
 use crate::tray::{self, Tray};
@@ -331,59 +333,6 @@ impl ProfileForm {
     }
 }
 
-fn parse_port(input: &str, what: &str) -> Result<u16, String> {
-    input
-        .trim()
-        .parse::<u16>()
-        .ok()
-        .filter(|p| *p != 0)
-        .ok_or_else(|| format!("{what} must be 1-65535"))
-}
-
-/// Validate a forward's remote host — an IP literal (IPv4, IPv6, `[IPv6]`) or
-/// a hostname — returning the normalized form to store (brackets stripped so
-/// the wire sees a bare address). Hostname rules are deliberately permissive
-/// (underscores allowed for internal names) but catch real typos: empty
-/// labels (`a..b`, leading/trailing dots), bad characters, oversized labels.
-fn validate_remote_host(input: &str) -> Result<String, String> {
-    let host = input.trim();
-    if host.is_empty() {
-        return Err("Remote host is required".into());
-    }
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    if bare.parse::<std::net::IpAddr>().is_ok() {
-        return Ok(bare.to_string());
-    }
-    // SOCKS5 ATYP_DOMAIN caps the name at 255 bytes; DNS at 253.
-    if host.len() > 253 {
-        return Err("Remote host is too long (253 characters max)".into());
-    }
-    for label in host.split('.') {
-        if label.is_empty() {
-            return Err("Remote host has an empty label — check the dots".into());
-        }
-        if label.len() > 63 {
-            return Err("Remote host has a label longer than 63 characters".into());
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            return Err("Remote host labels can't start or end with a hyphen".into());
-        }
-        if !label
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        {
-            return Err(
-                "Remote host may only contain letters, digits, dots, hyphens and underscores"
-                    .into(),
-            );
-        }
-    }
-    Ok(host.to_string())
-}
-
 /// Editable add/edit buffers for one port forward, mirroring the iOS sheet.
 /// `editing_id` is `None` when adding.
 pub struct ForwardForm {
@@ -425,10 +374,7 @@ impl ForwardForm {
     /// Validate against every profile: local ports share one namespace since
     /// any set of profiles can run concurrently.
     pub fn validate(&self, profiles: &[Profile]) -> Result<PortForward, String> {
-        let label = self.label.trim();
-        if label.len() > 64 {
-            return Err("Label must be 64 characters or fewer".into());
-        }
+        let label = validate_label(&self.label)?;
         let local_port = parse_port(&self.local_port, "Local port")?;
         let remote_host = validate_remote_host(&self.remote_host)?;
         let remote_port = parse_port(&self.remote_port, "Remote port")?;
@@ -442,37 +388,13 @@ impl ForwardForm {
                 .editing_id
                 .clone()
                 .unwrap_or_else(PortForward::new_id),
-            label: label.to_string(),
+            label,
             local_port,
             remote_host,
             remote_port,
             enabled: self.enabled,
         })
     }
-}
-
-/// Enable/disable semantics for the per-forward switch: a forward whose initial
-/// setup failed (its listener could not bind — e.g. the local port is in use)
-/// is flipped back off instead of sitting enabled-but-failed. `Failed` is only
-/// ever set at bind time (see `forward::run_forward`), so every failed status
-/// is a setup failure. Returns the `(id, reason)` pairs of the forwards
-/// disabled, for display next to their rows.
-fn disable_failed_forwards(
-    forwards: &mut [PortForward],
-    statuses: &[ForwardStatus],
-) -> Vec<(String, String)> {
-    let mut disabled = Vec::new();
-    for status in statuses {
-        if let ForwardState::Failed(reason) = &status.state
-            && let Some(forward) = forwards
-                .iter_mut()
-                .find(|f| f.id == status.id && f.enabled)
-        {
-            forward.enabled = false;
-            disabled.push((forward.id.clone(), reason.clone()));
-        }
-    }
-    disabled
 }
 
 pub fn format_duration(d: Duration) -> String {
@@ -1316,37 +1238,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_forward_is_toggled_off() {
-        let mut forwards = vec![existing_forward("a", 8080), existing_forward("b", 8081)];
-        let statuses = vec![
-            ForwardStatus {
-                id: "a".into(),
-                state: ForwardState::Failed("port 8080 is in use".into()),
-                active: 0,
-                last_conn_error: None,
-            },
-            ForwardStatus {
-                id: "b".into(),
-                state: ForwardState::Listening,
-                active: 0,
-                last_conn_error: None,
-            },
-        ];
-
-        let disabled = disable_failed_forwards(&mut forwards, &statuses);
-        assert_eq!(
-            disabled,
-            vec![("a".to_string(), "port 8080 is in use".to_string())]
-        );
-        assert!(!forwards[0].enabled, "failed forward flips off");
-        assert!(forwards[1].enabled, "listening forward untouched");
-
-        // Idempotent: an already-disabled forward is not reported again while
-        // its stale Failed status lingers for a frame.
-        assert!(disable_failed_forwards(&mut forwards, &statuses).is_empty());
-    }
-
-    #[test]
     fn forward_form_trims_and_builds() {
         let profiles = [existing_profile("p1", 1080, vec![])];
         let forward = valid_forward_form().validate(&profiles).expect("valid");
@@ -1356,32 +1247,6 @@ mod tests {
         assert_eq!(forward.remote_port, 5432);
         assert!(forward.enabled);
         assert!(!forward.id.is_empty());
-    }
-
-    #[test]
-    fn remote_host_validation() {
-        // Valid hostnames and IP literals, normalized where relevant.
-        assert_eq!(validate_remote_host(" db.internal "), Ok("db.internal".into()));
-        assert_eq!(
-            validate_remote_host("net_dev-1.example.com"),
-            Ok("net_dev-1.example.com".into())
-        );
-        assert_eq!(validate_remote_host("10.0.0.7"), Ok("10.0.0.7".into()));
-        assert_eq!(validate_remote_host("::1"), Ok("::1".into()));
-        assert_eq!(validate_remote_host("[2001:db8::1]"), Ok("2001:db8::1".into()));
-
-        // The typo class that motivated this: empty labels.
-        assert!(validate_remote_host("networking..internal").is_err());
-        assert!(validate_remote_host(".internal").is_err());
-        assert!(validate_remote_host("internal.").is_err());
-
-        assert!(validate_remote_host("").is_err());
-        assert!(validate_remote_host("has space.com").is_err());
-        assert!(validate_remote_host("bad!char.com").is_err());
-        assert!(validate_remote_host("-leading.com").is_err());
-        assert!(validate_remote_host("trailing-.com").is_err());
-        assert!(validate_remote_host(&"a".repeat(64)).is_err());
-        assert!(validate_remote_host(&format!("{}.com", "a.".repeat(130))).is_err());
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub mod auth;
 pub mod blocklist;
 pub mod config;
 pub mod error;
+pub mod forwards;
 pub mod lock;
 pub mod machine_id;
 pub mod proxy;

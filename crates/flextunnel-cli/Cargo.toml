@@ -14,4 +14,10 @@ anyhow.workspace = true
 clap.workspace = true
 dirs.workspace = true
 log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
+ratatui.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -12,7 +12,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
@@ -132,12 +131,20 @@ pub struct ServerConfig {
 pub struct ClientConfig {
     /// EndpointId of the server to connect to.
     pub server_node_id: Option<String>,
-    /// Local address for the SOCKS5 listener.
-    pub socks_listen: Option<SocketAddr>,
-    /// Local address for the optional HTTP proxy listener (CONNECT tunneling +
-    /// absolute-URI plain-HTTP forwarding). Unset = HTTP front-end disabled.
-    /// The command-line client still requires a SOCKS5 listener.
-    pub http_listen: Option<SocketAddr>,
+    /// Friendly display name for this profile (e.g. "aws", "home network"),
+    /// shown in status UIs. Purely cosmetic — the client's on-disk identity
+    /// (lock, control socket, forwards file) is keyed by `server_node_id`.
+    pub name: Option<String>,
+    /// Loopback port for the optional SOCKS5 listener (binds `127.0.0.1`
+    /// only, like the desktop client — the front-ends are unauthenticated and
+    /// never exposed beyond the local machine). Unset = SOCKS front-end
+    /// disabled; with neither `socks_port` nor `http_port` the client runs in
+    /// port-forward/control-panel-only mode.
+    pub socks_port: Option<u16>,
+    /// Loopback port for the optional HTTP proxy listener (CONNECT tunneling +
+    /// absolute-URI plain-HTTP forwarding; binds `127.0.0.1` only). Unset =
+    /// HTTP front-end disabled.
+    pub http_port: Option<u16>,
     /// Auth token to send to the server.
     pub auth_token: Option<String>,
     /// File containing the auth token.
@@ -154,7 +161,7 @@ pub struct ClientConfig {
 
 /// Agent config file schema. Every field is optional; CLI flags override these.
 /// Like the client but with no local listener (the agent serves reverse-routed
-/// streams the server opens back to it), so there is no `socks_listen`.
+/// streams the server opens back to it), so there is no `socks_port`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
@@ -215,8 +222,9 @@ pub struct ResolvedServer {
 /// Fully-resolved client settings (CLI > file > default), paths tilde-expanded.
 pub struct ResolvedClient {
     pub server_node_id: Option<String>,
-    pub socks_listen: SocketAddr,
-    pub http_listen: Option<SocketAddr>,
+    pub name: Option<String>,
+    pub socks_port: Option<u16>,
+    pub http_port: Option<u16>,
     pub auth_token: Option<String>,
     pub auth_token_file: Option<PathBuf>,
     pub relay_urls: Vec<String>,
@@ -235,9 +243,6 @@ pub struct ResolvedAgent {
     pub auto_reconnect: bool,
     pub max_reconnect_attempts: Option<NonZeroU32>,
 }
-
-/// Default SOCKS5 listen address when neither CLI nor config sets one.
-const DEFAULT_SOCKS_LISTEN: &str = "127.0.0.1:1080";
 
 /// Expand a leading `~` / `~/…` to the user's home directory.
 pub fn expand_tilde(path: &Path) -> PathBuf {
@@ -493,12 +498,10 @@ pub fn resolve_client(cli: ClientConfig, file: Option<ClientConfig>) -> Resolved
 
     ResolvedClient {
         server_node_id: cli.server_node_id.or(file.server_node_id),
-        socks_listen: cli
-            .socks_listen
-            .or(file.socks_listen)
-            .unwrap_or_else(|| DEFAULT_SOCKS_LISTEN.parse().expect("valid default addr")),
-        // No default: the HTTP front-end is off unless explicitly configured.
-        http_listen: cli.http_listen.or(file.http_listen),
+        name: cli.name.or(file.name),
+        // No defaults: each proxy front-end is off unless explicitly configured.
+        socks_port: cli.socks_port.or(file.socks_port),
+        http_port: cli.http_port.or(file.http_port),
         auth_token,
         auth_token_file: auth_token_file.map(|p| expand_tilde(&p)),
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
@@ -553,14 +556,14 @@ mod tests {
     fn parse_client_config() {
         let toml = r#"
             server_node_id = "abc123"
-            socks_listen = "127.0.0.1:1085"
+            socks_port = 1085
             auth_token = "ftcTOKEN"
             auto_reconnect = false
             max_reconnect_attempts = 5
         "#;
         let cfg: ClientConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.server_node_id.as_deref(), Some("abc123"));
-        assert_eq!(cfg.socks_listen, Some("127.0.0.1:1085".parse().unwrap()));
+        assert_eq!(cfg.socks_port, Some(1085));
         assert_eq!(cfg.auto_reconnect, Some(false));
         assert_eq!(cfg.max_reconnect_attempts, NonZeroU32::new(5));
     }
@@ -807,7 +810,7 @@ mod tests {
     #[test]
     fn client_defaults_applied() {
         let r = resolve_client(ClientConfig::default(), None);
-        assert_eq!(r.socks_listen, "127.0.0.1:1080".parse().unwrap());
+        assert_eq!(r.socks_port, None);
         assert!(r.auto_reconnect);
     }
 

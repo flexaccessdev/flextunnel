@@ -7,7 +7,7 @@ use crate::app::{
     format_duration, App, ForwardForm, Message, ProfileForm, Selection, LOG_FILTER_ALL,
 };
 use crate::config::Profile;
-use crate::forward::{ForwardState, ForwardStatus, PortForward};
+use flextunnel_core::forwards::{ForwardState, ForwardStatus, PortForward};
 use crate::style::{self, AMBER, GRAY, GREEN, RED};
 use crate::tunnel::{Phase, Snapshot};
 use flextunnel_core::proxy::signaling::Target;

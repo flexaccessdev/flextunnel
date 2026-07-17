@@ -9,7 +9,7 @@
 //! close.
 
 use crate::config::Profile;
-use crate::forward::{ForwardManager, ForwardStatus, PortForward};
+use flextunnel_core::forwards::{ForwardManager, ForwardStatus, PortForward};
 use flextunnel_core::proxy::{ClientConfig, ProxyClient, TunnelRoutes};
 use flextunnel_core::transport::endpoint::{create_client_endpoint, ConnPath};
 use std::collections::HashMap;
