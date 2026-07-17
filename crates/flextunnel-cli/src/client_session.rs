@@ -59,6 +59,10 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
     // All forwards load disabled (`enabled` is never persisted) — enabling is
     // an explicit per-session action, like the desktop.
     let mut forwards = store::load(&key)?;
+    if let Err(e) = validate_loaded(&forwards) {
+        let path = store::forwards_path(&key)?;
+        anyhow::bail!("Invalid port forwards in {}: {e}", path.display());
+    }
     if !forwards.is_empty() {
         log::info!(
             "Loaded {} port forward(s) (disabled) from {}",
@@ -340,59 +344,104 @@ impl SessionState {
         forwards: &mut Vec<PortForward>,
         fwd_mgr: &mut ForwardManager,
     ) -> Result<(), String> {
-        let persist = !matches!(mutation, Mutation::SetEnabled(..));
-        match mutation {
+        // `enabled` is never persisted, so a toggle is live-only: apply it
+        // directly and skip the save path entirely.
+        if let Mutation::SetEnabled(id, enabled) = mutation {
+            let forward = forwards
+                .iter_mut()
+                .find(|f| f.id == id)
+                .ok_or_else(|| format!("No forward with id {id:?}"))?;
+            forward.enabled = enabled;
+            if enabled {
+                self.disabled_reasons.remove(&id);
+            }
+            fwd_mgr.apply(forwards);
+            return Ok(());
+        }
+
+        // Add/Update/Delete change the persisted set. Stage the change on a
+        // clone and persist *first*: if the save fails, live state and
+        // listeners are untouched, so they never diverge from the file on disk.
+        let mut staged = forwards.clone();
+        // The id whose retained bind-failure reason to clear on commit (an
+        // edit or delete supersedes it); `None` for an add.
+        let reason_to_clear = match mutation {
             Mutation::Add(wire) => {
-                let mut forward = validated(wire, forwards, None)?;
+                let mut forward = validated(wire, &staged, None)?;
                 if forward.id.is_empty() {
                     forward.id = PortForward::new_id();
-                } else if forwards.iter().any(|f| f.id == forward.id) {
+                } else if staged.iter().any(|f| f.id == forward.id) {
                     return Err(format!("A forward with id {:?} already exists", forward.id));
                 }
-                forwards.push(forward);
+                staged.push(forward);
+                None
             }
             Mutation::Update(wire) => {
                 let id = wire.id.clone();
-                let forward = validated(wire, forwards, Some(&id))?;
-                let slot = forwards
+                let forward = validated(wire, &staged, Some(&id))?;
+                let slot = staged
                     .iter_mut()
                     .find(|f| f.id == id)
                     .ok_or_else(|| format!("No forward with id {id:?}"))?;
                 *slot = forward;
-                self.disabled_reasons.remove(&id);
+                Some(id)
             }
             Mutation::Delete(id) => {
-                let before = forwards.len();
-                forwards.retain(|f| f.id != id);
-                if forwards.len() == before {
+                let before = staged.len();
+                staged.retain(|f| f.id != id);
+                if staged.len() == before {
                     return Err(format!("No forward with id {id:?}"));
                 }
-                self.disabled_reasons.remove(&id);
+                Some(id)
             }
-            Mutation::SetEnabled(id, enabled) => {
-                let forward = forwards
-                    .iter_mut()
-                    .find(|f| f.id == id)
-                    .ok_or_else(|| format!("No forward with id {id:?}"))?;
-                forward.enabled = enabled;
-                if enabled {
-                    self.disabled_reasons.remove(&id);
-                }
-            }
+            Mutation::SetEnabled(..) => unreachable!("handled above"),
+        };
+
+        if let Err(e) = store::save(&self.instance, &staged) {
+            log::warn!("Failed to persist port forwards: {e:#}");
+            return Err(format!("Failed to save forwards: {e:#}"));
         }
 
-        // Reconcile listeners first so the change is live even if persisting
-        // fails; a failed save is reported but deliberately not rolled back
-        // (the file wins on the next successful save).
+        // Committed: swap in the staged set, reconcile the listeners, and only
+        // now apply the matching `disabled_reasons` update.
+        *forwards = staged;
         fwd_mgr.apply(forwards);
-        if persist
-            && let Err(e) = store::save(&self.instance, forwards)
-        {
-            log::warn!("Failed to persist port forwards: {e:#}");
-            return Err(format!("Applied, but failed to save forwards: {e:#}"));
+        if let Some(id) = reason_to_clear {
+            self.disabled_reasons.remove(&id);
         }
         Ok(())
     }
+}
+
+/// Reject a persisted forwards file that breaks the invariants the running
+/// client and the TUI assume: nonempty and unique ids, valid remote hosts and
+/// labels, and nonzero, unique local ports (plus nonzero remote ports). The
+/// file is program-written (only by the running client, always after
+/// [`validated`]), so a violation means corruption or a hand-edit — treated
+/// like a corrupt config: a startup error, not a silent load.
+fn validate_loaded(forwards: &[PortForward]) -> Result<(), String> {
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut seen_ports = std::collections::HashSet::new();
+    for f in forwards {
+        if f.id.is_empty() {
+            return Err("a forward has an empty id".into());
+        }
+        if !seen_ids.insert(f.id.as_str()) {
+            return Err(format!("duplicate forward id {:?}", f.id));
+        }
+        validate_label(&f.label).map_err(|e| format!("forward {:?}: {e}", f.id))?;
+        validate_remote_host(&f.remote_host).map_err(|e| format!("forward {:?}: {e}", f.id))?;
+        if f.local_port == 0 {
+            return Err(format!("forward {:?} has a local port of 0", f.id));
+        }
+        if f.remote_port == 0 {
+            return Err(format!("forward {:?} has a remote port of 0", f.id));
+        }
+        if !seen_ports.insert(f.local_port) {
+            return Err(format!("duplicate local port {}", f.local_port));
+        }
+    }
+    Ok(())
 }
 
 /// Server-side (authoritative) validation of a wire forward; the TUI form
@@ -523,6 +572,31 @@ mod tests {
         let mut bad_remote = wire("", 5001);
         bad_remote.remote_port = 0;
         assert!(validated(bad_remote, &current, None).is_err());
+    }
+
+    #[test]
+    fn validate_loaded_rejects_broken_persisted_data() {
+        let ok = vec![existing("a", 5000), existing("b", 5001)];
+        assert!(validate_loaded(&ok).is_ok());
+
+        assert!(validate_loaded(&[existing("", 5000)]).is_err(), "empty id");
+        assert!(
+            validate_loaded(&[existing("a", 5000), existing("a", 5002)]).is_err(),
+            "duplicate id"
+        );
+        assert!(
+            validate_loaded(&[existing("a", 5000), existing("b", 5000)]).is_err(),
+            "duplicate local port"
+        );
+        assert!(validate_loaded(&[existing("a", 0)]).is_err(), "zero local port");
+
+        let mut zero_remote = existing("a", 5000);
+        zero_remote.remote_port = 0;
+        assert!(validate_loaded(&[zero_remote]).is_err(), "zero remote port");
+
+        let mut bad_host = existing("a", 5000);
+        bad_host.remote_host = "bad..host".into();
+        assert!(validate_loaded(&[bad_host]).is_err(), "bad host");
     }
 
     #[test]

@@ -157,10 +157,16 @@ impl App {
     }
 
     fn set_snapshot(&mut self, snapshot: StatusSnapshot) {
+        // Follow the selected forward by its stable id across the refresh: a
+        // row added or removed above it shifts the index, so clamping alone
+        // would silently move the selection to a different forward.
+        let selected_id = self
+            .selected_forward()
+            .map(|row| row.forward.id.clone());
         self.snapshot = snapshot;
-        self.selected = self
-            .selected
-            .min(self.snapshot.forwards.len().saturating_sub(1));
+        self.selected = selected_id
+            .and_then(|id| self.snapshot.forwards.iter().position(|r| r.forward.id == id))
+            .unwrap_or_else(|| self.selected.min(self.snapshot.forwards.len().saturating_sub(1)));
     }
 
     /// Send a mutation; a fresh snapshot means success, an error message is

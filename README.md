@@ -32,11 +32,14 @@ local app ──SOCKS5/HTTP──► flextunnel client (optional listeners, e.g.
 
 - **SOCKS5 `CONNECT` only.** No UDP `ASSOCIATE`, no `BIND`. The optional HTTP
   proxy supports HTTP `CONNECT` plus absolute-URI plain-HTTP forwarding.
-- The local SOCKS5 and HTTP proxy listeners are **no-auth**, and each is
-  disabled unless explicitly configured. Access control is enforced by the QUIC
-  layer (auth token), not by the local proxy front-ends — which is why they
-  **bind `127.0.0.1` only** (you configure just the port, like the desktop
-  client); the authenticated tunnel is never exposed beyond the local machine.
+- The local SOCKS5 and HTTP proxy listeners are **unauthenticated**, and each is
+  disabled unless explicitly configured. Any local user or process that can reach
+  them can use the tunnel, so they **bind `127.0.0.1` only** (you configure just
+  the port, like the desktop client) and flextunnel assumes a **trusted,
+  single-user host**. The QUIC auth token authenticates the client *process* to
+  the server; it does **not** authenticate local callers of the proxy
+  front-ends, and is no substitute for OS-level access control on a shared
+  machine.
 
 ## Security model
 

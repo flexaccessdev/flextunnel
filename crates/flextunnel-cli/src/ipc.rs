@@ -416,7 +416,14 @@ type ClientStream = tokio::net::UnixStream;
 type ClientStream = tokio::net::windows::named_pipe::NamedPipeClient;
 
 pub struct IpcClient {
-    stream: BufReader<ClientStream>,
+    /// Kept so a request that had to discard its stream (see [`request`]) can
+    /// reconnect on the next call.
+    ///
+    /// [`request`]: IpcClient::request
+    key: String,
+    /// `None` after a timed-out request left a half-consumed response on the
+    /// wire; the next request reconnects before sending.
+    stream: Option<BufReader<ClientStream>>,
 }
 
 impl IpcClient {
@@ -425,7 +432,8 @@ impl IpcClient {
     pub async fn connect(key: &str) -> Result<Option<Self>> {
         match tokio::time::timeout(REQUEST_TIMEOUT, Self::open(key)).await {
             Ok(Ok(stream)) => Ok(Some(Self {
-                stream: BufReader::new(stream),
+                key: key.to_string(),
+                stream: Some(BufReader::new(stream)),
             })),
             Ok(Err(e)) if is_not_running(&e) => Ok(None),
             Ok(Err(e)) => Err(e).context("Failed to connect to the control socket"),
@@ -461,19 +469,46 @@ impl IpcClient {
     }
 
     /// One request → response round trip, bounded by [`REQUEST_TIMEOUT`].
+    ///
+    /// On timeout the stream is discarded rather than reused: a response may
+    /// still be in flight, and pairing it with the *next* request would return
+    /// a stale answer. The next call reconnects through [`Self::open`] first.
     pub async fn request(&mut self, request: &Request) -> Result<Response> {
-        tokio::time::timeout(REQUEST_TIMEOUT, self.round_trip(request))
-            .await
-            .map_err(|_| anyhow::anyhow!("Timed out waiting for the client's response"))?
+        if self.stream.is_none() {
+            self.reconnect().await?;
+        }
+        match tokio::time::timeout(REQUEST_TIMEOUT, self.round_trip(request)).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.stream = None;
+                Err(anyhow::anyhow!("Timed out waiting for the client's response"))
+            }
+        }
+    }
+
+    /// Re-establish the connection after a prior request discarded its stream.
+    async fn reconnect(&mut self) -> Result<()> {
+        match tokio::time::timeout(REQUEST_TIMEOUT, Self::open(&self.key)).await {
+            Ok(Ok(stream)) => {
+                self.stream = Some(BufReader::new(stream));
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e).context("Failed to reconnect to the control socket"),
+            Err(_) => anyhow::bail!("Timed out reconnecting to the control socket"),
+        }
     }
 
     async fn round_trip(&mut self, request: &Request) -> Result<Response> {
+        let stream = self
+            .stream
+            .as_mut()
+            .expect("stream reconnected before round_trip");
         let mut buf = serde_json::to_vec(request)?;
         buf.push(b'\n');
-        self.stream.get_mut().write_all(&buf).await?;
+        stream.get_mut().write_all(&buf).await?;
 
         let mut line = Vec::new();
-        let read = read_line_capped(&mut self.stream, &mut line).await?;
+        let read = read_line_capped(stream, &mut line).await?;
         if read == 0 {
             anyhow::bail!("The client closed the control connection");
         }
@@ -627,7 +662,10 @@ mod tests {
         let mut client = {
             let path = _dir.path().join(format!("client-{instance}.sock"));
             IpcClient {
-                stream: BufReader::new(tokio::net::UnixStream::connect(path).await.unwrap()),
+                key: instance.clone(),
+                stream: Some(BufReader::new(
+                    tokio::net::UnixStream::connect(path).await.unwrap(),
+                )),
             }
         };
         #[cfg(windows)]
