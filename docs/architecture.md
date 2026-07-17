@@ -13,7 +13,7 @@ admin/root — it is ordinary userspace sockets end to end.
 
 ```
 local app ──SOCKS5/HTTP──► flextunnel client                    flextunnel server
-                      (127.0.0.1:1080 / optional HTTP)           (no root, no TUN)
+                      (optional SOCKS5/HTTP listeners)           (no root, no TUN)
                           │                                          │
                           │   one iroh QUIC Connection               │
                           │   (fixed ALPN + TLS 1.3)                 │

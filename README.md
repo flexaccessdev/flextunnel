@@ -1,7 +1,7 @@
 # flextunnel
 
-A SOCKS5/HTTP-proxy-over-QUIC split tunnel. The **client** runs a local SOCKS5
-listener and, optionally, an HTTP proxy listener. Each request is matched
+A SOCKS5/HTTP-proxy-over-QUIC split tunnel. The **client** runs optional local
+SOCKS5 and HTTP proxy listeners. Each request is matched
 against the server-pushed tunnel set: routed targets are tunneled as reliable
 QUIC bi-streams to the **server**, which performs **DNS resolution and the
 outbound TCP connection from its own network**, then pipes bytes back; off-list
@@ -17,7 +17,7 @@ Transport, NAT traversal, relay fallback, and TLS 1.3 encryption are provided by
 `EndpointId`, so the server needs no public inbound port or port forwarding.
 
 ```
-local app ──SOCKS5/HTTP──► flextunnel client (127.0.0.1:1080 / optional :8081)
+local app ──SOCKS5/HTTP──► flextunnel client (optional listeners, e.g. 127.0.0.1:1080 / :8081)
                           │  one iroh QUIC connection (fixed ALPN + auth handshake)
                           │  ├─ control stream:  Hello / HelloResponse
                           │  └─ N data streams:  [target header][reply][raw bytes]
@@ -32,10 +32,12 @@ local app ──SOCKS5/HTTP──► flextunnel client (127.0.0.1:1080 / optiona
 
 - **SOCKS5 `CONNECT` only.** No UDP `ASSOCIATE`, no `BIND`. The optional HTTP
   proxy supports HTTP `CONNECT` plus absolute-URI plain-HTTP forwarding.
-- The local SOCKS5 and optional HTTP proxy listeners are **no-auth**; the SOCKS5
-  listener binds to loopback by default, and the HTTP listener is disabled unless
-  explicitly configured. Access control is enforced by the QUIC layer (auth
-  token), not by the local proxy front-ends.
+- The local SOCKS5 and HTTP proxy listeners are **no-auth**, and each is
+  disabled unless explicitly configured. Access control is enforced by the QUIC
+  layer (auth token), not by the local proxy front-ends — so **bind them to
+  loopback** (`127.0.0.1:…`), as every example here does. Binding to `0.0.0.0`
+  or a LAN address hands the authenticated tunnel to anything that can reach
+  the port; do that only when that exposure is intentional.
 
 ## Security model
 
@@ -303,7 +305,8 @@ still happens on the server.
 flextunnel client \
     --server-node-id <ENDPOINT_ID> \
     --auth-token     <AUTH_TOKEN> \
-    --http-listen    127.0.0.1:8081     # SOCKS5 on :1080 stays on
+    --socks-listen   127.0.0.1:1080 \
+    --http-listen    127.0.0.1:8081
 
 # HTTPS tunnels via CONNECT; plain HTTP is forwarded
 https_proxy=http://127.0.0.1:8081 curl https://example.com
@@ -318,7 +321,7 @@ analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 | Command | Description |
 |---|---|
 | `server` | Run the proxy server. |
-| `client` | Run the proxy client (local SOCKS5 listener, optional HTTP proxy). |
+| `client` | Run the proxy client (optional SOCKS5 and HTTP proxy listeners, port forwards). |
 | `generate-server-key -o <FILE> [--force]` | Generate the server identity key. |
 | `show-server-id --secret-file <FILE>` | Print the EndpointId for a key. |
 | `generate-auth-token [-c N]` | Generate N client auth tokens (prefix `ftc`). |
@@ -349,7 +352,7 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `-c, --config <FILE>` | Load options from a TOML file (CLI flags override it). |
 | `--default-config` | Load `~/.config/flextunnel/client.toml`. |
 | `-n, --server-node-id <ID>` | Server EndpointId. |
-| `--socks-listen <ADDR>` | Local SOCKS5 bind address (default `127.0.0.1:1080`). |
+| `--socks-listen <ADDR>` | Optional local SOCKS5 bind address, e.g. `127.0.0.1:1080`. Disabled unless set. |
 | `--http-listen <ADDR>` | Optional HTTP proxy bind address (CONNECT + plain-HTTP forwarding). |
 | `--auth-token <TOKEN>` / `--auth-token-file <FILE>` | Client auth token (one required). |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). |
@@ -357,6 +360,42 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `--auto-reconnect` | Force auto-reconnect on (overrides `auto_reconnect = false` in the config). |
 | `--no-auto-reconnect` | Exit on the first disconnection instead of reconnecting. |
 | `--max-reconnect-attempts <N>` | Cap reconnect attempts between successful connections (unlimited if unset). |
+
+With neither `--socks-listen` nor `--http-listen` (nor the config keys) the
+client runs in **port-forward-only mode**: it holds the tunnel and serves only
+the control panel and any enabled port forwards.
+
+A client's on-disk identity — the single-instance lock, the control socket,
+and the persisted port forwards — is keyed by the prefix of its
+`server_node_id` (which never changes for a profile). So one client runs per
+server per user, and clients for different servers coexist without any extra
+configuration. The optional `name` key in the config ("aws", "home network")
+is a display-only label shown in the control panel.
+
+### `client control`
+
+```sh
+flextunnel client control                # profile from ~/.config/flextunnel/client.toml
+flextunnel client control -c aws.toml    # profile from a specific config
+flextunnel client control -n <ENDPOINT_ID>   # or by server id directly
+```
+
+Attaches a terminal control panel to the **running** client for a profile,
+over its control socket (`~/.config/flextunnel/client-<server id prefix>.sock`;
+a named pipe on Windows). It shows live status — connection phase and uptime,
+server/client node ids, connection paths (direct/relay), and the server-pushed
+routing breakdown (split-tunnel rules, host aliases, DNS forwards, bridge and
+agent routes) — plus an editable **port forwards** table: add/edit/delete
+forwards and toggle them on/off (`space`), live.
+
+Forwards open server-direct streams on the authenticated connection (the
+server enforces its routed set) and listen on localhost. They persist in
+`~/.config/flextunnel/forwards-<server id prefix>.json` — written only by the
+running client — and always load **disabled**; enabling is a per-session
+action, like the desktop app. A forward whose local port can't bind flips back
+off with the reason shown next to its row.
+
+Detaching (`q`) never affects the tunnel; several panels can attach at once.
 
 ## Configuration files
 

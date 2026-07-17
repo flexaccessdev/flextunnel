@@ -1,8 +1,9 @@
 //! flextunnel
 //!
 //! A SOCKS5/HTTP-proxy-over-QUIC split tunnel via iroh P2P connections. The
-//! client runs a local SOCKS5 listener and, optionally, an HTTP proxy listener;
-//! routed targets are tunneled as reliable QUIC bi-streams to the server, which
+//! client runs optional local SOCKS5/HTTP proxy listeners and server-direct
+//! port forwards (managed live from `flextunnel client control`); routed
+//! targets are tunneled as reliable QUIC bi-streams to the server, which
 //! resolves DNS and connects from its own network. Uses a fixed ALPN for
 //! protocol selection, auth tokens for access control, and TLS 1.3/QUIC for
 //! encryption. Neither side needs admin/root (no TUN device).
@@ -13,18 +14,20 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
+mod client_session;
+mod forwards;
+mod instance;
+mod ipc;
 mod lock;
+mod tui;
 
 use flextunnel_core::app;
 use flextunnel_core::blocklist::BlockList;
 use flextunnel_core::iroh::EndpointId;
 use flextunnel_core::proxy::{
-    BridgeUpstream, BridgeUpstreamConfig, ClientConfig, DnsForwarder, ProxyClient, ProxyServer,
-    ProxyServerParams, RoutedSet,
+    BridgeUpstream, BridgeUpstreamConfig, DnsForwarder, ProxyServer, ProxyServerParams, RoutedSet,
 };
-use flextunnel_core::transport::endpoint::{
-    create_client_endpoint, create_server_endpoint, secret_to_endpoint_id,
-};
+use flextunnel_core::transport::endpoint::{create_server_endpoint, secret_to_endpoint_id};
 use flextunnel_core::{auth, config, secret};
 
 #[derive(Parser)]
@@ -69,21 +72,23 @@ enum Command {
         #[arg(long)]
         dns_server: Option<String>,
     },
-    /// Start the proxy client (local SOCKS5 listener, optional HTTP proxy).
-    #[command(arg_required_else_help = true)]
+    /// Start the proxy client (optional SOCKS5 + HTTP proxy listeners, port forwards).
+    #[command(arg_required_else_help = true, args_conflicts_with_subcommands = true)]
     Client {
+        #[command(subcommand)]
+        action: Option<ClientAction>,
         /// Config file path (TOML). CLI flags override file values.
         #[arg(short = 'c', long)]
         config: Option<PathBuf>,
         /// Load config from ~/.config/flextunnel/client.toml.
         #[arg(long)]
         default_config: bool,
-        /// Local address for the SOCKS5 listener (default 127.0.0.1:1080).
+        /// Local address for the optional SOCKS5 listener, e.g. 127.0.0.1:1080.
+        /// Disabled unless set here or in the config.
         #[arg(long)]
         socks_listen: Option<SocketAddr>,
-        /// Also run an HTTP proxy listener (CONNECT + plain-HTTP forwarding) on
-        /// this address, e.g. 127.0.0.1:8081. Disabled unless set; the SOCKS5
-        /// listener stays on.
+        /// Local address for the optional HTTP proxy listener (CONNECT +
+        /// plain-HTTP forwarding), e.g. 127.0.0.1:8081. Disabled unless set.
         #[arg(long)]
         http_listen: Option<SocketAddr>,
         /// EndpointId of the server to connect to.
@@ -147,6 +152,26 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum ClientAction {
+    /// Attach the control panel to the running client for a profile: live
+    /// status + editable port forwards (in this terminal). The client is
+    /// identified by the profile's server node id; with no flags, the default
+    /// config (~/.config/flextunnel/client.toml) selects it.
+    Control {
+        /// Config file path (TOML) of the profile to attach to.
+        #[arg(short = 'c', long)]
+        config: Option<PathBuf>,
+        /// Use ~/.config/flextunnel/client.toml (the default when no other
+        /// selector is given).
+        #[arg(long)]
+        default_config: bool,
+        /// Attach by server EndpointId directly (overrides the config file).
+        #[arg(short = 'n', long)]
+        server_node_id: Option<String>,
+    },
+}
+
 fn log_version() {
     app::log_version(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 }
@@ -156,6 +181,18 @@ fn main() -> Result<()> {
     app::init_logger(app::DEFAULT_LOG_FILTER);
 
     match args.command {
+        // The control panel drives the terminal with its own blocking event
+        // loop (and a small runtime for the IPC calls), so it never enters the
+        // shared multi-thread runtime below.
+        Command::Client {
+            action:
+                Some(ClientAction::Control {
+                    config,
+                    default_config,
+                    server_node_id,
+                }),
+            ..
+        } => tui::run(config, default_config, server_node_id),
         Command::GenerateServerKey { output, force } => secret::generate_secret(output, force),
         Command::ShowServerId {
             config,
@@ -231,6 +268,7 @@ async fn run_async(command: Command) -> Result<()> {
             run_server(config::resolve_server(cli, file)?).await
         }
         Command::Client {
+            action: None,
             config: config_path,
             default_config,
             socks_listen,
@@ -257,6 +295,7 @@ async fn run_async(command: Command) -> Result<()> {
             };
             let cli = config::ClientConfig {
                 server_node_id,
+                name: None, // display name is config-file only; no CLI flag
                 socks_listen,
                 http_listen,
                 auth_token,
@@ -267,7 +306,7 @@ async fn run_async(command: Command) -> Result<()> {
                 max_reconnect_attempts,
             };
             let file = config::load_client_config(config_path.as_deref(), default_config)?;
-            run_client(config::resolve_client(cli, file)).await
+            client_session::run(config::resolve_client(cli, file)).await
         }
         _ => unreachable!("synchronous commands handled in main()"),
     }
@@ -531,67 +570,6 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
     // Close the endpoint gracefully before it is dropped. Skipping this makes
     // iroh tear down its relay tasks via an ungraceful abort, which panics
     // (`JoinSet::join_all` on a cancelled task) — fatal under panic=abort.
-    endpoint.close().await;
-    res
-}
-
-async fn run_client(r: config::ResolvedClient) -> Result<()> {
-    let server_node_id = r.server_node_id.context(
-        "The client requires a server node id (--server-node-id or server_node_id in the config).",
-    )?;
-
-    if r.auth_token.is_some() && r.auth_token_file.is_some() {
-        anyhow::bail!("Provide only one of auth_token or auth_token_file, not both");
-    }
-    let token = if let Some(token) = r.auth_token {
-        auth::validate_client_token(&token).context("Invalid authentication token")?;
-        token
-    } else if let Some(path) = r.auth_token_file {
-        auth::load_auth_token_from_file(&path, auth::CLIENT_TOKEN_PREFIX)
-            .context("Failed to load authentication token from file")?
-    } else {
-        anyhow::bail!(
-            "The client requires an authentication token.\n\
-             Use --auth-token <TOKEN>, --auth-token-file <FILE>, or set \
-             auth_token/auth_token_file in the config."
-        );
-    };
-
-    // The routed set (tunnel set) is no longer configured on the client; it is
-    // pushed by the server during the handshake (see ProxyClient::handshake).
-
-    let endpoint = create_client_endpoint(&r.relay_urls, r.dns_server.as_deref())
-        .await
-        .context("Failed to create iroh endpoint")?;
-    log::info!("flextunnel client Node ID: {}", endpoint.id());
-
-    let client = ProxyClient::new(ClientConfig {
-        server_node_id,
-        auth_token: token,
-        socks_listen: Some(r.socks_listen),
-        http_listen: r.http_listen,
-        relay_urls: r.relay_urls,
-        auto_reconnect: r.auto_reconnect,
-        max_reconnect_attempts: r.max_reconnect_attempts,
-    });
-
-    let run = async {
-        client
-            .run(&endpoint)
-            .await
-            .map_err(|e| anyhow::anyhow!("Client error: {e}"))
-    };
-
-    let res = tokio::select! {
-        res = run => res,
-        sig = app::shutdown_signal() => {
-            sig?;
-            log::info!("Received shutdown signal, stopping client");
-            Ok(())
-        }
-    };
-
-    // Close the endpoint gracefully before it is dropped (see run_server).
     endpoint.close().await;
     res
 }

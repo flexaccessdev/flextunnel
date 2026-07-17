@@ -14,7 +14,6 @@
 
 mod app;
 mod config;
-mod forward;
 mod icon;
 mod logging;
 mod style;

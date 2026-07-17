@@ -132,11 +132,16 @@ pub struct ServerConfig {
 pub struct ClientConfig {
     /// EndpointId of the server to connect to.
     pub server_node_id: Option<String>,
-    /// Local address for the SOCKS5 listener.
+    /// Friendly display name for this profile (e.g. "aws", "home network"),
+    /// shown in status UIs. Purely cosmetic — the client's on-disk identity
+    /// (lock, control socket, forwards file) is keyed by `server_node_id`.
+    pub name: Option<String>,
+    /// Local address for the optional SOCKS5 listener. Unset = SOCKS
+    /// front-end disabled; with neither `socks_listen` nor `http_listen` the
+    /// client runs in port-forward/control-panel-only mode.
     pub socks_listen: Option<SocketAddr>,
     /// Local address for the optional HTTP proxy listener (CONNECT tunneling +
     /// absolute-URI plain-HTTP forwarding). Unset = HTTP front-end disabled.
-    /// The command-line client still requires a SOCKS5 listener.
     pub http_listen: Option<SocketAddr>,
     /// Auth token to send to the server.
     pub auth_token: Option<String>,
@@ -215,7 +220,8 @@ pub struct ResolvedServer {
 /// Fully-resolved client settings (CLI > file > default), paths tilde-expanded.
 pub struct ResolvedClient {
     pub server_node_id: Option<String>,
-    pub socks_listen: SocketAddr,
+    pub name: Option<String>,
+    pub socks_listen: Option<SocketAddr>,
     pub http_listen: Option<SocketAddr>,
     pub auth_token: Option<String>,
     pub auth_token_file: Option<PathBuf>,
@@ -235,9 +241,6 @@ pub struct ResolvedAgent {
     pub auto_reconnect: bool,
     pub max_reconnect_attempts: Option<NonZeroU32>,
 }
-
-/// Default SOCKS5 listen address when neither CLI nor config sets one.
-const DEFAULT_SOCKS_LISTEN: &str = "127.0.0.1:1080";
 
 /// Expand a leading `~` / `~/…` to the user's home directory.
 pub fn expand_tilde(path: &Path) -> PathBuf {
@@ -493,11 +496,9 @@ pub fn resolve_client(cli: ClientConfig, file: Option<ClientConfig>) -> Resolved
 
     ResolvedClient {
         server_node_id: cli.server_node_id.or(file.server_node_id),
-        socks_listen: cli
-            .socks_listen
-            .or(file.socks_listen)
-            .unwrap_or_else(|| DEFAULT_SOCKS_LISTEN.parse().expect("valid default addr")),
-        // No default: the HTTP front-end is off unless explicitly configured.
+        name: cli.name.or(file.name),
+        // No defaults: each proxy front-end is off unless explicitly configured.
+        socks_listen: cli.socks_listen.or(file.socks_listen),
         http_listen: cli.http_listen.or(file.http_listen),
         auth_token,
         auth_token_file: auth_token_file.map(|p| expand_tilde(&p)),
@@ -807,7 +808,7 @@ mod tests {
     #[test]
     fn client_defaults_applied() {
         let r = resolve_client(ClientConfig::default(), None);
-        assert_eq!(r.socks_listen, "127.0.0.1:1080".parse().unwrap());
+        assert_eq!(r.socks_listen, None);
         assert!(r.auto_reconnect);
     }
 

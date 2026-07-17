@@ -3,9 +3,12 @@
 The flextunnel client exposes up to two local proxy listeners, both sharing the
 same routing core:
 
-- a **SOCKS5** listener (default `127.0.0.1:1080`), always on; and
-- an optional **HTTP proxy** listener (`--http-listen 127.0.0.1:8081`), off
-  unless you enable it.
+- an optional **SOCKS5** listener (`--socks-listen 127.0.0.1:1080`); and
+- an optional **HTTP proxy** listener (`--http-listen 127.0.0.1:8081`).
+
+Each is off unless you enable it (this guide's examples assume SOCKS5 on
+`127.0.0.1:1080`); with neither enabled the client runs in port-forward-only
+mode.
 
 Which one you point a tool at depends only on what that tool can speak — the
 client applies the server-pushed tunnel set after parsing the request. On-list
@@ -84,13 +87,14 @@ protocol that isn't HTTP: a database wire protocol, RDP, or SSH does not speak
 HTTP `CONNECT`, so those still go through SOCKS5 or a `socat` forward. The HTTP
 proxy *complements* SOCKS5; it doesn't replace it.
 
-Enable the HTTP proxy by adding `--http-listen` when you start the client (the
-SOCKS5 listener stays on):
+Enable the HTTP proxy by adding `--http-listen` when you start the client.
+SOCKS5 is not on by default — keep `--socks-listen` too if you also want it:
 
 ```sh
 flextunnel client \
     --server-node-id <ENDPOINT_ID> \
     --auth-token     <AUTH_TOKEN> \
+    --socks-listen   127.0.0.1:1080 \
     --http-listen    127.0.0.1:8081
 ```
 

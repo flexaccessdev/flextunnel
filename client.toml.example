@@ -6,13 +6,22 @@
 # CLI flags override these values. Unknown keys are rejected.
 
 # EndpointId of the server to connect to (from `flextunnel show-server-id`).
+# Also the client's identity: its prefix keys the single-instance lock, the
+# control socket, and the persisted port forwards, so one client runs per
+# server (per user) and `flextunnel client control` finds it from this config.
 server_node_id = "<server endpoint id>"
 
-# Local SOCKS5 listen address (default 127.0.0.1:1080).
-socks_listen = "127.0.0.1:1080"
+# Optional friendly name for this profile, shown in the control panel and
+# statuses. Display-only.
+# name = "aws"
+
+# Optional local SOCKS5 listen address. Unset means disabled.
+# socks_listen = "127.0.0.1:1080"
 
 # Optional HTTP proxy listen address (CONNECT + absolute-URI plain-HTTP
-# forwarding). Unset means disabled; the SOCKS5 listener still runs.
+# forwarding). Unset means disabled. With neither socks_listen nor
+# http_listen set, the client runs in port-forward-only mode (manage
+# forwards with `flextunnel client control`).
 # http_listen = "127.0.0.1:8081"
 
 # Auth token for this client. Provide exactly one of `auth_token` or `auth_token_file`.

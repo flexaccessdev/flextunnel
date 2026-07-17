@@ -10,7 +10,7 @@
 //! loop doesn't hit the macOS keychain access prompt on every unsigned binary.
 //! Never set it for a real install — the auth tokens are stored unencrypted.
 
-use crate::forward::PortForward;
+use flextunnel_core::forwards::PortForward;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
