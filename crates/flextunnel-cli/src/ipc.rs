@@ -30,6 +30,9 @@ use tokio::io::{
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+// Windows derives everything from the pipe name; only the Unix socket path
+// lives under the instance dir.
+#[cfg(unix)]
 use crate::instance;
 
 /// Cap on one JSON line in either direction.
