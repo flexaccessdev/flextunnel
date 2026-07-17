@@ -51,8 +51,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
         routing_area,
     );
 
+    // Keep the selected row visible when the list is taller than the table:
+    // scroll just enough that the selection sits at the bottom edge.
+    let visible_forwards = forwards_area.height.saturating_sub(2) as usize;
+    let forwards_scroll = (app.selected + 1).saturating_sub(visible_forwards.max(1)) as u16;
     frame.render_widget(
         Paragraph::new(forward_lines(&s.forwards, app.selected, matches!(app.mode, Mode::Normal)))
+            .scroll((forwards_scroll, 0))
             .block(titled_block(&format!("Port forwards · {}", s.forwards.len()))),
         forwards_area,
     );
@@ -308,8 +313,9 @@ fn forward_lines(forwards: &[ForwardRow], selected: usize, show_cursor: bool) ->
                     Style::new().add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!(
-                    " localhost:{} → {}:{}  ",
-                    f.local_port, f.remote_host, f.remote_port
+                    " localhost:{} → {}  ",
+                    f.local_port,
+                    flextunnel_core::forwards::format_host_port(&f.remote_host, f.remote_port)
                 )),
                 forward_state_span(row),
             ];

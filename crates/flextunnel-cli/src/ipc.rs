@@ -288,11 +288,16 @@ fn spawn_pipe(name: String, tx: mpsc::Sender<IpcCmd>) -> Result<IpcServerGuard> 
             }
             // Create the next pipe instance *before* serving the connected one
             // so the name never briefly disappears for a concurrent attacher.
-            let next = match ServerOptions::new().create(&name) {
-                Ok(next) => next,
-                Err(e) => {
-                    log::warn!("Failed to re-create control pipe {name}: {e}");
-                    break;
+            // A transient creation failure must not disable IPC for the rest
+            // of the session — retry until it succeeds (the guard aborts this
+            // task on shutdown, which bounds the loop).
+            let next = loop {
+                match ServerOptions::new().create(&name) {
+                    Ok(next) => break next,
+                    Err(e) => {
+                        log::warn!("Failed to re-create control pipe {name}: {e}; retrying");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
                 }
             };
             let conn = std::mem::replace(&mut server, next);

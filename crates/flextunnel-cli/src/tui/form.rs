@@ -109,7 +109,7 @@ impl FormState {
 pub fn display_name(forward: &WireForward) -> String {
     let label = forward.label.trim();
     if label.is_empty() {
-        format!("{}:{}", forward.remote_host, forward.remote_port)
+        flextunnel_core::forwards::format_host_port(&forward.remote_host, forward.remote_port)
     } else {
         label.to_string()
     }

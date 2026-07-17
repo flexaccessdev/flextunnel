@@ -33,7 +33,7 @@ impl PortForward {
     pub fn display_name(&self) -> String {
         let label = self.label.trim();
         if label.is_empty() {
-            format!("{}:{}", self.remote_host, self.remote_port)
+            self.remote_endpoint()
         } else {
             label.to_string()
         }
@@ -44,7 +44,7 @@ impl PortForward {
     }
 
     pub fn remote_endpoint(&self) -> String {
-        format!("{}:{}", self.remote_host, self.remote_port)
+        format_host_port(&self.remote_host, self.remote_port)
     }
 
     fn spec(&self) -> ForwardSpec {
@@ -89,13 +89,24 @@ fn enabled_specs(forwards: &[PortForward]) -> Vec<ForwardSpec> {
         .collect()
 }
 
-/// Maximum label length accepted by [`validate_label`].
+/// Render a `host:port` endpoint unambiguously: bare IPv6 addresses (stored
+/// bracket-less — see [`validate_remote_host`]) get brackets back so the port
+/// separator can't be confused with the address's own colons.
+pub fn format_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Maximum label length accepted by [`validate_label`], in characters.
 pub const MAX_LABEL_LEN: usize = 64;
 
 /// Validate a forward's display label (returns the trimmed form to store).
 pub fn validate_label(input: &str) -> Result<String, String> {
     let label = input.trim();
-    if label.len() > MAX_LABEL_LEN {
+    if label.chars().count() > MAX_LABEL_LEN {
         return Err(format!("Label must be {MAX_LABEL_LEN} characters or fewer"));
     }
     Ok(label.to_string())
@@ -205,6 +216,13 @@ mod tests {
         );
         forward.label = "  echo  ".into();
         assert_eq!(forward.display_name(), "echo");
+
+        // Bare IPv6 hosts render bracketed so the port stays unambiguous.
+        forward.label = String::new();
+        forward.remote_host = "2001:db8::1".into();
+        assert_eq!(forward.remote_endpoint(), "[2001:db8::1]:7");
+        assert_eq!(forward.display_name(), "[2001:db8::1]:7");
+        assert_eq!(format_host_port("10.0.0.7", 80), "10.0.0.7:80");
     }
 
     #[test]
@@ -283,5 +301,8 @@ mod tests {
 
         assert_eq!(validate_label("  db  "), Ok("db".into()));
         assert!(validate_label(&"a".repeat(65)).is_err());
+        // The cap counts characters, not UTF-8 bytes.
+        assert!(validate_label(&"é".repeat(64)).is_ok());
+        assert!(validate_label(&"é".repeat(65)).is_err());
     }
 }

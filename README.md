@@ -1,7 +1,7 @@
 # flextunnel
 
-A SOCKS5/HTTP-proxy-over-QUIC split tunnel. The **client** runs a local SOCKS5
-listener and, optionally, an HTTP proxy listener. Each request is matched
+A SOCKS5/HTTP-proxy-over-QUIC split tunnel. The **client** runs optional local
+SOCKS5 and HTTP proxy listeners. Each request is matched
 against the server-pushed tunnel set: routed targets are tunneled as reliable
 QUIC bi-streams to the **server**, which performs **DNS resolution and the
 outbound TCP connection from its own network**, then pipes bytes back; off-list
@@ -32,10 +32,9 @@ local app ──SOCKS5/HTTP──► flextunnel client (127.0.0.1:1080 / optiona
 
 - **SOCKS5 `CONNECT` only.** No UDP `ASSOCIATE`, no `BIND`. The optional HTTP
   proxy supports HTTP `CONNECT` plus absolute-URI plain-HTTP forwarding.
-- The local SOCKS5 and optional HTTP proxy listeners are **no-auth**; the SOCKS5
-  listener binds to loopback by default, and the HTTP listener is disabled unless
-  explicitly configured. Access control is enforced by the QUIC layer (auth
-  token), not by the local proxy front-ends.
+- The local SOCKS5 and HTTP proxy listeners are **no-auth**, and each is
+  disabled unless explicitly configured. Access control is enforced by the QUIC
+  layer (auth token), not by the local proxy front-ends.
 
 ## Security model
 
@@ -319,7 +318,7 @@ analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 | Command | Description |
 |---|---|
 | `server` | Run the proxy server. |
-| `client` | Run the proxy client (local SOCKS5 listener, optional HTTP proxy). |
+| `client` | Run the proxy client (optional SOCKS5 and HTTP proxy listeners, port forwards). |
 | `generate-server-key -o <FILE> [--force]` | Generate the server identity key. |
 | `show-server-id --secret-file <FILE>` | Print the EndpointId for a key. |
 | `generate-auth-token [-c N]` | Generate N client auth tokens (prefix `ftc`). |

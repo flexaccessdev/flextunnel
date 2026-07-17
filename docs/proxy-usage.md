@@ -87,13 +87,14 @@ protocol that isn't HTTP: a database wire protocol, RDP, or SSH does not speak
 HTTP `CONNECT`, so those still go through SOCKS5 or a `socat` forward. The HTTP
 proxy *complements* SOCKS5; it doesn't replace it.
 
-Enable the HTTP proxy by adding `--http-listen` when you start the client (the
-SOCKS5 listener stays on):
+Enable the HTTP proxy by adding `--http-listen` when you start the client.
+SOCKS5 is not on by default — keep `--socks-listen` too if you also want it:
 
 ```sh
 flextunnel client \
     --server-node-id <ENDPOINT_ID> \
     --auth-token     <AUTH_TOKEN> \
+    --socks-listen   127.0.0.1:1080 \
     --http-listen    127.0.0.1:8081
 ```
 

@@ -120,7 +120,16 @@ pub async fn run(instance_name: String, r: config::ResolvedClient) -> Result<()>
     );
 
     let (ipc_tx, mut ipc_rx) = mpsc::channel(8);
-    let ipc_guard = ipc::spawn_ipc_server(&instance_name, ipc_tx)?;
+    // Like the listener binds above: any failure past endpoint creation must
+    // still close the endpoint gracefully (fatal under panic=abort otherwise).
+    let ipc_guard = match ipc::spawn_ipc_server(&instance_name, ipc_tx) {
+        Ok(guard) => guard,
+        Err(e) => {
+            drop(fwd_mgr);
+            endpoint.close().await;
+            return Err(e);
+        }
+    };
 
     let mut state = SessionState {
         instance: instance_name.clone(),
@@ -171,9 +180,12 @@ pub async fn run(instance_name: String, r: config::ResolvedClient) -> Result<()>
                 None => {}
             },
             sig = app::shutdown_signal() => {
-                sig?;
-                log::info!("Received shutdown signal, stopping client");
-                break Ok(());
+                // Break (not return) even on a signal-handler error so the
+                // graceful endpoint close below still runs.
+                if sig.is_ok() {
+                    log::info!("Received shutdown signal, stopping client");
+                }
+                break sig;
             }
         }
     };
