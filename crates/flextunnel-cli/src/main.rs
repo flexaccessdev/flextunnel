@@ -67,9 +67,6 @@ enum Command {
         /// Custom relay server URL(s) for failover (repeatable).
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
-        /// Custom DNS server URL for peer discovery ("none" to disable).
-        #[arg(long)]
-        dns_server: Option<String>,
     },
     /// Start or control the proxy client.
     #[command(arg_required_else_help = true)]
@@ -145,9 +142,6 @@ enum ClientAction {
         /// Custom relay server URL(s) for failover (repeatable).
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
-        /// Custom DNS server URL for peer discovery ("none" to disable).
-        #[arg(long)]
-        dns_server: Option<String>,
         /// Force auto-reconnect on (overrides `auto_reconnect = false` in the config).
         #[arg(long, conflicts_with = "no_auto_reconnect")]
         auto_reconnect: bool,
@@ -308,7 +302,6 @@ async fn run_async(command: Command) -> Result<()> {
             agent_auth_tokens,
             agent_auth_tokens_file,
             relay_urls,
-            dns_server,
         } => {
             log_version();
             let cli = config::ServerConfig {
@@ -320,7 +313,6 @@ async fn run_async(command: Command) -> Result<()> {
                 agent_auth_tokens_file,
                 agent_routes: None, // config-file only; no CLI flag
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
-                dns_server,
                 host_aliases: None, // config-file only; no CLI flag
                 routed_domains: None, // config-file only; no CLI flag
                 routed_cidrs: None,   // config-file only; no CLI flag
@@ -344,7 +336,6 @@ async fn run_async(command: Command) -> Result<()> {
                     auth_token,
                     auth_token_file,
                     relay_urls,
-                    dns_server,
                     auto_reconnect,
                     no_auto_reconnect,
                     max_reconnect_attempts,
@@ -369,7 +360,6 @@ async fn run_async(command: Command) -> Result<()> {
                 auth_token,
                 auth_token_file,
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
-                dns_server,
                 auto_reconnect,
                 max_reconnect_attempts,
             };
@@ -580,7 +570,7 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
         log::info!("Loaded {} bridge route(s)", bridges.len());
     }
 
-    let endpoint = create_server_endpoint(&r.relay_urls, secret_key, r.dns_server.as_deref())
+    let endpoint = create_server_endpoint(&r.relay_urls, secret_key)
         .await
         .context("Failed to create iroh endpoint")?;
 

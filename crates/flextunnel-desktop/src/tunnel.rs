@@ -400,7 +400,7 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
     // endpoint is closed gracefully.
     let mut create = tokio::spawn({
         let relay_urls = profile.relay_urls.clone();
-        async move { create_client_endpoint(&relay_urls, None).await }
+        async move { create_client_endpoint(&relay_urls).await }
     });
     let endpoint = loop {
         tokio::select! {

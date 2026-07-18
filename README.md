@@ -346,8 +346,7 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `--auth-tokens-file <FILE>` | File of accepted client tokens, one per line. |
 | `--agent-auth-token <TOKEN>` | Accepted agent token (repeatable). Separate pool from clients. |
 | `--agent-auth-tokens-file <FILE>` | File of accepted agent tokens, one per line. |
-| `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). |
-| `--dns-server <URL>` | Custom discovery DNS server, or `none` to disable. |
+| `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). A custom relay doubles as the rendezvous point, so iroh peer discovery is disabled automatically when one is set. |
 
 ### `client start`
 
@@ -359,8 +358,7 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `--socks-port <PORT>` | Optional SOCKS5 listener port, e.g. `1080`. Binds `127.0.0.1` only. Disabled unless set. |
 | `--http-port <PORT>` | Optional HTTP proxy listener port (CONNECT + plain-HTTP forwarding). Binds `127.0.0.1` only. |
 | `--auth-token <TOKEN>` / `--auth-token-file <FILE>` | Client auth token (one required). |
-| `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). |
-| `--dns-server <URL>` | Custom discovery DNS server, or `none` to disable. |
+| `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). A custom relay doubles as the rendezvous point, so iroh peer discovery is disabled automatically when one is set. |
 | `--auto-reconnect` | Force auto-reconnect on (overrides `auto_reconnect = false` in the config). |
 | `--no-auto-reconnect` | Exit on the first disconnection instead of reconnecting. |
 | `--max-reconnect-attempts <N>` | Cap reconnect attempts between successful connections (unlimited if unset). |

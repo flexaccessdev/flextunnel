@@ -59,9 +59,6 @@ enum Command {
         /// Custom relay server URL(s) for failover (repeatable).
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
-        /// Custom DNS server URL for peer discovery ("none" to disable).
-        #[arg(long)]
-        dns_server: Option<String>,
         /// Force auto-reconnect on (overrides `auto_reconnect = false` in the config).
         #[arg(long, conflicts_with = "no_auto_reconnect")]
         auto_reconnect: bool,
@@ -115,7 +112,6 @@ async fn run_async(command: Command) -> Result<()> {
             auth_token,
             auth_token_file,
             relay_urls,
-            dns_server,
             auto_reconnect,
             no_auto_reconnect,
             max_reconnect_attempts,
@@ -133,7 +129,6 @@ async fn run_async(command: Command) -> Result<()> {
                 auth_token,
                 auth_token_file,
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
-                dns_server,
                 auto_reconnect,
                 max_reconnect_attempts,
             };
@@ -183,7 +178,7 @@ async fn run_agent(r: config::ResolvedAgent) -> Result<()> {
 
     // Ephemeral iroh identity (like the client): no persistent secret key. The
     // agent is identified by its machine id, not its node id.
-    let endpoint = create_client_endpoint(&r.relay_urls, r.dns_server.as_deref())
+    let endpoint = create_client_endpoint(&r.relay_urls)
         .await
         .context("Failed to create iroh endpoint")?;
     log::info!("flextunnel agent Node ID (ephemeral): {}", endpoint.id());

@@ -31,8 +31,9 @@ auth_token = "ftcXXXXXXX"
 # auth_token_file = "~/.config/flextunnel/token.txt"
 
 # Optional iroh tuning and reconnect behavior.
-# relay_urls = ["https://relay.example"]
-# dns_server = "https://dns.example"        # or "none"
+# relay_urls = ["https://relay.example"]     # a custom relay doubles as the rendezvous
+                                             # point, so iroh peer discovery is disabled
+                                             # automatically whenever one is set
 # auto_reconnect = true                      # default: true. set false to exit on first disconnect
 # max_reconnect_attempts = 10                # default: unlimited (omit for no cap)
 

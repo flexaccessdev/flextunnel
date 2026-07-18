@@ -50,7 +50,7 @@ void flextunnel_init_logging(void);
  *
  * config_json : NUL-terminated UTF-8 JSON, e.g.
  *   {"server_node_id":"<id>","auth_token":"<token>",
- *    "socks_port":0,"relay_urls":[],"dns_server":null}
+ *    "socks_port":0,"relay_urls":[]}
  *   socks_port is optional; null/omitted disables SOCKS5, while 0 requests an
  *   OS-assigned port (read it from the result JSON). The routed set
  *   is configured on the server and pushed to the client during the

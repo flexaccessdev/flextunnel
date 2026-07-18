@@ -40,8 +40,7 @@
 //!   "server_node_id": "<iroh endpoint id>",
 //!   "auth_token": "<flextunnel auth token>",
 //!   "socks_port": null,
-//!   "relay_urls": ["https://relay.example/"],
-//!   "dns_server": null
+//!   "relay_urls": ["https://relay.example/"]
 //! }
 //! ```
 //!
@@ -104,8 +103,6 @@ struct FfiConfig {
     socks_port: Option<u16>,
     #[serde(default)]
     relay_urls: Vec<String>,
-    #[serde(default)]
-    dns_server: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -231,7 +228,7 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
     };
 
     let endpoint = runtime
-        .block_on(create_client_endpoint(&cfg.relay_urls, cfg.dns_server.as_deref()))
+        .block_on(create_client_endpoint(&cfg.relay_urls))
         .map_err(|e| format!("failed to create iroh endpoint: {e}"))?;
 
     let client = Arc::new(ProxyClient::new(ClientConfig {
