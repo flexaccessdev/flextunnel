@@ -74,7 +74,7 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
     // The routed set (tunnel set) is configured on the server and pushed
     // during the handshake (see ProxyClient::handshake).
 
-    let endpoint = create_client_endpoint(&r.relay_urls, r.dns_server.as_deref())
+    let endpoint = create_client_endpoint(&r.relay_urls)
         .await
         .context("Failed to create iroh endpoint")?;
     log::info!("flextunnel client Node ID: {}", endpoint.id());

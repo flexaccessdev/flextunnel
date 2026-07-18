@@ -84,8 +84,6 @@ pub struct ServerConfig {
     pub agent_routes: Option<HashMap<String, AgentRoute>>,
     /// Custom relay URL(s) for failover.
     pub relay_urls: Option<Vec<String>>,
-    /// Custom discovery DNS server URL ("none" to disable).
-    pub dns_server: Option<String>,
     /// Hostname aliases resolved on the server side: a requested host that
     /// matches a key is rewritten to its value (an IP or another hostname on the
     /// server's network) before connecting. Keeps the requested port. Lets a
@@ -151,8 +149,6 @@ pub struct ClientConfig {
     pub auth_token_file: Option<PathBuf>,
     /// Custom relay URL(s) for failover.
     pub relay_urls: Option<Vec<String>>,
-    /// Custom discovery DNS server URL ("none" to disable).
-    pub dns_server: Option<String>,
     /// Reconnect with backoff on a transient drop (default true).
     pub auto_reconnect: Option<bool>,
     /// Cap on reconnect attempts between successful connections.
@@ -173,8 +169,6 @@ pub struct AgentConfig {
     pub auth_token_file: Option<PathBuf>,
     /// Custom relay URL(s) for failover.
     pub relay_urls: Option<Vec<String>>,
-    /// Custom discovery DNS server URL ("none" to disable).
-    pub dns_server: Option<String>,
     /// Reconnect with backoff on a transient drop (default true).
     pub auto_reconnect: Option<bool>,
     /// Cap on reconnect attempts between successful connections.
@@ -194,7 +188,6 @@ pub struct ResolvedServer {
     /// matching, mapping an alias to an agent's machine id. See [`AgentRoute`].
     pub agent_routes: HashMap<String, String>,
     pub relay_urls: Vec<String>,
-    pub dns_server: Option<String>,
     /// Server-side host aliases, keys lowercased for case-insensitive matching.
     pub host_aliases: HashMap<String, String>,
     /// Raw routed-set entries (parsed into a `RoutedSet` at startup).
@@ -228,7 +221,6 @@ pub struct ResolvedClient {
     pub auth_token: Option<String>,
     pub auth_token_file: Option<PathBuf>,
     pub relay_urls: Vec<String>,
-    pub dns_server: Option<String>,
     pub auto_reconnect: bool,
     pub max_reconnect_attempts: Option<NonZeroU32>,
 }
@@ -239,7 +231,6 @@ pub struct ResolvedAgent {
     pub auth_token: Option<String>,
     pub auth_token_file: Option<PathBuf>,
     pub relay_urls: Vec<String>,
-    pub dns_server: Option<String>,
     pub auto_reconnect: bool,
     pub max_reconnect_attempts: Option<NonZeroU32>,
 }
@@ -444,7 +435,6 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
         agent_auth_tokens_file: agent_auth_tokens_file.map(|p| expand_tilde(&p)),
         agent_routes,
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
-        dns_server: cli.dns_server.or(file.dns_server),
         host_aliases,
         routed_domains: cli
             .routed_domains
@@ -505,7 +495,6 @@ pub fn resolve_client(cli: ClientConfig, file: Option<ClientConfig>) -> Resolved
         auth_token,
         auth_token_file: auth_token_file.map(|p| expand_tilde(&p)),
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
-        dns_server: cli.dns_server.or(file.dns_server),
         auto_reconnect: cli.auto_reconnect.or(file.auto_reconnect).unwrap_or(true),
         max_reconnect_attempts: cli.max_reconnect_attempts.or(file.max_reconnect_attempts),
     }
@@ -527,7 +516,6 @@ pub fn resolve_agent(cli: AgentConfig, file: Option<AgentConfig>) -> ResolvedAge
         auth_token,
         auth_token_file: auth_token_file.map(|p| expand_tilde(&p)),
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
-        dns_server: cli.dns_server.or(file.dns_server),
         auto_reconnect: cli.auto_reconnect.or(file.auto_reconnect).unwrap_or(true),
         max_reconnect_attempts: cli.max_reconnect_attempts.or(file.max_reconnect_attempts),
     }
@@ -543,12 +531,11 @@ mod tests {
             secret_file = "./server.key"
             auth_tokens = ["ftcAAA", "ftcBBB"]
             relay_urls = ["https://relay.example"]
-            dns_server = "none"
         "#;
         let cfg: ServerConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.secret_file, Some(PathBuf::from("./server.key")));
         assert_eq!(cfg.auth_tokens.as_deref().map(<[_]>::len), Some(2));
-        assert_eq!(cfg.dns_server.as_deref(), Some("none"));
+        assert_eq!(cfg.relay_urls.as_deref().map(<[_]>::len), Some(1));
         assert!(cfg.secret.is_none());
     }
 
@@ -578,17 +565,17 @@ mod tests {
     #[test]
     fn cli_overrides_file() {
         let file = ServerConfig {
-            dns_server: Some("https://file.example".into()),
+            secret_file: Some(PathBuf::from("/file/server.key")),
             relay_urls: Some(vec!["https://file-relay".into()]),
             ..Default::default()
         };
         let cli = ServerConfig {
-            dns_server: Some("https://cli.example".into()),
+            secret_file: Some(PathBuf::from("/cli/server.key")),
             ..Default::default()
         };
         let r = resolve_server(cli, Some(file)).unwrap();
         // CLI wins where set; file fills the rest.
-        assert_eq!(r.dns_server.as_deref(), Some("https://cli.example"));
+        assert_eq!(r.secret_file, Some(PathBuf::from("/cli/server.key")));
         assert_eq!(r.relay_urls, vec!["https://file-relay".to_string()]);
     }
 

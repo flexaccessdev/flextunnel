@@ -21,8 +21,9 @@ auth_tokens = ["ftcXXXXXXX"]
 # agent_auth_tokens_file = "/etc/flextunnel/agent_auth_tokens.txt"
 
 # Optional iroh tuning.
-# relay_urls = ["https://relay.example"]   # custom relay(s) for failover
-# dns_server = "https://dns.example"        # custom discovery DNS, or "none"
+# relay_urls = ["https://relay.example"]   # custom relay(s) for failover; a custom relay
+                                          # doubles as the rendezvous point, so iroh peer
+                                          # discovery is disabled automatically when set
 
 # Duplicate-id blocklist (JSON). This path is fixed at
 # ~/.config/flextunnel/blocklist.json and is deliberately not configurable. The
