@@ -129,8 +129,11 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 # as [host_aliases] above — every matched subdomain still dials 127.0.0.1 on the
 # SAME agent, since reverse routing is loopback-only in v1). Checked BEFORE
 # [host_aliases]; a name should appear in only one. When a routed set is active
-# (it always is), add the alias name (or a covering `*.suffix`) to routed_domains
-# above too — filtering happens on the requested hostname first.
+# (it always is), the requested hostname must also be on routed_domains above —
+# filtering happens on the requested hostname first. An EXACT alias
+# (`web.internal`) needs a matching exact routed_domains entry, or the global `*`;
+# a `*.web.internal` wildcard alias covers subdomains only, so add `*.web.internal`
+# there — it does NOT cover the bare apex `web.internal`.
 # [agent_routes]
 # "web.internal"   = { machine_id = "ftm1…" }   # exact; from `flextunnel-agent machine-id`
 # "*.web.internal" = { machine_id = "ftm1…" }   # wildcard: any subdomain -> same agent
