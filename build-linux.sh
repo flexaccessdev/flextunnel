@@ -1,8 +1,8 @@
 #!/bin/bash
 set -e
 
-# Build script for cross-compiling Linux binaries using Docker
-# Builds for both AMD64 and ARM64 architectures
+# Build script for cross-compiling the flextunnel CLI using Docker
+# Builds the CLI for both AMD64 and ARM64 architectures
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/target/build"

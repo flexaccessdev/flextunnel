@@ -448,13 +448,14 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
 ///   "bridges": [{"name": "lab", "endpoint_id": "…", "domains": ["*.svc"], "cidrs": ["fd34::/64"]}] }
 /// ```
 ///
-/// This is the required split-tunnel set the server pushes during the handshake
-/// — the domains/CIDRs routed through the tunnel. The caller owns the split:
-/// off-list targets must bypass the proxy and be connected directly from the
-/// caller side, because the server rejects any off-list target sent through the
-/// SOCKS proxy. Before the first successful handshake, `connected` is false and
-/// the lists are empty. The set becomes available shortly after start, once the
-/// handshake completes, so the caller should poll it.
+/// This is the split-tunnel set the server pushes during the handshake — the
+/// domains/CIDRs routed through the tunnel. The local SOCKS proxy owns the split:
+/// matching targets use the tunnel, while off-list targets connect directly from
+/// the client device. The server independently rejects any off-list request that
+/// reaches it. The caller may use the lists for OS routing or display, but does
+/// not need to enforce the split itself. Before the first successful handshake,
+/// `connected` is false and the lists are empty. The set becomes available shortly
+/// after start, once the handshake completes, so the caller should poll it.
 ///
 /// `host_aliases` (`[alias, target]` pairs) and `agent_aliases` are
 /// informational, for display in status UIs only — the server resolves both

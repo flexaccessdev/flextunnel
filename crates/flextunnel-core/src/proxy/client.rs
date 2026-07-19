@@ -404,8 +404,9 @@ impl ProxyClient {
     /// bad node id, wrong relay, or down server is not worth retrying blindly).
     /// Once connected at least once, transient drops are retried with exponential
     /// backoff, indefinitely (unless `--max-reconnect-attempts` caps it or
-    /// `--no-auto-reconnect` is set). The listeners stay bound across reconnects
-    /// so local apps queue rather than see connection-refused during the gap.
+    /// `--no-auto-reconnect` is set). The listeners stay bound across reconnects:
+    /// off-list targets keep connecting directly, while on-list requests fail with
+    /// network-unreachable until the tunnel recovers.
     pub async fn run(&self, endpoint: &Endpoint) -> ProxyResult<()> {
         let socks = match self.config.socks_listen {
             Some(addr) => Some(TcpListener::bind(addr).await?),

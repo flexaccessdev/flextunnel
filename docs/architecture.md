@@ -243,8 +243,9 @@ Implemented in `ProxyClient::run` / `handle_failure`:
   backoff + jitter** (1s → 60s), indefinitely, unless `--max-reconnect-attempts`
   caps it or `--no-auto-reconnect` disables it.
 - Permanent errors (`AuthenticationFailed` / `Config`) never retry.
-- The local proxy listeners stay bound across reconnects, so local apps queue
-  rather than get connection-refused during the gap.
+- The local proxy listeners stay bound across reconnects. Off-list targets keep
+  connecting directly; on-list requests fail immediately with a network-unreachable
+  reply until the tunnel recovers.
 
 On every exit path both `run_server` and `run_client` call
 `endpoint.close().await` before the `Endpoint` drops; skipping it makes iroh tear

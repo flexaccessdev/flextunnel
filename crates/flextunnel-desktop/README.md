@@ -89,7 +89,7 @@ a Dock icon instead of running as a pure menu-bar app because it has no
 
 ```sh
 cargo install cargo-packager        # or: cargo binstall cargo-packager
-cargo packager --release -p flextunnel-desktop --formats app   # or dmg / msi
+cargo packager --release -p flextunnel-desktop --formats app   # or dmg / wix
 # bundle: target/release/flextunnel.app
 ```
 

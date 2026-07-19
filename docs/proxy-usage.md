@@ -24,7 +24,7 @@ guide covers, in order:
    browsers, and other common tools.
 4. **Programs that need the HTTP proxy** — tools that can't speak SOCKS5 at
    all, or whose SOCKS5 support resolves DNS client-side (which breaks routed
-   internal names): `wget`, Docker, JVM/JDBC, .NET, and the generic
+   internal names): `wget`, Docker, JVM/JDBC, and the generic
    `https_proxy=` path.
 5. **`ssh` through the proxy** — reach an internal SSH host, then use SSH's own
    `-L` / `-D` forwards for a second hop.
@@ -79,8 +79,8 @@ to prefer it for tools whose SOCKS5 support is client-DNS-only (see below).
 |---|---|
 | speaks SOCKS5 with remote DNS (`socks5h`) — curl, ssh, browsers, apt | **SOCKS5** `127.0.0.1:1080` |
 | needs raw TCP — databases, RDP, native JDBC | **SOCKS5** (or a `socat` forward; see "Adapters for programs that don't speak either proxy") |
-| only speaks an HTTP proxy — `wget`, Docker pulls, older .NET | **HTTP proxy** `127.0.0.1:8081` |
-| speaks SOCKS5 but only with **client-side** DNS — JVM `socksProxyHost`, .NET 6+ | **HTTP proxy** (client DNS can't resolve routed names) |
+| only speaks an HTTP proxy — `wget`, Docker pulls | **HTTP proxy** `127.0.0.1:8081` |
+| speaks SOCKS5 but only with **client-side** DNS — JVM `socksProxyHost` | **HTTP proxy** (client DNS can't resolve routed names) |
 
 The HTTP proxy handles **HTTPS and any TCP** via `CONNECT` tunneling and
 **plain HTTP** via absolute-URI forwarding. What it *cannot* do is carry a
@@ -362,18 +362,13 @@ java -Dhttp.proxyHost=127.0.0.1  -Dhttp.proxyPort=8081 \
 proxy or CONNECT — route those through `socat`; see "Adapters for programs that
 don't speak either proxy.")
 
-### .NET
-
-Pre-.NET-6 has no SOCKS support at all; .NET 6+ added SOCKS5 but without remote
-DNS (`socks5h`), so routed names don't resolve. Both work against the HTTP
-proxy — set `https_proxy` / `http_proxy`, or configure `HttpClient.Proxy` /
-`defaultProxy` to `http://127.0.0.1:8081`.
-
 ### Docker, npm/yarn, and other HTTP-only clients
 
-- **Docker** daemon and `docker build` image pulls speak HTTP/HTTPS proxies
-  only; set `HTTPS_PROXY=http://127.0.0.1:8081` (in the daemon's environment,
-  or `~/.docker/config.json` for the CLI).
+- **Docker** daemon and `docker build` base-image pulls speak HTTP/HTTPS proxies
+  only. Configure the daemon with `HTTPS_PROXY=http://127.0.0.1:8081` in its
+  environment or daemon configuration. `~/.docker/config.json` instead injects
+  proxy environment variables and build arguments into new containers and build
+  steps; it does not configure daemon image pulls.
 - **npm / yarn** — `npm config set proxy http://127.0.0.1:8081` and
   `https-proxy` likewise, or the `https_proxy` env var.
 - **Python `requests` / `pip`** — the HTTP proxy works out of the box

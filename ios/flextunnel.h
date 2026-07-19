@@ -105,11 +105,15 @@ int flextunnel_health(const FlextunnelHandle *handle);
  *    "agent_aliases":[{"name":"workstation.internal","status":"connected"}],
  *    "dns_forwards":[{"suffix":"corp.example.com","servers":["10.1.0.10:5353"]}],
  *    "bridges":[{"name":"lab","endpoint_id":"…","domains":["*.svc"],"cidrs":["fd34::/64"]}]}
- * This is the required split-tunnel set the server pushes during the handshake
- * — the domains/CIDRs routed through the tunnel (off-list targets connect
- * directly). Before the first successful handshake, connected is false and the
- * lists are empty. The set becomes available shortly after start once the
- * handshake completes, so poll it. host_aliases ([alias, target] pairs) and
+ * This is the split-tunnel set the server pushes during the handshake — the
+ * domains/CIDRs routed through the tunnel. The local SOCKS proxy owns the split:
+ * matching targets use the tunnel, while off-list targets connect directly from
+ * the client device. The server independently rejects any off-list request that
+ * reaches it. The caller may use the lists for OS routing or display, but does
+ * not need to enforce the split itself. Before the first successful handshake,
+ * connected is false and the lists are empty. The set becomes available shortly
+ * after start once the handshake completes, so poll it. host_aliases ([alias,
+ * target] pairs) and
  * agent_aliases are informational, for display only — the server resolves both
  * itself. Each agent_aliases entry is {"name","status"} where status is
  * "connected", "disconnected", or "unknown"; it rides the heartbeat control
