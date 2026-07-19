@@ -235,7 +235,7 @@ routed_cidrs = ["0.0.0.0/0", "::/0"]
 ```
 
 ```sh
-flextunnel server -c server.toml
+flextunnel server start -c server.toml
 ```
 
 It prints `flextunnel server Node ID: <ENDPOINT_ID>` — give that to clients.
@@ -264,6 +264,35 @@ curl -x socks5h://127.0.0.1:1080 http://server.internal:8000/
 # SSH through the proxy
 ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 ```
+
+#### Quick ephemeral tunnel (no setup)
+
+For a throwaway "route everything through this box for a few minutes" session,
+`--quick` skips all of the above — no key file, no token, no config:
+
+```sh
+# On the server host: mints an in-memory identity + client token, full-tunnels
+# all traffic, and prints the two values to paste. Exits on its own if no client
+# connects within 5 minutes. Nothing is persisted.
+flextunnel server start --quick
+
+# On the client host: ignores any saved config and prompts for the server
+# EndpointId and auth token printed above (token entry is masked), then shows a
+# live control panel in this terminal. Needs an interactive terminal.
+flextunnel client start --quick
+```
+
+The quick server runs a full tunnel (`routed_domains = ["*"]`,
+`routed_cidrs = ["0.0.0.0/0", "::/0"]`); enter a SOCKS5/HTTP port at the client
+prompt to open a local proxy listener. Both sides are fully ephemeral: neither
+takes the single-instance lock (so a quick session can run alongside a real one,
+or another quick one), and both forget everything on exit.
+
+The quick client is **self-contained**: after the prompt it runs the same live
+panel as [`client control`](#client-control) right in that terminal — but it
+opens **no control socket** (nothing else can attach to it), and quitting the
+panel (`q`) **disconnects** the tunnel and exits, rather than detaching. Port
+forwards added in the panel live in memory only and are never written to disk.
 
 #### Server status page
 
@@ -322,7 +351,7 @@ analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 
 | Command | Description |
 |---|---|
-| `server` | Run the proxy server. |
+| `server start` | Run the proxy server. |
 | `client start` | Run the proxy client (optional SOCKS5 and HTTP proxy listeners, port forwards). |
 | `client control` | Attach the terminal control panel to a running client. |
 | `client help` | Show the client subcommands and their help. |
@@ -335,7 +364,7 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 (subcommands `run`, `generate-token`, and `machine-id`) — see
 [Reverse-routing agent](#reverse-routing-agent) below.
 
-### `server`
+### `server start`
 
 | Flag | Description |
 |---|---|
@@ -347,13 +376,13 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `--agent-auth-token <TOKEN>` | Accepted agent token (repeatable). Separate pool from clients. |
 | `--agent-auth-tokens-file <FILE>` | File of accepted agent tokens, one per line. |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). A custom relay doubles as the rendezvous point, so iroh peer discovery is disabled automatically when one is set. |
+| `--quick` | Ephemeral one-off server: mint an in-memory identity + client token, full-tunnel all traffic, print the EndpointId/token, and exit if no client connects within 5 minutes. Takes no single-instance lock; nothing is persisted. Conflicts with `-c`/`--secret-file`/`--auth-token(s)`. |
 
 ### `client start`
 
 | Flag | Description |
 |---|---|
-| `-c, --config <FILE>` | Load options from a TOML file (CLI flags override it). |
-| `--default-config` | Load `~/.config/flextunnel/client.toml`. |
+| `-c, --config <FILE>` | Load options from a TOML file (CLI flags override it). Without it, `~/.config/flextunnel/client.toml` is used if present. |
 | `-n, --server-node-id <ID>` | Server EndpointId. |
 | `--socks-port <PORT>` | Optional SOCKS5 listener port, e.g. `1080`. Binds `127.0.0.1` only. Disabled unless set. |
 | `--http-port <PORT>` | Optional HTTP proxy listener port (CONNECT + plain-HTTP forwarding). Binds `127.0.0.1` only. |
@@ -362,6 +391,16 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `--auto-reconnect` | Force auto-reconnect on (overrides `auto_reconnect = false` in the config). |
 | `--no-auto-reconnect` | Exit on the first disconnection instead of reconnecting. |
 | `--max-reconnect-attempts <N>` | Cap reconnect attempts between successful connections (unlimited if unset). |
+| `--quick` | Self-contained ephemeral session (pairs with `server start --quick`): ignore any saved config, prompt for the server EndpointId + auth token, then run the live control panel in this terminal. Needs an interactive terminal. Takes no lock and opens no control socket; quitting the panel disconnects. Nothing is persisted. Conflicts with `-c`. |
+
+`flextunnel client start` needs at least one flag — run with no arguments and it
+prints help. With a flag but no `-c`, it loads `~/.config/flextunnel/client.toml`
+if it exists (so `flextunnel client start --socks-port 1080` runs off the default
+config). `--quick` ignores any saved config and prompts (on an interactive
+terminal) for the server EndpointId, auth token, and optional proxy ports, then
+runs the self-contained control panel described under [`client control`](#client-control)
+right in that terminal — but with no control socket exposed, and quitting the
+panel disconnects instead of detaching. Nothing is saved.
 
 With neither `--socks-port` nor `--http-port` (nor the config keys) the
 client runs in **port-forward-only mode**: it holds the tunnel and serves only
@@ -372,7 +411,8 @@ and the persisted port forwards — is keyed by the prefix of its
 `server_node_id` (which never changes for a profile). So one client runs per
 server per user, and clients for different servers coexist without any extra
 configuration. The optional `name` key in the config ("aws", "home network")
-is a display-only label shown in the control panel.
+is a display-only label shown in the control panel. (A `--quick` client is
+exempt: it takes none of these — no lock, no socket, no forwards file.)
 
 ### `client control`
 
@@ -401,12 +441,13 @@ Detaching (`q`) never affects the tunnel; several panels can attach at once.
 
 ## Configuration files
 
-Instead of passing everything on the command line, `server` and
+Instead of passing everything on the command line, `server start` and
 `client start` can read a TOML file:
 
 ```sh
-flextunnel server -c server.toml
-flextunnel client start --default-config   # ~/.config/flextunnel/client.toml
+flextunnel server start -c server.toml
+flextunnel client start -c client.toml
+flextunnel client start --socks-port 1080  # loads ~/.config/flextunnel/client.toml
 ```
 
 Precedence is **CLI flag > config file > built-in default**, so you can keep a

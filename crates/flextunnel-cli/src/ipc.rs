@@ -358,23 +358,70 @@ where
 }
 
 async fn dispatch(request: Request, tx: &mpsc::Sender<IpcCmd>) -> Option<Response> {
-    let mutation = match request {
-        Request::Status => {
-            let (reply, rx) = oneshot::channel();
-            tx.send(IpcCmd::Status(reply)).await.ok()?;
-            return Some(Response::Status(Box::new(rx.await.ok()?)));
-        }
-        Request::AddForward { forward } => Mutation::Add(forward),
-        Request::UpdateForward { forward } => Mutation::Update(forward),
-        Request::DeleteForward { id } => Mutation::Delete(id),
-        Request::SetForwardEnabled { id, enabled } => Mutation::SetEnabled(id, enabled),
-    };
-    let (reply, rx) = oneshot::channel();
-    tx.send(IpcCmd::Mutate(mutation, reply)).await.ok()?;
-    Some(match rx.await.ok()? {
+    let (cmd, pending) = build_cmd(request);
+    tx.send(cmd).await.ok()?;
+    pending.into_response().await
+}
+
+/// Run one request against the session loop over the in-process command channel,
+/// blocking the current thread for the reply. Used by the self-contained quick
+/// panel (`client start --quick`), which drives its own session directly instead
+/// of over a socket. Returns `None` once the session loop is gone (its receiver
+/// dropped, or the reply sender dropped), which signals the panel to exit.
+pub fn blocking_request(tx: &mpsc::Sender<IpcCmd>, request: Request) -> Option<Response> {
+    let (cmd, pending) = build_cmd(request);
+    tx.blocking_send(cmd).ok()?;
+    pending.blocking_into_response()
+}
+
+/// The reply half of an [`IpcCmd`], kept separate from sending it so the command
+/// can be awaited either async (the socket accept loop) or blocking (the
+/// in-process quick panel) while the request → command mapping stays in one
+/// place ([`build_cmd`]).
+enum PendingReply {
+    Status(oneshot::Receiver<StatusSnapshot>),
+    Mutate(oneshot::Receiver<Result<StatusSnapshot, String>>),
+}
+
+impl PendingReply {
+    async fn into_response(self) -> Option<Response> {
+        Some(match self {
+            PendingReply::Status(rx) => Response::Status(Box::new(rx.await.ok()?)),
+            PendingReply::Mutate(rx) => reply_to_response(rx.await.ok()?),
+        })
+    }
+
+    fn blocking_into_response(self) -> Option<Response> {
+        Some(match self {
+            PendingReply::Status(rx) => Response::Status(Box::new(rx.blocking_recv().ok()?)),
+            PendingReply::Mutate(rx) => reply_to_response(rx.blocking_recv().ok()?),
+        })
+    }
+}
+
+fn reply_to_response(reply: Result<StatusSnapshot, String>) -> Response {
+    match reply {
         Ok(snapshot) => Response::Status(Box::new(snapshot)),
         Err(message) => Response::Error { message },
-    })
+    }
+}
+
+fn build_cmd(request: Request) -> (IpcCmd, PendingReply) {
+    match request {
+        Request::Status => {
+            let (reply, rx) = oneshot::channel();
+            (IpcCmd::Status(reply), PendingReply::Status(rx))
+        }
+        Request::AddForward { forward } => mutate_cmd(Mutation::Add(forward)),
+        Request::UpdateForward { forward } => mutate_cmd(Mutation::Update(forward)),
+        Request::DeleteForward { id } => mutate_cmd(Mutation::Delete(id)),
+        Request::SetForwardEnabled { id, enabled } => mutate_cmd(Mutation::SetEnabled(id, enabled)),
+    }
+}
+
+fn mutate_cmd(mutation: Mutation) -> (IpcCmd, PendingReply) {
+    let (reply, rx) = oneshot::channel();
+    (IpcCmd::Mutate(mutation, reply), PendingReply::Mutate(rx))
 }
 
 /// Read one `\n`-terminated line into `buf`, rejecting lines over [`MAX_LINE`]

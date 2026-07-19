@@ -104,8 +104,17 @@ pub fn generate_secret(output: PathBuf, force: bool) -> Result<()> {
     )
 }
 
+/// Generate a fresh ephemeral server identity, returning its base64 encoding
+/// (suitable for `ServerConfig.secret`) and derived `EndpointId`. Used by
+/// `server start --quick`, which never persists the key to disk.
+pub fn generate_ephemeral_secret() -> (String, crate::iroh::EndpointId) {
+    let secret = SecretKey::generate();
+    let endpoint_id = secret_to_endpoint_id(&secret);
+    (BASE64.encode(secret.to_bytes()), endpoint_id)
+}
+
 /// Resolve a server secret key from an inline base64 string and/or a key file,
-/// exactly one of which must be provided. Shared by `flextunnel server` and
+/// exactly one of which must be provided. Shared by `flextunnel server start` and
 /// `flextunnel show-server-id` so both accept the same `secret`/`secret_file`
 /// config.
 pub fn resolve_secret_key(secret: Option<&str>, secret_file: Option<&Path>) -> Result<SecretKey> {

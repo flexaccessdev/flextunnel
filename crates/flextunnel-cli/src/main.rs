@@ -10,14 +10,19 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Notify;
 
 mod client_session;
 mod forwards;
 mod instance;
 mod ipc;
 mod lock;
+mod prompt;
 mod tui;
 
 use flextunnel_core::app;
@@ -43,30 +48,8 @@ enum Command {
     /// Start the proxy server.
     #[command(arg_required_else_help = true)]
     Server {
-        /// Config file path (TOML). CLI flags override file values.
-        #[arg(short = 'c', long)]
-        config: Option<PathBuf>,
-        /// Load config from ~/.config/flextunnel/server.toml.
-        #[arg(long)]
-        default_config: bool,
-        /// Secret key file for the server's persistent identity.
-        #[arg(long)]
-        secret_file: Option<PathBuf>,
-        /// Accepted client auth token (repeatable).
-        #[arg(long = "auth-token")]
-        auth_tokens: Vec<String>,
-        /// File of accepted client auth tokens (one per line).
-        #[arg(long)]
-        auth_tokens_file: Option<PathBuf>,
-        /// Accepted agent auth token (repeatable). Separate pool from clients.
-        #[arg(long = "agent-auth-token")]
-        agent_auth_tokens: Vec<String>,
-        /// File of accepted agent auth tokens (one per line).
-        #[arg(long)]
-        agent_auth_tokens_file: Option<PathBuf>,
-        /// Custom relay server URL(s) for failover (repeatable).
-        #[arg(long = "relay-url")]
-        relay_urls: Vec<String>,
+        #[command(subcommand)]
+        action: ServerAction,
     },
     /// Start or control the proxy client.
     #[command(arg_required_else_help = true)]
@@ -111,16 +94,62 @@ enum Command {
 }
 
 #[derive(Subcommand)]
-enum ClientAction {
-    /// Start the proxy client (optional SOCKS5 + HTTP proxy listeners, port forwards).
+enum ServerAction {
+    /// Start the proxy server (SOCKS5/HTTP proxy over QUIC). Needs at least one
+    /// flag: `-c`/other options load a config (the default
+    /// ~/.config/flextunnel/server.toml with --default-config), or `--quick`
+    /// runs an ephemeral one-off server. Run with no arguments to print this help.
     #[command(arg_required_else_help = true)]
     Start {
         /// Config file path (TOML). CLI flags override file values.
         #[arg(short = 'c', long)]
         config: Option<PathBuf>,
-        /// Load config from ~/.config/flextunnel/client.toml.
+        /// Load config from ~/.config/flextunnel/server.toml.
         #[arg(long)]
         default_config: bool,
+        /// Secret key file for the server's persistent identity.
+        #[arg(long)]
+        secret_file: Option<PathBuf>,
+        /// Accepted client auth token (repeatable).
+        #[arg(long = "auth-token")]
+        auth_tokens: Vec<String>,
+        /// File of accepted client auth tokens (one per line).
+        #[arg(long)]
+        auth_tokens_file: Option<PathBuf>,
+        /// Accepted agent auth token (repeatable). Separate pool from clients.
+        #[arg(long = "agent-auth-token")]
+        agent_auth_tokens: Vec<String>,
+        /// File of accepted agent auth tokens (one per line).
+        #[arg(long)]
+        agent_auth_tokens_file: Option<PathBuf>,
+        /// Custom relay server URL(s) for failover (repeatable).
+        #[arg(long = "relay-url")]
+        relay_urls: Vec<String>,
+        /// Ephemeral one-off server: generate an in-memory identity + client
+        /// token, full-tunnel all traffic, print the EndpointId/token, and exit
+        /// if no client connects within 5 minutes. Nothing is persisted.
+        #[arg(
+            long,
+            conflicts_with_all = ["config", "default_config", "secret_file", "auth_tokens",
+                "auth_tokens_file", "agent_auth_tokens", "agent_auth_tokens_file"]
+        )]
+        quick: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClientAction {
+    /// Start the proxy client (optional SOCKS5 + HTTP proxy listeners, port
+    /// forwards). Needs at least one flag: `-c`/other options load a config (the
+    /// default ~/.config/flextunnel/client.toml when no -c is given), or
+    /// `--quick` prompts for the connection details without persisting them. Run
+    /// with no arguments to print this help.
+    #[command(arg_required_else_help = true)]
+    Start {
+        /// Config file path (TOML). CLI flags override file values. Without
+        /// this, ~/.config/flextunnel/client.toml is used if it exists.
+        #[arg(short = 'c', long)]
+        config: Option<PathBuf>,
         /// Loopback port for the optional SOCKS5 listener (binds 127.0.0.1
         /// only), e.g. 1080. Disabled unless set here or in the config.
         #[arg(long)]
@@ -151,19 +180,20 @@ enum ClientAction {
         /// Cap on reconnect attempts between successful connections (unlimited if unset).
         #[arg(long)]
         max_reconnect_attempts: Option<NonZeroU32>,
+        /// Ignore any saved config and prompt for the server EndpointId + auth
+        /// token (pairs with `server start --quick`). Nothing is persisted.
+        #[arg(long, conflicts_with = "config")]
+        quick: bool,
     },
     /// Attach the control panel to the running client for a profile: live
     /// status + editable port forwards (in this terminal). The client is
     /// identified by the profile's server node id; with no flags, the default
     /// config (~/.config/flextunnel/client.toml) selects it.
     Control {
-        /// Config file path (TOML) of the profile to attach to.
+        /// Config file path (TOML) of the profile to attach to. With no flags,
+        /// ~/.config/flextunnel/client.toml selects the profile.
         #[arg(short = 'c', long)]
         config: Option<PathBuf>,
-        /// Use ~/.config/flextunnel/client.toml (the default when no other
-        /// selector is given).
-        #[arg(long)]
-        default_config: bool,
         /// Attach by server EndpointId directly (overrides the config file).
         #[arg(short = 'n', long)]
         server_node_id: Option<String>,
@@ -208,6 +238,46 @@ mod cli_tests {
     }
 
     #[test]
+    fn bare_start_subcommands_show_help() {
+        // `client start` / `server start` with no flags print help rather than
+        // starting (arg_required_else_help): there is nothing to run with.
+        for args in [
+            ["flextunnel", "client", "start"],
+            ["flextunnel", "server", "start"],
+        ] {
+            let Err(error) = Args::try_parse_from(args) else {
+                panic!("bare {args:?} must display help, not parse");
+            };
+            assert_eq!(
+                error.kind(),
+                ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn start_subcommands_parse_with_one_flag() {
+        // A single flag satisfies arg_required_else_help and reaches dispatch.
+        Args::try_parse_from(["flextunnel", "client", "start", "--socks-port", "1080"])
+            .unwrap_or_else(|error| panic!("client start with a flag should parse: {error}"));
+        Args::try_parse_from(["flextunnel", "server", "start", "--default-config"])
+            .unwrap_or_else(|error| panic!("server start with a flag should parse: {error}"));
+    }
+
+    #[test]
+    fn client_rejects_removed_default_config_flag() {
+        for action in ["start", "control"] {
+            let Err(error) =
+                Args::try_parse_from(["flextunnel", "client", action, "--default-config"])
+            else {
+                panic!("--default-config must be rejected for client {action}");
+            };
+            assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
     fn client_rejects_legacy_startup_flags() {
         let Err(error) = Args::try_parse_from([
             "flextunnel",
@@ -218,6 +288,69 @@ mod cli_tests {
             panic!("startup flags without the start action must be rejected");
         };
         assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn server_start_parses_quick_flag() {
+        let args = Args::try_parse_from(["flextunnel", "server", "start", "--quick"])
+            .unwrap_or_else(|error| panic!("server start --quick should parse: {error}"));
+        assert!(matches!(
+            args.command,
+            Command::Server {
+                action: ServerAction::Start { quick: true, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn client_start_parses_quick_flag() {
+        let args = Args::try_parse_from(["flextunnel", "client", "start", "--quick"])
+            .unwrap_or_else(|error| panic!("client start --quick should parse: {error}"));
+        assert!(matches!(
+            args.command,
+            Command::Client {
+                action: ClientAction::Start { quick: true, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn quick_conflicts_with_config_and_secret() {
+        // `--quick` mints everything ephemerally, so it is mutually exclusive
+        // with the config/secret/token flags on both sides.
+        let cases = [
+            vec!["flextunnel", "server", "start", "--quick", "-c", "server.toml"],
+            vec!["flextunnel", "server", "start", "--quick", "--secret-file", "k.key"],
+            vec!["flextunnel", "server", "start", "--quick", "--auth-token", "ftcXXX"],
+            vec!["flextunnel", "client", "start", "--quick", "-c", "client.toml"],
+        ];
+        for case in cases {
+            let Err(error) = Args::try_parse_from(&case) else {
+                panic!("expected a conflict for {case:?}");
+            };
+            assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{case:?}");
+        }
+    }
+
+    #[test]
+    fn quick_server_config_is_full_tunnel_with_one_token() {
+        let (cli, endpoint_id, token) = quick_server_config(Vec::new());
+        // The generated token is a valid client token, and it is the sole
+        // accepted token in the ephemeral config.
+        auth::validate_client_token(&token).expect("generated token must be valid");
+        assert_eq!(cli.auth_tokens.as_deref(), Some([token.clone()].as_slice()));
+        // Full tunnel: the catch-alls for domains and both IP families.
+        assert_eq!(cli.routed_domains.as_deref(), Some(["*".to_string()].as_slice()));
+        assert_eq!(
+            cli.routed_cidrs.as_deref(),
+            Some(["0.0.0.0/0".to_string(), "::/0".to_string()].as_slice())
+        );
+        // The config resolves (validation passes) and re-derives the same id
+        // from the inline secret it carries.
+        let resolved = config::resolve_server(cli, None).expect("quick config must resolve");
+        let secret = secret::resolve_secret_key(resolved.secret.as_deref(), None)
+            .expect("inline secret must resolve");
+        assert_eq!(secret_to_endpoint_id(&secret), endpoint_id);
     }
 
     #[test]
@@ -237,9 +370,26 @@ fn log_version() {
     app::log_version(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 }
 
+/// Whether the command is `client start --quick`, whose in-process TUI must own
+/// the terminal without a logger writing over it.
+fn is_quick_client_start(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Client {
+            action: ClientAction::Start { quick: true, .. }
+        }
+    )
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
-    app::init_logger(app::DEFAULT_LOG_FILTER);
+    // `client start --quick` runs a full-screen control panel in this process;
+    // an stderr logger would splatter log lines across it. Every other command
+    // (including the detached `client control`, which is a separate process)
+    // wants the logger. `log::*` calls are silent no-ops when it is not set.
+    if !is_quick_client_start(&args.command) {
+        app::init_logger(app::DEFAULT_LOG_FILTER);
+    }
 
     match args.command {
         // The control panel drives the terminal with its own blocking event
@@ -249,10 +399,9 @@ fn main() -> Result<()> {
             action:
                 ClientAction::Control {
                     config,
-                    default_config,
                     server_node_id,
                 },
-        } => tui::run(config, default_config, server_node_id),
+        } => tui::run(config, server_node_id),
         Command::GenerateServerKey { output, force } => secret::generate_secret(output, force),
         Command::ShowServerId {
             config,
@@ -294,16 +443,31 @@ async fn run_async(command: Command) -> Result<()> {
     app::raise_fd_limit();
     match command {
         Command::Server {
-            config: config_path,
-            default_config,
-            secret_file,
-            auth_tokens,
-            auth_tokens_file,
-            agent_auth_tokens,
-            agent_auth_tokens_file,
-            relay_urls,
+            action:
+                ServerAction::Start {
+                    config: config_path,
+                    default_config,
+                    secret_file,
+                    auth_tokens,
+                    auth_tokens_file,
+                    agent_auth_tokens,
+                    agent_auth_tokens_file,
+                    relay_urls,
+                    quick,
+                },
         } => {
             log_version();
+            if quick {
+                // Ephemeral one-off server: mint an identity + client token,
+                // full-tunnel everything, print the bootstrap, and exit if no
+                // client connects within QUICK_IDLE_TIMEOUT. `--quick` conflicts
+                // with the config/secret/token flags (clap-enforced), so the
+                // ephemeral values are the whole configuration.
+                let (cli, endpoint_id, token) = quick_server_config(relay_urls);
+                print_quick_server_bootstrap(&endpoint_id, &token);
+                return run_server(config::resolve_server(cli, None)?, Some(QUICK_IDLE_TIMEOUT))
+                    .await;
+            }
             let cli = config::ServerConfig {
                 secret_file,
                 secret: None, // no inline-secret CLI flag; config file only
@@ -323,13 +487,12 @@ async fn run_async(command: Command) -> Result<()> {
                 bridge_auth_tokens_file: None, // config-file only; no CLI flag
             };
             let file = config::load_server_config(config_path.as_deref(), default_config)?;
-            run_server(config::resolve_server(cli, file)?).await
+            run_server(config::resolve_server(cli, file)?, None).await
         }
         Command::Client {
             action:
                 ClientAction::Start {
                     config: config_path,
-                    default_config,
                     socks_port,
                     http_port,
                     server_node_id,
@@ -339,6 +502,7 @@ async fn run_async(command: Command) -> Result<()> {
                     auto_reconnect,
                     no_auto_reconnect,
                     max_reconnect_attempts,
+                    quick,
                 },
         } => {
             log_version();
@@ -352,7 +516,7 @@ async fn run_async(command: Command) -> Result<()> {
             } else {
                 None
             };
-            let cli = config::ClientConfig {
+            let mut cli = config::ClientConfig {
                 server_node_id,
                 name: None, // display name is config-file only; no CLI flag
                 socks_port,
@@ -363,7 +527,24 @@ async fn run_async(command: Command) -> Result<()> {
                 auto_reconnect,
                 max_reconnect_attempts,
             };
-            let file = config::load_client_config(config_path.as_deref(), default_config)?;
+            // `--quick` is a self-contained ephemeral session: it ignores any
+            // saved config, prompts for the connection details, and then runs a
+            // live control panel in this terminal (pairs with `server start
+            // --quick`). Both the prompt and the panel need a TTY, so a piped
+            // `--quick` fails fast instead of hanging. Nothing is persisted and
+            // no control socket is exposed. A bare `client start` never reaches
+            // here — clap prints help (arg_required_else_help).
+            if quick {
+                if !std::io::stdin().is_terminal() {
+                    anyhow::bail!("`client start --quick` needs an interactive terminal.");
+                }
+                cli = tokio::task::spawn_blocking(move || {
+                    prompt::fill_client_config(&mut cli).map(|()| cli)
+                })
+                .await??;
+                return client_session::run_quick(config::resolve_client(cli, None)).await;
+            }
+            let file = config::load_client_config(config_path.as_deref())?;
             client_session::run(config::resolve_client(cli, file)).await
         }
         _ => unreachable!("synchronous commands handled in main()"),
@@ -387,10 +568,54 @@ fn validate_dns_forwards_coverage(forwarder: &DnsForwarder, routed_set: &RoutedS
     Ok(())
 }
 
-async fn run_server(r: config::ResolvedServer) -> Result<()> {
-    // Enforce one server per user before doing any work. Held for the process
-    // lifetime; released automatically on exit or crash.
-    let _lock = lock::acquire()?;
+/// How long a `server start --quick` server waits for its first client before
+/// exiting on its own. A one-shot grace window: once a client connects the timer
+/// is cancelled for the rest of the process's life.
+const QUICK_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long to wait for a graceful `endpoint.close()` during shutdown before
+/// forcing exit. iroh's close normally completes promptly, but a lingering
+/// relay/connection teardown must never leave the process unkillable.
+const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Build the ephemeral `ServerConfig` for `server start --quick`: a freshly
+/// generated in-memory identity + client token and a full-tunnel routed set
+/// (`routed_domains = ["*"]`, `routed_cidrs = ["0.0.0.0/0", "::/0"]`). Returns
+/// the config plus the EndpointId and token to print. Nothing is written to
+/// disk. `--relay-url` stays compatible with `--quick`, so any relays are kept.
+fn quick_server_config(relay_urls: Vec<String>) -> (config::ServerConfig, EndpointId, String) {
+    let (secret, endpoint_id) = secret::generate_ephemeral_secret();
+    let token = auth::generate_client_token();
+    let cli = config::ServerConfig {
+        secret: Some(secret),
+        auth_tokens: Some(vec![token.clone()]),
+        routed_domains: Some(vec!["*".to_string()]),
+        routed_cidrs: Some(vec!["0.0.0.0/0".to_string(), "::/0".to_string()]),
+        relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
+        ..Default::default()
+    };
+    (cli, endpoint_id, token)
+}
+
+/// Print the copy-paste bootstrap block for a quick-mode server: the EndpointId
+/// and client token a `flextunnel client start --quick` needs.
+fn print_quick_server_bootstrap(endpoint_id: &EndpointId, token: &str) {
+    println!("Quick mode — ephemeral server, full tunnel (all traffic routed). Nothing saved.");
+    println!("  Server EndpointId: {endpoint_id}");
+    println!("  Auth token:        {token}");
+    println!("On the client:  flextunnel client start --quick   (paste the two values above)");
+    println!("Waiting for a client — will exit in 5 minutes if none connects.");
+}
+
+async fn run_server(
+    r: config::ResolvedServer,
+    quick_timeout: Option<Duration>,
+) -> Result<()> {
+    // Enforce one server per user before doing any work (held for the process
+    // lifetime; released automatically on exit or crash) — except a quick
+    // ephemeral server, which is an intentional throwaway and takes no lock, so
+    // it can run alongside a real server (or another quick one).
+    let _lock = quick_timeout.is_none().then(lock::acquire).transpose()?;
 
     let valid_tokens = auth::load_auth_tokens(
         &r.auth_tokens,
@@ -594,6 +819,9 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
         r.routed_domains.len(),
         r.routed_cidrs.len()
     );
+    // Quick mode arms an idle-exit timer; the server fires this on the first
+    // client to cancel it. `None` for a normal server (the timer never runs).
+    let first_client = quick_timeout.map(|_| Arc::new(Notify::new()));
     let server = ProxyServer::new(ProxyServerParams {
         own_id,
         valid_tokens,
@@ -608,12 +836,30 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
         dns_forwarder,
         bridges,
         blocklist,
+        first_client: first_client.clone(),
     });
     let run = async {
         server
             .run(&endpoint)
             .await
             .map_err(|e| anyhow::anyhow!("Server error: {e}"))
+    };
+
+    // Quick-mode grace window: fire after `quick_timeout` unless a client
+    // connects first (which resolves `notified()` and parks this future
+    // forever). A normal server parks here immediately, so the arm never fires.
+    // `notify_one` stores a permit, so a client that connects before this future
+    // is first polled is not missed.
+    let grace = async {
+        match (quick_timeout, &first_client) {
+            (Some(timeout), Some(notify)) => {
+                tokio::select! {
+                    _ = notify.notified() => std::future::pending::<()>().await,
+                    _ = tokio::time::sleep(timeout) => {}
+                }
+            }
+            _ => std::future::pending::<()>().await,
+        }
     };
 
     let res = tokio::select! {
@@ -623,13 +869,36 @@ async fn run_server(r: config::ResolvedServer) -> Result<()> {
             log::info!("Received shutdown signal, stopping server");
             Ok(())
         }
+        _ = grace => {
+            log::warn!("Quick mode: no client connected within 5 minutes — exiting");
+            Ok(())
+        }
     };
 
-    // Close the endpoint gracefully before it is dropped. Skipping this makes
-    // iroh tear down its relay tasks via an ungraceful abort, which panics
-    // (`JoinSet::join_all` on a cancelled task) — fatal under panic=abort.
-    endpoint.close().await;
+    close_endpoint_or_exit(&endpoint).await;
     res
+}
+
+/// Close `endpoint` gracefully before it is dropped — skipping the close makes
+/// iroh tear down its relay tasks via an ungraceful abort, which panics
+/// (`JoinSet::join_all` on a cancelled task), fatal under panic=abort. But never
+/// let a slow teardown make the process unkillable: once we are already shutting
+/// down, a second shutdown signal (e.g. another Ctrl-C) or `SHUTDOWN_CLOSE_TIMEOUT`
+/// forces an immediate clean exit. `std::process::exit` skips destructors, so it
+/// avoids the very ungraceful-drop panic the graceful close exists to prevent.
+/// Shared by the server ([`run_server`]) and the client (`client_session`).
+pub(crate) async fn close_endpoint_or_exit(endpoint: &flextunnel_core::iroh::Endpoint) {
+    tokio::select! {
+        _ = endpoint.close() => {}
+        _ = app::shutdown_signal() => {
+            log::warn!("Second shutdown signal — exiting now");
+            std::process::exit(0);
+        }
+        _ = tokio::time::sleep(SHUTDOWN_CLOSE_TIMEOUT) => {
+            log::warn!("Endpoint close is taking too long — exiting now");
+            std::process::exit(0);
+        }
+    }
 }
 
 #[cfg(test)]

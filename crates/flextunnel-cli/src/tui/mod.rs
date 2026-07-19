@@ -1,13 +1,17 @@
-//! `flextunnel client control` — a ratatui control panel attached to a
-//! running client over its control socket (see `ipc.rs`).
+//! The ratatui control panel — status (connection, routing, connection paths)
+//! plus editable port forwards — reachable two ways over the same UI:
 //!
-//! Read-only status (connection, routing, connection paths) plus editable
-//! port forwards. Detaching (q) never affects the tunnel; the panel can
-//! re-attach any time, and several panels can attach at once.
+//! - `flextunnel client control`: attaches to a *running* client over its
+//!   control socket (see `ipc.rs`), as a separate process. Detaching (q) never
+//!   affects the tunnel; the panel can re-attach any time, and several panels
+//!   can attach at once. This is the [`IpcBackend`] path.
+//! - `flextunnel client start --quick`: a *self-contained* session in this same
+//!   process, driven over an in-process channel with no socket. Quitting (q)
+//!   tears the session down — the tunnel disconnects. This is the
+//!   [`InProcessBackend`] path (entry point [`run_quick_panel`]).
 //!
-//! The panel runs a plain blocking event loop on the main thread with a
-//! current-thread tokio runtime for the IPC round trips (each is bounded by
-//! the 2 s request timeout). This deliberately avoids crossterm's
+//! Either way the panel runs a plain blocking event loop with per-request
+//! round trips to a [`ControlBackend`]. This deliberately avoids crossterm's
 //! `EventStream` so no separate crossterm dependency (with version-sync risk
 //! against ratatui's re-export) is needed.
 
@@ -20,10 +24,46 @@ use std::time::{Duration, Instant};
 
 use flextunnel_core::config;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use tokio::sync::mpsc;
 
 use crate::instance;
-use crate::ipc::{IpcClient, Request, Response, StatusSnapshot};
+use crate::ipc::{IpcClient, IpcCmd, Request, Response, StatusSnapshot};
 use form::{FIELD_ENABLED, FormState};
+
+/// The panel's transport to a client session: one request → one response,
+/// blocking the UI thread. Implemented over the control socket (a separate
+/// `client control` process) and over an in-process channel (the self-contained
+/// `client start --quick` session).
+trait ControlBackend {
+    fn request(&mut self, request: Request) -> Result<Response>;
+}
+
+/// Socket transport: a current-thread runtime driving the async [`IpcClient`]
+/// (each round trip bounded by the 2 s request timeout).
+struct IpcBackend {
+    rt: tokio::runtime::Runtime,
+    client: IpcClient,
+}
+
+impl ControlBackend for IpcBackend {
+    fn request(&mut self, request: Request) -> Result<Response> {
+        self.rt.block_on(self.client.request(&request))
+    }
+}
+
+/// In-process transport for the self-contained quick panel: drives the client
+/// session running in this process over its command channel. A closed channel
+/// (the session ended) surfaces as an error, which ends the panel loop; dropping
+/// this backend on quit drops the sender, which tears the session down.
+struct InProcessBackend {
+    tx: mpsc::Sender<IpcCmd>,
+}
+
+impl ControlBackend for InProcessBackend {
+    fn request(&mut self, request: Request) -> Result<Response> {
+        crate::ipc::blocking_request(&self.tx, request).context("the tunnel session ended")
+    }
+}
 
 /// How often the panel polls the client for a fresh snapshot.
 const REFRESH: Duration = Duration::from_secs(1);
@@ -44,18 +84,17 @@ struct App {
     notice: Option<String>,
 }
 
-pub fn run(
-    config_path: Option<PathBuf>,
-    default_config: bool,
-    server_node_id: Option<String>,
-) -> Result<()> {
+pub fn run(config_path: Option<PathBuf>, server_node_id: Option<String>) -> Result<()> {
     // The running client is identified by the profile's server node id
     // (-n wins over the config file; bare `client control` reads the default
     // config), from which the same instance key as the client's is derived.
-    let use_default =
-        default_config || (config_path.is_none() && server_node_id.is_none());
-    let file = config::load_client_config(config_path.as_deref(), use_default)
-        .context("client control needs a profile: -c <file>, --default-config, or -n <server id>")?;
+    // With -n and no -c, identify purely by server id (skip the config load).
+    let file = if server_node_id.is_some() && config_path.is_none() {
+        None
+    } else {
+        config::load_client_config(config_path.as_deref())
+            .context("client control needs a profile: -c <file>, the default config, or -n <server id>")?
+    };
     let cli = config::ClientConfig {
         server_node_id,
         ..Default::default()
@@ -71,48 +110,61 @@ pub fn run(
         .enable_all()
         .build()?;
 
-    let Some(mut client) = rt.block_on(IpcClient::connect(&key))? else {
+    let Some(client) = rt.block_on(IpcClient::connect(&key))? else {
         eprintln!("The flextunnel client for {profile} is not running.");
         std::process::exit(1);
     };
+    let mut backend = IpcBackend { rt, client };
     // First snapshot before touching terminal modes, so early failures print
     // as ordinary errors.
-    let snapshot = request_snapshot(&rt, &mut client, &Request::Status)?;
+    let snapshot = request_snapshot(&mut backend, Request::Status)?;
 
-    let mut app = App {
-        snapshot,
-        selected: 0,
-        routing_scroll: 0,
-        mode: Mode::Normal,
-        notice: None,
-    };
-
-    // `ratatui::init` installs a panic hook that restores the terminal first —
-    // required under the workspace's `panic = "abort"` release profile, where
-    // no unwinding drop guard would run.
-    let mut terminal = ratatui::init();
-    let res = app.run(&mut terminal, &rt, &mut client);
-    ratatui::restore();
-    res.context("Lost the connection to the client (did it stop?)")
+    let app = App::new(snapshot);
+    run_panel(app, &mut backend).context("Lost the connection to the client (did it stop?)")
 }
 
-fn request_snapshot(
-    rt: &tokio::runtime::Runtime,
-    client: &mut IpcClient,
-    request: &Request,
-) -> Result<StatusSnapshot> {
-    match rt.block_on(client.request(request))? {
+/// Run the self-contained control panel for `client start --quick`: the same UI
+/// as `client control`, but driving the session in this process over `tx`
+/// instead of a socket. Quitting (q/Esc/Ctrl-C) returns, dropping `tx` — which
+/// tears the session down, so the tunnel disconnects rather than detaching.
+pub fn run_quick_panel(tx: mpsc::Sender<IpcCmd>, initial: StatusSnapshot) -> Result<()> {
+    let mut backend = InProcessBackend { tx };
+    run_panel(App::new(initial), &mut backend)
+}
+
+/// Drive the panel's event loop against `backend`, bracketing it with terminal
+/// setup/teardown. `ratatui::init` installs a panic hook that restores the
+/// terminal first — required under the workspace's `panic = "abort"` release
+/// profile, where no unwinding drop guard would run.
+fn run_panel(mut app: App, backend: &mut dyn ControlBackend) -> Result<()> {
+    let mut terminal = ratatui::init();
+    let res = app.run(&mut terminal, backend);
+    ratatui::restore();
+    res
+}
+
+fn request_snapshot(backend: &mut dyn ControlBackend, request: Request) -> Result<StatusSnapshot> {
+    match backend.request(request)? {
         Response::Status(snapshot) => Ok(*snapshot),
         Response::Error { message } => anyhow::bail!("{message}"),
     }
 }
 
 impl App {
+    fn new(snapshot: StatusSnapshot) -> Self {
+        App {
+            snapshot,
+            selected: 0,
+            routing_scroll: 0,
+            mode: Mode::Normal,
+            notice: None,
+        }
+    }
+
     fn run(
         &mut self,
         terminal: &mut ratatui::DefaultTerminal,
-        rt: &tokio::runtime::Runtime,
-        client: &mut IpcClient,
+        backend: &mut dyn ControlBackend,
     ) -> Result<()> {
         let mut last_refresh = Instant::now();
         loop {
@@ -132,13 +184,13 @@ impl App {
                     return Ok(());
                 }
                 let quit = match &mut self.mode {
-                    Mode::Normal => self.handle_normal_key(key.code, rt, client)?,
+                    Mode::Normal => self.handle_normal_key(key.code, backend)?,
                     Mode::Form(_) => {
-                        self.handle_form_key(key.code, rt, client)?;
+                        self.handle_form_key(key.code, backend)?;
                         false
                     }
                     Mode::ConfirmDelete { .. } => {
-                        self.handle_confirm_key(key.code, rt, client)?;
+                        self.handle_confirm_key(key.code, backend)?;
                         false
                     }
                 };
@@ -150,7 +202,7 @@ impl App {
             if last_refresh.elapsed() >= REFRESH {
                 // Poll-based refresh, like the desktop's ticker. Mutations
                 // also refresh inline via the returned snapshot.
-                self.set_snapshot(request_snapshot(rt, client, &Request::Status)?);
+                self.set_snapshot(request_snapshot(backend, Request::Status)?);
                 last_refresh = Instant::now();
             }
         }
@@ -173,11 +225,10 @@ impl App {
     /// returned for the caller to surface (form line or footer notice).
     fn mutate(
         &mut self,
-        rt: &tokio::runtime::Runtime,
-        client: &mut IpcClient,
+        backend: &mut dyn ControlBackend,
         request: Request,
     ) -> Result<Option<String>> {
-        match rt.block_on(client.request(&request))? {
+        match backend.request(request)? {
             Response::Status(snapshot) => {
                 self.set_snapshot(*snapshot);
                 Ok(None)
@@ -193,8 +244,7 @@ impl App {
     fn handle_normal_key(
         &mut self,
         code: KeyCode,
-        rt: &tokio::runtime::Runtime,
-        client: &mut IpcClient,
+        backend: &mut dyn ControlBackend,
     ) -> Result<bool> {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
@@ -230,7 +280,7 @@ impl App {
                         id: row.forward.id.clone(),
                         enabled: !row.forward.enabled,
                     };
-                    self.notice = self.mutate(rt, client, request)?;
+                    self.notice = self.mutate(backend, request)?;
                 }
             }
             _ => {}
@@ -241,8 +291,7 @@ impl App {
     fn handle_form_key(
         &mut self,
         code: KeyCode,
-        rt: &tokio::runtime::Runtime,
-        client: &mut IpcClient,
+        backend: &mut dyn ControlBackend,
     ) -> Result<()> {
         let Mode::Form(form) = &mut self.mode else {
             return Ok(());
@@ -260,7 +309,7 @@ impl App {
                         } else {
                             Request::AddForward { forward }
                         };
-                        match self.mutate(rt, client, request)? {
+                        match self.mutate(backend, request)? {
                             // The running client rejected it (it re-validates
                             // authoritatively): keep the form open.
                             Some(message) => {
@@ -292,8 +341,7 @@ impl App {
     fn handle_confirm_key(
         &mut self,
         code: KeyCode,
-        rt: &tokio::runtime::Runtime,
-        client: &mut IpcClient,
+        backend: &mut dyn ControlBackend,
     ) -> Result<()> {
         let Mode::ConfirmDelete { id, .. } = &self.mode else {
             return Ok(());
@@ -302,7 +350,7 @@ impl App {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let request = Request::DeleteForward { id: id.clone() };
                 self.mode = Mode::Normal;
-                self.notice = self.mutate(rt, client, request)?;
+                self.notice = self.mutate(backend, request)?;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.mode = Mode::Normal,
             _ => {}

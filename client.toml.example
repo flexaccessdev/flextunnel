@@ -1,7 +1,13 @@
 # flextunnel client config (TOML).
 #
 # Load with:  flextunnel client start -c client.toml
-#         or: flextunnel client start --default-config   (~/.config/flextunnel/client.toml)
+#         or: place it at ~/.config/flextunnel/client.toml, where it is loaded
+#             automatically when `client start` is run with any other flag
+#             (e.g. `flextunnel client start --socks-port 1080`). A bare
+#             `client start` with no arguments prints help; `--quick` ignores
+#             this file entirely — it prompts for the connection details and
+#             runs a self-contained live panel in the terminal (no config, no
+#             lock, no control socket; quitting disconnects).
 #
 # CLI flags override these values. Unknown keys are rejected.
 

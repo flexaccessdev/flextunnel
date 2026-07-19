@@ -292,11 +292,16 @@ pub fn load_server_config(path: Option<&Path>, default_config: bool) -> Result<O
     }
 }
 
-/// Load the client config file (explicit path or `--default-config`), or `None`.
-pub fn load_client_config(path: Option<&Path>, default_config: bool) -> Result<Option<ClientConfig>> {
-    match resolve_config_path(path, default_config, "client.toml")? {
-        Some(p) => Ok(Some(load_config(&p)?)),
-        None => Ok(None),
+/// Load the client config: an explicit path (error if missing), else the
+/// default `~/.config/flextunnel/client.toml` when it exists, else `None`
+/// (the caller then falls back to CLI flags / the interactive prompt).
+pub fn load_client_config(path: Option<&Path>) -> Result<Option<ClientConfig>> {
+    match path {
+        Some(p) => Ok(Some(load_config(&expand_tilde(p))?)),
+        None => match default_config_path("client.toml") {
+            Some(p) if p.exists() => Ok(Some(load_config(&p)?)),
+            _ => Ok(None),
+        },
     }
 }
 
@@ -809,5 +814,68 @@ mod tests {
         }
         // Non-tilde paths are unchanged.
         assert_eq!(expand_tilde(Path::new("/etc/x")), PathBuf::from("/etc/x"));
+    }
+
+    #[test]
+    fn shipped_example_files_parse() {
+        // The committed examples must always deserialize against the current
+        // schema, so the docs can't drift from the structs (`deny_unknown_fields`
+        // would reject a stale/renamed key).
+        toml::from_str::<ServerConfig>(include_str!("../../../server.toml.example"))
+            .expect("server.toml.example must parse");
+        toml::from_str::<ClientConfig>(include_str!("../../../client.toml.example"))
+            .expect("client.toml.example must parse");
+    }
+
+    #[test]
+    fn examples_document_every_config_field() {
+        // A maximal config exercising every documented key must parse with
+        // deny_unknown_fields — catches a field renamed/removed in the struct but
+        // left in the examples (or a new struct field the examples never mention).
+        let server = r#"
+            secret_file = "./server.key"
+            secret = "<base64 key>"
+            auth_tokens = ["ftcAAA"]
+            auth_tokens_file = "/etc/flextunnel/auth_tokens.txt"
+            agent_auth_tokens = ["ftaAAA"]
+            agent_auth_tokens_file = "/etc/flextunnel/agent_auth_tokens.txt"
+            relay_urls = ["https://relay.example"]
+            allowed_bridge_servers = ["<endpoint id>"]
+            bridge_auth_tokens = ["ftbAAA"]
+            bridge_auth_tokens_file = "/etc/flextunnel/bridge_auth_tokens.txt"
+            routed_domains = ["*.example.com"]
+            routed_cidrs = ["10.0.0.0/8"]
+
+            [host_aliases]
+            "server.internal" = "127.0.0.1"
+
+            [agent_routes]
+            "web.internal" = { machine_id = "ftm1x" }
+
+            [dns_forwards]
+            "corp.example.com" = ["10.1.0.10:5353"]
+
+            [bridges.lab]
+            endpoint_id = "<endpoint id>"
+            auth_token = "ftbBBB"
+            domains = ["*.svc"]
+            cidrs = ["fd34::/64"]
+        "#;
+        let s: ServerConfig = toml::from_str(server).expect("maximal server config parses");
+        assert!(s.secret_file.is_some() && s.dns_forwards.is_some() && s.bridges.is_some());
+
+        let client = r#"
+            server_node_id = "<server endpoint id>"
+            name = "aws"
+            socks_port = 1080
+            http_port = 8081
+            auth_token = "ftcAAA"
+            auth_token_file = "~/.config/flextunnel/token.txt"
+            relay_urls = ["https://relay.example"]
+            auto_reconnect = true
+            max_reconnect_attempts = 10
+        "#;
+        let c: ClientConfig = toml::from_str(client).expect("maximal client config parses");
+        assert!(c.server_node_id.is_some() && c.max_reconnect_attempts.is_some());
     }
 }
