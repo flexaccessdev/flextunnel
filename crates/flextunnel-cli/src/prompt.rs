@@ -1,6 +1,6 @@
-//! Interactive first-run prompts for `flextunnel client start`, used when no
-//! config file exists (and stdin is a terminal). Fills only the values not
-//! already supplied on the command line; nothing is persisted.
+//! Interactive prompts for `flextunnel client start --quick`, used when the user
+//! opts into entering connection details on a terminal. Fills only the values
+//! not already supplied on the command line; nothing is persisted.
 
 use anyhow::{Context, Result};
 use std::io::{self, Write};
@@ -16,7 +16,7 @@ use flextunnel_core::iroh::EndpointId;
 /// mutating it in place. Never writes a config file — the collected values live
 /// only for this session.
 pub fn fill_client_config(cli: &mut ClientConfig) -> Result<()> {
-    println!("No client config found. Enter connection details (nothing is saved):");
+    println!("Quick mode. Enter connection details (nothing will be saved):");
 
     // EndpointId of the server to connect to (from `flextunnel show-server-id`).
     if cli.server_node_id.is_none() {

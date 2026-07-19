@@ -48,39 +48,8 @@ enum Command {
     /// Start the proxy server.
     #[command(arg_required_else_help = true)]
     Server {
-        /// Config file path (TOML). CLI flags override file values.
-        #[arg(short = 'c', long)]
-        config: Option<PathBuf>,
-        /// Load config from ~/.config/flextunnel/server.toml.
-        #[arg(long)]
-        default_config: bool,
-        /// Secret key file for the server's persistent identity.
-        #[arg(long)]
-        secret_file: Option<PathBuf>,
-        /// Accepted client auth token (repeatable).
-        #[arg(long = "auth-token")]
-        auth_tokens: Vec<String>,
-        /// File of accepted client auth tokens (one per line).
-        #[arg(long)]
-        auth_tokens_file: Option<PathBuf>,
-        /// Accepted agent auth token (repeatable). Separate pool from clients.
-        #[arg(long = "agent-auth-token")]
-        agent_auth_tokens: Vec<String>,
-        /// File of accepted agent auth tokens (one per line).
-        #[arg(long)]
-        agent_auth_tokens_file: Option<PathBuf>,
-        /// Custom relay server URL(s) for failover (repeatable).
-        #[arg(long = "relay-url")]
-        relay_urls: Vec<String>,
-        /// Ephemeral one-off server: generate an in-memory identity + client
-        /// token, full-tunnel all traffic, print the EndpointId/token, and exit
-        /// if no client connects within 5 minutes. Nothing is persisted.
-        #[arg(
-            long,
-            conflicts_with_all = ["config", "default_config", "secret_file", "auth_tokens",
-                "auth_tokens_file", "agent_auth_tokens", "agent_auth_tokens_file"]
-        )]
-        quick: bool,
+        #[command(subcommand)]
+        action: ServerAction,
     },
     /// Start or control the proxy client.
     #[command(arg_required_else_help = true)]
@@ -125,11 +94,57 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum ServerAction {
+    /// Start the proxy server (SOCKS5/HTTP proxy over QUIC). Needs at least one
+    /// flag: `-c`/other options load a config (the default
+    /// ~/.config/flextunnel/server.toml with --default-config), or `--quick`
+    /// runs an ephemeral one-off server. Run with no arguments to print this help.
+    #[command(arg_required_else_help = true)]
+    Start {
+        /// Config file path (TOML). CLI flags override file values.
+        #[arg(short = 'c', long)]
+        config: Option<PathBuf>,
+        /// Load config from ~/.config/flextunnel/server.toml.
+        #[arg(long)]
+        default_config: bool,
+        /// Secret key file for the server's persistent identity.
+        #[arg(long)]
+        secret_file: Option<PathBuf>,
+        /// Accepted client auth token (repeatable).
+        #[arg(long = "auth-token")]
+        auth_tokens: Vec<String>,
+        /// File of accepted client auth tokens (one per line).
+        #[arg(long)]
+        auth_tokens_file: Option<PathBuf>,
+        /// Accepted agent auth token (repeatable). Separate pool from clients.
+        #[arg(long = "agent-auth-token")]
+        agent_auth_tokens: Vec<String>,
+        /// File of accepted agent auth tokens (one per line).
+        #[arg(long)]
+        agent_auth_tokens_file: Option<PathBuf>,
+        /// Custom relay server URL(s) for failover (repeatable).
+        #[arg(long = "relay-url")]
+        relay_urls: Vec<String>,
+        /// Ephemeral one-off server: generate an in-memory identity + client
+        /// token, full-tunnel all traffic, print the EndpointId/token, and exit
+        /// if no client connects within 5 minutes. Nothing is persisted.
+        #[arg(
+            long,
+            conflicts_with_all = ["config", "default_config", "secret_file", "auth_tokens",
+                "auth_tokens_file", "agent_auth_tokens", "agent_auth_tokens_file"]
+        )]
+        quick: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ClientAction {
     /// Start the proxy client (optional SOCKS5 + HTTP proxy listeners, port
-    /// forwards). With no config file (neither -c nor
-    /// ~/.config/flextunnel/client.toml) and an interactive terminal, prompts
-    /// for the connection details and runs without persisting them.
+    /// forwards). Needs at least one flag: `-c`/other options load a config (the
+    /// default ~/.config/flextunnel/client.toml when no -c is given), or
+    /// `--quick` prompts for the connection details without persisting them. Run
+    /// with no arguments to print this help.
+    #[command(arg_required_else_help = true)]
     Start {
         /// Config file path (TOML). CLI flags override file values. Without
         /// this, ~/.config/flextunnel/client.toml is used if it exists.
@@ -166,7 +181,7 @@ enum ClientAction {
         #[arg(long)]
         max_reconnect_attempts: Option<NonZeroU32>,
         /// Ignore any saved config and prompt for the server EndpointId + auth
-        /// token (pairs with `server --quick`). Nothing is persisted.
+        /// token (pairs with `server start --quick`). Nothing is persisted.
         #[arg(long, conflicts_with = "config")]
         quick: bool,
     },
@@ -223,17 +238,31 @@ mod cli_tests {
     }
 
     #[test]
-    fn client_start_parses_without_flags() {
-        // Bare `client start` is valid: it loads the default config if present,
-        // otherwise prompts interactively (no `arg_required_else_help`).
-        let args = Args::try_parse_from(["flextunnel", "client", "start"])
-            .unwrap_or_else(|error| panic!("bare client start should parse: {error}"));
-        assert!(matches!(
-            args.command,
-            Command::Client {
-                action: ClientAction::Start { .. }
-            }
-        ));
+    fn bare_start_subcommands_show_help() {
+        // `client start` / `server start` with no flags print help rather than
+        // starting (arg_required_else_help): there is nothing to run with.
+        for args in [
+            ["flextunnel", "client", "start"],
+            ["flextunnel", "server", "start"],
+        ] {
+            let Err(error) = Args::try_parse_from(args) else {
+                panic!("bare {args:?} must display help, not parse");
+            };
+            assert_eq!(
+                error.kind(),
+                ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn start_subcommands_parse_with_one_flag() {
+        // A single flag satisfies arg_required_else_help and reaches dispatch.
+        Args::try_parse_from(["flextunnel", "client", "start", "--socks-port", "1080"])
+            .unwrap_or_else(|error| panic!("client start with a flag should parse: {error}"));
+        Args::try_parse_from(["flextunnel", "server", "start", "--default-config"])
+            .unwrap_or_else(|error| panic!("server start with a flag should parse: {error}"));
     }
 
     #[test]
@@ -263,9 +292,14 @@ mod cli_tests {
 
     #[test]
     fn server_start_parses_quick_flag() {
-        let args = Args::try_parse_from(["flextunnel", "server", "--quick"])
-            .unwrap_or_else(|error| panic!("server --quick should parse: {error}"));
-        assert!(matches!(args.command, Command::Server { quick: true, .. }));
+        let args = Args::try_parse_from(["flextunnel", "server", "start", "--quick"])
+            .unwrap_or_else(|error| panic!("server start --quick should parse: {error}"));
+        assert!(matches!(
+            args.command,
+            Command::Server {
+                action: ServerAction::Start { quick: true, .. }
+            }
+        ));
     }
 
     #[test]
@@ -285,9 +319,9 @@ mod cli_tests {
         // `--quick` mints everything ephemerally, so it is mutually exclusive
         // with the config/secret/token flags on both sides.
         let cases = [
-            vec!["flextunnel", "server", "--quick", "-c", "server.toml"],
-            vec!["flextunnel", "server", "--quick", "--secret-file", "k.key"],
-            vec!["flextunnel", "server", "--quick", "--auth-token", "ftcXXX"],
+            vec!["flextunnel", "server", "start", "--quick", "-c", "server.toml"],
+            vec!["flextunnel", "server", "start", "--quick", "--secret-file", "k.key"],
+            vec!["flextunnel", "server", "start", "--quick", "--auth-token", "ftcXXX"],
             vec!["flextunnel", "client", "start", "--quick", "-c", "client.toml"],
         ];
         for case in cases {
@@ -392,15 +426,18 @@ async fn run_async(command: Command) -> Result<()> {
     app::raise_fd_limit();
     match command {
         Command::Server {
-            config: config_path,
-            default_config,
-            secret_file,
-            auth_tokens,
-            auth_tokens_file,
-            agent_auth_tokens,
-            agent_auth_tokens_file,
-            relay_urls,
-            quick,
+            action:
+                ServerAction::Start {
+                    config: config_path,
+                    default_config,
+                    secret_file,
+                    auth_tokens,
+                    auth_tokens_file,
+                    agent_auth_tokens,
+                    agent_auth_tokens_file,
+                    relay_urls,
+                    quick,
+                },
         } => {
             log_version();
             if quick {
@@ -473,19 +510,21 @@ async fn run_async(command: Command) -> Result<()> {
                 auto_reconnect,
                 max_reconnect_attempts,
             };
-            // `--quick` ignores any saved config and forces the interactive
-            // prompt (it pairs with `server --quick`); otherwise load the
-            // default/explicit config as usual.
+            // `--quick` ignores any saved config and opts into the interactive
+            // prompt (it pairs with `server start --quick`); otherwise load the
+            // default/explicit config as usual. A bare `client start` with no
+            // arguments never reaches here — clap prints help
+            // (arg_required_else_help).
             let file = if quick {
                 None
             } else {
                 config::load_client_config(config_path.as_deref())?
             };
-            // No config file and an interactive terminal: prompt for the
-            // missing connection details (nothing is persisted). Blocking
-            // stdin work runs off the async runtime. Non-interactive with no
-            // config falls through to `client_session::run`'s bail messages.
-            if file.is_none() && std::io::stdin().is_terminal() {
+            // Interactive prompt (only via --quick): fill any missing connection
+            // details (nothing is persisted). Blocking stdin work runs off the
+            // async runtime. Non-interactive (piped) --quick skips the prompt and
+            // falls through to `client_session::run`'s bail messages.
+            if quick && std::io::stdin().is_terminal() {
                 cli = tokio::task::spawn_blocking(move || {
                     prompt::fill_client_config(&mut cli).map(|()| cli)
                 })
@@ -514,12 +553,12 @@ fn validate_dns_forwards_coverage(forwarder: &DnsForwarder, routed_set: &RoutedS
     Ok(())
 }
 
-/// How long a `server --quick` server waits for its first client before
+/// How long a `server start --quick` server waits for its first client before
 /// exiting on its own. A one-shot grace window: once a client connects the timer
 /// is cancelled for the rest of the process's life.
 const QUICK_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Build the ephemeral `ServerConfig` for `server --quick`: a freshly
+/// Build the ephemeral `ServerConfig` for `server start --quick`: a freshly
 /// generated in-memory identity + client token and a full-tunnel routed set
 /// (`routed_domains = ["*"]`, `routed_cidrs = ["0.0.0.0/0", "::/0"]`). Returns
 /// the config plus the EndpointId and token to print. Nothing is written to
