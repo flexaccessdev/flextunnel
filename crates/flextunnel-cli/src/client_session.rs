@@ -152,6 +152,7 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
         connected_since: None,
         last_error: None,
         disabled_reasons: HashMap::new(),
+        persist: true,
     };
 
     let run = client.run_with_optional_listeners(&endpoint, socks_listener, http_listener);
@@ -210,6 +211,165 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
     res
 }
 
+/// The self-contained `flextunnel client start --quick` session: an ephemeral
+/// client that runs the live control panel in *this* terminal instead of
+/// detaching. Unlike [`run`] it takes **no single-instance lock**, loads and
+/// writes **no forwards file**, and exposes **no control socket** — nothing is
+/// persisted and nothing else can attach. The panel and the session talk over an
+/// in-process channel; quitting the panel drops its sender, closing the channel,
+/// which shuts the session down — so the tunnel disconnects rather than detaching.
+pub async fn run_quick(r: config::ResolvedClient) -> Result<()> {
+    let server_node_id = r.server_node_id.context(
+        "The client requires a server node id (--server-node-id or server_node_id in the config).",
+    )?;
+    // Display-only in quick mode (no lock/socket/forwards paths are derived from
+    // it); computing it also validates the id shape up front.
+    let key = instance::instance_key(&server_node_id)?;
+
+    if r.auth_token.is_some() && r.auth_token_file.is_some() {
+        anyhow::bail!("Provide only one of auth_token or auth_token_file, not both");
+    }
+    let token = if let Some(token) = r.auth_token {
+        auth::validate_client_token(&token).context("Invalid authentication token")?;
+        token
+    } else if let Some(path) = r.auth_token_file {
+        auth::load_auth_token_from_file(&path, auth::CLIENT_TOKEN_PREFIX)
+            .context("Failed to load authentication token from file")?
+    } else {
+        anyhow::bail!(
+            "The client requires an authentication token.\n\
+             Use --auth-token <TOKEN>, --auth-token-file <FILE>, or set \
+             auth_token/auth_token_file in the config."
+        );
+    };
+
+    let endpoint = create_client_endpoint(&r.relay_urls)
+        .await
+        .context("Failed to create iroh endpoint")?;
+    log::info!("flextunnel client Node ID: {}", endpoint.id());
+
+    let socks_bind = r.socks_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p)));
+    let http_bind = r.http_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p)));
+
+    let client = ProxyClient::new(ClientConfig {
+        server_node_id: server_node_id.clone(),
+        auth_token: token,
+        socks_listen: socks_bind,
+        http_listen: http_bind,
+        relay_urls: r.relay_urls,
+        auto_reconnect: r.auto_reconnect,
+        max_reconnect_attempts: r.max_reconnect_attempts,
+    });
+    let routes = client.routes();
+
+    // Bind the enabled proxy front-ends before anything else can take the ports.
+    let listeners = async {
+        let socks = match socks_bind {
+            Some(addr) => Some(bind_local(addr, "SOCKS").await?),
+            None => None,
+        };
+        let http = match http_bind {
+            Some(addr) => Some(bind_local(addr, "HTTP").await?),
+            None => None,
+        };
+        anyhow::Ok((socks, http))
+    };
+    let (socks_listener, http_listener) = match listeners.await {
+        Ok(listeners) => listeners,
+        Err(e) => {
+            endpoint.close().await;
+            return Err(e);
+        }
+    };
+    let socks_addr = local_addr(&socks_listener);
+    let http_addr = local_addr(&http_listener);
+
+    // Forwards are ephemeral: none are loaded, none are saved (see `persist`).
+    // They can still be added/edited live in the panel, in memory only.
+    let mut forwards: Vec<PortForward> = Vec::new();
+    let mut fwd_mgr = ForwardManager::new(
+        tokio::runtime::Handle::current(),
+        client.server_forwarder(),
+        &forwards,
+    );
+
+    // In-process control channel to the panel — no socket is exposed, so
+    // `flextunnel client control` cannot attach to a quick session.
+    let (ipc_tx, mut ipc_rx) = mpsc::channel(8);
+
+    let mut state = SessionState {
+        instance: key,
+        name: r.name,
+        server_node_id,
+        client_node_id: endpoint.id().to_string(),
+        socks_addr,
+        http_addr,
+        ever_connected: false,
+        connected_since: None,
+        last_error: None,
+        disabled_reasons: HashMap::new(),
+        persist: false,
+    };
+
+    // Seed the panel with a first snapshot before it takes over the terminal.
+    // The panel runs a blocking ratatui loop on a dedicated thread and owns the
+    // only command sender: when the user quits, that sender drops, so the
+    // channel closes (`recv` yields `None`) — the disconnect signal below.
+    let initial = state.snapshot(&client, &routes, &forwards, &fwd_mgr);
+    let panel = tokio::task::spawn_blocking(move || crate::tui::run_quick_panel(ipc_tx, initial));
+
+    let run = client.run_with_optional_listeners(&endpoint, socks_listener, http_listener);
+    tokio::pin!(run);
+    let mut ticker = tokio::time::interval(Duration::from_millis(500));
+
+    let res = loop {
+        tokio::select! {
+            res = &mut run => {
+                break res.map_err(|e| anyhow::anyhow!("Client error: {e}"));
+            }
+            _ = ticker.tick() => {
+                let failed = disable_failed_forwards(&mut forwards, &fwd_mgr.statuses());
+                if !failed.is_empty() {
+                    for (id, reason) in failed {
+                        log::warn!("Port forward disabled: {reason}");
+                        state.disabled_reasons.insert(id, reason);
+                    }
+                    fwd_mgr.apply(&forwards);
+                }
+                state.observe_connection(routes.lock().map(|r| r.connected).unwrap_or(false));
+            }
+            cmd = ipc_rx.recv() => match cmd {
+                Some(IpcCmd::Status(reply)) => {
+                    let _ = reply.send(state.snapshot(&client, &routes, &forwards, &fwd_mgr));
+                }
+                Some(IpcCmd::Mutate(mutation, reply)) => {
+                    let result = state
+                        .apply_mutation(mutation, &mut forwards, &mut fwd_mgr)
+                        .map(|()| state.snapshot(&client, &routes, &forwards, &fwd_mgr));
+                    let _ = reply.send(result);
+                }
+                // The panel dropped its sender (the user quit): disconnect.
+                None => break Ok(()),
+            },
+            sig = app::shutdown_signal() => {
+                if sig.is_ok() {
+                    log::info!("Received shutdown signal, stopping client");
+                }
+                break sig;
+            }
+        }
+    };
+
+    // Close the channel so a panel still waiting on a reply (or issuing its next
+    // request) unblocks and exits, tear down forwards + endpoint gracefully,
+    // then join the panel so the terminal is always restored.
+    drop(ipc_rx);
+    drop(fwd_mgr);
+    endpoint.close().await;
+    let _ = panel.await;
+    res
+}
+
 /// Bind a local listener, mapping the common taken-port case to a clear error.
 async fn bind_local(addr: SocketAddr, label: &str) -> Result<tokio::net::TcpListener> {
     tokio::net::TcpListener::bind(addr).await.map_err(|e| {
@@ -244,6 +404,10 @@ struct SessionState {
     /// Retained bind-failure reasons of auto-disabled forwards, keyed by
     /// forward id; cleared when the forward is re-enabled, edited, or deleted.
     disabled_reasons: HashMap<String, String>,
+    /// Whether forward Add/Update/Delete are written to the forwards file. True
+    /// for a normal session; false for the ephemeral quick panel, whose forwards
+    /// live only in memory (nothing is persisted).
+    persist: bool,
 }
 
 impl SessionState {
@@ -359,8 +523,8 @@ impl SessionState {
             return Ok(());
         }
 
-        // Add/Update/Delete change the persisted set. Stage the change on a
-        // clone and persist *first*: if the save fails, live state and
+        // Add/Update/Delete change the forward set. Stage the change on a clone
+        // and, when persisting, save *first*: if the save fails, live state and
         // listeners are untouched, so they never diverge from the file on disk.
         let mut staged = forwards.clone();
         // The id whose retained bind-failure reason to clear on commit (an
@@ -397,7 +561,9 @@ impl SessionState {
             Mutation::SetEnabled(..) => unreachable!("handled above"),
         };
 
-        if let Err(e) = store::save(&self.instance, &staged) {
+        if self.persist
+            && let Err(e) = store::save(&self.instance, &staged)
+        {
             log::warn!("Failed to persist port forwards: {e:#}");
             return Err(format!("Failed to save forwards: {e:#}"));
         }
@@ -607,5 +773,59 @@ mod tests {
         let f = validated(w, &[], None).unwrap();
         assert_eq!(f.label, "db");
         assert_eq!(f.remote_host, "2001:db8::1");
+    }
+
+    fn session_state(instance: &str, persist: bool) -> SessionState {
+        SessionState {
+            instance: instance.into(),
+            name: None,
+            server_node_id: "server".into(),
+            client_node_id: "client".into(),
+            socks_addr: None,
+            http_addr: None,
+            ever_connected: false,
+            connected_since: None,
+            last_error: None,
+            disabled_reasons: HashMap::new(),
+            persist,
+        }
+    }
+
+    /// The quick panel edits forwards in memory only: an Add applies to the live
+    /// set but writes no `forwards-<key>.json`. (With `persist=false` nothing is
+    /// written, so on success this touches no disk; the file is removed
+    /// defensively in case a regression re-enables the save.)
+    #[tokio::test]
+    async fn quick_session_does_not_persist_forward_edits() {
+        use flextunnel_core::proxy::{ClientConfig, ProxyClient};
+
+        let key = "quickpersisttestkey0";
+        let path = store::forwards_path(key).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let client = ProxyClient::new(ClientConfig {
+            server_node_id: "server".into(),
+            auth_token: "ftc".into(),
+            socks_listen: None,
+            http_listen: None,
+            relay_urls: Vec::new(),
+            auto_reconnect: false,
+            max_reconnect_attempts: None,
+        });
+        let mut fwd_mgr = ForwardManager::new(
+            tokio::runtime::Handle::current(),
+            client.server_forwarder(),
+            &[],
+        );
+        let mut state = session_state(key, false);
+
+        let mut forwards = Vec::new();
+        state
+            .apply_mutation(Mutation::Add(wire("", 5555)), &mut forwards, &mut fwd_mgr)
+            .expect("in-memory add should succeed");
+        assert_eq!(forwards.len(), 1, "the forward is applied in memory");
+        assert!(!path.exists(), "quick mode must not write the forwards file");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

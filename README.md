@@ -277,13 +277,22 @@ For a throwaway "route everything through this box for a few minutes" session,
 flextunnel server start --quick
 
 # On the client host: ignores any saved config and prompts for the server
-# EndpointId and auth token printed above (token entry is masked).
+# EndpointId and auth token printed above (token entry is masked), then shows a
+# live control panel in this terminal. Needs an interactive terminal.
 flextunnel client start --quick
 ```
 
 The quick server runs a full tunnel (`routed_domains = ["*"]`,
 `routed_cidrs = ["0.0.0.0/0", "::/0"]`); enter a SOCKS5/HTTP port at the client
-prompt to open a local proxy listener. Both sides forget everything on exit.
+prompt to open a local proxy listener. Both sides are fully ephemeral: neither
+takes the single-instance lock (so a quick session can run alongside a real one,
+or another quick one), and both forget everything on exit.
+
+The quick client is **self-contained**: after the prompt it runs the same live
+panel as [`client control`](#client-control) right in that terminal — but it
+opens **no control socket** (nothing else can attach to it), and quitting the
+panel (`q`) **disconnects** the tunnel and exits, rather than detaching. Port
+forwards added in the panel live in memory only and are never written to disk.
 
 #### Server status page
 
@@ -367,7 +376,7 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `--agent-auth-token <TOKEN>` | Accepted agent token (repeatable). Separate pool from clients. |
 | `--agent-auth-tokens-file <FILE>` | File of accepted agent tokens, one per line. |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). A custom relay doubles as the rendezvous point, so iroh peer discovery is disabled automatically when one is set. |
-| `--quick` | Ephemeral one-off server: mint an in-memory identity + client token, full-tunnel all traffic, print the EndpointId/token, and exit if no client connects within 5 minutes. Nothing is persisted. Conflicts with `-c`/`--secret-file`/`--auth-token(s)`. |
+| `--quick` | Ephemeral one-off server: mint an in-memory identity + client token, full-tunnel all traffic, print the EndpointId/token, and exit if no client connects within 5 minutes. Takes no single-instance lock; nothing is persisted. Conflicts with `-c`/`--secret-file`/`--auth-token(s)`. |
 
 ### `client start`
 
@@ -382,14 +391,16 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `--auto-reconnect` | Force auto-reconnect on (overrides `auto_reconnect = false` in the config). |
 | `--no-auto-reconnect` | Exit on the first disconnection instead of reconnecting. |
 | `--max-reconnect-attempts <N>` | Cap reconnect attempts between successful connections (unlimited if unset). |
-| `--quick` | Ignore any saved config and prompt for the server EndpointId + auth token (pairs with `server start --quick`). Nothing is persisted. Conflicts with `-c`. |
+| `--quick` | Self-contained ephemeral session (pairs with `server start --quick`): ignore any saved config, prompt for the server EndpointId + auth token, then run the live control panel in this terminal. Needs an interactive terminal. Takes no lock and opens no control socket; quitting the panel disconnects. Nothing is persisted. Conflicts with `-c`. |
 
 `flextunnel client start` needs at least one flag — run with no arguments and it
 prints help. With a flag but no `-c`, it loads `~/.config/flextunnel/client.toml`
 if it exists (so `flextunnel client start --socks-port 1080` runs off the default
 config). `--quick` ignores any saved config and prompts (on an interactive
-terminal) for the server EndpointId, auth token, and optional proxy ports,
-running without saving them.
+terminal) for the server EndpointId, auth token, and optional proxy ports, then
+runs the self-contained control panel described under [`client control`](#client-control)
+right in that terminal — but with no control socket exposed, and quitting the
+panel disconnects instead of detaching. Nothing is saved.
 
 With neither `--socks-port` nor `--http-port` (nor the config keys) the
 client runs in **port-forward-only mode**: it holds the tunnel and serves only
@@ -400,7 +411,8 @@ and the persisted port forwards — is keyed by the prefix of its
 `server_node_id` (which never changes for a profile). So one client runs per
 server per user, and clients for different servers coexist without any extra
 configuration. The optional `name` key in the config ("aws", "home network")
-is a display-only label shown in the control panel.
+is a display-only label shown in the control panel. (A `--quick` client is
+exempt: it takes none of these — no lock, no socket, no forwards file.)
 
 ### `client control`
 

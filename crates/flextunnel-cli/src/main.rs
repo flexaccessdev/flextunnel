@@ -370,9 +370,26 @@ fn log_version() {
     app::log_version(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 }
 
+/// Whether the command is `client start --quick`, whose in-process TUI must own
+/// the terminal without a logger writing over it.
+fn is_quick_client_start(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Client {
+            action: ClientAction::Start { quick: true, .. }
+        }
+    )
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
-    app::init_logger(app::DEFAULT_LOG_FILTER);
+    // `client start --quick` runs a full-screen control panel in this process;
+    // an stderr logger would splatter log lines across it. Every other command
+    // (including the detached `client control`, which is a separate process)
+    // wants the logger. `log::*` calls are silent no-ops when it is not set.
+    if !is_quick_client_start(&args.command) {
+        app::init_logger(app::DEFAULT_LOG_FILTER);
+    }
 
     match args.command {
         // The control panel drives the terminal with its own blocking event
@@ -510,26 +527,24 @@ async fn run_async(command: Command) -> Result<()> {
                 auto_reconnect,
                 max_reconnect_attempts,
             };
-            // `--quick` ignores any saved config and opts into the interactive
-            // prompt (it pairs with `server start --quick`); otherwise load the
-            // default/explicit config as usual. A bare `client start` with no
-            // arguments never reaches here — clap prints help
-            // (arg_required_else_help).
-            let file = if quick {
-                None
-            } else {
-                config::load_client_config(config_path.as_deref())?
-            };
-            // Interactive prompt (only via --quick): fill any missing connection
-            // details (nothing is persisted). Blocking stdin work runs off the
-            // async runtime. Non-interactive (piped) --quick skips the prompt and
-            // falls through to `client_session::run`'s bail messages.
-            if quick && std::io::stdin().is_terminal() {
+            // `--quick` is a self-contained ephemeral session: it ignores any
+            // saved config, prompts for the connection details, and then runs a
+            // live control panel in this terminal (pairs with `server start
+            // --quick`). Both the prompt and the panel need a TTY, so a piped
+            // `--quick` fails fast instead of hanging. Nothing is persisted and
+            // no control socket is exposed. A bare `client start` never reaches
+            // here — clap prints help (arg_required_else_help).
+            if quick {
+                if !std::io::stdin().is_terminal() {
+                    anyhow::bail!("`client start --quick` needs an interactive terminal.");
+                }
                 cli = tokio::task::spawn_blocking(move || {
                     prompt::fill_client_config(&mut cli).map(|()| cli)
                 })
                 .await??;
+                return client_session::run_quick(config::resolve_client(cli, None)).await;
             }
+            let file = config::load_client_config(config_path.as_deref())?;
             client_session::run(config::resolve_client(cli, file)).await
         }
         _ => unreachable!("synchronous commands handled in main()"),
@@ -591,9 +606,11 @@ async fn run_server(
     r: config::ResolvedServer,
     quick_timeout: Option<Duration>,
 ) -> Result<()> {
-    // Enforce one server per user before doing any work. Held for the process
-    // lifetime; released automatically on exit or crash.
-    let _lock = lock::acquire()?;
+    // Enforce one server per user before doing any work (held for the process
+    // lifetime; released automatically on exit or crash) — except a quick
+    // ephemeral server, which is an intentional throwaway and takes no lock, so
+    // it can run alongside a real server (or another quick one).
+    let _lock = quick_timeout.is_none().then(lock::acquire).transpose()?;
 
     let valid_tokens = auth::load_auth_tokens(
         &r.auth_tokens,
