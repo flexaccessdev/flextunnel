@@ -203,13 +203,14 @@ pub struct ProxyServer {
     /// [`Self::bridge_for`]). Their persistent upstream connections are
     /// maintained by tasks spawned in [`run`](Self::run).
     bridges: Vec<Arc<BridgeUpstream>>,
-    /// Reverse-routing reservations: a requested hostname (lowercased key) that
-    /// matches is forwarded over the connected agent whose machine id is the
-    /// value, instead of dialed from the server's own network. Checked *before*
-    /// [`apply_alias`]. See [`route_to_agent`].
+    /// Reverse-routing reservations: a requested hostname that matches a key is
+    /// forwarded over the connected agent whose machine id is the value, instead
+    /// of dialed from the server's own network. Keys are lowercased and may be an
+    /// exact host or a `*.suffix` wildcard (see [`resolve_alias`]). Checked
+    /// *before* [`apply_alias`]. See [`route_to_agent`].
     agent_routes: HashMap<String, String>,
-    /// Host aliases (lowercased keys) rewritten before connecting; see
-    /// [`apply_alias`].
+    /// Host aliases rewritten before connecting. Keys are lowercased and may be an
+    /// exact host or a `*.suffix` wildcard; see [`resolve_alias`]/[`apply_alias`].
     host_aliases: HashMap<String, String>,
     /// Destinations routed through the tunnel, enforced here as a whitelist: a
     /// request for a target not on the set is rejected (defense in depth — the
@@ -1183,12 +1184,38 @@ fn persist_blocklist(bl: &BlockList) -> io::Result<()> {
 /// port; the value is then resolved + connected like any other domain.
 fn apply_alias(target: Target, aliases: &HashMap<String, String>) -> Target {
     if let Target::Domain(host, port) = &target
-        && let Some(mapped) = aliases.get(&host.to_ascii_lowercase())
+        && let Some(mapped) = resolve_alias(aliases, host)
     {
         log::debug!("Aliasing host {host} -> {mapped}");
-        return Target::Domain(mapped.clone(), *port);
+        return Target::Domain(mapped.to_string(), *port);
     }
     target
+}
+
+/// Resolve a requested `host` against an alias/route map whose keys are exact
+/// lowercased hostnames or `*.suffix` wildcards (subdomains only — the bare apex
+/// is excluded, matching the routed-set `*.` semantics). An exact key always
+/// wins over any wildcard; among competing wildcards the most specific (longest
+/// suffix) wins. Returns the matched value. Shared by `[host_aliases]` (whose
+/// value is a rewrite target) and `[agent_routes]` (whose value is an agent
+/// machine id). Keys are validated at config resolution, so a bare `*` and
+/// malformed patterns never reach here.
+fn resolve_alias<'a>(map: &'a HashMap<String, String>, host: &str) -> Option<&'a str> {
+    let host = host.to_ascii_lowercase();
+    if let Some(value) = map.get(&host) {
+        return Some(value.as_str());
+    }
+    // No exact hit: fall back to the most specific `*.suffix` wildcard. A key
+    // `*.web.internal` matches `foo.web.internal` (and deeper) but not the apex
+    // `web.internal`, and not a sibling like `evil-web.internal`.
+    map.iter()
+        .filter_map(|(key, value)| {
+            let suffix = key.strip_prefix("*.")?;
+            host.ends_with(&format!(".{suffix}"))
+                .then_some((suffix.len(), value.as_str()))
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, value)| value)
 }
 
 /// Handle one SOCKS5 stream from a client (or an inbound bridge): read the
@@ -1233,7 +1260,7 @@ async fn handle_socks_stream(
     // They also beat bridge routes: an agent-route entry is an exact-hostname
     // reservation, strictly more specific than a bridge's suffix/CIDR classes.
     if let Target::Domain(host, port) = &requested
-        && let Some(machine_id) = server.agent_routes.get(&host.to_ascii_lowercase())
+        && let Some(machine_id) = resolve_alias(&server.agent_routes, host)
     {
         return route_to_agent(send, recv, server, machine_id, *port).await;
     }
@@ -1508,5 +1535,54 @@ mod tests {
     fn ip_target_is_never_aliased() {
         let t = Target::Ip("127.0.0.1:8000".parse().unwrap());
         assert_eq!(apply_alias(t.clone(), &aliases()), t);
+    }
+
+    fn wildcard_aliases() -> HashMap<String, String> {
+        HashMap::from([
+            ("*.web.internal".to_string(), "10.0.0.1".to_string()),
+            // A more specific wildcard nested under the broader one.
+            ("*.api.web.internal".to_string(), "10.0.0.2".to_string()),
+            // An exact host that shadows the `*.web.internal` wildcard for one name.
+            ("special.web.internal".to_string(), "10.0.0.9".to_string()),
+        ])
+    }
+
+    #[test]
+    fn wildcard_matches_subdomain() {
+        assert_eq!(resolve_alias(&wildcard_aliases(), "foo.web.internal"), Some("10.0.0.1"));
+        // Deeper subdomains match the broad wildcard too (when no closer one wins).
+        assert_eq!(resolve_alias(&wildcard_aliases(), "a.b.web.internal"), Some("10.0.0.1"));
+    }
+
+    #[test]
+    fn wildcard_does_not_match_apex_or_sibling() {
+        // `*.web.internal` excludes the bare apex...
+        assert_eq!(resolve_alias(&wildcard_aliases(), "web.internal"), None);
+        // ...and a sibling that only shares a label suffix, not a dot boundary.
+        assert_eq!(resolve_alias(&wildcard_aliases(), "evil-web.internal"), None);
+    }
+
+    #[test]
+    fn exact_key_beats_wildcard() {
+        // `special.web.internal` has an exact entry; it must win over `*.web.internal`.
+        assert_eq!(resolve_alias(&wildcard_aliases(), "special.web.internal"), Some("10.0.0.9"));
+    }
+
+    #[test]
+    fn most_specific_wildcard_wins() {
+        // `x.api.web.internal` matches both `*.web.internal` and `*.api.web.internal`;
+        // the longer (more specific) suffix wins regardless of map iteration order.
+        assert_eq!(resolve_alias(&wildcard_aliases(), "x.api.web.internal"), Some("10.0.0.2"));
+    }
+
+    #[test]
+    fn wildcard_match_is_case_insensitive() {
+        assert_eq!(resolve_alias(&wildcard_aliases(), "Foo.Web.Internal"), Some("10.0.0.1"));
+    }
+
+    #[test]
+    fn wildcard_alias_rewrites_through_apply_alias() {
+        let got = apply_alias(Target::Domain("db.web.internal".into(), 5432), &wildcard_aliases());
+        assert_eq!(got, Target::Domain("10.0.0.1".into(), 5432));
     }
 }

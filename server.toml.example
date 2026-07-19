@@ -100,6 +100,10 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 # `localhost`/`127.0.0.1` (use `socks5h://` / remote DNS so the name reaches the
 # server). Only domain targets are aliased; literal IPs pass through unchanged.
 #
+# A key is an exact hostname or a `*.suffix` wildcard (subdomains only, apex
+# excluded — the same syntax as routed_domains). An exact key wins over any
+# wildcard, and the most specific (longest-suffix) wildcard wins among wildcards.
+#
 # For an IPv6 value, write the address BARE — no brackets, no port. Brackets
 # (`[::1]`) are only for embedding a port in one string; here the requested port
 # is kept separately, so `[::1]` would fail to parse. A link-local address needs
@@ -107,6 +111,7 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 # [host_aliases]
 # "server.internal" = "127.0.0.1"      # -> the server's own loopback (IPv4)
 # "node2.internal"  = "192.168.1.50"   # -> another host on the server's network
+# "*.svc.internal"  = "192.168.1.60"   # -> wildcard: any subdomain of svc.internal
 # "server6.internal" = "::1"           # -> the server's own loopback (IPv6, bare)
 # "node6.internal"   = "2001:db8::50"  # -> another host, global IPv6 (bare)
 
@@ -120,11 +125,15 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 # server cannot dial directly.
 #
 # Get the network id by running `flextunnel-agent machine-id` on the agent host.
-# Checked BEFORE [host_aliases]; a name should appear in only one. When a routed
-# set is active (it always is), add the alias name to routed_domains above too —
-# filtering happens on the requested hostname first.
+# A key is an exact hostname or a `*.suffix` wildcard (same syntax and precedence
+# as [host_aliases] above — every matched subdomain still dials 127.0.0.1 on the
+# SAME agent, since reverse routing is loopback-only in v1). Checked BEFORE
+# [host_aliases]; a name should appear in only one. When a routed set is active
+# (it always is), add the alias name (or a covering `*.suffix`) to routed_domains
+# above too — filtering happens on the requested hostname first.
 # [agent_routes]
-# "web.internal" = { machine_id = "ftm1…" }   # from `flextunnel-agent machine-id`
+# "web.internal"   = { machine_id = "ftm1…" }   # exact; from `flextunnel-agent machine-id`
+# "*.web.internal" = { machine_id = "ftm1…" }   # wildcard: any subdomain -> same agent
 
 # Optional conditional DNS forwarding (split-DNS), applied server-side when the
 # server resolves a tunneled hostname. By default the server uses its own system

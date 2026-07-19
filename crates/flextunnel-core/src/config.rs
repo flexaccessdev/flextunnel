@@ -79,8 +79,10 @@ pub struct ServerConfig {
     /// (by its derived network id) instead of to a host on the server's own
     /// network. A requested hostname matching a key is forwarded over the agent's
     /// live connection; the agent dials `127.0.0.1` on its own network, keeping
-    /// the requested port. Checked *before* `host_aliases`; a name should appear
-    /// in only one. See [`AgentRoute`].
+    /// the requested port. A key is an exact host or a `*.suffix` wildcard
+    /// (subdomains only), the same syntax as `routed_domains`; an exact key beats
+    /// a wildcard and the most specific wildcard wins. Checked *before*
+    /// `host_aliases`; a name should appear in only one. See [`AgentRoute`].
     pub agent_routes: Option<HashMap<String, AgentRoute>>,
     /// Custom relay URL(s) for failover.
     pub relay_urls: Option<Vec<String>>,
@@ -89,7 +91,9 @@ pub struct ServerConfig {
     /// server's network) before connecting. Keeps the requested port. Lets a
     /// client reach the server's loopback or internal hosts via a real name
     /// (e.g. `server.internal` → `127.0.0.1`), which also dodges Firefox's refusal
-    /// to proxy literal `localhost`/`127.0.0.1`.
+    /// to proxy literal `localhost`/`127.0.0.1`. A key is an exact host or a
+    /// `*.suffix` wildcard (subdomains only), the same syntax as `routed_domains`;
+    /// an exact key beats a wildcard and the most specific wildcard wins.
     pub host_aliases: Option<HashMap<String, String>>,
     /// Domains routed through the tunnel (the tunnel set). Exact (`example.com`),
     /// wildcard (`*.example.com`, subdomains only), or `*` to match every host
@@ -371,6 +375,14 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
         cli.dns_forwards.or(file.dns_forwards).unwrap_or_default(),
         "dns_forwards",
     )?;
+    // Alias keys are either an exact host or a `*.suffix` wildcard (same syntax
+    // as the routed set); reject malformed patterns loudly at startup.
+    for key in agent_routes.keys() {
+        validate_alias_key(key, "agent_routes")?;
+    }
+    for key in host_aliases.keys() {
+        validate_alias_key(key, "host_aliases")?;
+    }
     // A name must not appear in both: agent_routes is checked first at request
     // time, so an overlap would silently shadow the host alias.
     for key in agent_routes.keys() {
@@ -462,6 +474,26 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
 /// normalize (ASCII-lowercase) to the same key. Aliases are matched
 /// case-insensitively, so a case-only duplicate would otherwise let one entry
 /// silently shadow the other.
+/// Validate one `[host_aliases]`/`[agent_routes]` key. A key is either an exact
+/// hostname or a `*.suffix` wildcard matching subdomains of `suffix` (the same
+/// syntax as `routed_domains`; resolved by `proxy::server::resolve_alias`). A
+/// bare `*` is rejected — an alias catch-all mapping every host to one target is
+/// almost certainly a misconfiguration — as are malformed patterns like
+/// `*.*.x`, `*..x`, or a `*` anywhere but a leading `*.`. Keys are already
+/// lowercased by [`collect_lowercased`].
+fn validate_alias_key(key: &str, what: &str) -> Result<()> {
+    if let Some(suffix) = key.strip_prefix("*.") {
+        if suffix.contains('*') || suffix.split('.').any(str::is_empty) {
+            anyhow::bail!("invalid [{what}] wildcard pattern '{key}'");
+        }
+    } else if key.is_empty() || key.contains('*') {
+        anyhow::bail!(
+            "invalid [{what}] name '{key}': use an exact hostname or a '*.suffix' wildcard"
+        );
+    }
+    Ok(())
+}
+
 fn collect_lowercased<V>(
     entries: impl IntoIterator<Item = (String, V)>,
     what: &str,
@@ -651,6 +683,53 @@ mod tests {
             assert!(err.to_string().contains("reserved"), "{err}");
         }
         let toml = "[agent_routes]\n\"flextunnel.internal\" = { machine_id = \"abc\" }\n";
+        let file: ServerConfig = toml::from_str(toml).unwrap();
+        let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
+        assert!(err.to_string().contains("reserved"), "{err}");
+    }
+
+    #[test]
+    fn wildcard_alias_keys_parsed_and_lowercased() {
+        let toml = r#"
+            [host_aliases]
+            "*.Web.Internal" = "10.0.0.1"
+
+            [agent_routes]
+            "*.Svc.Internal" = { machine_id = "abc" }
+        "#;
+        let file: ServerConfig = toml::from_str(toml).unwrap();
+        let r = resolve_server(ServerConfig::default(), Some(file)).unwrap();
+        // The `*.` prefix survives lowercasing of the rest of the key.
+        assert_eq!(r.host_aliases.get("*.web.internal").map(String::as_str), Some("10.0.0.1"));
+        assert_eq!(r.agent_routes.get("*.svc.internal").map(String::as_str), Some("abc"));
+    }
+
+    #[test]
+    fn malformed_wildcard_alias_is_rejected() {
+        // A bare `*` catch-all, a doubled wildcard, an empty label, and a stray
+        // `*` outside a leading `*.` are all rejected at config resolution.
+        for (table, key) in [
+            ("host_aliases", "*"),
+            ("host_aliases", "*.*.internal"),
+            ("host_aliases", "*..internal"),
+            ("host_aliases", "web*.internal"),
+        ] {
+            let toml = format!("[{table}]\n\"{key}\" = \"10.0.0.1\"\n");
+            let file: ServerConfig = toml::from_str(&toml).unwrap();
+            let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
+            assert!(err.to_string().contains(table), "key {key:?}: {err}");
+        }
+        // Same for agent_routes (value shape differs).
+        let toml = "[agent_routes]\n\"*.*.internal\" = { machine_id = \"abc\" }\n";
+        let file: ServerConfig = toml::from_str(toml).unwrap();
+        let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
+        assert!(err.to_string().contains("agent_routes"), "{err}");
+    }
+
+    #[test]
+    fn reserved_namespace_wildcard_alias_is_rejected() {
+        // A `*.flextunnel.internal` wildcard collides with the reserved namespace.
+        let toml = "[host_aliases]\n\"*.flextunnel.internal\" = \"127.0.0.1\"\n";
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
         assert!(err.to_string().contains("reserved"), "{err}");

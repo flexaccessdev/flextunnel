@@ -595,6 +595,86 @@ async fn agent_reverse_route_pipes_to_agent_loopback() {
     drop(agent_conn);
 }
 
+/// The routed-set whitelist is enforced on the *requested* hostname before any
+/// alias/route resolution, so a `*.web.internal` host alias whose subdomain was
+/// never added to the routed set does NOT smuggle an off-list host past the
+/// gate. The same request, once the wildcard is on the routed set, resolves
+/// through the alias to the server's loopback and pipes bytes. (The whitelist is
+/// a single gate shared with `[agent_routes]`, so this covers both alias paths.)
+#[tokio::test]
+async fn wildcard_host_alias_still_requires_routed_set_coverage() {
+    // The alias rewrites to loopback; this echo server is the on-list dial target.
+    let echo_port = spawn_echo().await;
+    let host_aliases = HashMap::from([("*.web.internal".to_string(), "127.0.0.1".to_string())]);
+
+    // --- Off-list: the alias exists, but the routed set does not cover it. ---
+    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
+    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
+    spawn_server_full(
+        server_ep,
+        temp_blocklist("wildcard-alias-offlist"),
+        HashSet::new(),
+        HashMap::new(),
+        host_aliases.clone(),
+        // Covers a different name — `*.web.internal` is deliberately absent.
+        vec!["allowed.example.com".to_string()],
+    );
+
+    let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
+    let (conn, _cs, _cr, resp) = client_handshake(&client_ep, server_addr, 61, false).await;
+    assert!(resp.accepted, "client should be accepted");
+
+    let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
+    signaling::write_request(&mut send, &Target::Domain("db.web.internal".to_string(), echo_port))
+        .await
+        .unwrap();
+    send.flush().await.unwrap();
+    let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
+    assert_eq!(
+        rep,
+        signaling::REP_NOT_ALLOWED,
+        "off-list wildcard-aliased host must be rejected by the whitelist before aliasing"
+    );
+
+    // --- On-list: add the wildcard to the routed set; the alias now resolves. ---
+    let server_ep2 = loopback_endpoint(SecretKey::generate(), true).await;
+    let server_addr2 =
+        EndpointAddr::new(server_ep2.id()).with_ip_addr(server_ep2.bound_sockets()[0]);
+    spawn_server_full(
+        server_ep2,
+        temp_blocklist("wildcard-alias-onlist"),
+        HashSet::new(),
+        HashMap::new(),
+        host_aliases,
+        vec!["*.web.internal".to_string()],
+    );
+
+    let client_ep2 = loopback_endpoint(SecretKey::generate(), false).await;
+    let (conn2, _cs2, _cr2, resp2) = client_handshake(&client_ep2, server_addr2, 62, false).await;
+    assert!(resp2.accepted, "client should be accepted");
+
+    let (mut send2, mut recv2) = with_timeout(conn2.open_bi()).await.unwrap();
+    signaling::write_request(
+        &mut send2,
+        &Target::Domain("db.web.internal".to_string(), echo_port),
+    )
+    .await
+    .unwrap();
+    send2.flush().await.unwrap();
+    let rep2 = with_timeout(signaling::read_reply(&mut recv2)).await.unwrap();
+    assert_eq!(
+        rep2,
+        signaling::REP_SUCCESS,
+        "on-list wildcard alias should resolve to the server's loopback"
+    );
+    // Round-trip through the aliased loopback echo server: greeting + echo.
+    send2.write_all(b"ping").await.unwrap();
+    send2.flush().await.unwrap();
+    let mut buf = [0u8; 9]; // "HELLO" + "ping"
+    with_timeout(recv2.read_exact(&mut buf)).await.unwrap();
+    assert_eq!(&buf, b"HELLOping");
+}
+
 /// End-to-end reserved namespace: a request for `flextunnel.internal` is served
 /// by the server itself as an HTTP status page (bypassing the routed-set
 /// whitelist — note the routed set here does NOT contain it), and a
