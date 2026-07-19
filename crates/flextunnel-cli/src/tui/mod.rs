@@ -44,18 +44,17 @@ struct App {
     notice: Option<String>,
 }
 
-pub fn run(
-    config_path: Option<PathBuf>,
-    default_config: bool,
-    server_node_id: Option<String>,
-) -> Result<()> {
+pub fn run(config_path: Option<PathBuf>, server_node_id: Option<String>) -> Result<()> {
     // The running client is identified by the profile's server node id
     // (-n wins over the config file; bare `client control` reads the default
     // config), from which the same instance key as the client's is derived.
-    let use_default =
-        default_config || (config_path.is_none() && server_node_id.is_none());
-    let file = config::load_client_config(config_path.as_deref(), use_default)
-        .context("client control needs a profile: -c <file>, --default-config, or -n <server id>")?;
+    // With -n and no -c, identify purely by server id (skip the config load).
+    let file = if server_node_id.is_some() && config_path.is_none() {
+        None
+    } else {
+        config::load_client_config(config_path.as_deref())
+            .context("client control needs a profile: -c <file>, the default config, or -n <server id>")?
+    };
     let cli = config::ClientConfig {
         server_node_id,
         ..Default::default()

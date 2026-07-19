@@ -292,11 +292,16 @@ pub fn load_server_config(path: Option<&Path>, default_config: bool) -> Result<O
     }
 }
 
-/// Load the client config file (explicit path or `--default-config`), or `None`.
-pub fn load_client_config(path: Option<&Path>, default_config: bool) -> Result<Option<ClientConfig>> {
-    match resolve_config_path(path, default_config, "client.toml")? {
-        Some(p) => Ok(Some(load_config(&p)?)),
-        None => Ok(None),
+/// Load the client config: an explicit path (error if missing), else the
+/// default `~/.config/flextunnel/client.toml` when it exists, else `None`
+/// (the caller then falls back to CLI flags / the interactive prompt).
+pub fn load_client_config(path: Option<&Path>) -> Result<Option<ClientConfig>> {
+    match path {
+        Some(p) => Ok(Some(load_config(&expand_tilde(p))?)),
+        None => match default_config_path("client.toml") {
+            Some(p) if p.exists() => Ok(Some(load_config(&p)?)),
+            _ => Ok(None),
+        },
     }
 }
 

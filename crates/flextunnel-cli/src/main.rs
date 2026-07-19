@@ -10,6 +10,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
@@ -18,6 +19,7 @@ mod forwards;
 mod instance;
 mod ipc;
 mod lock;
+mod prompt;
 mod tui;
 
 use flextunnel_core::app;
@@ -112,15 +114,15 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ClientAction {
-    /// Start the proxy client (optional SOCKS5 + HTTP proxy listeners, port forwards).
-    #[command(arg_required_else_help = true)]
+    /// Start the proxy client (optional SOCKS5 + HTTP proxy listeners, port
+    /// forwards). With no config file (neither -c nor
+    /// ~/.config/flextunnel/client.toml) and an interactive terminal, prompts
+    /// for the connection details and runs without persisting them.
     Start {
-        /// Config file path (TOML). CLI flags override file values.
+        /// Config file path (TOML). CLI flags override file values. Without
+        /// this, ~/.config/flextunnel/client.toml is used if it exists.
         #[arg(short = 'c', long)]
         config: Option<PathBuf>,
-        /// Load config from ~/.config/flextunnel/client.toml.
-        #[arg(long)]
-        default_config: bool,
         /// Loopback port for the optional SOCKS5 listener (binds 127.0.0.1
         /// only), e.g. 1080. Disabled unless set here or in the config.
         #[arg(long)]
@@ -157,13 +159,10 @@ enum ClientAction {
     /// identified by the profile's server node id; with no flags, the default
     /// config (~/.config/flextunnel/client.toml) selects it.
     Control {
-        /// Config file path (TOML) of the profile to attach to.
+        /// Config file path (TOML) of the profile to attach to. With no flags,
+        /// ~/.config/flextunnel/client.toml selects the profile.
         #[arg(short = 'c', long)]
         config: Option<PathBuf>,
-        /// Use ~/.config/flextunnel/client.toml (the default when no other
-        /// selector is given).
-        #[arg(long)]
-        default_config: bool,
         /// Attach by server EndpointId directly (overrides the config file).
         #[arg(short = 'n', long)]
         server_node_id: Option<String>,
@@ -208,6 +207,32 @@ mod cli_tests {
     }
 
     #[test]
+    fn client_start_parses_without_flags() {
+        // Bare `client start` is valid: it loads the default config if present,
+        // otherwise prompts interactively (no `arg_required_else_help`).
+        let args = Args::try_parse_from(["flextunnel", "client", "start"])
+            .unwrap_or_else(|error| panic!("bare client start should parse: {error}"));
+        assert!(matches!(
+            args.command,
+            Command::Client {
+                action: ClientAction::Start { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn client_rejects_removed_default_config_flag() {
+        for action in ["start", "control"] {
+            let Err(error) =
+                Args::try_parse_from(["flextunnel", "client", action, "--default-config"])
+            else {
+                panic!("--default-config must be rejected for client {action}");
+            };
+            assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
     fn client_rejects_legacy_startup_flags() {
         let Err(error) = Args::try_parse_from([
             "flextunnel",
@@ -249,10 +274,9 @@ fn main() -> Result<()> {
             action:
                 ClientAction::Control {
                     config,
-                    default_config,
                     server_node_id,
                 },
-        } => tui::run(config, default_config, server_node_id),
+        } => tui::run(config, server_node_id),
         Command::GenerateServerKey { output, force } => secret::generate_secret(output, force),
         Command::ShowServerId {
             config,
@@ -329,7 +353,6 @@ async fn run_async(command: Command) -> Result<()> {
             action:
                 ClientAction::Start {
                     config: config_path,
-                    default_config,
                     socks_port,
                     http_port,
                     server_node_id,
@@ -352,7 +375,7 @@ async fn run_async(command: Command) -> Result<()> {
             } else {
                 None
             };
-            let cli = config::ClientConfig {
+            let mut cli = config::ClientConfig {
                 server_node_id,
                 name: None, // display name is config-file only; no CLI flag
                 socks_port,
@@ -363,7 +386,17 @@ async fn run_async(command: Command) -> Result<()> {
                 auto_reconnect,
                 max_reconnect_attempts,
             };
-            let file = config::load_client_config(config_path.as_deref(), default_config)?;
+            let file = config::load_client_config(config_path.as_deref())?;
+            // No config file and an interactive terminal: prompt for the
+            // missing connection details (nothing is persisted). Blocking
+            // stdin work runs off the async runtime. Non-interactive with no
+            // config falls through to `client_session::run`'s bail messages.
+            if file.is_none() && std::io::stdin().is_terminal() {
+                cli = tokio::task::spawn_blocking(move || {
+                    prompt::fill_client_config(&mut cli).map(|()| cli)
+                })
+                .await??;
+            }
             client_session::run(config::resolve_client(cli, file)).await
         }
         _ => unreachable!("synchronous commands handled in main()"),

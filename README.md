@@ -352,8 +352,7 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 
 | Flag | Description |
 |---|---|
-| `-c, --config <FILE>` | Load options from a TOML file (CLI flags override it). |
-| `--default-config` | Load `~/.config/flextunnel/client.toml`. |
+| `-c, --config <FILE>` | Load options from a TOML file (CLI flags override it). Without it, `~/.config/flextunnel/client.toml` is used if present. |
 | `-n, --server-node-id <ID>` | Server EndpointId. |
 | `--socks-port <PORT>` | Optional SOCKS5 listener port, e.g. `1080`. Binds `127.0.0.1` only. Disabled unless set. |
 | `--http-port <PORT>` | Optional HTTP proxy listener port (CONNECT + plain-HTTP forwarding). Binds `127.0.0.1` only. |
@@ -362,6 +361,10 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `--auto-reconnect` | Force auto-reconnect on (overrides `auto_reconnect = false` in the config). |
 | `--no-auto-reconnect` | Exit on the first disconnection instead of reconnecting. |
 | `--max-reconnect-attempts <N>` | Cap reconnect attempts between successful connections (unlimited if unset). |
+
+A bare `flextunnel client start` loads `~/.config/flextunnel/client.toml` if it
+exists; otherwise (on an interactive terminal) it prompts for the server
+EndpointId, auth token, and optional proxy ports and runs without saving them.
 
 With neither `--socks-port` nor `--http-port` (nor the config keys) the
 client runs in **port-forward-only mode**: it holds the tunnel and serves only
@@ -406,7 +409,7 @@ Instead of passing everything on the command line, `server` and
 
 ```sh
 flextunnel server -c server.toml
-flextunnel client start --default-config   # ~/.config/flextunnel/client.toml
+flextunnel client start                    # ~/.config/flextunnel/client.toml if present
 ```
 
 Precedence is **CLI flag > config file > built-in default**, so you can keep a
