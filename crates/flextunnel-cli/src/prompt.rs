@@ -83,9 +83,11 @@ fn read_masked_line(prompt: &str) -> Result<String> {
     // Enable raw mode before printing the prompt so no keystroke (fast typing or
     // a paste) can be cooked-echoed as plaintext before masking takes over.
     enable_raw_mode().context("Failed to enable raw terminal mode")?;
-    print!("{prompt}");
-    io::stdout().flush().ok();
-    let outcome = read_masked_raw();
+    let outcome = (|| {
+        print!("{prompt}");
+        io::stdout().flush().context("Failed to write prompt")?;
+        read_masked_raw()
+    })();
     disable_raw_mode().context("Failed to restore terminal mode")?;
     // Raw mode swallowed the Enter newline; move to the next line ourselves.
     println!();
@@ -116,17 +118,23 @@ fn read_masked_raw() -> Result<String> {
             KeyCode::Char('u') if ctrl => {
                 erase(buf.chars().count());
                 buf.clear();
-                io::stdout().flush().ok();
+                io::stdout()
+                    .flush()
+                    .context("Failed to write masked input")?;
             }
             KeyCode::Char(c) => {
                 buf.push(c);
                 print!("*");
-                io::stdout().flush().ok();
+                io::stdout()
+                    .flush()
+                    .context("Failed to write masked input")?;
             }
             KeyCode::Backspace => {
                 if buf.pop().is_some() {
                     erase(1);
-                    io::stdout().flush().ok();
+                    io::stdout()
+                        .flush()
+                        .context("Failed to write masked input")?;
                 }
             }
             _ => {}
