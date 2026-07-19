@@ -265,6 +265,26 @@ curl -x socks5h://127.0.0.1:1080 http://server.internal:8000/
 ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 ```
 
+#### Quick ephemeral tunnel (no setup)
+
+For a throwaway "route everything through this box for a few minutes" session,
+`--quick` skips all of the above — no key file, no token, no config:
+
+```sh
+# On the server host: mints an in-memory identity + client token, full-tunnels
+# all traffic, and prints the two values to paste. Exits on its own if no client
+# connects within 5 minutes. Nothing is persisted.
+flextunnel server --quick
+
+# On the client host: ignores any saved config and prompts for the server
+# EndpointId and auth token printed above (token entry is masked).
+flextunnel client start --quick
+```
+
+The quick server runs a full tunnel (`routed_domains = ["*"]`,
+`routed_cidrs = ["0.0.0.0/0", "::/0"]`); enter a SOCKS5/HTTP port at the client
+prompt to open a local proxy listener. Both sides forget everything on exit.
+
 #### Server status page
 
 From a connected client, `flextunnel.internal` is reserved by flextunnel and is
@@ -347,6 +367,7 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `--agent-auth-token <TOKEN>` | Accepted agent token (repeatable). Separate pool from clients. |
 | `--agent-auth-tokens-file <FILE>` | File of accepted agent tokens, one per line. |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). A custom relay doubles as the rendezvous point, so iroh peer discovery is disabled automatically when one is set. |
+| `--quick` | Ephemeral one-off server: mint an in-memory identity + client token, full-tunnel all traffic, print the EndpointId/token, and exit if no client connects within 5 minutes. Nothing is persisted. Conflicts with `-c`/`--secret-file`/`--auth-token(s)`. |
 
 ### `client start`
 
@@ -361,10 +382,12 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `--auto-reconnect` | Force auto-reconnect on (overrides `auto_reconnect = false` in the config). |
 | `--no-auto-reconnect` | Exit on the first disconnection instead of reconnecting. |
 | `--max-reconnect-attempts <N>` | Cap reconnect attempts between successful connections (unlimited if unset). |
+| `--quick` | Ignore any saved config and prompt for the server EndpointId + auth token (pairs with `server --quick`). Nothing is persisted. Conflicts with `-c`. |
 
 A bare `flextunnel client start` loads `~/.config/flextunnel/client.toml` if it
 exists; otherwise (on an interactive terminal) it prompts for the server
 EndpointId, auth token, and optional proxy ports and runs without saving them.
+`--quick` forces that prompt even when the default config exists.
 
 With neither `--socks-port` nor `--http-port` (nor the config keys) the
 client runs in **port-forward-only mode**: it holds the tunnel and serves only

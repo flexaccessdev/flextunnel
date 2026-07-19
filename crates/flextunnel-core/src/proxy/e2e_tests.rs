@@ -154,6 +154,7 @@ fn spawn_server_dns(
         dns_forwarder,
         bridges: Vec::new(),
         blocklist: BlockList::load(blocklist_path).unwrap(),
+        first_client: None,
     });
     tokio::spawn(async move {
         // Surface why the server task ended — captured by the test harness and
@@ -184,6 +185,7 @@ fn base_params(own_id: iroh::EndpointId, blocklist_path: std::path::PathBuf) -> 
         dns_forwarder: None,
         bridges: Vec::new(),
         blocklist: BlockList::load(blocklist_path).unwrap(),
+        first_client: None,
     }
 }
 

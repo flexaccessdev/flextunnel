@@ -236,6 +236,9 @@ pub struct ProxyServer {
     /// Tripped when the server must stop itself (duplicate-server self-block);
     /// wakes the accept loop in [`run`](Self::run).
     shutdown: Arc<Notify>,
+    /// Notified once on the first successful client connection (quick-mode idle
+    /// timer cancellation); `None` for a normal server.
+    first_client: Option<Arc<Notify>>,
 }
 
 /// Inputs for [`ProxyServer::new`], grouped into a struct so the many
@@ -254,6 +257,10 @@ pub struct ProxyServerParams {
     pub dns_forwarder: Option<DnsForwarder>,
     pub bridges: Vec<Arc<BridgeUpstream>>,
     pub blocklist: BlockList,
+    /// Fired once when the first client successfully connects. `server start
+    /// --quick` uses it to cancel its "exit if idle" grace timer; `None` for a
+    /// normal server.
+    pub first_client: Option<Arc<Notify>>,
 }
 
 impl ProxyServer {
@@ -280,6 +287,7 @@ impl ProxyServer {
             bridge_registry: Arc::new(Mutex::new(BridgeRegistry::new())),
             blocklist: Arc::new(Mutex::new(params.blocklist)),
             shutdown: Arc::new(Notify::new()),
+            first_client: params.first_client,
         })
     }
 
@@ -795,6 +803,12 @@ impl ProxyServer {
         signaling::write_message(&mut send, &signaling::encode_hello_response(&resp)?).await?;
         send.flush().await?;
         log::info!("Client {remote_id} authenticated");
+
+        // Cancel the quick-mode idle-exit timer on the first client to connect
+        // (harmless no-op for a normal server; `notify_one` is idempotent).
+        if let Some(notify) = &self.first_client {
+            notify.notify_one();
+        }
 
         // Serve SOCKS5 streams and the heartbeat concurrently until either ends
         // (connection closed, or heartbeat liveness lost). `_guard` cleans the
