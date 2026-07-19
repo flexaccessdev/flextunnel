@@ -573,6 +573,11 @@ fn validate_dns_forwards_coverage(forwarder: &DnsForwarder, routed_set: &RoutedS
 /// is cancelled for the rest of the process's life.
 const QUICK_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long to wait for a graceful `endpoint.close()` during shutdown before
+/// forcing exit. iroh's close normally completes promptly, but a lingering
+/// relay/connection teardown must never leave the process unkillable.
+const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Build the ephemeral `ServerConfig` for `server start --quick`: a freshly
 /// generated in-memory identity + client token and a full-tunnel routed set
 /// (`routed_domains = ["*"]`, `routed_cidrs = ["0.0.0.0/0", "::/0"]`). Returns
@@ -873,7 +878,21 @@ async fn run_server(
     // Close the endpoint gracefully before it is dropped. Skipping this makes
     // iroh tear down its relay tasks via an ungraceful abort, which panics
     // (`JoinSet::join_all` on a cancelled task) — fatal under panic=abort.
-    endpoint.close().await;
+    // But never let a slow teardown make the process unkillable: once we are
+    // already shutting down, a second Ctrl-C (or a short timeout) forces an
+    // immediate clean exit. `std::process::exit` skips destructors, so it
+    // avoids the ungraceful-drop panic the graceful close exists to prevent.
+    tokio::select! {
+        _ = endpoint.close() => {}
+        _ = app::shutdown_signal() => {
+            log::warn!("Second shutdown signal — exiting now");
+            std::process::exit(0);
+        }
+        _ = tokio::time::sleep(SHUTDOWN_CLOSE_TIMEOUT) => {
+            log::warn!("Endpoint close is taking too long — exiting now");
+            std::process::exit(0);
+        }
+    }
     res
 }
 
