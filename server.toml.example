@@ -25,6 +25,21 @@ auth_tokens = ["ftcXXXXXXX"]
                                           # doubles as the rendezvous point, so iroh peer
                                           # discovery is disabled automatically when set
 
+# Optional INBOUND bridging: allow other flextunnel servers to bridge INTO this
+# server (the inbound counterpart to the [bridges.*] OUTBOUND routes at the
+# bottom of this file). A connecting bridge must pass BOTH gates: its endpoint
+# id (TLS-authenticated by iroh, no extra proof needed) must be listed in
+# allowed_bridge_servers, AND it must present an `ftb` token from the
+# bridge_auth_tokens pool (a separate pool from client and agent tokens). An
+# empty/absent allowlist disables inbound bridging entirely; configuring only
+# one of the two halves is rejected at startup as dead config. Bridged-in
+# targets must also be on this server's routed set (routed_domains/routed_cidrs
+# below). These are top-level keys, so they must appear BEFORE the [tables]
+# below (bare keys after a [table] header would bind to that table).
+# allowed_bridge_servers = ["<endpoint id of the bridging server>"]
+# bridge_auth_tokens = ["ftbXXXXXXX"]
+# bridge_auth_tokens_file = "/etc/flextunnel/bridge_auth_tokens.txt"
+
 # Duplicate-id blocklist (JSON). This path is fixed at
 # ~/.config/flextunnel/blocklist.json and is deliberately not configurable. The
 # server records confirmed duplicate client ids here, duplicate agent network
@@ -160,14 +175,7 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 # domains = ["*.svc"]
 # cidrs = ["fd34::/64"]
 
-# Optional INBOUND bridging: allow other flextunnel servers to bridge INTO this
-# server. A connecting bridge must pass BOTH gates: its endpoint id (TLS-
-# authenticated by iroh, no extra proof needed) must be listed in
-# allowed_bridge_servers, AND it must present an `ftb` token from the
-# bridge_auth_tokens pool (a separate pool from client and agent tokens).
-# An empty/absent allowlist disables inbound bridging entirely; configuring
-# only one of the two halves is rejected at startup as dead config. Bridged-in
-# targets must also be on THIS server's routed set above.
-# allowed_bridge_servers = ["<endpoint id of the bridging server>"]
-# bridge_auth_tokens = ["ftbXXXXXXX"]
-# # bridge_auth_tokens_file = "/etc/flextunnel/bridge_auth_tokens.txt"
+# INBOUND bridging (letting other flextunnel servers bridge INTO this one) is
+# configured via the top-level `allowed_bridge_servers` / `bridge_auth_tokens`
+# keys near the top of this file — top-level keys must precede the [tables]
+# above, so they can't live down here beside the outbound routes.
