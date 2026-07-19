@@ -7,6 +7,7 @@ use std::io::{self, Write};
 
 use flextunnel_core::auth;
 use flextunnel_core::config::ClientConfig;
+use flextunnel_core::iroh::EndpointId;
 
 /// Prompt (on the terminal) for any client values still missing from `cli`,
 /// mutating it in place. Never writes a config file — the collected values live
@@ -16,9 +17,7 @@ pub fn fill_client_config(cli: &mut ClientConfig) -> Result<()> {
 
     // EndpointId of the server to connect to (from `flextunnel show-server-id`).
     if cli.server_node_id.is_none() {
-        cli.server_node_id = Some(prompt_required(
-            "Server EndpointId (from `flextunnel show-server-id`)",
-        )?);
+        cli.server_node_id = Some(prompt_server_id()?);
     }
 
     // Auth token for this client. A `--auth-token-file` supplied on the CLI
@@ -39,20 +38,25 @@ pub fn fill_client_config(cli: &mut ClientConfig) -> Result<()> {
     Ok(())
 }
 
-/// Prompt until a non-empty line is entered.
-fn prompt_required(label: &str) -> Result<String> {
+/// Prompt for the server EndpointId, re-asking until it parses (the same check
+/// the client runs when it connects).
+fn prompt_server_id() -> Result<String> {
     loop {
-        print!("{label}: ");
+        print!("Server EndpointId (from `flextunnel show-server-id`): ");
         io::stdout().flush().context("Failed to write prompt")?;
         let mut line = String::new();
         io::stdin()
             .read_line(&mut line)
             .context("Failed to read input")?;
         let value = line.trim();
-        if !value.is_empty() {
-            return Ok(value.to_string());
+        if value.is_empty() {
+            eprintln!("A value is required.");
+            continue;
         }
-        eprintln!("A value is required.");
+        match value.parse::<EndpointId>() {
+            Ok(_) => return Ok(value.to_string()),
+            Err(err) => eprintln!("Invalid EndpointId: {err}"),
+        }
     }
 }
 
