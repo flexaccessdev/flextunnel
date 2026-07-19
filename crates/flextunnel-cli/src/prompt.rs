@@ -5,6 +5,9 @@
 use anyhow::{Context, Result};
 use std::io::{self, Write};
 
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
 use flextunnel_core::auth;
 use flextunnel_core::config::ClientConfig;
 use flextunnel_core::iroh::EndpointId;
@@ -64,13 +67,77 @@ fn prompt_server_id() -> Result<String> {
 /// shape (`ftc…`).
 fn prompt_auth_token() -> Result<String> {
     loop {
-        let token = rpassword::prompt_password("Auth token (hidden): ")
-            .context("Failed to read auth token")?;
+        let token = read_masked_line("Auth token (masked): ")?;
         let token = token.trim().to_string();
         match auth::validate_client_token(&token) {
             Ok(()) => return Ok(token),
             Err(err) => eprintln!("Invalid token: {err}"),
         }
+    }
+}
+
+/// Read a line with each character echoed as `*`. Uses crossterm raw mode
+/// (already a dependency via ratatui), so the token is masked rather than fully
+/// hidden — the caller gates this behind an interactive terminal.
+fn read_masked_line(prompt: &str) -> Result<String> {
+    // Enable raw mode before printing the prompt so no keystroke (fast typing or
+    // a paste) can be cooked-echoed as plaintext before masking takes over.
+    enable_raw_mode().context("Failed to enable raw terminal mode")?;
+    print!("{prompt}");
+    io::stdout().flush().ok();
+    let outcome = read_masked_raw();
+    disable_raw_mode().context("Failed to restore terminal mode")?;
+    // Raw mode swallowed the Enter newline; move to the next line ourselves.
+    println!();
+    outcome
+}
+
+/// The raw-mode read loop for [`read_masked_line`]. Kept separate so the caller
+/// always restores cooked mode, whatever this returns.
+fn read_masked_raw() -> Result<String> {
+    let mut buf = String::new();
+    loop {
+        let Event::Key(key) = event::read().context("Failed to read input")? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Enter => return Ok(buf),
+            // Raw mode suppresses SIGINT, so honor Ctrl-C ourselves.
+            KeyCode::Char('c') if ctrl => {
+                disable_raw_mode().ok();
+                println!();
+                std::process::exit(130);
+            }
+            // Ctrl-U clears the current input, like a shell.
+            KeyCode::Char('u') if ctrl => {
+                erase(buf.chars().count());
+                buf.clear();
+                io::stdout().flush().ok();
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                print!("*");
+                io::stdout().flush().ok();
+            }
+            KeyCode::Backspace => {
+                if buf.pop().is_some() {
+                    erase(1);
+                    io::stdout().flush().ok();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Erase `n` characters to the left of the cursor (backspace, space, backspace).
+fn erase(n: usize) {
+    for _ in 0..n {
+        print!("\u{8} \u{8}");
     }
 }
 

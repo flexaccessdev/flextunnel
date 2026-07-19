@@ -18,7 +18,6 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 ratatui.workspace = true
-rpassword = "7"
 
 [dev-dependencies]
 tempfile.workspace = true
