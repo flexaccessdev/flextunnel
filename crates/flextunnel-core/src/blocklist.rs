@@ -3,7 +3,7 @@
 //! The blocklist is a small JSON file (default
 //! `~/.config/flextunnel/blocklist.json`) that records identities involved in a
 //! **duplicate-id conflict** — a guard rail against accidental misconfiguration
-//! (see `docs/architecture.md`, "Security model"). It holds two kinds of entry:
+//! (see `docs/architecture.md`, "Security model"). It holds three kinds of entry:
 //!
 //! * **`blocked_clients`** — iroh node ids the server saw as a *confirmed
 //!   duplicate client* (two live processes presenting the same node id). Because
@@ -33,7 +33,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// One blocklist entry: an identity plus why/when it was recorded.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockEntry {
-    /// The iroh `EndpointId`, as its canonical string form.
+    /// Canonical identifier: an iroh `EndpointId` for clients/servers, or an
+    /// `ftm1…` network id for agents.
     pub id: String,
     /// Human-readable reason the id was blocked (for the operator).
     pub reason: String,

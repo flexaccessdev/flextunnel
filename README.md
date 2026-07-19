@@ -197,8 +197,8 @@ cargo build --release
 
 Requires a recent Rust toolchain (edition 2024). A bare `cargo build --release`
 uses the workspace's default members and builds the CLI and the agent, but not
-the iOS static library. To cross-build static Linux binaries for amd64 + arm64
-via Docker, use `./build-linux.sh`.
+the iOS static library. To cross-build the CLI for Linux amd64 + arm64 via
+Docker, use `./build-linux.sh`; the script does not build the agent.
 
 ## Quick start
 
@@ -327,7 +327,7 @@ speak SOCKS5 (databases, RDP, most GUIs) — see
 
 Add `--http-port <PORT>` to also run an HTTP proxy alongside SOCKS5 — useful
 for the many tools that only speak an HTTP proxy or whose SOCKS5 support
-resolves DNS client-side (`wget`, Docker pulls, npm/yarn, JVM/JDBC, .NET). It
+resolves DNS client-side (`wget`, Docker pulls, npm/yarn, JVM/JDBC). It
 handles HTTPS (and any TCP) via `CONNECT` tunneling and plain-HTTP via
 absolute-URI forwarding; either way the hostname goes to the proxy, so DNS
 still happens on the server.
@@ -638,8 +638,9 @@ Auto-reconnect is **enabled by default** (`auto_reconnect = true`); pass
   **exponential backoff + jitter** (1s → 60s), indefinitely, unless
   `--max-reconnect-attempts` caps it or auto-reconnect is disabled.
 - A permanent error (auth/config) never retries.
-- The local proxy listeners stay bound across reconnects, so local apps queue
-  briefly instead of seeing connection-refused during the gap.
+- The local proxy listeners stay bound across reconnects. Off-list targets keep
+  connecting directly; on-list requests fail immediately with a network-unreachable
+  reply until the tunnel recovers.
 
 ## Logging
 
@@ -657,7 +658,7 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
   and remaining hardening work.
 - [`docs/proxy-usage.md`](docs/proxy-usage.md) — using the SOCKS5 and HTTP
   proxies: which listener a tool needs, native SOCKS5 clients (`curl`, `git`,
-  browsers), HTTP-proxy-only tools (`wget`, Docker, JVM/JDBC, .NET), `ssh`
+  browsers), HTTP-proxy-only tools (`wget`, Docker, JVM/JDBC), `ssh`
   through the tunnel, and `socat`/`ssh -L`/`-D` forwards for apps that speak
   neither.
 
