@@ -329,9 +329,11 @@ async fn drive_session(
 
     // Close the channel so a quick panel still waiting on a reply (or issuing
     // its next request) unblocks and exits, tear down forwards and the control
-    // socket, then close the endpoint gracefully before it is dropped (an
-    // ungraceful drop aborts iroh's relay tasks, fatal under panic=abort).
-    // Finally join the panel (if any) so the terminal is always restored.
+    // socket, then close the endpoint gracefully — bounded so a slow teardown
+    // can't leave the client hung (a second signal or timeout forces exit, just
+    // like the server). Finally join the panel (if any) so the terminal is
+    // restored; a graceful close completes well before that, so the normal path
+    // reaches it.
     drop(ipc_rx);
     drop(fwd_mgr);
     let panel = match sink {
@@ -341,7 +343,7 @@ async fn drive_session(
         }
         IpcSink::Panel(panel) => Some(panel),
     };
-    endpoint.close().await;
+    crate::close_endpoint_or_exit(&endpoint).await;
     if let Some(panel) = panel {
         let _ = panel.await;
     }

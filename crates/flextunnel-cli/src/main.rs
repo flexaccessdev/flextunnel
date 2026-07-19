@@ -875,13 +875,19 @@ async fn run_server(
         }
     };
 
-    // Close the endpoint gracefully before it is dropped. Skipping this makes
-    // iroh tear down its relay tasks via an ungraceful abort, which panics
-    // (`JoinSet::join_all` on a cancelled task) — fatal under panic=abort.
-    // But never let a slow teardown make the process unkillable: once we are
-    // already shutting down, a second Ctrl-C (or a short timeout) forces an
-    // immediate clean exit. `std::process::exit` skips destructors, so it
-    // avoids the ungraceful-drop panic the graceful close exists to prevent.
+    close_endpoint_or_exit(&endpoint).await;
+    res
+}
+
+/// Close `endpoint` gracefully before it is dropped — skipping the close makes
+/// iroh tear down its relay tasks via an ungraceful abort, which panics
+/// (`JoinSet::join_all` on a cancelled task), fatal under panic=abort. But never
+/// let a slow teardown make the process unkillable: once we are already shutting
+/// down, a second shutdown signal (e.g. another Ctrl-C) or `SHUTDOWN_CLOSE_TIMEOUT`
+/// forces an immediate clean exit. `std::process::exit` skips destructors, so it
+/// avoids the very ungraceful-drop panic the graceful close exists to prevent.
+/// Shared by the server ([`run_server`]) and the client (`client_session`).
+pub(crate) async fn close_endpoint_or_exit(endpoint: &flextunnel_core::iroh::Endpoint) {
     tokio::select! {
         _ = endpoint.close() => {}
         _ = app::shutdown_signal() => {
@@ -893,7 +899,6 @@ async fn run_server(
             std::process::exit(0);
         }
     }
-    res
 }
 
 #[cfg(test)]
