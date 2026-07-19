@@ -28,29 +28,13 @@ use crate::ipc::{
 use crate::{forwards as store, instance, lock};
 
 pub async fn run(r: config::ResolvedClient) -> Result<()> {
-    let server_node_id = r.server_node_id.context(
+    let server_node_id = r.server_node_id.clone().context(
         "The client requires a server node id (--server-node-id or server_node_id in the config).",
     )?;
     // A profile's server id never changes, so its prefix is the client's
     // on-disk identity: lock, control socket, and forwards file.
     let key = instance::instance_key(&server_node_id)?;
-
-    if r.auth_token.is_some() && r.auth_token_file.is_some() {
-        anyhow::bail!("Provide only one of auth_token or auth_token_file, not both");
-    }
-    let token = if let Some(token) = r.auth_token {
-        auth::validate_client_token(&token).context("Invalid authentication token")?;
-        token
-    } else if let Some(path) = r.auth_token_file {
-        auth::load_auth_token_from_file(&path, auth::CLIENT_TOKEN_PREFIX)
-            .context("Failed to load authentication token from file")?
-    } else {
-        anyhow::bail!(
-            "The client requires an authentication token.\n\
-             Use --auth-token <TOKEN>, --auth-token-file <FILE>, or set \
-             auth_token/auth_token_file in the config."
-        );
-    };
+    let token = resolve_token(&r)?;
 
     // Held for the process lifetime; also what makes removing a stale control
     // socket safe (see ipc.rs).
@@ -58,7 +42,7 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
 
     // All forwards load disabled (`enabled` is never persisted) — enabling is
     // an explicit per-session action, like the desktop.
-    let mut forwards = store::load(&key)?;
+    let forwards = store::load(&key)?;
     if let Err(e) = validate_loaded(&forwards) {
         let path = store::forwards_path(&key)?;
         anyhow::bail!("Invalid port forwards in {}: {e}", path.display());
@@ -73,14 +57,106 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
 
     // The routed set (tunnel set) is configured on the server and pushed
     // during the handshake (see ProxyClient::handshake).
+    let runtime = build_session(r, server_node_id, token, key.clone(), forwards, true).await?;
+    if runtime.state.socks_addr.is_none() && runtime.state.http_addr.is_none() {
+        log::info!("No local proxy listeners configured; running in port-forward-only mode");
+    }
 
+    // Serve the control socket others attach to; a detaching panel never stops
+    // the tunnel, and the loop keeps running when the channel closes.
+    drive_session(runtime, move |tx, _initial| {
+        ipc::spawn_ipc_server(&key, tx).map(IpcSink::Socket)
+    })
+    .await
+}
+
+/// Resolve the client auth token: exactly one of the inline token or the token
+/// file. Shared by [`run`] and [`run_quick`].
+fn resolve_token(r: &config::ResolvedClient) -> Result<String> {
+    if r.auth_token.is_some() && r.auth_token_file.is_some() {
+        anyhow::bail!("Provide only one of auth_token or auth_token_file, not both");
+    }
+    if let Some(token) = &r.auth_token {
+        auth::validate_client_token(token).context("Invalid authentication token")?;
+        Ok(token.clone())
+    } else if let Some(path) = &r.auth_token_file {
+        auth::load_auth_token_from_file(path, auth::CLIENT_TOKEN_PREFIX)
+            .context("Failed to load authentication token from file")
+    } else {
+        anyhow::bail!(
+            "The client requires an authentication token.\n\
+             Use --auth-token <TOKEN>, --auth-token-file <FILE>, or set \
+             auth_token/auth_token_file in the config."
+        )
+    }
+}
+
+/// The self-contained `flextunnel client start --quick` session: an ephemeral
+/// client that runs the live control panel in *this* terminal instead of
+/// detaching. Unlike [`run`] it takes **no single-instance lock**, loads and
+/// writes **no forwards file**, and exposes **no control socket** — nothing is
+/// persisted and nothing else can attach. The panel and the session talk over an
+/// in-process channel; quitting the panel drops its sender, closing the channel,
+/// which shuts the session down — so the tunnel disconnects rather than detaching.
+pub async fn run_quick(r: config::ResolvedClient) -> Result<()> {
+    let server_node_id = r.server_node_id.clone().context(
+        "The client requires a server node id (--server-node-id or server_node_id in the config).",
+    )?;
+    // Display-only in quick mode (no lock/socket/forwards paths are derived from
+    // it); computing it also validates the id shape up front.
+    let key = instance::instance_key(&server_node_id)?;
+    let token = resolve_token(&r)?;
+
+    // Forwards are ephemeral: none are loaded, none are saved (`persist=false`).
+    // They can still be added/edited live in the panel, in memory only.
+    let runtime = build_session(r, server_node_id, token, key, Vec::new(), false).await?;
+
+    // Drive the self-contained panel over an in-process channel — no socket is
+    // exposed, so `flextunnel client control` cannot attach. The panel runs a
+    // blocking ratatui loop on a dedicated thread and owns the only command
+    // sender: when the user quits, that sender drops, closing the channel, and
+    // the loop treats that as the disconnect signal.
+    drive_session(runtime, |tx, initial| {
+        Ok(IpcSink::Panel(tokio::task::spawn_blocking(move || {
+            crate::tui::run_quick_panel(tx, initial)
+        })))
+    })
+    .await
+}
+
+/// The assembled per-session runtime that [`drive_session`] consumes: the iroh
+/// endpoint, the proxy client and its live routes, the bound proxy listeners,
+/// the forward manager + set, and the status/mutation state.
+struct SessionRuntime {
+    endpoint: flextunnel_core::iroh::Endpoint,
+    client: ProxyClient,
+    routes: std::sync::Arc<std::sync::Mutex<flextunnel_core::proxy::TunnelRoutes>>,
+    socks_listener: Option<tokio::net::TcpListener>,
+    http_listener: Option<tokio::net::TcpListener>,
+    fwd_mgr: ForwardManager,
+    forwards: Vec<PortForward>,
+    state: SessionState,
+}
+
+/// Create the iroh endpoint, bind the enabled proxy front-ends (127.0.0.1 only,
+/// like the desktop client — unauthenticated, never exposed off-machine), and
+/// assemble the [`SessionRuntime`]. Shared by [`run`] and [`run_quick`]; the
+/// caller supplies the auth `token`, the instance `key` (status display), the
+/// initial `forwards`, and whether mutations `persist`. On any failure past
+/// endpoint creation the endpoint is closed gracefully before returning.
+async fn build_session(
+    r: config::ResolvedClient,
+    server_node_id: String,
+    token: String,
+    key: String,
+    forwards: Vec<PortForward>,
+    persist: bool,
+) -> Result<SessionRuntime> {
     let endpoint = create_client_endpoint(&r.relay_urls)
         .await
         .context("Failed to create iroh endpoint")?;
     log::info!("flextunnel client Node ID: {}", endpoint.id());
 
-    // The proxy front-ends bind 127.0.0.1 only (like the desktop client):
-    // they are unauthenticated, so they are never exposed beyond this machine.
     let socks_bind = r.socks_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p)));
     let http_bind = r.http_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p)));
 
@@ -117,31 +193,16 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
     };
     let socks_addr = local_addr(&socks_listener);
     let http_addr = local_addr(&http_listener);
-    if socks_addr.is_none() && http_addr.is_none() {
-        log::info!("No local proxy listeners configured; running in port-forward-only mode");
-    }
 
     // Forwards run for the whole session (including reconnect gaps); they die
     // with the manager when the session ends.
-    let mut fwd_mgr = ForwardManager::new(
+    let fwd_mgr = ForwardManager::new(
         tokio::runtime::Handle::current(),
         client.server_forwarder(),
         &forwards,
     );
 
-    let (ipc_tx, mut ipc_rx) = mpsc::channel(8);
-    // Like the listener binds above: any failure past endpoint creation must
-    // still close the endpoint gracefully (fatal under panic=abort otherwise).
-    let ipc_guard = match ipc::spawn_ipc_server(&key, ipc_tx) {
-        Ok(guard) => guard,
-        Err(e) => {
-            drop(fwd_mgr);
-            endpoint.close().await;
-            return Err(e);
-        }
-    };
-
-    let mut state = SessionState {
+    let state = SessionState {
         instance: key,
         name: r.name,
         server_node_id,
@@ -152,8 +213,70 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
         connected_since: None,
         last_error: None,
         disabled_reasons: HashMap::new(),
-        persist: true,
+        persist,
     };
+
+    Ok(SessionRuntime {
+        endpoint,
+        client,
+        routes,
+        socks_listener,
+        http_listener,
+        fwd_mgr,
+        forwards,
+        state,
+    })
+}
+
+/// Where the session's control channel is served — the only structural
+/// difference between a normal and a quick session's loop.
+enum IpcSink {
+    /// A control socket others attach to; a detaching panel never stops the
+    /// tunnel, and the guard removes the socket on teardown.
+    Socket(ipc::IpcServerGuard),
+    /// The self-contained quick panel; when it quits (its sender drops, closing
+    /// the channel) the tunnel disconnects, and the task is joined on teardown
+    /// so the terminal is always restored.
+    Panel(tokio::task::JoinHandle<Result<()>>),
+}
+
+/// Run the session's `tokio::select!` loop until the client future ends, a
+/// shutdown signal arrives, or (panel only) the control channel closes; then
+/// tear everything down and close the endpoint gracefully. `make_sink` wires the
+/// freshly-created command channel to its consumer — the control socket server,
+/// or the quick panel seeded with `initial` — keeping the differing IPC/panel
+/// setup in the wrappers.
+async fn drive_session(
+    runtime: SessionRuntime,
+    make_sink: impl FnOnce(mpsc::Sender<IpcCmd>, StatusSnapshot) -> Result<IpcSink>,
+) -> Result<()> {
+    let SessionRuntime {
+        endpoint,
+        client,
+        routes,
+        socks_listener,
+        http_listener,
+        mut fwd_mgr,
+        mut forwards,
+        mut state,
+    } = runtime;
+
+    let (ipc_tx, mut ipc_rx) = mpsc::channel(8);
+    let initial = state.snapshot(&client, &routes, &forwards, &fwd_mgr);
+    // Any failure past endpoint creation must still close the endpoint
+    // gracefully (fatal under panic=abort otherwise).
+    let sink = match make_sink(ipc_tx, initial) {
+        Ok(sink) => sink,
+        Err(e) => {
+            drop(fwd_mgr);
+            endpoint.close().await;
+            return Err(e);
+        }
+    };
+    // A closed control channel means the quick panel quit → disconnect. A normal
+    // session's IPC accept task holds its sender while the guard lives, so the
+    // channel never closes there and the `None` arm stays a no-op.
+    let quit_on_ipc_close = matches!(sink, IpcSink::Panel(_));
 
     let run = client.run_with_optional_listeners(&endpoint, socks_listener, http_listener);
     tokio::pin!(run);
@@ -187,9 +310,11 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
                         .map(|()| state.snapshot(&client, &routes, &forwards, &fwd_mgr));
                     let _ = reply.send(result);
                 }
-                // The IPC accept task never drops its sender while the guard
-                // lives; treat a closed channel as a bug-tolerant no-op.
-                None => {}
+                None => {
+                    if quit_on_ipc_close {
+                        break Ok(());
+                    }
+                }
             },
             sig = app::shutdown_signal() => {
                 // Break (not return) even on a signal-handler error so the
@@ -202,171 +327,24 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
         }
     };
 
-    // Tear the forward listeners and the control socket down with the session,
-    // then close the endpoint gracefully before it is dropped (an ungraceful
-    // drop aborts iroh's relay tasks, which is fatal under panic=abort).
-    drop(fwd_mgr);
-    drop(ipc_guard);
-    endpoint.close().await;
-    res
-}
-
-/// The self-contained `flextunnel client start --quick` session: an ephemeral
-/// client that runs the live control panel in *this* terminal instead of
-/// detaching. Unlike [`run`] it takes **no single-instance lock**, loads and
-/// writes **no forwards file**, and exposes **no control socket** — nothing is
-/// persisted and nothing else can attach. The panel and the session talk over an
-/// in-process channel; quitting the panel drops its sender, closing the channel,
-/// which shuts the session down — so the tunnel disconnects rather than detaching.
-pub async fn run_quick(r: config::ResolvedClient) -> Result<()> {
-    let server_node_id = r.server_node_id.context(
-        "The client requires a server node id (--server-node-id or server_node_id in the config).",
-    )?;
-    // Display-only in quick mode (no lock/socket/forwards paths are derived from
-    // it); computing it also validates the id shape up front.
-    let key = instance::instance_key(&server_node_id)?;
-
-    if r.auth_token.is_some() && r.auth_token_file.is_some() {
-        anyhow::bail!("Provide only one of auth_token or auth_token_file, not both");
-    }
-    let token = if let Some(token) = r.auth_token {
-        auth::validate_client_token(&token).context("Invalid authentication token")?;
-        token
-    } else if let Some(path) = r.auth_token_file {
-        auth::load_auth_token_from_file(&path, auth::CLIENT_TOKEN_PREFIX)
-            .context("Failed to load authentication token from file")?
-    } else {
-        anyhow::bail!(
-            "The client requires an authentication token.\n\
-             Use --auth-token <TOKEN>, --auth-token-file <FILE>, or set \
-             auth_token/auth_token_file in the config."
-        );
-    };
-
-    let endpoint = create_client_endpoint(&r.relay_urls)
-        .await
-        .context("Failed to create iroh endpoint")?;
-    log::info!("flextunnel client Node ID: {}", endpoint.id());
-
-    let socks_bind = r.socks_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p)));
-    let http_bind = r.http_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p)));
-
-    let client = ProxyClient::new(ClientConfig {
-        server_node_id: server_node_id.clone(),
-        auth_token: token,
-        socks_listen: socks_bind,
-        http_listen: http_bind,
-        relay_urls: r.relay_urls,
-        auto_reconnect: r.auto_reconnect,
-        max_reconnect_attempts: r.max_reconnect_attempts,
-    });
-    let routes = client.routes();
-
-    // Bind the enabled proxy front-ends before anything else can take the ports.
-    let listeners = async {
-        let socks = match socks_bind {
-            Some(addr) => Some(bind_local(addr, "SOCKS").await?),
-            None => None,
-        };
-        let http = match http_bind {
-            Some(addr) => Some(bind_local(addr, "HTTP").await?),
-            None => None,
-        };
-        anyhow::Ok((socks, http))
-    };
-    let (socks_listener, http_listener) = match listeners.await {
-        Ok(listeners) => listeners,
-        Err(e) => {
-            endpoint.close().await;
-            return Err(e);
-        }
-    };
-    let socks_addr = local_addr(&socks_listener);
-    let http_addr = local_addr(&http_listener);
-
-    // Forwards are ephemeral: none are loaded, none are saved (see `persist`).
-    // They can still be added/edited live in the panel, in memory only.
-    let mut forwards: Vec<PortForward> = Vec::new();
-    let mut fwd_mgr = ForwardManager::new(
-        tokio::runtime::Handle::current(),
-        client.server_forwarder(),
-        &forwards,
-    );
-
-    // In-process control channel to the panel — no socket is exposed, so
-    // `flextunnel client control` cannot attach to a quick session.
-    let (ipc_tx, mut ipc_rx) = mpsc::channel(8);
-
-    let mut state = SessionState {
-        instance: key,
-        name: r.name,
-        server_node_id,
-        client_node_id: endpoint.id().to_string(),
-        socks_addr,
-        http_addr,
-        ever_connected: false,
-        connected_since: None,
-        last_error: None,
-        disabled_reasons: HashMap::new(),
-        persist: false,
-    };
-
-    // Seed the panel with a first snapshot before it takes over the terminal.
-    // The panel runs a blocking ratatui loop on a dedicated thread and owns the
-    // only command sender: when the user quits, that sender drops, so the
-    // channel closes (`recv` yields `None`) — the disconnect signal below.
-    let initial = state.snapshot(&client, &routes, &forwards, &fwd_mgr);
-    let panel = tokio::task::spawn_blocking(move || crate::tui::run_quick_panel(ipc_tx, initial));
-
-    let run = client.run_with_optional_listeners(&endpoint, socks_listener, http_listener);
-    tokio::pin!(run);
-    let mut ticker = tokio::time::interval(Duration::from_millis(500));
-
-    let res = loop {
-        tokio::select! {
-            res = &mut run => {
-                break res.map_err(|e| anyhow::anyhow!("Client error: {e}"));
-            }
-            _ = ticker.tick() => {
-                let failed = disable_failed_forwards(&mut forwards, &fwd_mgr.statuses());
-                if !failed.is_empty() {
-                    for (id, reason) in failed {
-                        log::warn!("Port forward disabled: {reason}");
-                        state.disabled_reasons.insert(id, reason);
-                    }
-                    fwd_mgr.apply(&forwards);
-                }
-                state.observe_connection(routes.lock().map(|r| r.connected).unwrap_or(false));
-            }
-            cmd = ipc_rx.recv() => match cmd {
-                Some(IpcCmd::Status(reply)) => {
-                    let _ = reply.send(state.snapshot(&client, &routes, &forwards, &fwd_mgr));
-                }
-                Some(IpcCmd::Mutate(mutation, reply)) => {
-                    let result = state
-                        .apply_mutation(mutation, &mut forwards, &mut fwd_mgr)
-                        .map(|()| state.snapshot(&client, &routes, &forwards, &fwd_mgr));
-                    let _ = reply.send(result);
-                }
-                // The panel dropped its sender (the user quit): disconnect.
-                None => break Ok(()),
-            },
-            sig = app::shutdown_signal() => {
-                if sig.is_ok() {
-                    log::info!("Received shutdown signal, stopping client");
-                }
-                break sig;
-            }
-        }
-    };
-
-    // Close the channel so a panel still waiting on a reply (or issuing its next
-    // request) unblocks and exits, tear down forwards + endpoint gracefully,
-    // then join the panel so the terminal is always restored.
+    // Close the channel so a quick panel still waiting on a reply (or issuing
+    // its next request) unblocks and exits, tear down forwards and the control
+    // socket, then close the endpoint gracefully before it is dropped (an
+    // ungraceful drop aborts iroh's relay tasks, fatal under panic=abort).
+    // Finally join the panel (if any) so the terminal is always restored.
     drop(ipc_rx);
     drop(fwd_mgr);
+    let panel = match sink {
+        IpcSink::Socket(guard) => {
+            drop(guard);
+            None
+        }
+        IpcSink::Panel(panel) => Some(panel),
+    };
     endpoint.close().await;
-    let _ = panel.await;
+    if let Some(panel) = panel {
+        let _ = panel.await;
+    }
     res
 }
 
