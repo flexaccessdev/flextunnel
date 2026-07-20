@@ -26,9 +26,8 @@ auth_token = "ftaXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 # auth_token_file = "/etc/flextunnel/agent_token.txt"
 
 # Optional iroh tuning.
-# relay_urls = ["https://relay.example"]   # custom relay(s) for failover; a custom relay
-                                          # doubles as the rendezvous point, so iroh peer
-                                          # discovery is disabled automatically when set
+# relay_urls = ["https://relay.example"]   # custom relay(s) for failover; iroh peer
+                                          # discovery remains enabled
 
 # Reconnect behavior (mirrors the client). Defaults to reconnecting with backoff.
 # auto_reconnect = true

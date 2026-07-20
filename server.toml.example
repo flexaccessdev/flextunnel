@@ -21,9 +21,8 @@ auth_tokens = ["ftcXXXXXXX"]
 # agent_auth_tokens_file = "/etc/flextunnel/agent_auth_tokens.txt"
 
 # Optional iroh tuning.
-# relay_urls = ["https://relay.example"]   # custom relay(s) for failover; a custom relay
-                                          # doubles as the rendezvous point, so iroh peer
-                                          # discovery is disabled automatically when set
+# relay_urls = ["https://relay.example"]   # custom relay(s) for failover; iroh peer
+                                          # discovery remains enabled
 
 # Optional INBOUND bridging: allow other flextunnel servers to bridge INTO this
 # server (the inbound counterpart to the [bridges.*] OUTBOUND routes at the
