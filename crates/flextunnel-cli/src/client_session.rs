@@ -24,7 +24,7 @@ use flextunnel_core::{app, auth, config};
 
 use crate::ipc::{
     self, ForwardRow, ForwardRowState, IpcCmd, Mutation, Phase, StatusSnapshot, WireBridge,
-    WireConnPath, WireForward, WireRoutes,
+    WireConnPath, WireConnSnapshot, WireCustomRelay, WireForward, WireRoutes,
 };
 use crate::{forwards as store, instance, lock};
 
@@ -266,7 +266,7 @@ async fn drive_session(
     } = runtime;
 
     let (ipc_tx, mut ipc_rx) = mpsc::channel(8);
-    let initial = state.snapshot(&client, &routes, &forwards, &fwd_mgr);
+    let initial = state.snapshot(&routes, &forwards, &fwd_mgr);
     // Any failure past endpoint creation must still close the endpoint
     // gracefully (fatal under panic=abort otherwise).
     let sink = match make_sink(ipc_tx, initial) {
@@ -306,12 +306,30 @@ async fn drive_session(
             }
             cmd = ipc_rx.recv() => match cmd {
                 Some(IpcCmd::Status(reply)) => {
-                    let _ = reply.send(state.snapshot(&client, &routes, &forwards, &fwd_mgr));
+                    let _ = reply.send(state.snapshot(&routes, &forwards, &fwd_mgr));
+                }
+                // On-demand connection snapshot: paths + custom-relay /healthz.
+                // Awaited here (never on the polled Status path) because the
+                // health probe does on-demand HTTP; ~3s worst case.
+                Some(IpcCmd::ConnPath(reply)) => {
+                    let snap = client.connection_snapshot().await;
+                    let _ = reply.send(WireConnSnapshot {
+                        paths: snap.paths.iter().map(wire_conn_path).collect(),
+                        custom_relays: snap
+                            .custom_relays
+                            .into_iter()
+                            .map(|r| WireCustomRelay {
+                                url: r.url,
+                                working: r.working,
+                                error: r.error,
+                            })
+                            .collect(),
+                    });
                 }
                 Some(IpcCmd::Mutate(mutation, reply)) => {
                     let result = state
                         .apply_mutation(mutation, &mut forwards, &mut fwd_mgr)
-                        .map(|()| state.snapshot(&client, &routes, &forwards, &fwd_mgr));
+                        .map(|()| state.snapshot(&routes, &forwards, &fwd_mgr));
                     let _ = reply.send(result);
                 }
                 None => {
@@ -418,7 +436,6 @@ impl SessionState {
 
     fn snapshot(
         &self,
-        client: &ProxyClient,
         routes: &std::sync::Arc<std::sync::Mutex<flextunnel_core::proxy::TunnelRoutes>>,
         forwards: &[PortForward],
         fwd_mgr: &ForwardManager,
@@ -436,7 +453,6 @@ impl SessionState {
             http_addr: self.http_addr,
             status_page_host: reserved::STATUS_HOST.to_string(),
             last_error: self.last_error.clone(),
-            conn_paths: client.conn_paths().iter().map(wire_conn_path).collect(),
             routes: wire_routes(routes),
             forwards: forwards
                 .iter()

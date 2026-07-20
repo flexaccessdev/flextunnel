@@ -49,6 +49,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Status,
+    /// On-demand connection-path + custom-relay-health snapshot (mirrors the
+    /// desktop modal / iOS sheet). Kept off the polled `Status` because the
+    /// custom-relay `/healthz` probe does on-demand HTTP.
+    ConnPath,
     AddForward { forward: WireForward },
     UpdateForward { forward: WireForward },
     DeleteForward { id: String },
@@ -61,6 +65,7 @@ pub enum Request {
 #[serde(tag = "resp", rename_all = "snake_case")]
 pub enum Response {
     Status(Box<StatusSnapshot>),
+    ConnPath(WireConnSnapshot),
     Error { message: String },
 }
 
@@ -115,10 +120,24 @@ pub struct StatusSnapshot {
     pub status_page_host: String,
     pub last_error: Option<String>,
     pub routes: WireRoutes,
-    /// Point-in-time snapshot of the QUIC connection's paths (empty while
-    /// disconnected).
-    pub conn_paths: Vec<WireConnPath>,
     pub forwards: Vec<ForwardRow>,
+}
+
+/// On-demand connection snapshot served for [`Request::ConnPath`]: the live iroh
+/// path(s) plus custom-relay `/healthz` health. Both are empty while the tunnel
+/// link is down.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct WireConnSnapshot {
+    pub paths: Vec<WireConnPath>,
+    pub custom_relays: Vec<WireCustomRelay>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WireCustomRelay {
+    pub url: String,
+    /// `Some(true)` = up (2xx), `Some(false)` = down, `None` = check not run.
+    pub working: Option<bool>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -180,6 +199,7 @@ pub struct ForwardRow {
 /// What a connection task asks of the client session loop.
 pub enum IpcCmd {
     Status(oneshot::Sender<StatusSnapshot>),
+    ConnPath(oneshot::Sender<WireConnSnapshot>),
     Mutate(Mutation, oneshot::Sender<Result<StatusSnapshot, String>>),
 }
 
@@ -380,6 +400,7 @@ pub fn blocking_request(tx: &mpsc::Sender<IpcCmd>, request: Request) -> Option<R
 /// place ([`build_cmd`]).
 enum PendingReply {
     Status(oneshot::Receiver<StatusSnapshot>),
+    ConnPath(oneshot::Receiver<WireConnSnapshot>),
     Mutate(oneshot::Receiver<Result<StatusSnapshot, String>>),
 }
 
@@ -387,6 +408,7 @@ impl PendingReply {
     async fn into_response(self) -> Option<Response> {
         Some(match self {
             PendingReply::Status(rx) => Response::Status(Box::new(rx.await.ok()?)),
+            PendingReply::ConnPath(rx) => Response::ConnPath(rx.await.ok()?),
             PendingReply::Mutate(rx) => reply_to_response(rx.await.ok()?),
         })
     }
@@ -394,6 +416,7 @@ impl PendingReply {
     fn blocking_into_response(self) -> Option<Response> {
         Some(match self {
             PendingReply::Status(rx) => Response::Status(Box::new(rx.blocking_recv().ok()?)),
+            PendingReply::ConnPath(rx) => Response::ConnPath(rx.blocking_recv().ok()?),
             PendingReply::Mutate(rx) => reply_to_response(rx.blocking_recv().ok()?),
         })
     }
@@ -411,6 +434,10 @@ fn build_cmd(request: Request) -> (IpcCmd, PendingReply) {
         Request::Status => {
             let (reply, rx) = oneshot::channel();
             (IpcCmd::Status(reply), PendingReply::Status(rx))
+        }
+        Request::ConnPath => {
+            let (reply, rx) = oneshot::channel();
+            (IpcCmd::ConnPath(reply), PendingReply::ConnPath(rx))
         }
         Request::AddForward { forward } => mutate_cmd(Mutation::Add(forward)),
         Request::UpdateForward { forward } => mutate_cmd(Mutation::Update(forward)),
@@ -614,11 +641,6 @@ mod tests {
                     cidrs: vec![],
                 }],
             },
-            conn_paths: vec![WireConnPath {
-                kind: "direct".into(),
-                display: "Direct 1.2.3.4:52186 (rtt 1ms)".into(),
-                selected: true,
-            }],
             forwards: vec![ForwardRow {
                 forward: wire_forward(),
                 state: ForwardRowState::Listening,
@@ -633,6 +655,7 @@ mod tests {
     fn wire_types_roundtrip() {
         for request in [
             Request::Status,
+            Request::ConnPath,
             Request::AddForward {
                 forward: wire_forward(),
             },
@@ -672,6 +695,20 @@ mod tests {
                 match cmd {
                     IpcCmd::Status(reply) => {
                         let _ = reply.send(snapshot());
+                    }
+                    IpcCmd::ConnPath(reply) => {
+                        let _ = reply.send(WireConnSnapshot {
+                            paths: vec![WireConnPath {
+                                kind: "direct".into(),
+                                display: "Direct 1.2.3.4:52186 (rtt 1ms)".into(),
+                                selected: true,
+                            }],
+                            custom_relays: vec![WireCustomRelay {
+                                url: "https://relay.example/".into(),
+                                working: Some(true),
+                                error: None,
+                            }],
+                        });
                     }
                     IpcCmd::Mutate(Mutation::Delete(id), reply) => {
                         let _ = reply.send(Err(format!("no forward with id {id:?}")));

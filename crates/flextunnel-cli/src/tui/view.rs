@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use crate::ipc::{ForwardRow, ForwardRowState, Phase, StatusSnapshot, WireRoutes};
+use crate::ipc::{ForwardRow, ForwardRowState, Phase, StatusSnapshot, WireConnSnapshot, WireRoutes};
 
 use super::form::{
     FIELD_ENABLED, FIELD_LABEL, FIELD_LOCAL_PORT, FIELD_REMOTE_HOST, FIELD_REMOTE_PORT, FormState,
@@ -21,25 +21,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let s = &app.snapshot;
 
     let header_lines = header_lines(s);
-    let paths_height = (s.conn_paths.len().max(1) + 2) as u16;
     let forwards_height = (s.forwards.len().max(1) + 2).min(12) as u16;
-    let [header_area, paths_area, routing_area, forwards_area, footer_area] =
-        Layout::vertical([
-            Constraint::Length(header_lines.len() as u16 + 2),
-            Constraint::Length(paths_height),
-            Constraint::Min(3),
-            Constraint::Length(forwards_height),
-            Constraint::Length(1),
-        ])
-        .areas(frame.area());
+    let [header_area, routing_area, forwards_area, footer_area] = Layout::vertical([
+        Constraint::Length(header_lines.len() as u16 + 2),
+        Constraint::Min(3),
+        Constraint::Length(forwards_height),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
 
     frame.render_widget(
         Paragraph::new(header_lines).block(titled_block("Connection")),
         header_area,
-    );
-    frame.render_widget(
-        Paragraph::new(conn_path_lines(s)).block(titled_block("Connection path")),
-        paths_area,
     );
 
     let routing = routing_lines(&s.routes, &s.status_page_host);
@@ -68,6 +61,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Mode::Normal => {}
         Mode::Form(form) => draw_form(frame, form),
         Mode::ConfirmDelete { name, .. } => draw_confirm(frame, name),
+        Mode::ConnPath(snapshot) => draw_conn_path(frame, snapshot),
     }
 }
 
@@ -148,20 +142,17 @@ fn header_lines(s: &StatusSnapshot) -> Vec<Line<'static>> {
     lines
 }
 
-fn conn_path_lines(s: &StatusSnapshot) -> Vec<Line<'static>> {
-    if s.conn_paths.is_empty() {
-        return vec![Line::from(Span::styled(
-            if s.phase == Phase::Connected {
-                "no path information"
-            } else {
-                "not connected"
-            },
+/// Lines for the on-demand connection-path overlay: the iroh path(s) and, when
+/// custom relays are configured, their `/healthz` health.
+fn conn_path_lines(snapshot: &WireConnSnapshot) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if snapshot.paths.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No path yet — the tunnel link is down or still establishing.",
             DIM,
-        ))];
-    }
-    s.conn_paths
-        .iter()
-        .map(|p| {
+        )));
+    } else {
+        for p in &snapshot.paths {
             let style = match p.kind.as_str() {
                 "direct" => Style::new().fg(Color::Green),
                 "relay" => Style::new().fg(Color::Yellow),
@@ -174,9 +165,47 @@ fn conn_path_lines(s: &StatusSnapshot) -> Vec<Line<'static>> {
                     Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
                 ));
             }
-            Line::from(spans)
-        })
-        .collect()
+            lines.push(Line::from(spans));
+        }
+    }
+
+    // Custom-relay health (empty with the default relays). /healthz is
+    // unauthenticated — it confirms the relay is up, not that a token is accepted.
+    if !snapshot.custom_relays.is_empty() {
+        lines.push(Line::default());
+        lines.push(section("Custom relays:".to_string()));
+        for relay in &snapshot.custom_relays {
+            let (style, status) = match relay.working {
+                Some(true) => (Style::new().fg(Color::Green), "working".to_string()),
+                Some(false) => (
+                    Style::new().fg(Color::Red),
+                    match &relay.error {
+                        Some(e) => format!("not working — {e}"),
+                        None => "not working".to_string(),
+                    },
+                ),
+                None => (DIM, "status unavailable".to_string()),
+            };
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {}  ", relay.url)),
+                Span::styled(format!("[{status}]"), style),
+            ]));
+        }
+    }
+    lines
+}
+
+/// The on-demand connection-path overlay (r refresh · Esc close), captured when
+/// opened — mirrors the desktop connection-path modal and the iOS sheet.
+fn draw_conn_path(frame: &mut Frame, snapshot: &WireConnSnapshot) {
+    let lines = conn_path_lines(snapshot);
+    let height = (lines.len() as u16 + 2).clamp(3, frame.area().height);
+    let area = centered(frame.area(), 74, height);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(titled_block("Connection path  (r refresh · Esc close)")),
+        area,
+    );
 }
 
 fn section(title: String) -> Line<'static> {
@@ -348,9 +377,12 @@ fn footer_line(app: &App) -> Line<'static> {
         ));
     }
     let hints = match app.mode {
-        Mode::Normal => "q quit · ↑/↓ select · space on/off · a add · e edit · d delete · [/] scroll",
+        Mode::Normal => {
+            "q quit · ↑/↓ select · space on/off · a add · e edit · d delete · p path · [/] scroll"
+        }
         Mode::Form(_) => "Tab/Shift-Tab field · space toggle enabled · Enter save · Esc cancel",
         Mode::ConfirmDelete { .. } => "y delete · n cancel",
+        Mode::ConnPath(_) => "r refresh · Esc close",
     };
     Line::from(Span::styled(hints, DIM))
 }
