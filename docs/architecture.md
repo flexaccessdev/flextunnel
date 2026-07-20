@@ -44,7 +44,7 @@ server.
 | `secret.rs` | server secret-key (iroh identity) generation and loading; prints the `EndpointId` |
 | `error.rs` | `ProxyError` (`Network`/`Config`/`Signaling`/`AuthenticationFailed`/`ConnectionLost`) + `is_recoverable()` |
 | `transport/mod.rs` | QUIC transport config, ALPN, heartbeat/liveness timing |
-| `transport/endpoint.rs` | iroh `Endpoint` creation (relay mode, peer discovery — auto-disabled with a custom relay), secret/relay helpers |
+| `transport/endpoint.rs` | iroh `Endpoint` creation (relay mode and always-on peer discovery), secret/relay helpers |
 | `proxy/signaling.rs` | length-prefixed `Hello`/`HelloResponse`, control frames, per-stream `Target` codec, `REP_*` codes |
 | `proxy/socks5.rs` | client-side RFC 1928: method negotiation + `CONNECT` parsing + replies |
 | `proxy/client.rs` | connect + auth + SOCKS5/HTTP listeners + split-tunnel routing + reconnect loop |

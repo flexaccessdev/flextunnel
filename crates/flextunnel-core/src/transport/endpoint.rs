@@ -77,9 +77,8 @@ fn print_relay_status(relay_urls: &[String], using_custom_relay: bool) {
 /// Create a base endpoint builder with common configuration.
 ///
 /// iroh peer discovery (the n0 discovery service — pkarr publishing + DNS-based
-/// lookup) is used only with the default relays. A custom relay doubles as the
-/// rendezvous point, so discovery is disabled automatically whenever one is
-/// configured. (This is iroh peer discovery, not real DNS resolution.)
+/// lookup) is always enabled, including when custom relays are configured.
+/// (This is iroh peer discovery, not real DNS resolution.)
 ///
 /// # Arguments
 /// * `relay_mode` - The relay mode to use.
@@ -91,8 +90,6 @@ fn create_endpoint_builder(
     secret_key: Option<&SecretKey>,
 ) -> Result<EndpointBuilder> {
     let transport_config = build_quic_transport_config()?;
-    // Check before `relay_mode` is moved into the builder below.
-    let using_custom_relay = !matches!(relay_mode, RelayMode::Default);
     // iroh 1.0 requires the crypto provider to be set explicitly on the
     // builder when starting from the `Empty` preset — the `tls-ring` feature
     // only makes the ring backend available, it does not wire it in.
@@ -101,19 +98,13 @@ fn create_endpoint_builder(
         .transport_config(transport_config)
         .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()));
 
-    if using_custom_relay {
-        // Custom relay doubles as the rendezvous point, so the n0 discovery
-        // service is unnecessary and is disabled automatically.
-        info!("Peer discovery disabled (custom relay in use)");
-    } else {
-        // Default n0 discovery: always resolve, but only publish when we have a
-        // persistent identity. An ephemeral endpoint (no secret) shouldn't
-        // advertise itself.
-        if secret_key.is_some() {
-            builder = builder.address_lookup(PkarrPublisher::n0_dns());
-        }
-        builder = builder.address_lookup(DnsAddressLookup::n0_dns());
+    // Always resolve through n0 discovery, but only publish when we have a
+    // persistent identity. An ephemeral endpoint (no secret) shouldn't
+    // advertise itself.
+    if secret_key.is_some() {
+        builder = builder.address_lookup(PkarrPublisher::n0_dns());
     }
+    builder = builder.address_lookup(DnsAddressLookup::n0_dns());
     // mDNS always enabled for local network discovery.
     builder = builder.address_lookup(MdnsAddressLookup::builder());
 
