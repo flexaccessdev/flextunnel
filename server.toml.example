@@ -21,8 +21,13 @@ auth_tokens = ["ftcXXXXXXX"]
 # agent_auth_tokens_file = "/etc/flextunnel/agent_auth_tokens.txt"
 
 # Optional iroh tuning.
-# relay_urls = ["https://relay.example"]   # custom relay(s) for failover; iroh peer
-                                          # discovery remains enabled
+# Custom relay(s) for failover. Configuring custom relays disables n0 internet
+# discovery (pkarr/DNS) — clients reach the server via relay hints instead; mDNS
+# local-network discovery stays on. relay_auth_token is an optional shared bearer
+# token sent to every custom relay's WebSocket upgrade; it is only valid with
+# custom relay_urls (rejected with the default iroh relays).
+# relay_urls = ["https://relay.example"]
+# relay_auth_token = "shared-relay-secret"
 
 # Optional INBOUND bridging: allow other flextunnel servers to bridge INTO this
 # server (the inbound counterpart to the [bridges.*] OUTBOUND routes at the

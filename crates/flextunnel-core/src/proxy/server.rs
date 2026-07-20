@@ -667,7 +667,7 @@ impl ProxyServer {
         // Log the selected path (relay/direct) and any later switch, for the
         // lifetime of this connection. Guard is dropped when `handle_connection`
         // returns (it outlives the awaited agent path too).
-        let _path_watcher = crate::transport::endpoint::watch_connection_paths(&connection);
+        let _path_watcher = crate::transport::paths::watch_connection_paths(&connection);
 
         // Control stream: read Hello. Kept open afterwards for heartbeats, so the
         // send/recv halves flow through to the heartbeat loop. Bounded so a peer

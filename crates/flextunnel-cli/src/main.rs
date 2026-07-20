@@ -31,7 +31,9 @@ use flextunnel_core::iroh::EndpointId;
 use flextunnel_core::proxy::{
     BridgeUpstream, BridgeUpstreamConfig, DnsForwarder, ProxyServer, ProxyServerParams, RoutedSet,
 };
-use flextunnel_core::transport::endpoint::{create_server_endpoint, secret_to_endpoint_id};
+use flextunnel_core::transport::endpoint::{
+    RelayConfig, create_server_endpoint, secret_to_endpoint_id,
+};
 use flextunnel_core::{auth, config, secret};
 
 #[derive(Parser)]
@@ -125,6 +127,9 @@ enum ServerAction {
         /// Custom relay server URL(s) for failover (repeatable).
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
+        /// Shared bearer token sent to every custom relay (custom relays only).
+        #[arg(long)]
+        relay_auth_token: Option<String>,
         /// Ephemeral one-off server: generate an in-memory identity + client
         /// token, full-tunnel all traffic, print the EndpointId/token, and exit
         /// if no client connects within 5 minutes. Nothing is persisted.
@@ -171,6 +176,9 @@ enum ClientAction {
         /// Custom relay server URL(s) for failover (repeatable).
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
+        /// Shared bearer token sent to every custom relay (custom relays only).
+        #[arg(long)]
+        relay_auth_token: Option<String>,
         /// Force auto-reconnect on (overrides `auto_reconnect = false` in the config).
         #[arg(long, conflicts_with = "no_auto_reconnect")]
         auto_reconnect: bool,
@@ -334,7 +342,7 @@ mod cli_tests {
 
     #[test]
     fn quick_server_config_is_full_tunnel_with_one_token() {
-        let (cli, endpoint_id, token) = quick_server_config(Vec::new());
+        let (cli, endpoint_id, token) = quick_server_config(Vec::new(), None);
         // The generated token is a valid client token, and it is the sole
         // accepted token in the ephemeral config.
         auth::validate_client_token(&token).expect("generated token must be valid");
@@ -453,6 +461,7 @@ async fn run_async(command: Command) -> Result<()> {
                     agent_auth_tokens,
                     agent_auth_tokens_file,
                     relay_urls,
+                    relay_auth_token,
                     quick,
                 },
         } => {
@@ -463,7 +472,7 @@ async fn run_async(command: Command) -> Result<()> {
                 // client connects within QUICK_IDLE_TIMEOUT. `--quick` conflicts
                 // with the config/secret/token flags (clap-enforced), so the
                 // ephemeral values are the whole configuration.
-                let (cli, endpoint_id, token) = quick_server_config(relay_urls);
+                let (cli, endpoint_id, token) = quick_server_config(relay_urls, relay_auth_token);
                 print_quick_server_bootstrap(&endpoint_id, &token);
                 return run_server(config::resolve_server(cli, None)?, Some(QUICK_IDLE_TIMEOUT))
                     .await;
@@ -477,6 +486,7 @@ async fn run_async(command: Command) -> Result<()> {
                 agent_auth_tokens_file,
                 agent_routes: None, // config-file only; no CLI flag
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
+                relay_auth_token,
                 host_aliases: None, // config-file only; no CLI flag
                 routed_domains: None, // config-file only; no CLI flag
                 routed_cidrs: None,   // config-file only; no CLI flag
@@ -499,6 +509,7 @@ async fn run_async(command: Command) -> Result<()> {
                     auth_token,
                     auth_token_file,
                     relay_urls,
+                    relay_auth_token,
                     auto_reconnect,
                     no_auto_reconnect,
                     max_reconnect_attempts,
@@ -524,6 +535,7 @@ async fn run_async(command: Command) -> Result<()> {
                 auth_token,
                 auth_token_file,
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
+                relay_auth_token,
                 auto_reconnect,
                 max_reconnect_attempts,
             };
@@ -583,7 +595,10 @@ const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// (`routed_domains = ["*"]`, `routed_cidrs = ["0.0.0.0/0", "::/0"]`). Returns
 /// the config plus the EndpointId and token to print. Nothing is written to
 /// disk. `--relay-url` stays compatible with `--quick`, so any relays are kept.
-fn quick_server_config(relay_urls: Vec<String>) -> (config::ServerConfig, EndpointId, String) {
+fn quick_server_config(
+    relay_urls: Vec<String>,
+    relay_auth_token: Option<String>,
+) -> (config::ServerConfig, EndpointId, String) {
     let (secret, endpoint_id) = secret::generate_ephemeral_secret();
     let token = auth::generate_client_token();
     let cli = config::ServerConfig {
@@ -592,6 +607,7 @@ fn quick_server_config(relay_urls: Vec<String>) -> (config::ServerConfig, Endpoi
         routed_domains: Some(vec!["*".to_string()]),
         routed_cidrs: Some(vec!["0.0.0.0/0".to_string(), "::/0".to_string()]),
         relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
+        relay_auth_token,
         ..Default::default()
     };
     (cli, endpoint_id, token)
@@ -795,7 +811,9 @@ async fn run_server(
         log::info!("Loaded {} bridge route(s)", bridges.len());
     }
 
-    let endpoint = create_server_endpoint(&r.relay_urls, secret_key)
+    let relay_config = RelayConfig::from_urls_with_token(&r.relay_urls, r.relay_auth_token.clone())
+        .context("Invalid relay configuration")?;
+    let endpoint = create_server_endpoint(&relay_config, secret_key)
         .await
         .context("Failed to create iroh endpoint")?;
 

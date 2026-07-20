@@ -27,7 +27,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 use tokio::sync::mpsc;
 
 use crate::instance;
-use crate::ipc::{IpcClient, IpcCmd, Request, Response, StatusSnapshot};
+use crate::ipc::{IpcClient, IpcCmd, Request, Response, StatusSnapshot, WireConnSnapshot};
 use form::{FIELD_ENABLED, FormState};
 
 /// The panel's transport to a client session: one request → one response,
@@ -72,6 +72,10 @@ enum Mode {
     Normal,
     Form(FormState),
     ConfirmDelete { id: String, name: String },
+    /// On-demand connection-path overlay: a point-in-time snapshot (paths +
+    /// custom-relay health) captured when opened, refreshable, not polled —
+    /// mirrors the desktop modal / iOS sheet.
+    ConnPath(WireConnSnapshot),
 }
 
 struct App {
@@ -147,6 +151,7 @@ fn request_snapshot(backend: &mut dyn ControlBackend, request: Request) -> Resul
     match backend.request(request)? {
         Response::Status(snapshot) => Ok(*snapshot),
         Response::Error { message } => anyhow::bail!("{message}"),
+        Response::ConnPath(_) => anyhow::bail!("unexpected conn-path response to a status request"),
     }
 }
 
@@ -193,6 +198,10 @@ impl App {
                         self.handle_confirm_key(key.code, backend)?;
                         false
                     }
+                    Mode::ConnPath(_) => {
+                        self.handle_conn_path_key(key.code, backend)?;
+                        false
+                    }
                 };
                 if quit {
                     return Ok(());
@@ -234,6 +243,7 @@ impl App {
                 Ok(None)
             }
             Response::Error { message } => Ok(Some(message)),
+            Response::ConnPath(_) => Ok(Some("unexpected conn-path response".to_string())),
         }
     }
 
@@ -283,9 +293,48 @@ impl App {
                     self.notice = self.mutate(backend, request)?;
                 }
             }
+            // On-demand connection-path + custom-relay-health overlay (not polled).
+            KeyCode::Char('p') => match self.request_conn_path(backend)? {
+                Ok(snapshot) => self.mode = Mode::ConnPath(snapshot),
+                Err(message) => self.notice = Some(message),
+            },
             _ => {}
         }
         Ok(false)
+    }
+
+    /// Fetch an on-demand connection snapshot. The outer `Result` is a transport
+    /// failure (ends the loop); the inner is a session-reported error to surface
+    /// as a footer notice.
+    fn request_conn_path(
+        &mut self,
+        backend: &mut dyn ControlBackend,
+    ) -> Result<std::result::Result<WireConnSnapshot, String>> {
+        Ok(match backend.request(Request::ConnPath)? {
+            Response::ConnPath(snapshot) => Ok(snapshot),
+            Response::Error { message } => Err(message),
+            Response::Status(_) => Err("unexpected status response".to_string()),
+        })
+    }
+
+    fn handle_conn_path_key(
+        &mut self,
+        code: KeyCode,
+        backend: &mut dyn ControlBackend,
+    ) -> Result<()> {
+        match code {
+            // Re-probe in place (paths + relay /healthz).
+            KeyCode::Char('r') => match self.request_conn_path(backend)? {
+                Ok(snapshot) => self.mode = Mode::ConnPath(snapshot),
+                Err(message) => {
+                    self.notice = Some(message);
+                    self.mode = Mode::Normal;
+                }
+            },
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.mode = Mode::Normal,
+            _ => {}
+        }
+        Ok(())
     }
 
     fn handle_form_key(

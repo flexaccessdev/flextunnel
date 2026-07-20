@@ -37,8 +37,13 @@ auth_token = "ftcXXXXXXX"
 # auth_token_file = "~/.config/flextunnel/token.txt"
 
 # Optional iroh tuning and reconnect behavior.
-# relay_urls = ["https://relay.example"]     # custom relay(s) for failover; iroh peer
-                                             # discovery remains enabled
+# Custom relay(s) for failover. Configuring custom relays disables n0 internet
+# discovery (pkarr/DNS) — the peer is reached via relay hints instead; mDNS
+# local-network discovery stays on. relay_auth_token is an optional shared bearer
+# token sent to every custom relay's WebSocket upgrade; it is only valid with
+# custom relay_urls (rejected with the default iroh relays).
+# relay_urls = ["https://relay.example"]
+# relay_auth_token = "shared-relay-secret"
 # auto_reconnect = true                      # default: true. set false to exit on first disconnect
 # max_reconnect_attempts = 10                # default: unlimited (omit for no cap)
 

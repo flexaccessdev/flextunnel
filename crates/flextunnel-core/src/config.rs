@@ -86,6 +86,9 @@ pub struct ServerConfig {
     pub agent_routes: Option<HashMap<String, AgentRoute>>,
     /// Custom relay URL(s) for failover.
     pub relay_urls: Option<Vec<String>>,
+    /// Shared bearer token sent to every custom relay's WebSocket upgrade. Only
+    /// valid with custom `relay_urls`; rejected with the default iroh relays.
+    pub relay_auth_token: Option<String>,
     /// Hostname aliases resolved on the server side: a requested host that
     /// matches a key is rewritten to its value (an IP or another hostname on the
     /// server's network) before connecting. Keeps the requested port. Lets a
@@ -153,6 +156,9 @@ pub struct ClientConfig {
     pub auth_token_file: Option<PathBuf>,
     /// Custom relay URL(s) for failover.
     pub relay_urls: Option<Vec<String>>,
+    /// Shared bearer token sent to every custom relay's WebSocket upgrade. Only
+    /// valid with custom `relay_urls`; rejected with the default iroh relays.
+    pub relay_auth_token: Option<String>,
     /// Reconnect with backoff on a transient drop (default true).
     pub auto_reconnect: Option<bool>,
     /// Cap on reconnect attempts between successful connections.
@@ -173,6 +179,9 @@ pub struct AgentConfig {
     pub auth_token_file: Option<PathBuf>,
     /// Custom relay URL(s) for failover.
     pub relay_urls: Option<Vec<String>>,
+    /// Shared bearer token sent to every custom relay's WebSocket upgrade. Only
+    /// valid with custom `relay_urls`; rejected with the default iroh relays.
+    pub relay_auth_token: Option<String>,
     /// Reconnect with backoff on a transient drop (default true).
     pub auto_reconnect: Option<bool>,
     /// Cap on reconnect attempts between successful connections.
@@ -192,6 +201,8 @@ pub struct ResolvedServer {
     /// matching, mapping an alias to an agent's machine id. See [`AgentRoute`].
     pub agent_routes: HashMap<String, String>,
     pub relay_urls: Vec<String>,
+    /// Shared bearer token for custom relays (custom relays only).
+    pub relay_auth_token: Option<String>,
     /// Server-side host aliases, keys lowercased for case-insensitive matching.
     pub host_aliases: HashMap<String, String>,
     /// Raw routed-set entries (parsed into a `RoutedSet` at startup).
@@ -225,6 +236,8 @@ pub struct ResolvedClient {
     pub auth_token: Option<String>,
     pub auth_token_file: Option<PathBuf>,
     pub relay_urls: Vec<String>,
+    /// Shared bearer token for custom relays (custom relays only).
+    pub relay_auth_token: Option<String>,
     pub auto_reconnect: bool,
     pub max_reconnect_attempts: Option<NonZeroU32>,
 }
@@ -235,6 +248,8 @@ pub struct ResolvedAgent {
     pub auth_token: Option<String>,
     pub auth_token_file: Option<PathBuf>,
     pub relay_urls: Vec<String>,
+    /// Shared bearer token for custom relays (custom relays only).
+    pub relay_auth_token: Option<String>,
     pub auto_reconnect: bool,
     pub max_reconnect_attempts: Option<NonZeroU32>,
 }
@@ -452,6 +467,7 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
         agent_auth_tokens_file: agent_auth_tokens_file.map(|p| expand_tilde(&p)),
         agent_routes,
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
+        relay_auth_token: cli.relay_auth_token.or(file.relay_auth_token),
         host_aliases,
         routed_domains: cli
             .routed_domains
@@ -532,6 +548,7 @@ pub fn resolve_client(cli: ClientConfig, file: Option<ClientConfig>) -> Resolved
         auth_token,
         auth_token_file: auth_token_file.map(|p| expand_tilde(&p)),
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
+        relay_auth_token: cli.relay_auth_token.or(file.relay_auth_token),
         auto_reconnect: cli.auto_reconnect.or(file.auto_reconnect).unwrap_or(true),
         max_reconnect_attempts: cli.max_reconnect_attempts.or(file.max_reconnect_attempts),
     }
@@ -553,6 +570,7 @@ pub fn resolve_agent(cli: AgentConfig, file: Option<AgentConfig>) -> ResolvedAge
         auth_token,
         auth_token_file: auth_token_file.map(|p| expand_tilde(&p)),
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
+        relay_auth_token: cli.relay_auth_token.or(file.relay_auth_token),
         auto_reconnect: cli.auto_reconnect.or(file.auto_reconnect).unwrap_or(true),
         max_reconnect_attempts: cli.max_reconnect_attempts.or(file.max_reconnect_attempts),
     }

@@ -6,6 +6,7 @@
 //! idle timeout, and a larger initial MTU.
 
 pub mod endpoint;
+pub mod paths;
 
 use anyhow::{Context, Result};
 use iroh::endpoint::QuicTransportConfig;

@@ -189,7 +189,7 @@ impl ProxyAgent {
     ) -> ProxyResult<()> {
         // Log the selected path (relay/direct) and any later switch, for the
         // lifetime of this connection. Guard is dropped when `serve` returns.
-        let _path_watcher = crate::transport::endpoint::watch_connection_paths(connection);
+        let _path_watcher = crate::transport::paths::watch_connection_paths(connection);
         let accept = accept_server_streams(connection);
         // Agents have no routes UI to update, so pass `None`.
         let heartbeat = client_heartbeat_loop(ctrl_send, ctrl_recv, None);

@@ -60,6 +60,11 @@ pub struct Profile {
     pub http_port: Option<u16>,
     #[serde(default)]
     pub relay_urls: Vec<String>,
+    /// Shared bearer token sent to every custom relay (custom relays only).
+    /// TODO(keychain): stored in the profile for now; move to the keychain when
+    /// all secrets migrate there (see the iOS roadmap note).
+    #[serde(default)]
+    pub relay_auth_token: Option<String>,
     #[serde(default)]
     pub forwards: Vec<PortForward>,
 }
@@ -383,10 +388,13 @@ mod tests {
             id: "00000000deadbeef".into(),
             name: "prod".into(),
             server_node_id: "node".into(),
-            auth_token: "token".into(),
+            // Distinctive sentinel so the leak-check assertions match the token
+            // *value* and don't collide with field names like `relay_auth_token`.
+            auth_token: "ftc-secret-authtok".into(),
             socks_port: Some(1085),
             http_port: Some(8081),
             relay_urls: vec!["https://relay.example".into()],
+            relay_auth_token: None,
             forwards: vec![PortForward {
                 id: "aaaa".into(),
                 label: "db".into(),
@@ -414,7 +422,7 @@ mod tests {
     #[test]
     fn token_never_serializes_in_profile() {
         let json = serde_json::to_string(&profile()).unwrap();
-        assert!(!json.contains("token"), "token leaked: {json}");
+        assert!(!json.contains("ftc-secret-authtok"), "token leaked: {json}");
         // `enabled` is runtime-only on forwards and must not leak either.
         assert!(!json.contains("enabled"), "enabled leaked: {json}");
     }
@@ -459,7 +467,10 @@ mod tests {
         export_profiles(&path, &[profile()]).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("\"id\""), "ids leaked into the export: {raw}");
-        assert!(!raw.contains("token"), "token leaked into the export: {raw}");
+        assert!(
+            !raw.contains("ftc-secret-authtok"),
+            "token leaked into the export: {raw}"
+        );
 
         let imported = import_profiles(&path).unwrap();
         assert_eq!(imported.len(), 1);
@@ -497,7 +508,10 @@ mod tests {
         let mut profiles = vec![profile()];
         save_dev_file(&path, &profiles).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("\"auth_token\": \"token\""), "token missing: {raw}");
+        assert!(
+            raw.contains("\"auth_token\": \"ftc-secret-authtok\""),
+            "token missing: {raw}"
+        );
 
         // Forward `enabled` is runtime-only: comes back off.
         profiles[0].forwards[0].enabled = false;

@@ -50,9 +50,12 @@ void flextunnel_init_logging(void);
  *
  * config_json : NUL-terminated UTF-8 JSON, e.g.
  *   {"server_node_id":"<id>","auth_token":"<token>",
- *    "socks_port":0,"relay_urls":[]}
+ *    "socks_port":0,"relay_urls":[],"relay_auth_token":null}
  *   socks_port is optional; null/omitted disables SOCKS5, while 0 requests an
- *   OS-assigned port (read it from the result JSON). The routed set
+ *   OS-assigned port (read it from the result JSON). relay_auth_token is
+ *   optional: a shared bearer token sent to every custom relay's WebSocket
+ *   upgrade; it is only valid with custom relay_urls (rejected with the default
+ *   iroh relays). The routed set
  *   is configured on the server and pushed to the client during the
  *   handshake, so the app sends no routed set of its own.
  * out_buf/out_len : caller buffer. On success receives {"socks_port":N|null};
@@ -139,13 +142,22 @@ int flextunnel_routes(const FlextunnelHandle *handle, char *out_buf, size_t out_
  * `ezvpn client status`:
  *   {"paths":[
  *     {"kind":"direct","display":"Direct 1.2.3.4:52186 (rtt 1ms)","selected":true},
- *     {"kind":"relay","display":"Relay https://relay.example/ (rtt 42ms)","selected":false}]}
+ *     {"kind":"relay","display":"Relay https://relay.example/ (rtt 42ms)","selected":false}],
+ *    "custom_relays":[
+ *     {"url":"https://relay.example/","working":true,"error":null}]}
  * A point-in-time snapshot of how the client currently reaches the server,
  * showing ALL discovered paths (not just the selected one). kind is "direct",
  * "relay", or "other" (forward-compatible catch-all); selected marks the path
- * iroh routes over right now. The array is EMPTY while disconnected (during a
- * drop/backoff or before the first connect), so only offer this once the tunnel
+ * iroh routes over right now. The paths array is EMPTY while disconnected (during
+ * a drop/backoff or before the first connect), so only offer this once the tunnel
  * link is up.
+ *
+ * custom_relays reports each configured custom relay's health from an on-demand
+ * GET of its /healthz endpoint (checked in parallel, only when this snapshot is
+ * requested). working is true on a 2xx, false when unreachable/timed-out/non-2xx,
+ * and null if the check could not run; error carries the failure detail. The
+ * array is empty when the default relays are used. /healthz is unauthenticated:
+ * it confirms the relay is up, not that a relay_auth_token is accepted.
  *
  * Returns 1 on success (full JSON written), 0 if out_buf was too small (the JSON
  * is truncated; retry larger), and -1 for a NULL handle. out_buf is always
