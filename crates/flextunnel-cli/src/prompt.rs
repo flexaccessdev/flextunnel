@@ -129,13 +129,11 @@ fn read_masked_raw() -> Result<String> {
                     .flush()
                     .context("Failed to write masked input")?;
             }
-            KeyCode::Backspace => {
-                if buf.pop().is_some() {
-                    erase(1);
-                    io::stdout()
-                        .flush()
-                        .context("Failed to write masked input")?;
-                }
+            KeyCode::Backspace if buf.pop().is_some() => {
+                erase(1);
+                io::stdout()
+                    .flush()
+                    .context("Failed to write masked input")?;
             }
             _ => {}
         }
