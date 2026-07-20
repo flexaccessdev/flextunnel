@@ -130,7 +130,7 @@ pub async fn run_quick(r: config::ResolvedClient) -> Result<()> {
 /// the forward manager + set, and the status/mutation state.
 struct SessionRuntime {
     endpoint: flextunnel_core::iroh::Endpoint,
-    client: ProxyClient,
+    client: std::sync::Arc<ProxyClient>,
     routes: std::sync::Arc<std::sync::Mutex<flextunnel_core::proxy::TunnelRoutes>>,
     socks_listener: Option<tokio::net::TcpListener>,
     http_listener: Option<tokio::net::TcpListener>,
@@ -163,7 +163,7 @@ async fn build_session(
     let socks_bind = r.socks_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p)));
     let http_bind = r.http_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p)));
 
-    let client = ProxyClient::new(ClientConfig {
+    let client = std::sync::Arc::new(ProxyClient::new(ClientConfig {
         server_node_id: server_node_id.clone(),
         auth_token: token,
         socks_listen: socks_bind,
@@ -172,7 +172,7 @@ async fn build_session(
         relay_auth_token: r.relay_auth_token,
         auto_reconnect: r.auto_reconnect,
         max_reconnect_attempts: r.max_reconnect_attempts,
-    });
+    }));
     let routes = client.routes();
 
     // Bind the enabled proxy front-ends before anything else can take the
@@ -309,21 +309,26 @@ async fn drive_session(
                     let _ = reply.send(state.snapshot(&routes, &forwards, &fwd_mgr));
                 }
                 // On-demand connection snapshot: paths + custom-relay /healthz.
-                // Awaited here (never on the polled Status path) because the
-                // health probe does on-demand HTTP; ~3s worst case.
+                // Off-loaded to a task (never on the polled Status path, and
+                // never awaited in-loop) because the health probe does on-demand
+                // HTTP; ~3s worst case would otherwise stall the client run,
+                // ticker, and shutdown futures this select is also driving.
                 Some(IpcCmd::ConnPath(reply)) => {
-                    let snap = client.connection_snapshot().await;
-                    let _ = reply.send(WireConnSnapshot {
-                        paths: snap.paths.iter().map(wire_conn_path).collect(),
-                        custom_relays: snap
-                            .custom_relays
-                            .into_iter()
-                            .map(|r| WireCustomRelay {
-                                url: r.url,
-                                working: r.working,
-                                error: r.error,
-                            })
-                            .collect(),
+                    let client = std::sync::Arc::clone(&client);
+                    tokio::spawn(async move {
+                        let snap = client.connection_snapshot().await;
+                        let _ = reply.send(WireConnSnapshot {
+                            paths: snap.paths.iter().map(wire_conn_path).collect(),
+                            custom_relays: snap
+                                .custom_relays
+                                .into_iter()
+                                .map(|r| WireCustomRelay {
+                                    url: r.url,
+                                    working: r.working,
+                                    error: r.error,
+                                })
+                                .collect(),
+                        });
                     });
                 }
                 Some(IpcCmd::Mutate(mutation, reply)) => {

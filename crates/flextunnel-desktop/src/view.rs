@@ -165,7 +165,7 @@ fn conn_path_modal(snapshot: &ConnectionSnapshot) -> Element<'_, Message> {
 
     if snapshot.paths.is_empty() {
         card = card.push(
-            text("No path yet — still establishing. Close this and try again in a moment.")
+            text("No path available — close this and try again in a moment.")
                 .size(12)
                 .style(style::dim_text),
         );
@@ -213,14 +213,14 @@ fn conn_path_modal(snapshot: &ConnectionSnapshot) -> Element<'_, Message> {
 /// (down, with the error), or `None` (the check could not run).
 fn custom_relay_row(relay: &CustomRelayStatus) -> Element<'_, Message> {
     let (color, status) = match relay.working {
-        Some(true) => (GREEN, "Working".to_string()),
+        Some(true) => (GREEN, "Reachable".to_string()),
         Some(false) => (
             RED,
             relay
                 .error
                 .clone()
-                .map(|e| format!("Not working — {e}"))
-                .unwrap_or_else(|| "Not working".to_string()),
+                .map(|e| format!("Unreachable — {e}"))
+                .unwrap_or_else(|| "Unreachable".to_string()),
         ),
         None => (GRAY, "Status unavailable".to_string()),
     };

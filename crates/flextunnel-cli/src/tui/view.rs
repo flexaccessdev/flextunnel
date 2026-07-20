@@ -176,12 +176,12 @@ fn conn_path_lines(snapshot: &WireConnSnapshot) -> Vec<Line<'static>> {
         lines.push(section("Custom relays:".to_string()));
         for relay in &snapshot.custom_relays {
             let (style, status) = match relay.working {
-                Some(true) => (Style::new().fg(Color::Green), "working".to_string()),
+                Some(true) => (Style::new().fg(Color::Green), "reachable".to_string()),
                 Some(false) => (
                     Style::new().fg(Color::Red),
                     match &relay.error {
-                        Some(e) => format!("not working — {e}"),
-                        None => "not working".to_string(),
+                        Some(e) => format!("unreachable — {e}"),
+                        None => "unreachable".to_string(),
                     },
                 ),
                 None => (DIM, "status unavailable".to_string()),
@@ -199,7 +199,7 @@ fn conn_path_lines(snapshot: &WireConnSnapshot) -> Vec<Line<'static>> {
 /// opened — mirrors the desktop connection-path modal and the iOS sheet.
 fn draw_conn_path(frame: &mut Frame, snapshot: &WireConnSnapshot) {
     let lines = conn_path_lines(snapshot);
-    let height = (lines.len() as u16 + 2).clamp(3, frame.area().height);
+    let height = (lines.len() as u16 + 2).clamp(3, frame.area().height.max(3));
     let area = centered(frame.area(), 74, height);
     frame.render_widget(Clear, area);
     frame.render_widget(
