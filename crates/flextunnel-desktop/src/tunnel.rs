@@ -11,7 +11,8 @@
 use crate::config::Profile;
 use flextunnel_core::forwards::{ForwardManager, ForwardStatus, PortForward};
 use flextunnel_core::proxy::{ClientConfig, ProxyClient, TunnelRoutes};
-use flextunnel_core::transport::endpoint::{create_client_endpoint, ConnPath};
+use flextunnel_core::transport::endpoint::{RelayConfig, create_client_endpoint};
+use flextunnel_core::transport::paths::ConnectionSnapshot;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -21,10 +22,11 @@ use tokio::sync::mpsc;
 pub type ProfileId = String;
 
 /// Bound on the GUI thread's wait for a connection-path reply (see
-/// [`Controller::query_conn_path`]). Generous versus the sub-millisecond happy
-/// path — it exists only to fail open (empty result) rather than hang if a
-/// session stalls.
-const CONN_PATH_TIMEOUT: Duration = Duration::from_secs(2);
+/// [`Controller::query_conn_path`]). Must exceed the custom-relay `/healthz`
+/// probe budget (relays checked in parallel, ~3s worst case) the session now
+/// awaits before replying; it exists to fail open (empty result) rather than
+/// hang if a session stalls.
+const CONN_PATH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
@@ -83,7 +85,7 @@ enum Command {
     /// answered on the reply channel (the UI's connection-path CTA). Empty when
     /// no session is running. A `std` channel (not tokio `oneshot`) so the GUI
     /// caller can wait with a bounded [`std::sync::mpsc::Receiver::recv_timeout`].
-    QueryConnPath(ProfileId, std::sync::mpsc::Sender<Vec<ConnPath>>),
+    QueryConnPath(ProfileId, std::sync::mpsc::Sender<ConnectionSnapshot>),
     Shutdown,
 }
 
@@ -91,7 +93,7 @@ enum SessionCmd {
     Disconnect,
     SetForwards(Vec<PortForward>),
     /// Answer the reply channel with the live connection's path snapshot, once.
-    QueryConnPath(std::sync::mpsc::Sender<Vec<ConnPath>>),
+    QueryConnPath(std::sync::mpsc::Sender<ConnectionSnapshot>),
     Shutdown,
 }
 
@@ -174,14 +176,14 @@ impl Controller {
     /// hop (normally sub-millisecond), but the deadline is what guarantees a
     /// wedged session can never freeze the GUI thread calling this from
     /// `App::update`.
-    pub fn query_conn_path(&self, id: &str) -> Vec<ConnPath> {
+    pub fn query_conn_path(&self, id: &str) -> ConnectionSnapshot {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         if self
             .tx
             .blocking_send(Command::QueryConnPath(id.into(), reply_tx))
             .is_err()
         {
-            return Vec::new();
+            return ConnectionSnapshot::default();
         }
         reply_rx.recv_timeout(CONN_PATH_TIMEOUT).unwrap_or_default()
     }
@@ -398,9 +400,23 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
     // bound endpoint without `close()`, which is fatal under panic=abort (see
     // the CLI's run_client); on a stop the task finishes on its own and the
     // endpoint is closed gracefully.
+    let relay_config = match RelayConfig::from_urls_with_token(
+        &profile.relay_urls,
+        profile.relay_auth_token.clone(),
+    ) {
+        Ok(relay_config) => relay_config,
+        Err(e) => {
+            log::error!("Invalid relay configuration: {e:#}");
+            slot.update(|s| {
+                s.phase = Phase::Failed;
+                s.last_error = Some(format!("{e:#}"));
+            });
+            return;
+        }
+    };
     let mut create = tokio::spawn({
-        let relay_urls = profile.relay_urls.clone();
-        async move { create_client_endpoint(&relay_urls).await }
+        let relay_config = relay_config.clone();
+        async move { create_client_endpoint(&relay_config).await }
     });
     let endpoint = loop {
         tokio::select! {
@@ -438,7 +454,7 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
                 Some(SessionCmd::SetForwards(f)) => forwards = f,
                 // No connection yet during endpoint creation — report none.
                 Some(SessionCmd::QueryConnPath(reply)) => {
-                    let _ = reply.send(Vec::new());
+                    let _ = reply.send(ConnectionSnapshot::default());
                 }
                 Some(SessionCmd::Shutdown) | None => {
                     // Bounded grace so quitting stays responsive: close
@@ -467,6 +483,7 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
         socks_listen: socks_addr,
         http_listen: http_addr,
         relay_urls: profile.relay_urls.clone(),
+        relay_auth_token: profile.relay_auth_token.clone(),
         auto_reconnect: true,
         max_reconnect_attempts: None,
     });
@@ -563,7 +580,7 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
                     refresh_forward_statuses(&slot, &fwd_mgr);
                 }
                 Some(SessionCmd::QueryConnPath(reply)) => {
-                    let _ = reply.send(client.conn_paths());
+                    let _ = reply.send(client.connection_snapshot().await);
                 }
                 Some(SessionCmd::Shutdown) | None => {
                     slot.update(|s| s.phase = Phase::Idle);

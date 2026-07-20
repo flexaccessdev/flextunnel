@@ -12,7 +12,7 @@ use crate::style::{self, AMBER, GRAY, GREEN, RED};
 use crate::tunnel::{Phase, Snapshot};
 use flextunnel_core::proxy::signaling::Target;
 use flextunnel_core::proxy::{reserved, AgentConnState, RoutedSet, TunnelRoutes};
-use flextunnel_core::transport::endpoint::{ConnPath, ConnPathKind};
+use flextunnel_core::transport::paths::{ConnPathKind, ConnectionSnapshot, CustomRelayStatus};
 use iced::widget::{
     button, center, checkbox, column, container, mouse_area, opaque, pick_list, row, scrollable,
     space, stack, text, text_input, toggler,
@@ -118,7 +118,7 @@ fn phase_label(phase: Phase) -> &'static str {
 pub fn root(app: &App) -> Element<'_, Message> {
     let base = row![sidebar(app), detail_pane(app)];
     match &app.conn_path_modal {
-        Some(paths) => modal(base, conn_path_modal(paths)),
+        Some(snapshot) => modal(base, conn_path_modal(snapshot)),
         None => base.into(),
     }
 }
@@ -146,7 +146,7 @@ fn modal<'a>(
 /// The connection-path modal card: a point-in-time snapshot of how the profile
 /// reaches the server, each path dotted by transport (direct/relay) with the
 /// active one pilled — mirrors `ezvpn client status`.
-fn conn_path_modal(paths: &[ConnPath]) -> Element<'_, Message> {
+fn conn_path_modal(snapshot: &ConnectionSnapshot) -> Element<'_, Message> {
     let mut card = column![
         row![
             text("Connection path").size(15).font(semibold()),
@@ -163,14 +163,14 @@ fn conn_path_modal(paths: &[ConnPath]) -> Element<'_, Message> {
     ]
     .spacing(10);
 
-    if paths.is_empty() {
+    if snapshot.paths.is_empty() {
         card = card.push(
             text("No path yet — still establishing. Close this and try again in a moment.")
                 .size(12)
                 .style(style::dim_text),
         );
     } else {
-        for path in paths {
+        for path in &snapshot.paths {
             let color = match path.kind {
                 ConnPathKind::Direct => GREEN,
                 ConnPathKind::Relay => AMBER,
@@ -186,11 +186,52 @@ fn conn_path_modal(paths: &[ConnPath]) -> Element<'_, Message> {
         }
     }
 
+    // Custom-relay health, from an on-demand /healthz probe. Empty with the
+    // default iroh relays. /healthz is unauthenticated — it confirms the relay
+    // is up, not that a relay auth token is accepted.
+    if !snapshot.custom_relays.is_empty() {
+        card = card.push(
+            text("Custom relays")
+                .size(12)
+                .font(semibold())
+                .style(style::dim_text),
+        );
+        for relay in &snapshot.custom_relays {
+            card = card.push(custom_relay_row(relay));
+        }
+    }
+
     container(card)
         .padding([16, 18])
         .max_width(480)
         .style(style::card)
         .into()
+}
+
+/// One custom relay's health row: its URL plus a colored status derived from the
+/// on-demand `/healthz` probe — `working` is `Some(true)` (up), `Some(false)`
+/// (down, with the error), or `None` (the check could not run).
+fn custom_relay_row(relay: &CustomRelayStatus) -> Element<'_, Message> {
+    let (color, status) = match relay.working {
+        Some(true) => (GREEN, "Working".to_string()),
+        Some(false) => (
+            RED,
+            relay
+                .error
+                .clone()
+                .map(|e| format!("Not working — {e}"))
+                .unwrap_or_else(|| "Not working".to_string()),
+        ),
+        None => (GRAY, "Status unavailable".to_string()),
+    };
+    column![
+        row![dot(color, 7.0), mono(relay.url.clone())]
+            .spacing(8)
+            .align_y(Center),
+        text(status).size(11).color(color),
+    ]
+    .spacing(3)
+    .into()
 }
 
 // ---------------------------------------------------------------------------
@@ -879,6 +920,16 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
                 &form.relay_urls,
                 Message::RelayUrlsChanged,
             ),
+        ),
+        form_row(
+            "Relay auth token",
+            input(
+                "optional, custom relays only",
+                &form.relay_auth_token,
+                Message::RelayAuthTokenChanged,
+            )
+            .secure(true)
+            .width(240),
         ),
     ]
     .spacing(10);

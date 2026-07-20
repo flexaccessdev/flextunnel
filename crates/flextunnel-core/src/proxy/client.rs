@@ -5,7 +5,8 @@
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::signaling::{self, ControlMsg, Hello, Target};
 use crate::proxy::{dial, http, reserved, socks5, RoutedSet};
-use crate::transport::endpoint::{connection_paths, ConnPath};
+use crate::transport::endpoint::RelayConfig;
+use crate::transport::paths::{connection_paths, ConnPath, ConnectionSnapshot};
 use crate::transport::{HEARTBEAT_INTERVAL, LIVENESS_WINDOW};
 use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -113,8 +114,11 @@ pub struct ClientConfig {
     /// absolute-URI plain-HTTP forwarding). `None` leaves the HTTP front-end
     /// disabled.
     pub http_listen: Option<SocketAddr>,
-    /// Relay URL hints (optional).
+    /// Relay URL hints (optional). Empty selects the default iroh relays.
     pub relay_urls: Vec<String>,
+    /// Shared bearer token sent to every custom relay's WebSocket upgrade.
+    /// Only valid alongside custom `relay_urls`; ignored with the default relays.
+    pub relay_auth_token: Option<String>,
     /// Reconnect with backoff on a transient failure instead of exiting.
     pub auto_reconnect: bool,
     /// Cap on reconnect attempts between successful connections (unlimited if None).
@@ -381,6 +385,34 @@ impl ProxyClient {
             Some(conn) => connection_paths(conn),
             None => Vec::new(),
         }
+    }
+
+    /// Build a full connection snapshot — the iroh paths plus an on-demand
+    /// `/healthz` probe of each configured custom relay — for a status UI.
+    ///
+    /// Async because the relay health check performs on-demand HTTP; awaited when
+    /// a snapshot is built so it never blocks the runtime. Returns an empty
+    /// snapshot while disconnected (custom-relay health is only reported while the
+    /// tunnel is up, matching the paths list). The connection is cloned out from
+    /// under the std lock before the `.await`, so the lock is never held across it.
+    pub async fn connection_snapshot(&self) -> ConnectionSnapshot {
+        let conn = self
+            .current
+            .lock()
+            .expect("connection lock")
+            .as_ref()
+            .cloned();
+        let Some(conn) = conn else {
+            return ConnectionSnapshot::default();
+        };
+        // relay_urls were parse-validated at connect time; fall back to the
+        // default relays (no custom health) if they somehow don't re-parse.
+        let relay_config = RelayConfig::from_urls_with_token(
+            &self.config.relay_urls,
+            self.config.relay_auth_token.clone(),
+        )
+        .unwrap_or_default();
+        crate::transport::paths::connection_snapshot(&conn, &relay_config).await
     }
 
     /// A cloneable server-direct forwarding handle sharing this client's live
@@ -702,7 +734,7 @@ impl ProxyClient {
     ) -> ProxyResult<()> {
         // Log the selected path (relay/direct) and any later switch, for the
         // lifetime of this connection. Guard is dropped when `maintain` returns.
-        let _path_watcher = crate::transport::endpoint::watch_connection_paths(connection);
+        let _path_watcher = crate::transport::paths::watch_connection_paths(connection);
         tokio::select! {
             r = client_heartbeat_loop(ctrl_send, ctrl_recv, Some(self.routes.clone())) => r,
             reason = connection.closed() => Err(ProxyError::ConnectionLost(reason.to_string())),
@@ -1386,6 +1418,7 @@ mod tests {
             socks_listen: Some("127.0.0.1:0".parse().unwrap()),
             http_listen: None,
             relay_urls: Vec::new(),
+            relay_auth_token: None,
             auto_reconnect: true,
             max_reconnect_attempts: None,
         })

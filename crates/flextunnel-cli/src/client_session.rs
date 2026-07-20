@@ -18,7 +18,8 @@ use flextunnel_core::forwards::{
     validate_label, validate_remote_host,
 };
 use flextunnel_core::proxy::{ClientConfig, ProxyClient, reserved};
-use flextunnel_core::transport::endpoint::{ConnPath, ConnPathKind, create_client_endpoint};
+use flextunnel_core::transport::endpoint::{RelayConfig, create_client_endpoint};
+use flextunnel_core::transport::paths::{ConnPath, ConnPathKind};
 use flextunnel_core::{app, auth, config};
 
 use crate::ipc::{
@@ -152,7 +153,9 @@ async fn build_session(
     forwards: Vec<PortForward>,
     persist: bool,
 ) -> Result<SessionRuntime> {
-    let endpoint = create_client_endpoint(&r.relay_urls)
+    let relay_config = RelayConfig::from_urls_with_token(&r.relay_urls, r.relay_auth_token.clone())
+        .context("Invalid relay configuration")?;
+    let endpoint = create_client_endpoint(&relay_config)
         .await
         .context("Failed to create iroh endpoint")?;
     log::info!("flextunnel client Node ID: {}", endpoint.id());
@@ -166,6 +169,7 @@ async fn build_session(
         socks_listen: socks_bind,
         http_listen: http_bind,
         relay_urls: r.relay_urls,
+        relay_auth_token: r.relay_auth_token,
         auto_reconnect: r.auto_reconnect,
         max_reconnect_attempts: r.max_reconnect_attempts,
     });
@@ -789,6 +793,7 @@ mod tests {
             socks_listen: None,
             http_listen: None,
             relay_urls: Vec::new(),
+            relay_auth_token: None,
             auto_reconnect: false,
             max_reconnect_attempts: None,
         });

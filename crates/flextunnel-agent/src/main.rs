@@ -24,7 +24,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use flextunnel_core::proxy::{AgentConfig, ProxyAgent};
-use flextunnel_core::transport::endpoint::create_client_endpoint;
+use flextunnel_core::transport::endpoint::{RelayConfig, create_client_endpoint};
 use flextunnel_core::{app, auth, config};
 
 #[derive(Parser)]
@@ -59,6 +59,9 @@ enum Command {
         /// Custom relay server URL(s) for failover (repeatable).
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
+        /// Shared bearer token sent to every custom relay (custom relays only).
+        #[arg(long)]
+        relay_auth_token: Option<String>,
         /// Force auto-reconnect on (overrides `auto_reconnect = false` in the config).
         #[arg(long, conflicts_with = "no_auto_reconnect")]
         auto_reconnect: bool,
@@ -112,6 +115,7 @@ async fn run_async(command: Command) -> Result<()> {
             auth_token,
             auth_token_file,
             relay_urls,
+            relay_auth_token,
             auto_reconnect,
             no_auto_reconnect,
             max_reconnect_attempts,
@@ -129,6 +133,7 @@ async fn run_async(command: Command) -> Result<()> {
                 auth_token,
                 auth_token_file,
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
+                relay_auth_token,
                 auto_reconnect,
                 max_reconnect_attempts,
             };
@@ -177,8 +182,12 @@ async fn run_agent(r: config::ResolvedAgent) -> Result<()> {
     };
 
     // Ephemeral iroh identity (like the client): no persistent secret key. The
-    // agent is identified by its machine id, not its node id.
-    let endpoint = create_client_endpoint(&r.relay_urls)
+    // agent is identified by its machine id, not its node id. The relay auth
+    // token (if any) is carried by the endpoint's relay map, so the reverse-route
+    // hints in `AgentConfig` need only the URLs.
+    let relay_config = RelayConfig::from_urls_with_token(&r.relay_urls, r.relay_auth_token.clone())
+        .context("Invalid relay configuration")?;
+    let endpoint = create_client_endpoint(&relay_config)
         .await
         .context("Failed to create iroh endpoint")?;
     log::info!("flextunnel agent Node ID (ephemeral): {}", endpoint.id());

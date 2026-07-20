@@ -17,7 +17,7 @@ use crate::logging;
 use crate::tray::{self, Tray};
 use crate::tunnel::{Controller, Phase, ProfileId, Snapshot};
 use crate::view;
-use flextunnel_core::transport::endpoint::ConnPath;
+use flextunnel_core::transport::paths::ConnectionSnapshot;
 use iced::futures::Stream;
 use iced::{window, Element, Size, Subscription, Task};
 use std::collections::HashMap;
@@ -66,6 +66,7 @@ pub enum Message {
     HttpEnabledToggled(bool),
     HttpPortChanged(String),
     RelayUrlsChanged(String),
+    RelayAuthTokenChanged(String),
     ProfileFormSave,
     ProfileFormCancel,
     // Forwards
@@ -211,6 +212,7 @@ pub struct ProfileForm {
     pub http_enabled: bool,
     pub http_port: String,
     pub relay_urls: String,
+    pub relay_auth_token: String,
 }
 
 impl ProfileForm {
@@ -244,6 +246,7 @@ impl ProfileForm {
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| DEFAULT_HTTP_PORT.to_string()),
             relay_urls: profile.relay_urls.join(", "),
+            relay_auth_token: profile.relay_auth_token.clone().unwrap_or_default(),
         }
     }
 
@@ -308,13 +311,22 @@ impl ProfileForm {
         } else {
             None
         };
-        let relay_urls = self
+        let relay_urls: Vec<String> = self
             .relay_urls
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(String::from)
             .collect();
+        let relay_auth_token = {
+            let token = self.relay_auth_token.trim();
+            (!token.is_empty()).then(|| token.to_string())
+        };
+        // A relay token only applies to custom relays, so reject it with none set
+        // (mirrors the core `RelayConfig` guard and ezvpn-apple's form check).
+        if relay_auth_token.is_some() && relay_urls.is_empty() {
+            return Err("A relay auth token requires at least one relay URL".into());
+        }
         // Editing keeps the profile's forwards; the form doesn't touch them.
         let forwards = editing
             .and_then(|id| profiles.iter().find(|p| p.id == id))
@@ -328,6 +340,7 @@ impl ProfileForm {
             socks_port,
             http_port,
             relay_urls,
+            relay_auth_token,
             forwards,
         })
     }
@@ -482,7 +495,7 @@ pub struct App {
     pub notice: Option<String>,
     /// Open connection-path modal: a point-in-time path snapshot (`ezvpn
     /// status`-style), overlaid until dismissed. `None` when closed.
-    pub conn_path_modal: Option<Vec<ConnPath>>,
+    pub conn_path_modal: Option<ConnectionSnapshot>,
     /// Transient export/import result shown in the sidebar.
     pub io_notice: Option<String>,
     /// Setup-failure reason per forward id, retained after the failed forward
@@ -635,8 +648,8 @@ impl App {
                 // so it can't be mistaken for a live field and leaves the pane
                 // untouched.
                 if let Selection::Profile(id) = &self.selection {
-                    let paths = self.controller.query_conn_path(&id.clone());
-                    self.conn_path_modal = Some(paths);
+                    let snapshot = self.controller.query_conn_path(&id.clone());
+                    self.conn_path_modal = Some(snapshot);
                 }
                 Task::none()
             }
@@ -752,6 +765,12 @@ impl App {
             Message::RelayUrlsChanged(value) => {
                 if let Some(form) = &mut self.profile_form {
                     form.relay_urls = value;
+                }
+                Task::none()
+            }
+            Message::RelayAuthTokenChanged(value) => {
+                if let Some(form) = &mut self.profile_form {
+                    form.relay_auth_token = value;
                 }
                 Task::none()
             }
@@ -1199,6 +1218,7 @@ mod tests {
             http_enabled: false,
             http_port: "8080".into(),
             relay_urls: " https://a.example ,, https://b.example ".into(),
+            relay_auth_token: String::new(),
         }
     }
 
@@ -1233,6 +1253,7 @@ mod tests {
             socks_port: Some(socks_port),
             http_port: None,
             relay_urls: Vec::new(),
+            relay_auth_token: None,
             forwards,
         }
     }

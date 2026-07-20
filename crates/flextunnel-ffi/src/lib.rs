@@ -40,7 +40,8 @@
 //!   "server_node_id": "<iroh endpoint id>",
 //!   "auth_token": "<flextunnel auth token>",
 //!   "socks_port": null,
-//!   "relay_urls": ["https://relay.example/"]
+//!   "relay_urls": ["https://relay.example/"],
+//!   "relay_auth_token": null
 //! }
 //! ```
 //!
@@ -66,7 +67,8 @@ use flextunnel_core::proxy::signaling::Target;
 use flextunnel_core::proxy::{
     ClientConfig, ForwardManager, ForwardSpec, ForwardState, ProxyClient, TunnelRoutes,
 };
-use flextunnel_core::transport::endpoint::{ConnPathKind, create_client_endpoint};
+use flextunnel_core::transport::endpoint::{RelayConfig, create_client_endpoint};
+use flextunnel_core::transport::paths::ConnPathKind;
 
 /// Process-global guard enforcing **at most one** running proxy instance. A
 /// second [`flextunnel_start`] while one is live is rejected rather than racing.
@@ -103,6 +105,10 @@ struct FfiConfig {
     socks_port: Option<u16>,
     #[serde(default)]
     relay_urls: Vec<String>,
+    /// Shared bearer token sent to every custom relay's WebSocket upgrade. Only
+    /// valid with custom `relay_urls`; rejected with the default iroh relays.
+    #[serde(default)]
+    relay_auth_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -227,8 +233,10 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
         None => (None, None),
     };
 
+    let relay_config = RelayConfig::from_urls_with_token(&cfg.relay_urls, cfg.relay_auth_token.clone())
+        .map_err(|e| format!("invalid relay configuration: {e}"))?;
     let endpoint = runtime
-        .block_on(create_client_endpoint(&cfg.relay_urls))
+        .block_on(create_client_endpoint(&relay_config))
         .map_err(|e| format!("failed to create iroh endpoint: {e}"))?;
 
     let client = Arc::new(ProxyClient::new(ClientConfig {
@@ -239,6 +247,7 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
         // iOS exposes no HTTP front-end.
         http_listen: None,
         relay_urls: cfg.relay_urls,
+        relay_auth_token: cfg.relay_auth_token,
         auto_reconnect: true,
         max_reconnect_attempts: None,
     }));
@@ -559,9 +568,17 @@ pub unsafe extern "C" fn flextunnel_routes(
 /// This is a **point-in-time** snapshot of how the client currently reaches the
 /// server, showing *all* discovered paths (not just the selected one); `kind` is
 /// `"direct"`, `"relay"`, or `"other"` (a forward-compatible catch-all) and
-/// `selected` marks the path iroh routes over right now. The array is **empty**
-/// while disconnected (during a drop/backoff or before the first connect), so
-/// callers should only offer this once the tunnel link is up.
+/// `selected` marks the path iroh routes over right now. The `paths` array is
+/// **empty** while disconnected (during a drop/backoff or before the first
+/// connect), so callers should only offer this once the tunnel link is up.
+///
+/// `custom_relays` reports each configured custom relay's health from an
+/// on-demand GET of its `/healthz` endpoint (checked in parallel, only when this
+/// snapshot is requested). `working` is `true` on a 2xx, `false` when
+/// unreachable/timed-out/non-2xx, and `null` if the check could not run; `error`
+/// carries the failure detail. The array is empty when the default relays are
+/// used. `/healthz` is unauthenticated: it confirms the relay is up, not that a
+/// `relay_auth_token` is accepted.
 ///
 /// Returns `1` on success (full JSON written), `0` if `out_buf` was too small
 /// (the JSON is truncated; retry with a larger buffer), and `-1` for a null
@@ -583,9 +600,12 @@ pub unsafe extern "C" fn flextunnel_conn_path(
         return -1;
     }
     let handle = unsafe { &*handle };
-    let paths: Vec<_> = handle
-        .client
-        .conn_paths()
+    // The relay health check performs on-demand HTTP, so drive the async snapshot
+    // on the embedded runtime. Called from the app's own thread (never a runtime
+    // worker), so `block_on` is safe and does not stall the running tunnel task.
+    let snapshot = handle.runtime.block_on(handle.client.connection_snapshot());
+    let paths: Vec<_> = snapshot
+        .paths
         .into_iter()
         .map(|p| {
             let kind = match p.kind {
@@ -596,7 +616,13 @@ pub unsafe extern "C" fn flextunnel_conn_path(
             serde_json::json!({ "kind": kind, "display": p.display, "selected": p.selected })
         })
         .collect();
-    let json = serde_json::json!({ "paths": paths }).to_string();
+    let custom_relays: Vec<_> = snapshot
+        .custom_relays
+        .into_iter()
+        .map(|r| serde_json::json!({ "url": r.url, "working": r.working, "error": r.error }))
+        .collect();
+    let json =
+        serde_json::json!({ "paths": paths, "custom_relays": custom_relays }).to_string();
     if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
 }
 
