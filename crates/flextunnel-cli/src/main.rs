@@ -765,6 +765,12 @@ async fn run_server(
         );
     }
 
+    // Resolve the relay config once. Its URLs are installed on the endpoint and
+    // also attached as address hints when outbound bridges dial peer servers.
+    // The relay auth token remains endpoint-level state in the relay map.
+    let relay_config = RelayConfig::from_urls_with_token(&r.relay_urls, r.relay_auth_token.clone())
+        .context("Invalid relay configuration")?;
+
     // Outbound bridges: resolve each `[bridges.<name>]` entry (endpoint id,
     // token, rules) and reject rules the routed set never reaches — the server
     // rejects off-list targets before bridge routing, so such a rule is dead
@@ -802,6 +808,7 @@ async fn run_server(
             name: name.clone(),
             endpoint_id,
             auth_token,
+            relay_urls: relay_config.custom_urls().to_vec(),
             routed_set: bridge_routed_set,
             domains: b.domains.clone(),
             cidrs: b.cidrs.clone(),
@@ -811,8 +818,6 @@ async fn run_server(
         log::info!("Loaded {} bridge route(s)", bridges.len());
     }
 
-    let relay_config = RelayConfig::from_urls_with_token(&r.relay_urls, r.relay_auth_token.clone())
-        .context("Invalid relay configuration")?;
     let endpoint = create_server_endpoint(&relay_config, secret_key)
         .await
         .context("Failed to create iroh endpoint")?;

@@ -310,4 +310,42 @@ mod tests {
         // A domain that merely *looks* loopback-ish but isn't a loopback literal.
         assert!(!is_loopback_target(&Target::Domain("127.0.0.1.evil.com".into(), 80)));
     }
+
+    fn agent_with_relays(relay_urls: Vec<String>) -> ProxyAgent {
+        ProxyAgent::new(AgentConfig {
+            server_node_id: iroh::SecretKey::generate().public().to_string(),
+            machine_id: "ftm1-test".to_string(),
+            auth_token: "test-token".to_string(),
+            relay_urls,
+            auto_reconnect: false,
+            max_reconnect_attempts: None,
+        })
+    }
+
+    #[test]
+    fn server_addr_without_custom_relays_has_no_addressing_hints() {
+        let agent = agent_with_relays(Vec::new());
+
+        let addr = agent.resolve_server_addr().unwrap();
+
+        assert!(addr.is_empty());
+    }
+
+    #[test]
+    fn server_addr_includes_every_custom_relay() {
+        let relay_urls = vec![
+            "https://relay-b.example".to_string(),
+            "https://relay-a.example".to_string(),
+        ];
+        let mut expected = relay_urls
+            .iter()
+            .map(|url| url.parse::<RelayUrl>().unwrap())
+            .collect::<Vec<_>>();
+        let agent = agent_with_relays(relay_urls);
+
+        let addr = agent.resolve_server_addr().unwrap();
+
+        expected.sort();
+        assert_eq!(addr.relay_urls().cloned().collect::<Vec<_>>(), expected);
+    }
 }

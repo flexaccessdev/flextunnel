@@ -18,7 +18,7 @@ use crate::proxy::client::{calculate_backoff, client_heartbeat_loop, connect_wit
 use crate::proxy::signaling::{self, Hello};
 use crate::proxy::RoutedSet;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
 use rand::Rng;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -38,6 +38,10 @@ pub struct BridgeUpstreamConfig {
     pub endpoint_id: EndpointId,
     /// The `ftb` token presented in the bridge handshake.
     pub auth_token: String,
+    /// Relay hints for reaching the target server. These are the same custom
+    /// relay URLs installed on this server's endpoint; the relay PSK itself is
+    /// endpoint-level state and must not be copied into the peer address.
+    pub relay_urls: Vec<RelayUrl>,
     /// The bridge's rules parsed into a matcher: a target this set allows is
     /// forwarded over this bridge instead of dialed locally.
     pub routed_set: RoutedSet,
@@ -75,6 +79,24 @@ impl BridgeUpstream {
     /// Whether the upstream is authenticated and live right now.
     pub fn is_connected(&self) -> bool {
         self.conn.lock().expect("bridge conn lock").is_some()
+    }
+
+    /// Build the target address with the configured custom relays as hints.
+    /// Custom relay mode disables n0 internet discovery, so an endpoint id by
+    /// itself is not enough when the target is outside mDNS/direct reach.
+    fn target_addr(&self) -> EndpointAddr {
+        let mut addr = EndpointAddr::new(self.config.endpoint_id);
+        for relay_url in &self.config.relay_urls {
+            addr = addr.with_relay_url(relay_url.clone());
+        }
+        if !self.config.relay_urls.is_empty() {
+            log::info!(
+                "Bridge '{}': using {} relay hint(s)",
+                self.config.name,
+                self.config.relay_urls.len()
+            );
+        }
+        addr
     }
 
     /// Maintain the upstream forever: connect + authenticate, publish the
@@ -147,9 +169,7 @@ impl BridgeUpstream {
         &self,
         endpoint: &Endpoint,
     ) -> ProxyResult<(Connection, SendStream, RecvStream)> {
-        // No relay hints: a bridge target is configured by endpoint id alone;
-        // discovery + the default relays find it like any server.
-        let addr = EndpointAddr::new(self.config.endpoint_id);
+        let addr = self.target_addr();
         let connection = connect_with_timeout(endpoint, addr).await?;
         log::debug!(
             "Bridge '{}': connected to target server, authenticating...",
@@ -188,5 +208,47 @@ impl BridgeUpstream {
         // The target server pushes no routed set to a bridge (it re-enforces its
         // own set per stream); ignore any list fields.
         Ok((send, recv))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    fn bridge_with_relays(relay_urls: Vec<RelayUrl>) -> Arc<BridgeUpstream> {
+        BridgeUpstream::new(BridgeUpstreamConfig {
+            name: "test".to_string(),
+            endpoint_id: SecretKey::generate().public(),
+            auth_token: "test-token".to_string(),
+            relay_urls,
+            routed_set: RoutedSet::default(),
+            domains: Vec::new(),
+            cidrs: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn target_addr_without_custom_relays_has_no_addressing_hints() {
+        let bridge = bridge_with_relays(Vec::new());
+
+        let addr = bridge.target_addr();
+
+        assert_eq!(addr.id, bridge.config.endpoint_id);
+        assert!(addr.is_empty());
+    }
+
+    #[test]
+    fn target_addr_includes_every_custom_relay() {
+        let mut expected = vec![
+            "https://relay-b.example".parse::<RelayUrl>().unwrap(),
+            "https://relay-a.example".parse::<RelayUrl>().unwrap(),
+        ];
+        let bridge = bridge_with_relays(expected.clone());
+
+        let addr = bridge.target_addr();
+
+        expected.sort();
+        assert_eq!(addr.relay_urls().cloned().collect::<Vec<_>>(), expected);
     }
 }
