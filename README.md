@@ -375,7 +375,7 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `--auth-tokens-file <FILE>` | File of accepted client tokens, one per line. |
 | `--agent-auth-token <TOKEN>` | Accepted agent token (repeatable). Separate pool from clients. |
 | `--agent-auth-tokens-file <FILE>` | File of accepted agent tokens, one per line. |
-| `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). Configuring custom relays disables n0 internet discovery (clients reach the server via relay hints); mDNS local discovery stays on. |
+| `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). Configuring custom relays disables n0 internet discovery: clients and agents reach this server via relay hints, and outbound bridges attach the same hints when dialing peer servers. mDNS local discovery stays on. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
 | `--quick` | Ephemeral one-off server: mint an in-memory identity + client token, full-tunnel all traffic, print the EndpointId/token, and exit if no client connects within 5 minutes. Takes no single-instance lock; nothing is persisted. Conflicts with `-c`/`--secret-file`/`--auth-token(s)`. |
 

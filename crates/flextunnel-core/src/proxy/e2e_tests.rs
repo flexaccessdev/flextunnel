@@ -214,6 +214,7 @@ fn loopback_bridge(name: &str, target: iroh::EndpointId) -> Arc<BridgeUpstream> 
         name: name.to_string(),
         endpoint_id: target,
         auth_token: BRIDGE_TOKEN.to_string(),
+        relay_urls: Vec::new(),
         routed_set,
         domains: Vec::new(),
         cidrs,

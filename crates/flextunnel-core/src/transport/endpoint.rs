@@ -25,7 +25,7 @@ pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// stack (pkarr publishing + DNS resolution of the peer's home relay — see
 /// <https://docs.iroh.computer/concepts/address-lookup>), while
 /// [`Custom`](Self::Custom) uses the configured relays with n0 internet discovery
-/// disabled (clients reach the server through relay hints instead). mDNS
+/// disabled (clients, agents, and outbound bridges use relay hints instead). mDNS
 /// local-network discovery is independent of this and stays on in both modes.
 /// See "Relays and Address Lookup" in `docs/Architecture.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -179,9 +179,9 @@ fn print_relay_status(relay_config: &RelayConfig) {
 ///   (`secret_key`) is present, so an ephemeral client resolves peers but never
 ///   advertises itself.
 /// - [`RelayConfig::Custom`]: n0 internet discovery is disabled — nothing is
-///   published to or resolved from n0's public infrastructure. The client reaches
-///   the server through the configured relay hints it attaches to the server's
-///   `EndpointAddr` (see `ProxyClient::resolve_server_addr`): iroh sends QUIC
+///   published to or resolved from n0's public infrastructure. Dialers reach
+///   peer servers through configured relay hints attached to the peer's
+///   `EndpointAddr` (clients, agents, and outbound bridges all do this): iroh sends QUIC
 ///   Initials to every configured relay, so the handshake succeeds via whichever
 ///   relay the server is homed on.
 ///
@@ -312,7 +312,8 @@ async fn wait_online(endpoint: &Endpoint) -> Result<()> {
 /// A single endpoint serves both relay modes. With the default relays internet
 /// discovery is on, so the server publishes its current home relay and clients
 /// resolve it by endpoint ID. With custom relays discovery is off, so clients
-/// reach the server through the relay hints they attach to its `EndpointAddr`
+/// and agents reach the server through relay hints, while outbound bridges attach
+/// those same hints to their target `EndpointAddr`
 /// (see [`create_endpoint_builder`]).
 pub async fn create_server_endpoint(relay_config: &RelayConfig, secret: SecretKey) -> Result<Endpoint> {
     print_relay_status(relay_config);
