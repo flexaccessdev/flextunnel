@@ -12,6 +12,7 @@ use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Handle;
 use tokio::task::{JoinHandle, JoinSet};
@@ -49,6 +50,18 @@ struct ForwardShared {
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// First delay between listener rebind attempts while a forward's port is
+/// unavailable; doubles up to [`FORWARD_REBIND_MAX_BACKOFF`].
+const FORWARD_REBIND_BASE_BACKOFF: Duration = Duration::from_millis(250);
+/// Ceiling on the rebind backoff — keeps a forward whose port is held by
+/// another process from spinning while still reclaiming it promptly once free.
+const FORWARD_REBIND_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Backoff before the `attempt`-th (0-based) rebind retry.
+fn rebind_backoff(attempt: u32) -> Duration {
+    (FORWARD_REBIND_BASE_BACKOFF * (1u32 << attempt.min(5))).min(FORWARD_REBIND_MAX_BACKOFF)
 }
 
 struct ForwardTask {
@@ -162,8 +175,16 @@ async fn accept_on(listener: Option<&TcpListener>) -> io::Result<(TcpStream, Soc
 /// Classifies the error like the client's front-end loops: a broken listener
 /// (or an abort burst — the signature of a socket the OS defuncted underneath
 /// us, as iOS does on suspend) is rebound in place; transient failures back off
-/// and retry. A rebind failure leaves that listener dead and marks the forward
-/// [`ForwardState::Failed`]; a successful rebind restores [`ForwardState::Listening`].
+/// and retry.
+///
+/// Rebinding retries **until it succeeds**, marking the forward
+/// [`ForwardState::Failed`] while its port is unavailable and restoring
+/// [`ForwardState::Listening`] once rebound. Unlike the SOCKS5 front-end — whose
+/// accept loop ends the whole session on a rebind failure, so the embedder's
+/// health probe relaunches it — an individual forward has no session-level
+/// restart to fall back on. Giving up after a few attempts would leave it dead
+/// but still "enabled", recoverable only by toggling it off and on, which is
+/// exactly the stuck-forever symptom this avoids.
 async fn handle_accept_error(
     listener: &mut Option<TcpListener>,
     addr: SocketAddr,
@@ -177,17 +198,27 @@ async fn handle_accept_error(
             log::warn!("Forward localhost:{port} listener on {addr} is dead ({e}); rebinding");
             // Drop the dead socket first; it still owns the port.
             *listener = None;
-            match rebind_listener(addr).await {
-                Ok(rebound) => {
-                    *listener = Some(rebound);
-                    retry.record_rebind();
-                    log::info!("Forward localhost:{port} listener rebound on {addr}");
-                    *lock(&shared.state) = ForwardState::Listening;
-                }
-                Err(err) => {
-                    let reason = format!("listener on {addr} died and could not rebind: {err}");
-                    log::error!("Forward localhost:{port} {reason}");
-                    *lock(&shared.state) = ForwardState::Failed(reason);
+            let mut attempt: u32 = 0;
+            loop {
+                match rebind_listener(addr).await {
+                    Ok(rebound) => {
+                        *listener = Some(rebound);
+                        retry.record_rebind();
+                        log::info!("Forward localhost:{port} listener rebound on {addr}");
+                        *lock(&shared.state) = ForwardState::Listening;
+                        return;
+                    }
+                    Err(err) => {
+                        let reason = format!("listener on {addr} is down; retrying: {err}");
+                        if attempt == 0 {
+                            log::error!("Forward localhost:{port} {reason}");
+                        } else {
+                            log::debug!("Forward localhost:{port} {reason}");
+                        }
+                        *lock(&shared.state) = ForwardState::Failed(reason);
+                        tokio::time::sleep(rebind_backoff(attempt)).await;
+                        attempt = attempt.saturating_add(1);
+                    }
                 }
             }
         }
@@ -269,5 +300,52 @@ async fn run_forward(
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rebind_backoff_grows_and_caps() {
+        assert_eq!(rebind_backoff(0), FORWARD_REBIND_BASE_BACKOFF);
+        assert_eq!(rebind_backoff(1), FORWARD_REBIND_BASE_BACKOFF * 2);
+        // Doubling is clamped to the ceiling, and stays there for large attempts.
+        assert_eq!(rebind_backoff(5), FORWARD_REBIND_MAX_BACKOFF);
+        assert_eq!(rebind_backoff(50), FORWARD_REBIND_MAX_BACKOFF);
+    }
+
+    /// A dead listener whose port is momentarily held (e.g. the defunct socket
+    /// after iOS resume, or another process) must keep retrying and self-heal
+    /// once the port frees — never park permanently in `Failed`. This is the
+    /// regression guard for the stuck-until-toggled bug.
+    #[tokio::test]
+    async fn rebind_retries_until_the_port_frees() {
+        // Occupy an ephemeral loopback port so the first rebinds fail.
+        let occupier = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = occupier.local_addr().unwrap();
+
+        // Free the port shortly, after several rebind attempts have failed.
+        let freer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            drop(occupier);
+        });
+
+        let shared = ForwardShared {
+            state: Mutex::new(ForwardState::Listening),
+            active: AtomicUsize::new(0),
+            last_conn_error: Mutex::new(None),
+        };
+        let mut listener: Option<TcpListener> = None;
+        let mut retry = AcceptRetry::new("test");
+        // A non-abort error classifies as Broken → immediate Rebind outcome.
+        let err = io::Error::other("listener defunct");
+
+        handle_accept_error(&mut listener, addr, &mut retry, &err, addr.port(), &shared).await;
+
+        assert!(listener.is_some(), "listener should be rebound, not parked None");
+        assert_eq!(*lock(&shared.state), ForwardState::Listening);
+        freer.await.unwrap();
     }
 }
