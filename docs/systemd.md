@@ -2,9 +2,8 @@
 
 The CLI client is strictly **one process per server**: a `client.toml` holds a
 single `server_node_id`, and that id's prefix keys the client's on-disk
-identity — the single-instance lock, the control socket, and the persisted
-port forwards — so clients for different servers coexist with no extra
-configuration. The natural systemd shape for that is a **template unit**: one
+identity — the single-instance lock and the control socket — so clients for
+different servers coexist with no extra configuration. The natural systemd shape for that is a **template unit**: one
 `flextunnel-client@<name>` instance per server, each reading its own config
 file. (This mirrors what the desktop app does inside one process — one
 independent session per connected profile — the CLI just packages each session
@@ -91,10 +90,10 @@ have — each instance's profile is `<instance>.toml`. (Running it bare says so,
 and lists the profile files it found.) `-n <server EndpointId>` attaches
 without any config file.
 
-Detaching (`q`) never affects the tunnel. Port forwards edited there persist
-per server (`~/.config/flextunnel/forwards-<server id prefix>.json`) but
-always load **disabled**; enabling is a per-session action, so a unit restart
-comes up with all forwards off.
+Detaching (`q`) never affects the tunnel — the panel is read-only. Port
+forwards are declared in the instance's config (`[[forwards]]` tables) and come
+up with the unit; to change the set, edit the config and
+`systemctl --user restart flextunnel-client@<name>`.
 
 ## Duplicate configs
 

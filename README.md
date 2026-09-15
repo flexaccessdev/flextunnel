@@ -321,8 +321,8 @@ or another quick one), and both forget everything on exit.
 The quick client is **self-contained**: after the prompt it runs the same live
 panel as [`client control`](#client-control) right in that terminal — but it
 opens **no control socket** (nothing else can attach to it), and quitting the
-panel (`q`) **disconnects** the tunnel and exits, rather than detaching. Port
-forwards added in the panel live in memory only and are never written to disk.
+panel (`q`) **disconnects** the tunnel and exits, rather than detaching. A
+quick client reads no config, so it has no port forwards.
 
 #### Server status page
 
@@ -382,8 +382,8 @@ analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 | Command | Description |
 |---|---|
 | `server start` | Run the proxy server. |
-| `client start` | Run the proxy client (optional SOCKS5 and HTTP proxy listeners, port forwards). |
-| `client control` | Attach the terminal control panel to a running client. |
+| `client start` | Run the proxy client (optional SOCKS5 and HTTP proxy listeners, plus the port forwards declared in its config). |
+| `client control` | Attach the read-only terminal control panel to a running client. |
 | `client help` | Show the client subcommands and their help. |
 | `generate-iroh-key [-o <FILE>] [--force] [--json]` | Generate the server's iroh identity key (stdout without `-o`). |
 | `show-iroh-id --secret-file <FILE> [--json]` | Print the iroh id (EndpointId) for a key. |
@@ -431,17 +431,26 @@ runs the self-contained control panel described under [`client control`](#client
 right in that terminal — but with no control socket exposed, and quitting the
 panel disconnects instead of detaching. Nothing is saved.
 
+Port forwards are declared in the config as `[[forwards]]` tables (see
+[`client.toml.example`](client.toml.example)): each listens on
+`localhost:<local_port>` and opens a server-direct stream to
+`<remote_host>:<remote_port>` on the authenticated connection (the server
+enforces its routed set and resolves the host). They are validated at startup
+(nonzero ports, valid host, unique local ports) and all come up with the
+client. There is no CLI flag and nothing can be changed live: to change the
+set, edit the config and restart the client.
+
 With neither `--socks-port` nor `--http-port` (nor the config keys) the
 client runs in **port-forward-only mode**: it holds the tunnel and serves only
-the control panel and any enabled port forwards.
+the control panel and the port forwards.
 
-A client's on-disk identity — the single-instance lock, the control socket,
-and the persisted port forwards — is keyed by the prefix of its
-`server_node_id` (which never changes for a profile). So one client runs per
-server per user, and clients for different servers coexist without any extra
-configuration. The optional `name` key in the config ("aws", "home network")
-is a display-only label shown in the control panel. (A `--quick` client is
-exempt: it takes none of these — no lock, no socket, no forwards file.)
+A client's on-disk identity — the single-instance lock and the control
+socket — is keyed by the prefix of its `server_node_id` (which never changes
+for a profile). So one client runs per server per user, and clients for
+different servers coexist without any extra configuration. The optional `name`
+key in the config ("aws", "home network") is a display-only label shown in the
+control panel. (A `--quick` client is exempt: it takes neither — no lock, no
+socket.)
 
 ### `client control`
 
@@ -451,20 +460,19 @@ flextunnel client control -c aws.toml    # profile from a specific config
 flextunnel client control -n <ENDPOINT_ID>   # or by server id directly
 ```
 
-Attaches a terminal control panel to the **running** client for a profile,
-over its control socket (`~/.config/flextunnel/client-<server id prefix>.sock`;
-a named pipe on Windows). It shows live status — connection phase and uptime,
-server/client node ids, connection paths (direct/relay), and the server-pushed
-routing breakdown (split-tunnel rules, host aliases, DNS forwards, and bridge
-routes) — plus an editable **port forwards** table: add/edit/delete
-forwards and toggle them on/off (`space`), live.
+Attaches a **read-only** terminal control panel to the **running** client for
+a profile, over its control socket
+(`~/.config/flextunnel/client-<server id prefix>.sock`; a named pipe on
+Windows). It shows live status — connection phase and uptime, server/client
+node ids, connection paths (direct/relay), the server-pushed routing breakdown
+(split-tunnel rules, host aliases, DNS forwards, and bridge routes), and the
+**port forwards** declared in the client's config with their live state
+(listening, active connections, or switched off with the bind-failure reason).
 
-Forwards open server-direct streams on the authenticated connection (the
-server enforces its routed set) and listen on localhost. They persist in
-`~/.config/flextunnel/forwards-<server id prefix>.json` — written only by the
-running client — and always load **disabled**; enabling is a per-session
-action, like the desktop app. A forward whose local port can't bind flips back
-off with the reason shown next to its row.
+Nothing about the client can be changed from the panel: the forward set is
+fixed by the config for the life of the client (edit the config and restart to
+change it), and the channel carries no mutations. It runs as the same user as
+the client — no elevated privilege on either end.
 
 Detaching (`q`) never affects the tunnel; several panels can attach at once.
 

@@ -93,6 +93,28 @@ pub struct ServerConfig {
     pub allowed_bridge_servers: Option<Vec<String>>,
 }
 
+/// One `[[forwards]]` entry in the client config: a server-direct port forward
+/// `localhost:local_port` → `remote_host:remote_port`, opened on the
+/// authenticated connection (the server enforces its routed set and resolves
+/// names). Config-file only — the CLI client's forwards are declared here and
+/// nowhere else; the control panel only shows them. Validated at startup
+/// (nonzero ports, valid host, unique local ports), like the rest of the
+/// config.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardConfig {
+    /// Optional display label; the status rows show `remote_host:remote_port`
+    /// when it is empty.
+    #[serde(default)]
+    pub label: String,
+    /// Loopback port to listen on (binds `127.0.0.1`/`::1` only).
+    pub local_port: u16,
+    /// Host to connect to from the server's network — an IP literal or a name
+    /// the server resolves (host aliases apply).
+    pub remote_host: String,
+    pub remote_port: u16,
+}
+
 /// Client config file schema. Every field is optional; CLI flags override these.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,7 +123,7 @@ pub struct ClientConfig {
     pub server_node_id: Option<String>,
     /// Friendly display name for this profile (e.g. "aws", "home network"),
     /// shown in status UIs. Purely cosmetic — the client's on-disk identity
-    /// (lock, control socket, forwards file) is keyed by `server_node_id`.
+    /// (lock, control socket) is keyed by `server_node_id`.
     pub name: Option<String>,
     /// Loopback port for the optional SOCKS5 listener (binds `127.0.0.1`
     /// only, like the desktop client — the front-ends are unauthenticated and
@@ -132,6 +154,9 @@ pub struct ClientConfig {
     pub auto_reconnect: Option<bool>,
     /// Cap on reconnect attempts between successful connections.
     pub max_reconnect_attempts: Option<NonZeroU32>,
+    /// Server-direct port forwards (`[[forwards]]` tables). Config-file only —
+    /// there is no CLI flag.
+    pub forwards: Option<Vec<ForwardConfig>>,
 }
 
 /// Fully-resolved server settings (CLI > file > default), paths tilde-expanded.
@@ -176,6 +201,9 @@ pub struct ResolvedClient {
     pub relay_auth_token: Option<String>,
     pub auto_reconnect: bool,
     pub max_reconnect_attempts: Option<NonZeroU32>,
+    /// Declared port forwards, in config order (validated by the client at
+    /// startup).
+    pub forwards: Vec<ForwardConfig>,
 }
 
 /// Expand a leading `~` / `~/…` to the user's home directory.
@@ -417,6 +445,7 @@ pub fn resolve_client(cli: ClientConfig, file: Option<ClientConfig>) -> Resolved
         relay_auth_token: cli.relay_auth_token.or(file.relay_auth_token),
         auto_reconnect: cli.auto_reconnect.or(file.auto_reconnect).unwrap_or(true),
         max_reconnect_attempts: cli.max_reconnect_attempts.or(file.max_reconnect_attempts),
+        forwards: cli.forwards.or(file.forwards).unwrap_or_default(),
     }
 }
 
@@ -454,6 +483,40 @@ mod tests {
         assert_eq!(cfg.socks_port, Some(1085));
         assert_eq!(cfg.auto_reconnect, Some(false));
         assert_eq!(cfg.max_reconnect_attempts, NonZeroU32::new(5));
+    }
+
+    #[test]
+    fn client_forwards_parse_with_optional_label() {
+        let toml = r#"
+            server_node_id = "abc123"
+
+            [[forwards]]
+            local_port = 5432
+            remote_host = "db.internal"
+            remote_port = 5432
+
+            [[forwards]]
+            label = "nas"
+            local_port = 8443
+            remote_host = "10.0.0.7"
+            remote_port = 443
+        "#;
+        let cfg: ClientConfig = toml::from_str(toml).unwrap();
+        let forwards = cfg.forwards.expect("forwards parsed");
+        assert_eq!(forwards.len(), 2);
+        assert_eq!(forwards[0].label, "");
+        assert_eq!(forwards[0].local_port, 5432);
+        assert_eq!(forwards[1].label, "nas");
+        assert_eq!(forwards[1].remote_host, "10.0.0.7");
+
+        // Entries are strict too: a typo inside a table is a hard error, and a
+        // forward without a remote host is incomplete.
+        let err = toml::from_str::<ClientConfig>(
+            "[[forwards]]\nlocal_port = 1\nremote_hots = \"x\"\nremote_port = 1",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+        assert!(toml::from_str::<ClientConfig>("[[forwards]]\nlocal_port = 1\nremote_port = 1").is_err());
     }
 
     #[test]
@@ -734,8 +797,15 @@ mod tests {
             relay_urls = ["https://relay.example"]
             auto_reconnect = true
             max_reconnect_attempts = 10
+
+            [[forwards]]
+            label = "db"
+            local_port = 5432
+            remote_host = "db.internal"
+            remote_port = 5432
         "#;
         let c: ClientConfig = toml::from_str(client).expect("maximal client config parses");
         assert!(c.server_node_id.is_some() && c.max_reconnect_attempts.is_some());
+        assert_eq!(c.forwards.as_deref().map(<[_]>::len), Some(1));
     }
 }

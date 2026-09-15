@@ -2,7 +2,8 @@
 //!
 //! A SOCKS5/HTTP-proxy-over-QUIC split tunnel via iroh P2P connections. The
 //! client runs optional local SOCKS5/HTTP proxy listeners and server-direct
-//! port forwards (managed live from `flextunnel client control`); routed
+//! port forwards (declared in its config; `flextunnel client control` shows
+//! their state); routed
 //! targets are tunneled as reliable QUIC bi-streams to the server, which
 //! resolves DNS and connects from its own network. Uses a fixed ALPN for
 //! protocol selection, client keypairs (ed25519) for access control, and TLS
@@ -18,7 +19,6 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 mod client_session;
-mod forwards;
 mod instance;
 mod ipc;
 mod lock;
@@ -135,8 +135,8 @@ enum ServerAction {
 
 #[derive(Subcommand)]
 enum ClientAction {
-    /// Start the proxy client (optional SOCKS5 + HTTP proxy listeners, port
-    /// forwards). Needs at least one flag: `-c`/other options load a config (the
+    /// Start the proxy client (optional SOCKS5 + HTTP proxy listeners, plus the
+    /// port forwards declared in the config). Needs at least one flag: `-c`/other options load a config (the
     /// default ~/.config/flextunnel/client.toml when no -c is given), or
     /// `--quick` prompts for the connection details without persisting them. Run
     /// with no arguments to print this help.
@@ -188,8 +188,9 @@ enum ClientAction {
         #[arg(long, conflicts_with_all = ["config", "auth_key", "auth_key_file"])]
         quick: bool,
     },
-    /// Attach the control panel to the running client for a profile: live
-    /// status + editable port forwards (in this terminal). The client is
+    /// Attach the read-only control panel to the running client for a profile:
+    /// live status and the state of its config-declared port forwards (in this
+    /// terminal). The client is
     /// identified by the profile's server node id; with no flags, the default
     /// config (~/.config/flextunnel/client.toml) selects it.
     Control {
@@ -537,6 +538,7 @@ async fn run_async(command: Command) -> Result<()> {
                 relay_auth_token,
                 auto_reconnect,
                 max_reconnect_attempts,
+                forwards: None, // config-file only; no CLI flag
             };
             // `--quick` is a self-contained ephemeral session: it ignores any
             // saved config, mints a session identity whose EndpointId is the

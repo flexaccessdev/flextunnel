@@ -3,9 +3,9 @@
 //! A client *instance* is one running `flextunnel client start` process,
 //! identified by the server it connects to: since a profile's `server_node_id` never
 //! changes, its prefix keys every per-instance artifact — the single-instance
-//! lock (`client-<key>.lock`), the control socket (`client-<key>.sock` /
-//! `\\.\pipe\flextunnel-client-<key>`), and the persisted port forwards
-//! (`forwards-<key>.json`). There is deliberately no way to override the key:
+//! lock (`client-<key>.lock`) and the control socket (`client-<key>.sock` /
+//! `\\.\pipe\flextunnel-client-<key>`). There is deliberately no way to
+//! override the key:
 //! one client per server per user, and `flextunnel client control` finds the
 //! right socket from the same config. The optional `name` in the config
 //! ("aws", "home network") is display-only.
