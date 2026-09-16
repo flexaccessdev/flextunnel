@@ -1,6 +1,6 @@
 # flextunnel
 
-A SOCKS5/HTTP-proxy- and port-forward-over-QUIC split tunnel. The **client**
+A SOCKS5/HTTP-proxy, and port-forward-over-QUIC split tunnel. The **client**
 runs optional local SOCKS5 and HTTP proxy listeners, plus optional port
 forwards that send a local port straight to one server-side address. Each
 proxy request is matched
