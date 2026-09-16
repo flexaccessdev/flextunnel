@@ -224,7 +224,7 @@ Implemented in `ProxyClient::run` / `handle_failure`:
 
 - Every recoverable failure (`ConnectionLost` / `Network` / `Signaling` — see
   `ProxyError::is_recoverable`) is retried with **exponential backoff +
-  jitter** (1s doubling to `RECONNECT_BACKOFF_MAX`, 5 min), indefinitely,
+  jitter** (1s doubling to `RECONNECT_BACKOFF_MAX`, 60s), indefinitely,
   unless `--max-reconnect-attempts` caps it or `--no-auto-reconnect` disables
   it. The first attempt is no different from any later one: a server that is
   down or not up yet is the ordinary case (boot order, maintenance), not an
@@ -233,11 +233,11 @@ Implemented in `ProxyClient::run` / `handle_failure`:
 - Permanent errors (`AuthenticationFailed` / `Config`) never retry — the same
   credential and config would fail the same way every time.
 - A long outage costs one bounded connect (`CONNECT_TIMEOUT`) per attempt on
-  the endpoint the client already holds, once every five minutes at the cap.
+  the endpoint the client already holds, once a minute at the cap.
   Two events cut a backoff step short with a fresh series: the device
   reporting its network path back (`set_network_available`) and the embedding
   app coming to the foreground (`set_background(false)`), so a user who is
-  looking never waits out a step sized for an unattended outage.
+  looking never waits out a step sized for a long outage.
 - An outage's **third** consecutive failure escalates to a **full endpoint
   rebuild** (`ClientEndpoint::rebuild`), repeated at most every
   `REBUILD_ENDPOINT_MIN_INTERVAL` (30 min) for as long as the outage lasts; the
@@ -369,7 +369,7 @@ defenses.
 | `TUNNEL_OPEN_TIMEOUT` | 30s | `proxy/client.rs` |
 | `CONNECT_TIMEOUT` (server dial) | 10s | `proxy/dial.rs` |
 | `MAX_CONCURRENT_CONNECTIONS` | 1024 | `proxy/server.rs` |
-| reconnect backoff | 1s → 5 min + ≤500ms jitter | `proxy/client.rs` |
+| reconnect backoff | 1s → 60s + ≤500ms jitter | `proxy/client.rs` |
 | `REBUILD_ENDPOINT_ATTEMPTS` / `REBUILD_ENDPOINT_MIN_INTERVAL` (client endpoint rebuild) | 3rd failure, then ≥30 min apart | `proxy/client.rs` |
 | `MAX_HANDSHAKE_SIZE` | 64 KiB | `proxy/signaling.rs` |
 | `MAX_CONTROL_MSG_SIZE` | 16 KiB | `proxy/signaling.rs` |

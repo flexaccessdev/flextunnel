@@ -106,7 +106,7 @@ fn header_lines(s: &StatusSnapshot) -> Vec<Line<'static>> {
         first.push(Span::styled(format!("  for {}", format_uptime(secs)), DIM));
     }
     // While down, say how far the retry loop has got and when it tries again,
-    // so a backoff step of minutes reads as waiting, not stuck.
+    // so a backoff step reads as waiting, not stuck.
     if s.failed_attempts > 0 {
         let next = match s.next_attempt_secs {
             Some(secs) if secs > 0 => format!("next in {}", format_uptime(secs)),

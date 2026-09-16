@@ -27,14 +27,15 @@ use tokio::sync::{Semaphore, watch};
 
 /// Reconnect backoff: base 1s, doubling per consecutive failed attempt, capped
 /// here. The early steps (1s, 2s, 4s, …) catch a server restart within a
-/// minute or two; past them the doubling runs on up to the cap, so a server
-/// that stays down for hours or days is probed once every five minutes for as
-/// long as it takes. Each probe is one bounded connect ([`CONNECT_TIMEOUT`])
-/// on the endpoint the client already holds, so an outage of any length is
-/// cheap to sit through — at the price of noticing the server's return up to
-/// five minutes late. Events that make an earlier attempt worthwhile cut the
-/// wait short (see [`ProxyClient::wait_backoff`]).
-const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// minute or two; past them the doubling settles at the cap, so a server that
+/// stays down for hours or days is probed once a minute for as long as it
+/// takes. Each probe is one bounded connect ([`CONNECT_TIMEOUT`]) on the
+/// endpoint the client already holds, so an outage of any length is cheap to
+/// sit through while still noticing the server's return within a minute — a
+/// wait of several minutes saves little and reads as a hang to anyone
+/// watching. Events that make an earlier attempt worthwhile cut the wait
+/// short (see [`ProxyClient::wait_backoff`]).
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Escalate to a full endpoint rebuild once this many consecutive attempts of
 /// an outage have failed. The attempts before it get the cheap
 /// `network_change()` nudge, which repairs dead UDP sockets; a wedge that
@@ -862,7 +863,7 @@ impl ProxyClient {
     /// reconnect. While the path is up this is a plain backoff sleep, except
     /// that a mid-sleep loss switches to parking, and that the embedding app
     /// coming to the foreground ends the sleep the same way a restored path
-    /// does — a backoff step sized for an unattended outage (up to
+    /// does — a backoff step sized for a long outage (up to
     /// [`RECONNECT_BACKOFF_MAX`]) must not keep a user who is looking waiting.
     ///
     /// Returns whether the wait was cut short by one of those events (the
@@ -2180,12 +2181,12 @@ mod tests {
     #[test]
     fn backoff_doubles_to_the_cap() {
         let jitter = Duration::from_millis(RECONNECT_JITTER_MAX_MS);
-        for (attempt, secs) in [(0, 1), (1, 1), (2, 2), (3, 4), (7, 64), (9, 256)] {
+        for (attempt, secs) in [(0, 1), (1, 1), (2, 2), (3, 4), (6, 32)] {
             let b = calculate_backoff(attempt);
             let base = Duration::from_secs(secs);
             assert!(b >= base && b <= base + jitter, "attempt {attempt}: {b:?}");
         }
-        for attempt in [10, 11, 20, u32::MAX] {
+        for attempt in [7, 9, 10, 20, u32::MAX] {
             let b = calculate_backoff(attempt);
             assert!(
                 b >= RECONNECT_BACKOFF_MAX && b <= RECONNECT_BACKOFF_MAX + jitter,
