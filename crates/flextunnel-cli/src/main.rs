@@ -1,6 +1,7 @@
 //! flextunnel
 //!
-//! A SOCKS5/HTTP-proxy-over-QUIC split tunnel via iroh P2P connections. The
+//! A SOCKS5/HTTP-proxy- and port-forward-over-QUIC split tunnel via iroh P2P
+//! connections. The
 //! client runs optional local SOCKS5/HTTP proxy listeners and server-direct
 //! port forwards (declared in its config; `flextunnel client control` shows
 //! their state); routed
@@ -40,7 +41,7 @@ use flextunnel_core::{auth, config, secret};
 #[derive(Parser)]
 #[command(name = "flextunnel")]
 #[command(version)]
-#[command(about = "SOCKS5/HTTP-proxy-over-QUIC split tunnel via iroh P2P")]
+#[command(about = "SOCKS5/HTTP proxy and port forwards over QUIC — split tunnel via iroh P2P")]
 struct Args {
     #[command(subcommand)]
     command: Command,

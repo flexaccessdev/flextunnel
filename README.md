@@ -1,11 +1,15 @@
 # flextunnel
 
-A SOCKS5/HTTP-proxy-over-QUIC split tunnel. The **client** runs optional local
-SOCKS5 and HTTP proxy listeners. Each request is matched
+A SOCKS5/HTTP-proxy- and port-forward-over-QUIC split tunnel. The **client**
+runs optional local SOCKS5 and HTTP proxy listeners, plus optional port
+forwards that send a local port straight to one server-side address. Each
+proxy request is matched
 against the server-pushed tunnel set: routed targets are tunneled as reliable
 QUIC bi-streams to the **server**, which performs **DNS resolution and the
 outbound TCP connection from its own network**, then pipes bytes back; off-list
-targets are connected directly from the client device.
+targets are connected directly from the client device. A forwarded port does no
+matching on the client: everything it accepts goes to the server, which
+enforces its routed set there.
 
 This lets you reach hosts that are only reachable from the server side — a
 private network, the server's own `localhost`, or names that only resolve via

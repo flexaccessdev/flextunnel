@@ -1,6 +1,7 @@
 //! flextunnel
 //!
-//! A SOCKS5/HTTP-proxy-over-QUIC split tunnel via iroh P2P connections. The
+//! A SOCKS5/HTTP-proxy- and port-forward-over-QUIC split tunnel via iroh P2P
+//! connections. The
 //! clients may run local SOCKS5/HTTP proxy listeners or server-direct loopback
 //! forwards; routed targets are reliable QUIC bi-streams to the server, which
 //! resolves DNS and connects from its own network. Uses a fixed ALPN for
