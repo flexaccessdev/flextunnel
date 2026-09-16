@@ -552,9 +552,9 @@ pub unsafe extern "C" fn flextunnel_close_listeners(handle: *const FlextunnelHan
 /// heartbeat — the connection's only periodic traffic — slows from 10s to 60s,
 /// keeping the cellular radio in its low-power state almost the whole time; the
 /// foreground flip snaps it back and sends any overdue beat immediately, and if
-/// the core is sitting out a reconnect backoff (up to 60s on iOS once an
-/// outage has pushed it to the cap) it ends that wait and attempts at once
-/// with a fresh backoff series. Idempotent; safe to call with the same value
+/// the core is sitting out a reconnect backoff (up to 60s once a long outage
+/// has pushed it to the cap) it ends that wait and attempts at once with a
+/// fresh backoff series. Idempotent; safe to call with the same value
 /// repeatedly.
 ///
 /// Returns 1 on success and -1 for a null handle.

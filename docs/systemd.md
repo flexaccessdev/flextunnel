@@ -57,12 +57,12 @@ The client already supervises itself where it matters:
 
 - Auto-reconnect (on by default) retries every failed connection attempt and
   every lost connection internally with exponential backoff (1s doubling to
-  5 min), indefinitely — the first attempt included. A server that is down
+  60s), indefinitely — the first attempt included. A server that is down
   when the unit starts, or a network that isn't up yet at boot, is waited
   out, not exited on: the client connects when the server appears, and there
   is no user-manager `network-online.target` to order against nor any need
-  for one. A long outage costs one bounded connect attempt every five
-  minutes. Reconnects that keep failing escalate to rebuilding the iroh
+  for one. A long outage costs one bounded connect attempt a minute.
+  Reconnects that keep failing escalate to rebuilding the iroh
   endpoint from scratch (after the third failure, then at most every 30
   minutes) — the in-process equivalent of a unit restart, covering wedges (a
   dead relay link, stale path state) that only a fresh endpoint repairs. The
