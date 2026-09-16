@@ -8,9 +8,10 @@
 //! ends are this one binary and the repo has a no-compatibility policy, so
 //! there is no protocol version field.
 //!
-//! Unlike a read-only status socket, this channel *mutates* state (port
-//! forwards), so the Unix socket is chmod'd 0600 (owner only). On Windows the
-//! default pipe security descriptor already restricts other users.
+//! The channel is read-only (status and connection-path snapshots), but the
+//! snapshots describe the user's network (routes, hosts, forwards), so the Unix
+//! socket is still chmod'd 0600 (owner only). On Windows the default pipe
+//! security descriptor already restricts other users.
 //!
 //! The socket is not the single-instance lock — see `lock.rs` for why. But
 //! *because* the caller holds that lock, unconditionally removing a stale
@@ -53,14 +54,8 @@ pub enum Request {
     /// desktop modal / iOS sheet). Kept off the polled `Status` because the
     /// custom-relay `/healthz` probe does on-demand HTTP.
     ConnPath,
-    AddForward { forward: WireForward },
-    UpdateForward { forward: WireForward },
-    DeleteForward { id: String },
-    SetForwardEnabled { id: String, enabled: bool },
 }
 
-/// Every success — mutations included — answers with a fresh snapshot so the
-/// TUI redraws immediately instead of waiting for its next poll tick.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "resp", rename_all = "snake_case")]
 pub enum Response {
@@ -69,18 +64,26 @@ pub enum Response {
     Error { message: String },
 }
 
-/// [`flextunnel_core::forwards::PortForward`] with `enabled` made explicit
-/// (the model marks it `#[serde(skip)]` so it is never *persisted*, but the
-/// live wire must carry it).
+/// One declared forward as the panel sees it (the config entry, normalized).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireForward {
-    pub id: String,
     #[serde(default)]
     pub label: String,
     pub local_port: u16,
     pub remote_host: String,
     pub remote_port: u16,
-    pub enabled: bool,
+}
+
+impl WireForward {
+    /// Label if set, otherwise `host:port` — mirrors `PortForward::display_name`.
+    pub fn display_name(&self) -> String {
+        let label = self.label.trim();
+        if label.is_empty() {
+            flextunnel_core::forwards::format_host_port(&self.remote_host, self.remote_port)
+        } else {
+            label.to_string()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,7 +173,7 @@ pub struct WireConnPath {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ForwardRowState {
-    /// Disabled (the switch is off).
+    /// Switched off after its listener failed to bind (see `error`).
     Stopped,
     Starting,
     Listening,
@@ -198,14 +201,6 @@ pub struct ForwardRow {
 pub enum IpcCmd {
     Status(oneshot::Sender<StatusSnapshot>),
     ConnPath(oneshot::Sender<WireConnSnapshot>),
-    Mutate(Mutation, oneshot::Sender<Result<StatusSnapshot, String>>),
-}
-
-pub enum Mutation {
-    Add(WireForward),
-    Update(WireForward),
-    Delete(String),
-    SetEnabled(String, bool),
 }
 
 // ---------------------------------------------------------------------------
@@ -267,7 +262,7 @@ fn spawn_unix(socket: std::path::PathBuf, tx: mpsc::Sender<IpcCmd>) -> Result<Ip
     let _ = std::fs::remove_file(&socket);
     let listener = tokio::net::UnixListener::bind(&socket)
         .with_context(|| format!("Failed to bind control socket {}", socket.display()))?;
-    // Owner-only: this channel accepts mutations.
+    // Owner-only: the snapshots describe the user's network layout.
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("Failed to set permissions on {}", socket.display()))?;
     log::info!("Control socket listening on {}", socket.display());
@@ -399,7 +394,6 @@ pub fn blocking_request(tx: &mpsc::Sender<IpcCmd>, request: Request) -> Option<R
 enum PendingReply {
     Status(oneshot::Receiver<StatusSnapshot>),
     ConnPath(oneshot::Receiver<WireConnSnapshot>),
-    Mutate(oneshot::Receiver<Result<StatusSnapshot, String>>),
 }
 
 impl PendingReply {
@@ -407,7 +401,6 @@ impl PendingReply {
         Some(match self {
             PendingReply::Status(rx) => Response::Status(Box::new(rx.await.ok()?)),
             PendingReply::ConnPath(rx) => Response::ConnPath(rx.await.ok()?),
-            PendingReply::Mutate(rx) => reply_to_response(rx.await.ok()?),
         })
     }
 
@@ -415,15 +408,7 @@ impl PendingReply {
         Some(match self {
             PendingReply::Status(rx) => Response::Status(Box::new(rx.blocking_recv().ok()?)),
             PendingReply::ConnPath(rx) => Response::ConnPath(rx.blocking_recv().ok()?),
-            PendingReply::Mutate(rx) => reply_to_response(rx.blocking_recv().ok()?),
         })
-    }
-}
-
-fn reply_to_response(reply: Result<StatusSnapshot, String>) -> Response {
-    match reply {
-        Ok(snapshot) => Response::Status(Box::new(snapshot)),
-        Err(message) => Response::Error { message },
     }
 }
 
@@ -437,16 +422,7 @@ fn build_cmd(request: Request) -> (IpcCmd, PendingReply) {
             let (reply, rx) = oneshot::channel();
             (IpcCmd::ConnPath(reply), PendingReply::ConnPath(rx))
         }
-        Request::AddForward { forward } => mutate_cmd(Mutation::Add(forward)),
-        Request::UpdateForward { forward } => mutate_cmd(Mutation::Update(forward)),
-        Request::DeleteForward { id } => mutate_cmd(Mutation::Delete(id)),
-        Request::SetForwardEnabled { id, enabled } => mutate_cmd(Mutation::SetEnabled(id, enabled)),
     }
-}
-
-fn mutate_cmd(mutation: Mutation) -> (IpcCmd, PendingReply) {
-    let (reply, rx) = oneshot::channel();
-    (IpcCmd::Mutate(mutation, reply), PendingReply::Mutate(rx))
 }
 
 /// Read one `\n`-terminated line into `buf`, rejecting lines over [`MAX_LINE`]
@@ -605,12 +581,10 @@ mod tests {
 
     fn wire_forward() -> WireForward {
         WireForward {
-            id: "f1".into(),
             label: "db".into(),
             local_port: 5432,
             remote_host: "db.internal".into(),
             remote_port: 5432,
-            enabled: true,
         }
     }
 
@@ -650,21 +624,7 @@ mod tests {
 
     #[test]
     fn wire_types_roundtrip() {
-        for request in [
-            Request::Status,
-            Request::ConnPath,
-            Request::AddForward {
-                forward: wire_forward(),
-            },
-            Request::UpdateForward {
-                forward: wire_forward(),
-            },
-            Request::DeleteForward { id: "f1".into() },
-            Request::SetForwardEnabled {
-                id: "f1".into(),
-                enabled: false,
-            },
-        ] {
+        for request in [Request::Status, Request::ConnPath] {
             let json = serde_json::to_string(&request).unwrap();
             let _: Request = serde_json::from_str(&json).unwrap();
         }
@@ -675,16 +635,14 @@ mod tests {
             Response::Status(s) => {
                 assert_eq!(s.phase, Phase::Connected);
                 assert_eq!(s.forwards.len(), 1);
-                // The wire carries `enabled` even though the model's serde skips it.
-                assert!(s.forwards[0].forward.enabled);
+                assert_eq!(s.forwards[0].forward.local_port, 5432);
                 assert_eq!(s.forwards[0].state, ForwardRowState::Listening);
             }
             other => panic!("expected Status, got {other:?}"),
         }
     }
 
-    /// Stub session loop: answers Status with a canned snapshot, accepts
-    /// SetEnabled, rejects Delete.
+    /// Stub session loop: answers Status and ConnPath with canned snapshots.
     fn stub_session() -> mpsc::Sender<IpcCmd> {
         let (tx, mut rx) = mpsc::channel(8);
         tokio::spawn(async move {
@@ -707,12 +665,6 @@ mod tests {
                             }],
                         });
                     }
-                    IpcCmd::Mutate(Mutation::Delete(id), reply) => {
-                        let _ = reply.send(Err(format!("no forward with id {id:?}")));
-                    }
-                    IpcCmd::Mutate(_, reply) => {
-                        let _ = reply.send(Ok(snapshot()));
-                    }
                 }
             }
         });
@@ -722,7 +674,7 @@ mod tests {
     /// Spin up the real platform transport (UDS here, named pipe on Windows)
     /// against the stub session and drive it through the real `IpcClient`.
     #[tokio::test]
-    async fn loopback_status_and_mutations() {
+    async fn loopback_status_and_conn_path() {
         // Unique per test run: instance names (and thus pipe names on
         // Windows) are global, and parallel `cargo test` runs must not collide.
         let instance = format!("test-ipc-{}", std::process::id());
@@ -761,26 +713,19 @@ mod tests {
             other => panic!("expected Status, got {other:?}"),
         }
 
-        // A mutation that the session accepts returns a fresh snapshot...
-        match client
-            .request(&Request::SetForwardEnabled {
-                id: "f1".into(),
-                enabled: false,
-            })
-            .await
-            .unwrap()
-        {
-            Response::Status(_) => {}
-            other => panic!("expected Status, got {other:?}"),
+        // The on-demand snapshot...
+        match client.request(&Request::ConnPath).await.unwrap() {
+            Response::ConnPath(s) => assert_eq!(s.paths.len(), 1),
+            other => panic!("expected ConnPath, got {other:?}"),
         }
 
-        // ...and one it rejects surfaces the message, keeping the connection open.
-        match client
-            .request(&Request::DeleteForward { id: "nope".into() })
-            .await
-            .unwrap()
-        {
-            Response::Error { message } => assert!(message.contains("nope"), "{message}"),
+        // ...and a malformed line gets an error while the connection stays open.
+        let stream = client.stream.as_mut().unwrap();
+        stream.get_mut().write_all(b"{\"cmd\":\"nope\"}\n").await.unwrap();
+        let mut line = Vec::new();
+        read_line_capped(stream, &mut line).await.unwrap();
+        match serde_json::from_slice::<Response>(&line).unwrap() {
+            Response::Error { message } => assert!(message.contains("Bad request"), "{message}"),
             other => panic!("expected Error, got {other:?}"),
         }
         match client.request(&Request::Status).await.unwrap() {

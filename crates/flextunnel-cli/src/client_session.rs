@@ -4,8 +4,9 @@
 //!
 //! Mirrors the desktop client's per-profile session (`flextunnel-desktop`'s
 //! `tunnel.rs`): bind the enabled listeners, run the reconnecting client, poll
-//! routes/forward state on a ticker, and serve status/mutation commands — here
-//! arriving over the IPC socket instead of a GUI channel.
+//! routes/forward state on a ticker, and serve status snapshots — here over the
+//! IPC socket instead of a GUI channel. Unlike the desktop, nothing is mutable
+//! from the panel: the forward set is the config's.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -17,6 +18,7 @@ use flextunnel_core::forwards::{
     ForwardManager, ForwardState, ForwardStatus, PortForward, disable_failed_forwards,
     validate_label, validate_remote_host,
 };
+use flextunnel_core::config::ForwardConfig;
 use flextunnel_core::iroh::SecretKey;
 use flextunnel_core::proxy::{ClientAuth, ClientConfig, ProxyClient, reserved};
 use flextunnel_core::transport::endpoint::{
@@ -26,17 +28,17 @@ use flextunnel_core::transport::paths::{ConnPath, ConnPathKind};
 use flextunnel_core::{app, auth, config};
 
 use crate::ipc::{
-    self, ForwardRow, ForwardRowState, IpcCmd, Mutation, Phase, StatusSnapshot, WireBridge,
-    WireConnPath, WireConnSnapshot, WireCustomRelay, WireForward, WireRoutes,
+    self, ForwardRow, ForwardRowState, IpcCmd, Phase, StatusSnapshot, WireBridge, WireConnPath,
+    WireConnSnapshot, WireCustomRelay, WireForward, WireRoutes,
 };
-use crate::{forwards as store, instance, lock};
+use crate::{instance, lock};
 
 pub async fn run(r: config::ResolvedClient) -> Result<()> {
     let server_node_id = r.server_node_id.clone().context(
         "The client requires a server node id (--server-node-id or server_node_id in the config).",
     )?;
     // A profile's server id never changes, so its prefix is the client's
-    // on-disk identity: lock, control socket, and forwards file.
+    // on-disk identity: lock and control socket.
     let key = instance::instance_key(&server_node_id)?;
     let client_key = resolve_client_key(&r)?;
     // The public half is what the server operator needs on their
@@ -47,19 +49,14 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
     // socket safe (see ipc.rs).
     let _lock = lock::acquire_client(&key)?;
 
-    // All forwards load disabled (`enabled` is never persisted) — enabling is
-    // an explicit per-session action, like the desktop.
-    let forwards = store::load(&key)?;
-    if let Err(e) = validate_loaded(&forwards) {
-        let path = store::forwards_path(&key)?;
-        anyhow::bail!("Invalid port forwards in {}: {e}", path.display());
-    }
+    // The forward set is the config's `[[forwards]]` tables, fixed for the
+    // session (the panel only observes it). Validated here like the rest of
+    // the config, before the endpoint exists. All start enabled; one whose
+    // listener fails to bind is switched off by the ticker below.
+    let forwards = forwards_from_config(&r.forwards)
+        .map_err(|e| anyhow::anyhow!("Invalid [[forwards]] in the client config: {e}"))?;
     if !forwards.is_empty() {
-        log::info!(
-            "Loaded {} port forward(s) (disabled) from {}",
-            forwards.len(),
-            store::forwards_path(&key)?.display()
-        );
+        log::info!("Loaded {} port forward(s) from the config", forwards.len());
     }
 
     // The routed set (tunnel set) is configured on the server and pushed
@@ -70,7 +67,6 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
         SessionAuth::Key(client_key),
         key.clone(),
         forwards,
-        true,
     )
     .await?;
     if runtime.state.socks_addr.is_none() && runtime.state.http_addr.is_none() {
@@ -110,11 +106,12 @@ fn resolve_client_key(r: &config::ResolvedClient) -> Result<auth::ClientKey> {
 
 /// The self-contained `flextunnel client start --quick` session: an ephemeral
 /// client that runs the live control panel in *this* terminal instead of
-/// detaching. Unlike [`run`] it takes **no single-instance lock**, loads and
-/// writes **no forwards file**, and exposes **no control socket** — nothing is
-/// persisted and nothing else can attach. The panel and the session talk over an
-/// in-process channel; quitting the panel drops its sender, closing the channel,
-/// which shuts the session down — so the tunnel disconnects rather than detaching.
+/// detaching. Unlike [`run`] it takes **no single-instance lock** and exposes
+/// **no control socket** — nothing is persisted and nothing else can attach.
+/// It reads no config, so it has no port forwards. The panel and the session
+/// talk over an in-process channel; quitting the panel drops its sender, closing
+/// the channel, which shuts the session down — so the tunnel disconnects rather
+/// than detaching.
 ///
 /// `client_secret` is the session's pre-generated identity, whose endpoint id
 /// the caller already printed for the user to allowlist on the quick server —
@@ -124,19 +121,17 @@ pub async fn run_quick(r: config::ResolvedClient, client_secret: SecretKey) -> R
     let server_node_id = r.server_node_id.clone().context(
         "The client requires a server node id (--server-node-id or server_node_id in the config).",
     )?;
-    // Display-only in quick mode (no lock/socket/forwards paths are derived from
-    // it); computing it also validates the id shape up front.
+    // Display-only in quick mode (no lock/socket paths are derived from it);
+    // computing it also validates the id shape up front.
     let key = instance::instance_key(&server_node_id)?;
 
-    // Forwards are ephemeral: none are loaded, none are saved (`persist=false`).
-    // They can still be added/edited live in the panel, in memory only.
+    // No config, so no forwards (the panel cannot declare any).
     let runtime = build_session(
         r,
         server_node_id,
         SessionAuth::Quick(client_secret),
         key,
         Vec::new(),
-        false,
     )
     .await?;
 
@@ -155,7 +150,7 @@ pub async fn run_quick(r: config::ResolvedClient, client_secret: SecretKey) -> R
 
 /// The assembled per-session runtime that [`drive_session`] consumes: the iroh
 /// endpoint, the proxy client and its live routes, the bound proxy listeners,
-/// the forward manager + set, and the status/mutation state.
+/// the forward manager + set, and the status state.
 struct SessionRuntime {
     endpoint: ClientEndpoint,
     client: std::sync::Arc<ProxyClient>,
@@ -184,16 +179,15 @@ enum SessionAuth {
 /// like the desktop client — unauthenticated, never exposed off-machine), and
 /// assemble the [`SessionRuntime`]. Shared by [`run`] and [`run_quick`]; the
 /// caller supplies the [`SessionAuth`] (which also determines the endpoint's
-/// identity), the instance `key` (status display), the initial `forwards`, and
-/// whether mutations `persist`. On any failure past endpoint creation the
-/// endpoint is closed gracefully before returning.
+/// identity), the instance `key` (status display), and the session's fixed
+/// `forwards`. On any failure past endpoint creation the endpoint is closed
+/// gracefully before returning.
 async fn build_session(
     r: config::ResolvedClient,
     server_node_id: String,
     auth: SessionAuth,
     key: String,
     forwards: Vec<PortForward>,
-    persist: bool,
 ) -> Result<SessionRuntime> {
     let relay_config = RelayConfig::from_urls_with_token(&r.relay_urls, r.relay_auth_token.clone())
         .context("Invalid relay configuration")?;
@@ -267,7 +261,6 @@ async fn build_session(
         connected_since: None,
         last_error: None,
         disabled_reasons: HashMap::new(),
-        persist,
     };
 
     Ok(SessionRuntime {
@@ -385,12 +378,6 @@ async fn drive_session(
                         });
                     });
                 }
-                Some(IpcCmd::Mutate(mutation, reply)) => {
-                    let result = state
-                        .apply_mutation(mutation, &mut forwards, &mut fwd_mgr)
-                        .map(|()| state.snapshot(&routes, &forwards, &fwd_mgr));
-                    let _ = reply.send(result);
-                }
                 None => {
                     if quit_on_ipc_close {
                         break Ok(());
@@ -449,7 +436,7 @@ fn local_addr(listener: &Option<tokio::net::TcpListener>) -> Option<SocketAddr> 
     listener.as_ref().and_then(|l| l.local_addr().ok())
 }
 
-/// Session-scoped status/mutation state shared by the ticker and the IPC arms.
+/// Session-scoped status state shared by the ticker and the IPC arms.
 struct SessionState {
     /// The server-id-prefix instance key (see `instance.rs`).
     instance: String,
@@ -462,13 +449,9 @@ struct SessionState {
     ever_connected: bool,
     connected_since: Option<Instant>,
     last_error: Option<String>,
-    /// Retained bind-failure reasons of auto-disabled forwards, keyed by
-    /// forward id; cleared when the forward is re-enabled, edited, or deleted.
+    /// Bind-failure reasons of forwards switched off by the ticker, keyed by
+    /// forward id, shown next to their rows for the rest of the session.
     disabled_reasons: HashMap<String, String>,
-    /// Whether forward Add/Update/Delete are written to the forwards file. True
-    /// for a normal session; false for the ephemeral quick panel, whose forwards
-    /// live only in memory (nothing is persisted).
-    persist: bool,
 }
 
 impl SessionState {
@@ -557,162 +540,54 @@ impl SessionState {
             last_conn_error,
         }
     }
-
-    /// Validate and apply one forward mutation, reconcile the listeners, and
-    /// persist (Add/Update/Delete only — `enabled` is never persisted, so
-    /// toggles don't touch the file).
-    fn apply_mutation(
-        &mut self,
-        mutation: Mutation,
-        forwards: &mut Vec<PortForward>,
-        fwd_mgr: &mut ForwardManager,
-    ) -> Result<(), String> {
-        // `enabled` is never persisted, so a toggle is live-only: apply it
-        // directly and skip the save path entirely.
-        if let Mutation::SetEnabled(id, enabled) = mutation {
-            let forward = forwards
-                .iter_mut()
-                .find(|f| f.id == id)
-                .ok_or_else(|| format!("No forward with id {id:?}"))?;
-            forward.enabled = enabled;
-            if enabled {
-                self.disabled_reasons.remove(&id);
-            }
-            fwd_mgr.apply(forwards);
-            return Ok(());
-        }
-
-        // Add/Update/Delete change the forward set. Stage the change on a clone
-        // and, when persisting, save *first*: if the save fails, live state and
-        // listeners are untouched, so they never diverge from the file on disk.
-        let mut staged = forwards.clone();
-        // The id whose retained bind-failure reason to clear on commit (an
-        // edit or delete supersedes it); `None` for an add.
-        let reason_to_clear = match mutation {
-            Mutation::Add(wire) => {
-                let mut forward = validated(wire, &staged, None)?;
-                if forward.id.is_empty() {
-                    forward.id = PortForward::new_id();
-                } else if staged.iter().any(|f| f.id == forward.id) {
-                    return Err(format!("A forward with id {:?} already exists", forward.id));
-                }
-                staged.push(forward);
-                None
-            }
-            Mutation::Update(wire) => {
-                let id = wire.id.clone();
-                let forward = validated(wire, &staged, Some(&id))?;
-                let slot = staged
-                    .iter_mut()
-                    .find(|f| f.id == id)
-                    .ok_or_else(|| format!("No forward with id {id:?}"))?;
-                *slot = forward;
-                Some(id)
-            }
-            Mutation::Delete(id) => {
-                let before = staged.len();
-                staged.retain(|f| f.id != id);
-                if staged.len() == before {
-                    return Err(format!("No forward with id {id:?}"));
-                }
-                Some(id)
-            }
-            Mutation::SetEnabled(..) => unreachable!("handled above"),
-        };
-
-        if self.persist
-            && let Err(e) = store::save(&self.instance, &staged)
-        {
-            log::warn!("Failed to persist port forwards: {e:#}");
-            return Err(format!("Failed to save forwards: {e:#}"));
-        }
-
-        // Committed: swap in the staged set, reconcile the listeners, and only
-        // now apply the matching `disabled_reasons` update.
-        *forwards = staged;
-        fwd_mgr.apply(forwards);
-        if let Some(id) = reason_to_clear {
-            self.disabled_reasons.remove(&id);
-        }
-        Ok(())
-    }
 }
 
-/// Reject a persisted forwards file that breaks the invariants the running
-/// client and the TUI assume: nonempty and unique ids, valid remote hosts and
-/// labels, and nonzero, unique local ports (plus nonzero remote ports). The
-/// file is program-written (only by the running client, always after
-/// [`validated`]), so a violation means corruption or a hand-edit — treated
-/// like a corrupt config: a startup error, not a silent load.
-fn validate_loaded(forwards: &[PortForward]) -> Result<(), String> {
-    let mut seen_ids = std::collections::HashSet::new();
-    let mut seen_ports = std::collections::HashSet::new();
-    for f in forwards {
-        if f.id.is_empty() {
-            return Err("a forward has an empty id".into());
+/// Build the session's forward set from the config's `[[forwards]]` tables,
+/// enforcing the invariants the running client and the panel rely on: valid
+/// labels and remote hosts, nonzero ports, and unique local ports (the local
+/// port identifies a forward on the control channel). Hosts and labels are
+/// stored normalized (trimmed, IPv6 brackets stripped). Every forward starts
+/// enabled. Errors name the offending entry by its 1-based position.
+fn forwards_from_config(entries: &[ForwardConfig]) -> Result<Vec<PortForward>, String> {
+    let mut forwards: Vec<PortForward> = Vec::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        let n = i + 1;
+        let label = validate_label(&entry.label).map_err(|e| format!("forward #{n}: {e}"))?;
+        let remote_host =
+            validate_remote_host(&entry.remote_host).map_err(|e| format!("forward #{n}: {e}"))?;
+        if entry.local_port == 0 {
+            return Err(format!("forward #{n}: local_port must be 1-65535"));
         }
-        if !seen_ids.insert(f.id.as_str()) {
-            return Err(format!("duplicate forward id {:?}", f.id));
+        if entry.remote_port == 0 {
+            return Err(format!("forward #{n}: remote_port must be 1-65535"));
         }
-        validate_label(&f.label).map_err(|e| format!("forward {:?}: {e}", f.id))?;
-        validate_remote_host(&f.remote_host).map_err(|e| format!("forward {:?}: {e}", f.id))?;
-        if f.local_port == 0 {
-            return Err(format!("forward {:?} has a local port of 0", f.id));
+        if let Some(owner) = forwards.iter().find(|f| f.local_port == entry.local_port) {
+            return Err(format!(
+                "forward #{n}: local_port {} is already used by {}",
+                entry.local_port,
+                owner.display_name()
+            ));
         }
-        if f.remote_port == 0 {
-            return Err(format!("forward {:?} has a remote port of 0", f.id));
-        }
-        if !seen_ports.insert(f.local_port) {
-            return Err(format!("duplicate local port {}", f.local_port));
-        }
+        forwards.push(PortForward {
+            // The core manager keys listeners by id; the local port is the
+            // natural unique key here (there is no persisted identity).
+            id: entry.local_port.to_string(),
+            label,
+            local_port: entry.local_port,
+            remote_host,
+            remote_port: entry.remote_port,
+            enabled: true,
+        });
     }
-    Ok(())
-}
-
-/// Server-side (authoritative) validation of a wire forward; the TUI form
-/// runs the same core validators for instant feedback.
-fn validated(
-    wire: WireForward,
-    forwards: &[PortForward],
-    editing_id: Option<&str>,
-) -> Result<PortForward, String> {
-    let label = validate_label(&wire.label)?;
-    let remote_host = validate_remote_host(&wire.remote_host)?;
-    if wire.local_port == 0 {
-        return Err("Local port must be 1-65535".into());
-    }
-    if wire.remote_port == 0 {
-        return Err("Remote port must be 1-65535".into());
-    }
-    if let Some(owner) = forwards
-        .iter()
-        .filter(|f| editing_id != Some(f.id.as_str()))
-        .find(|f| f.local_port == wire.local_port)
-    {
-        return Err(format!(
-            "Local port {} is already used by {}",
-            wire.local_port,
-            owner.display_name()
-        ));
-    }
-    Ok(PortForward {
-        id: wire.id,
-        label,
-        local_port: wire.local_port,
-        remote_host,
-        remote_port: wire.remote_port,
-        enabled: wire.enabled,
-    })
+    Ok(forwards)
 }
 
 fn wire_forward(f: &PortForward) -> WireForward {
     WireForward {
-        id: f.id.clone(),
         label: f.label.clone(),
         local_port: f.local_port,
         remote_host: f.remote_host.clone(),
         remote_port: f.remote_port,
-        enabled: f.enabled,
     }
 }
 
@@ -752,134 +627,45 @@ fn wire_routes(routes: flextunnel_core::proxy::TunnelRoutes) -> WireRoutes {
 mod tests {
     use super::*;
 
-    fn wire(id: &str, local_port: u16) -> WireForward {
-        WireForward {
-            id: id.into(),
+    fn entry(local_port: u16, remote_host: &str) -> ForwardConfig {
+        ForwardConfig {
             label: String::new(),
             local_port,
-            remote_host: "db.internal".into(),
+            remote_host: remote_host.into(),
             remote_port: 5432,
-            enabled: false,
-        }
-    }
-
-    fn existing(id: &str, local_port: u16) -> PortForward {
-        PortForward {
-            id: id.into(),
-            label: String::new(),
-            local_port,
-            remote_host: "other.internal".into(),
-            remote_port: 80,
-            enabled: false,
         }
     }
 
     #[test]
-    fn validated_enforces_ports_host_and_uniqueness() {
-        let current = vec![existing("a", 5000)];
+    fn config_forwards_are_validated_and_start_enabled() {
+        let forwards =
+            forwards_from_config(&[entry(5000, "db.internal"), entry(5001, "other.internal")])
+                .expect("valid");
+        assert_eq!(forwards.len(), 2);
+        assert!(forwards.iter().all(|f| f.enabled));
+        assert_eq!(forwards[0].id, "5000");
+        assert_eq!(forwards[1].local_port, 5001);
 
-        assert!(validated(wire("", 5001), &current, None).is_ok());
-        assert!(validated(wire("", 0), &current, None).is_err());
-        assert!(validated(wire("", 5000), &current, None).is_err(), "taken port");
-        // Updating the owner itself may keep its port.
-        assert!(validated(wire("a", 5000), &current, Some("a")).is_ok());
+        let err = forwards_from_config(&[entry(5000, "a"), entry(5000, "b")]).unwrap_err();
+        assert!(err.contains("forward #2") && err.contains("5000"), "{err}");
+        assert!(forwards_from_config(&[entry(0, "db.internal")]).is_err(), "zero local port");
+        assert!(forwards_from_config(&[entry(5000, "bad..host")]).is_err(), "bad host");
 
-        let mut bad_host = wire("", 5001);
-        bad_host.remote_host = "bad..host".into();
-        assert!(validated(bad_host, &current, None).is_err());
-
-        let mut bad_remote = wire("", 5001);
-        bad_remote.remote_port = 0;
-        assert!(validated(bad_remote, &current, None).is_err());
-    }
-
-    #[test]
-    fn validate_loaded_rejects_broken_persisted_data() {
-        let ok = vec![existing("a", 5000), existing("b", 5001)];
-        assert!(validate_loaded(&ok).is_ok());
-
-        assert!(validate_loaded(&[existing("", 5000)]).is_err(), "empty id");
-        assert!(
-            validate_loaded(&[existing("a", 5000), existing("a", 5002)]).is_err(),
-            "duplicate id"
-        );
-        assert!(
-            validate_loaded(&[existing("a", 5000), existing("b", 5000)]).is_err(),
-            "duplicate local port"
-        );
-        assert!(validate_loaded(&[existing("a", 0)]).is_err(), "zero local port");
-
-        let mut zero_remote = existing("a", 5000);
+        let mut zero_remote = entry(5000, "db.internal");
         zero_remote.remote_port = 0;
-        assert!(validate_loaded(&[zero_remote]).is_err(), "zero remote port");
+        assert!(forwards_from_config(&[zero_remote]).is_err(), "zero remote port");
 
-        let mut bad_host = existing("a", 5000);
-        bad_host.remote_host = "bad..host".into();
-        assert!(validate_loaded(&[bad_host]).is_err(), "bad host");
+        let mut long_label = entry(5000, "db.internal");
+        long_label.label = "x".repeat(65);
+        assert!(forwards_from_config(&[long_label]).is_err(), "oversized label");
     }
 
     #[test]
     fn host_and_label_are_normalized() {
-        let mut w = wire("", 5001);
-        w.label = "  db  ".into();
-        w.remote_host = " [2001:db8::1] ".into();
-        let f = validated(w, &[], None).unwrap();
+        let mut e = entry(5001, " [2001:db8::1] ");
+        e.label = "  db  ".into();
+        let f = forwards_from_config(&[e]).unwrap().remove(0);
         assert_eq!(f.label, "db");
         assert_eq!(f.remote_host, "2001:db8::1");
-    }
-
-    fn session_state(instance: &str, persist: bool) -> SessionState {
-        SessionState {
-            instance: instance.into(),
-            name: None,
-            server_node_id: "server".into(),
-            client_node_id: "client".into(),
-            socks_addr: None,
-            http_addr: None,
-            ever_connected: false,
-            connected_since: None,
-            last_error: None,
-            disabled_reasons: HashMap::new(),
-            persist,
-        }
-    }
-
-    /// The quick panel edits forwards in memory only: an Add applies to the live
-    /// set but writes no `forwards-<key>.json`. (With `persist=false` nothing is
-    /// written, so on success this touches no disk; the file is removed
-    /// defensively in case a regression re-enables the save.)
-    #[tokio::test]
-    async fn quick_session_does_not_persist_forward_edits() {
-        use flextunnel_core::proxy::{ClientAuth, ClientConfig, ProxyClient};
-
-        let key = "quickpersisttestkey0";
-        let path = store::forwards_path(key).unwrap();
-        let _ = std::fs::remove_file(&path);
-
-        let client = ProxyClient::new(ClientConfig {
-            server_node_id: "server".into(),
-            auth: ClientAuth::QuickAllowlisted,
-            socks_listen: None,
-            http_listen: None,
-            relay_urls: Vec::new(),
-            relay_auth_token: None,
-            auto_reconnect: false,
-            max_reconnect_attempts: None,
-        });
-        let mut fwd_mgr = ForwardManager::new(
-            tokio::runtime::Handle::current(),
-            client.server_forwarder(),
-            &[],
-        );
-        let mut state = session_state(key, false);
-
-        let mut forwards = Vec::new();
-        state
-            .apply_mutation(Mutation::Add(wire("", 5555)), &mut forwards, &mut fwd_mgr)
-            .expect("in-memory add should succeed");
-        assert_eq!(forwards.len(), 1, "the forward is applied in memory");
-        assert!(!path.exists(), "quick mode must not write the forwards file");
-
-        let _ = std::fs::remove_file(&path);
     }
 }

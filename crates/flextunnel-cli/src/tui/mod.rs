@@ -1,5 +1,6 @@
 //! The ratatui control panel — status (connection, routing, connection paths)
-//! plus editable port forwards — reachable two ways over the same UI:
+//! and the config-declared port forwards. Read-only: nothing about the client
+//! can be changed from here. Reachable two ways over the same UI:
 //!
 //! - `flextunnel client control`: attaches to a *running* client over its
 //!   control socket (see `ipc.rs`), as a separate process. Detaching (q) never
@@ -15,7 +16,6 @@
 //! `EventStream` so no separate crossterm dependency (with version-sync risk
 //! against ratatui's re-export) is needed.
 
-mod form;
 mod view;
 
 use anyhow::{Context, Result, anyhow};
@@ -28,7 +28,6 @@ use tokio::sync::mpsc;
 
 use crate::instance;
 use crate::ipc::{IpcClient, IpcCmd, Request, Response, StatusSnapshot, WireConnSnapshot};
-use form::{FIELD_ENABLED, FormState};
 
 /// The panel's transport to a client session: one request → one response,
 /// blocking the UI thread. Implemented over the control socket (a separate
@@ -70,8 +69,6 @@ const REFRESH: Duration = Duration::from_secs(1);
 
 enum Mode {
     Normal,
-    Form(FormState),
-    ConfirmDelete { id: String, name: String },
     /// On-demand connection-path overlay: a point-in-time snapshot (paths +
     /// custom-relay health) captured when opened, refreshable, not polled —
     /// mirrors the desktop modal / iOS sheet.
@@ -80,11 +77,10 @@ enum Mode {
 
 struct App {
     snapshot: StatusSnapshot,
-    /// Selected row in the forwards table.
-    selected: usize,
     routing_scroll: u16,
+    forwards_scroll: u16,
     mode: Mode,
-    /// Transient error line (e.g. a rejected toggle), cleared on next input.
+    /// Transient error line (e.g. a failed path probe), cleared on next input.
     notice: Option<String>,
 }
 
@@ -215,8 +211,8 @@ impl App {
     fn new(snapshot: StatusSnapshot) -> Self {
         App {
             snapshot,
-            selected: 0,
             routing_scroll: 0,
+            forwards_scroll: 0,
             mode: Mode::Normal,
             notice: None,
         }
@@ -246,14 +242,6 @@ impl App {
                 }
                 let quit = match &mut self.mode {
                     Mode::Normal => self.handle_normal_key(key.code, backend)?,
-                    Mode::Form(_) => {
-                        self.handle_form_key(key.code, backend)?;
-                        false
-                    }
-                    Mode::ConfirmDelete { .. } => {
-                        self.handle_confirm_key(key.code, backend)?;
-                        false
-                    }
                     Mode::ConnPath(_) => {
                         self.handle_conn_path_key(key.code, backend)?;
                         false
@@ -265,46 +253,11 @@ impl App {
             }
 
             if last_refresh.elapsed() >= REFRESH {
-                // Poll-based refresh, like the desktop's ticker. Mutations
-                // also refresh inline via the returned snapshot.
-                self.set_snapshot(request_snapshot(backend, Request::Status)?);
+                // Poll-based refresh, like the desktop's ticker.
+                self.snapshot = request_snapshot(backend, Request::Status)?;
                 last_refresh = Instant::now();
             }
         }
-    }
-
-    fn set_snapshot(&mut self, snapshot: StatusSnapshot) {
-        // Follow the selected forward by its stable id across the refresh: a
-        // row added or removed above it shifts the index, so clamping alone
-        // would silently move the selection to a different forward.
-        let selected_id = self
-            .selected_forward()
-            .map(|row| row.forward.id.clone());
-        self.snapshot = snapshot;
-        self.selected = selected_id
-            .and_then(|id| self.snapshot.forwards.iter().position(|r| r.forward.id == id))
-            .unwrap_or_else(|| self.selected.min(self.snapshot.forwards.len().saturating_sub(1)));
-    }
-
-    /// Send a mutation; a fresh snapshot means success, an error message is
-    /// returned for the caller to surface (form line or footer notice).
-    fn mutate(
-        &mut self,
-        backend: &mut dyn ControlBackend,
-        request: Request,
-    ) -> Result<Option<String>> {
-        match backend.request(request)? {
-            Response::Status(snapshot) => {
-                self.set_snapshot(*snapshot);
-                Ok(None)
-            }
-            Response::Error { message } => Ok(Some(message)),
-            Response::ConnPath(_) => Ok(Some("unexpected conn-path response".to_string())),
-        }
-    }
-
-    fn selected_forward(&self) -> Option<&crate::ipc::ForwardRow> {
-        self.snapshot.forwards.get(self.selected)
     }
 
     fn handle_normal_key(
@@ -314,10 +267,12 @@ impl App {
     ) -> Result<bool> {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
-            KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
+            // Both panes clamp against their content height at render time.
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.forwards_scroll = self.forwards_scroll.saturating_sub(1);
+            }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.selected = (self.selected + 1)
-                    .min(self.snapshot.forwards.len().saturating_sub(1));
+                self.forwards_scroll = self.forwards_scroll.saturating_add(1);
             }
             KeyCode::Char('[') | KeyCode::PageUp => {
                 self.routing_scroll = self.routing_scroll.saturating_sub(3);
@@ -325,29 +280,6 @@ impl App {
             KeyCode::Char(']') | KeyCode::PageDown => {
                 // Clamped against the content height at render time.
                 self.routing_scroll = self.routing_scroll.saturating_add(3);
-            }
-            KeyCode::Char('a') => self.mode = Mode::Form(FormState::add()),
-            KeyCode::Char('e') | KeyCode::Enter => {
-                if let Some(row) = self.selected_forward() {
-                    self.mode = Mode::Form(FormState::edit(&row.forward));
-                }
-            }
-            KeyCode::Char('d') => {
-                if let Some(row) = self.selected_forward() {
-                    self.mode = Mode::ConfirmDelete {
-                        id: row.forward.id.clone(),
-                        name: form::display_name(&row.forward),
-                    };
-                }
-            }
-            KeyCode::Char(' ') => {
-                if let Some(row) = self.selected_forward() {
-                    let request = Request::SetForwardEnabled {
-                        id: row.forward.id.clone(),
-                        enabled: !row.forward.enabled,
-                    };
-                    self.notice = self.mutate(backend, request)?;
-                }
             }
             // On-demand connection-path + custom-relay-health overlay (not polled).
             KeyCode::Char('p') => match self.request_conn_path(backend)? {
@@ -392,76 +324,6 @@ impl App {
         }
         Ok(())
     }
-
-    fn handle_form_key(
-        &mut self,
-        code: KeyCode,
-        backend: &mut dyn ControlBackend,
-    ) -> Result<()> {
-        let Mode::Form(form) = &mut self.mode else {
-            return Ok(());
-        };
-        match code {
-            KeyCode::Esc => self.mode = Mode::Normal,
-            KeyCode::Tab | KeyCode::Down => form.focus_next(),
-            KeyCode::BackTab | KeyCode::Up => form.focus_prev(),
-            KeyCode::Enter => {
-                match form.validate(&self.snapshot.forwards) {
-                    Err(message) => form.error = Some(message),
-                    Ok(forward) => {
-                        let request = if form.is_edit() {
-                            Request::UpdateForward { forward }
-                        } else {
-                            Request::AddForward { forward }
-                        };
-                        match self.mutate(backend, request)? {
-                            // The running client rejected it (it re-validates
-                            // authoritatively): keep the form open.
-                            Some(message) => {
-                                if let Mode::Form(form) = &mut self.mode {
-                                    form.error = Some(message);
-                                }
-                            }
-                            None => self.mode = Mode::Normal,
-                        }
-                    }
-                }
-            }
-            KeyCode::Char(' ') if form.focus == FIELD_ENABLED => form.enabled = !form.enabled,
-            KeyCode::Char(c) => {
-                if let Some(text) = form.focused_text() {
-                    text.push(c);
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(text) = form.focused_text() {
-                    text.pop();
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn handle_confirm_key(
-        &mut self,
-        code: KeyCode,
-        backend: &mut dyn ControlBackend,
-    ) -> Result<()> {
-        let Mode::ConfirmDelete { id, .. } = &self.mode else {
-            return Ok(());
-        };
-        match code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let request = Request::DeleteForward { id: id.clone() };
-                self.mode = Mode::Normal;
-                self.notice = self.mutate(backend, request)?;
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.mode = Mode::Normal,
-            _ => {}
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -475,7 +337,7 @@ mod tests {
             "macintel.toml",
             "aws.toml",
             "server.toml",
-            "forwards-abc.json",
+            "client-abc.lock",
             "client.key",
         ] {
             std::fs::write(dir.path().join(name), "").unwrap();

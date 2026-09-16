@@ -12,9 +12,9 @@
 # CLI flags override these values. Unknown keys are rejected.
 
 # EndpointId of the server to connect to (from `flextunnel show-iroh-id`).
-# Also the client's identity: its prefix keys the single-instance lock, the
-# control socket, and the persisted port forwards, so one client runs per
-# server (per user) and `flextunnel client control` finds it from this config.
+# Also the client's identity: its prefix keys the single-instance lock and the
+# control socket, so one client runs per server (per user) and `flextunnel
+# client control` finds it from this config.
 server_node_id = "<server endpoint id>"
 
 # Optional friendly name for this profile, shown in the control panel and
@@ -28,8 +28,7 @@ server_node_id = "<server endpoint id>"
 
 # Optional HTTP proxy listener port (CONNECT + absolute-URI plain-HTTP
 # forwarding). Unset means disabled. With neither socks_port nor http_port
-# set, the client runs in port-forward-only mode (manage forwards with
-# `flextunnel client control`).
+# set, the client runs in port-forward-only mode (see [[forwards]] below).
 # http_port = 8081
 
 # This client's authentication keypair — always a key file (generate with
@@ -54,3 +53,24 @@ auth_key_file = "~/.config/flextunnel/client.key"
 # The split-tunnel routed set (the "tunnel set") is configured on the server and
 # pushed to this client during the handshake — there is no client-side routed-set
 # config. See server.toml.example.
+
+# Server-direct port forwards: each `[[forwards]]` table listens on
+# localhost:<local_port> (127.0.0.1/::1 only) and opens a stream to
+# <remote_host>:<remote_port> on the authenticated server connection. The
+# server enforces its routed set and resolves the host (host aliases apply),
+# so the remote must be covered by the server's tunnel set. Forwards are
+# declared here only — the control panel (`flextunnel client control`) shows
+# their state but cannot change them; edit this file and restart the client
+# instead. A forward whose local port cannot bind is switched off with the
+# reason shown next to its row. Local ports must be unique and nonzero. label
+# is optional (display only).
+# [[forwards]]
+# label = "db"
+# local_port = 5432
+# remote_host = "db.internal"
+# remote_port = 5432
+#
+# [[forwards]]
+# local_port = 8443
+# remote_host = "10.0.0.7"
+# remote_port = 443

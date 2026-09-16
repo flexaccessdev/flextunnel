@@ -1,6 +1,6 @@
 //! Rendering for the control panel, mirroring the desktop status page:
-//! connection header, connection paths, routing breakdown, and the editable
-//! port-forwards table.
+//! connection header, connection paths, routing breakdown, and the
+//! config-declared port forwards with their live state.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -10,9 +10,6 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::ipc::{ForwardRow, ForwardRowState, Phase, StatusSnapshot, WireConnSnapshot, WireRoutes};
 
-use super::form::{
-    FIELD_ENABLED, FIELD_LABEL, FIELD_LOCAL_PORT, FIELD_REMOTE_HOST, FIELD_REMOTE_PORT, FormState,
-};
 use super::{App, Mode};
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
@@ -44,14 +41,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
         routing_area,
     );
 
-    // Keep the selected row visible when the list is taller than the table:
-    // scroll just enough that the selection sits at the bottom edge.
-    let visible_forwards = forwards_area.height.saturating_sub(2) as usize;
-    let forwards_scroll = (app.selected + 1).saturating_sub(visible_forwards.max(1)) as u16;
+    let max_forwards_scroll =
+        (s.forwards.len() as u16).saturating_sub(forwards_area.height.saturating_sub(2));
     frame.render_widget(
-        Paragraph::new(forward_lines(&s.forwards, app.selected, matches!(app.mode, Mode::Normal)))
-            .scroll((forwards_scroll, 0))
-            .block(titled_block(&format!("Port forwards · {}", s.forwards.len()))),
+        Paragraph::new(forward_lines(&s.forwards))
+            .scroll((app.forwards_scroll.min(max_forwards_scroll), 0))
+            .block(titled_block(&format!(
+                "Port forwards · {}  (↑/↓ to scroll)",
+                s.forwards.len()
+            ))),
         forwards_area,
     );
 
@@ -59,8 +57,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     match &app.mode {
         Mode::Normal => {}
-        Mode::Form(form) => draw_form(frame, form),
-        Mode::ConfirmDelete { name, .. } => draw_confirm(frame, name),
         Mode::ConnPath(snapshot) => draw_conn_path(frame, snapshot),
     }
 }
@@ -290,7 +286,7 @@ fn routing_lines(r: &WireRoutes, status_host: &str) -> Vec<Line<'static>> {
 
 fn forward_state_span(row: &ForwardRow) -> Span<'static> {
     match row.state {
-        ForwardRowState::Stopped => Span::styled("stopped", DIM),
+        ForwardRowState::Stopped => Span::styled("off", Style::new().fg(Color::Red)),
         ForwardRowState::Starting => Span::styled("starting", Style::new().fg(Color::Yellow)),
         ForwardRowState::Listening => Span::styled(
             format!("listening ({} active)", row.active),
@@ -300,30 +296,21 @@ fn forward_state_span(row: &ForwardRow) -> Span<'static> {
     }
 }
 
-fn forward_lines(forwards: &[ForwardRow], selected: usize, show_cursor: bool) -> Vec<Line<'static>> {
+fn forward_lines(forwards: &[ForwardRow]) -> Vec<Line<'static>> {
     if forwards.is_empty() {
         return vec![Line::from(Span::styled(
-            "no port forwards — press a to add one",
+            "no port forwards — declare them as [[forwards]] in the client config",
             DIM,
         ))];
     }
     forwards
         .iter()
-        .enumerate()
-        .map(|(i, row)| {
+        .map(|row| {
             let f = &row.forward;
             let mut spans = vec![
-                Span::raw(if show_cursor && i == selected { "❯ " } else { "  " }),
+                Span::raw("  "),
                 Span::styled(
-                    if f.enabled { "[on]  " } else { "[off] " },
-                    if f.enabled {
-                        Style::new().fg(Color::Green)
-                    } else {
-                        DIM
-                    },
-                ),
-                Span::styled(
-                    format!("{:<20}", super::form::display_name(f)),
+                    format!("{:<20}", f.display_name()),
                     Style::new().add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!(
@@ -341,12 +328,7 @@ fn forward_lines(forwards: &[ForwardRow], selected: usize, show_cursor: bool) ->
             } else if let Some(err) = &row.last_conn_error {
                 spans.push(Span::styled(format!("  last error: {err}"), DIM));
             }
-            let line = Line::from(spans);
-            if show_cursor && i == selected {
-                line.style(Style::new().bg(Color::Rgb(40, 40, 40)))
-            } else {
-                line
-            }
+            Line::from(spans)
         })
         .collect()
 }
@@ -359,11 +341,7 @@ fn footer_line(app: &App) -> Line<'static> {
         ));
     }
     let hints = match app.mode {
-        Mode::Normal => {
-            "q quit · ↑/↓ select · space on/off · a add · e edit · d delete · p path · [/] scroll"
-        }
-        Mode::Form(_) => "Tab/Shift-Tab field · space toggle enabled · Enter save · Esc cancel",
-        Mode::ConfirmDelete { .. } => "y delete · n cancel",
+        Mode::Normal => "q quit · p path · [/] scroll routing · ↑/↓ scroll forwards",
         Mode::ConnPath(_) => "r refresh · Esc close",
     };
     Line::from(Span::styled(hints, DIM))
@@ -379,65 +357,4 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     }
-}
-
-fn draw_form(frame: &mut Frame, form: &FormState) {
-    let area = centered(frame.area(), 56, 10);
-    frame.render_widget(Clear, area);
-
-    let field = |idx: usize, name: &str, value: String| {
-        let focused = form.focus == idx;
-        Line::from(vec![
-            Span::styled(
-                format!("{}{name:<12}", if focused { "❯ " } else { "  " }),
-                if focused {
-                    Style::new().add_modifier(Modifier::BOLD)
-                } else {
-                    DIM
-                },
-            ),
-            Span::styled(
-                if focused { format!("{value}█") } else { value },
-                Style::new(),
-            ),
-        ])
-    };
-
-    let mut lines = vec![
-        field(FIELD_LABEL, "Label", form.label.clone()),
-        field(FIELD_LOCAL_PORT, "Local port", form.local_port.clone()),
-        field(FIELD_REMOTE_HOST, "Remote host", form.remote_host.clone()),
-        field(FIELD_REMOTE_PORT, "Remote port", form.remote_port.clone()),
-        field(
-            FIELD_ENABLED,
-            "Enabled",
-            (if form.enabled { "[x]" } else { "[ ]" }).to_string(),
-        ),
-    ];
-    if let Some(err) = &form.error {
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            err.clone(),
-            Style::new().fg(Color::Red),
-        )));
-    }
-
-    frame.render_widget(
-        Paragraph::new(lines).block(titled_block(if form.is_edit() {
-            "Edit port forward"
-        } else {
-            "Add port forward"
-        })),
-        area,
-    );
-}
-
-fn draw_confirm(frame: &mut Frame, name: &str) {
-    let area = centered(frame.area(), 44, 3);
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(Line::from(format!("Delete forward \"{name}\"?  y/n")))
-            .block(titled_block("Confirm")),
-        area,
-    );
 }

@@ -11,11 +11,10 @@
 //! [`flextunnel_core::lock`]; this module only picks the per-user paths.
 //!
 //! The client lock is deliberately a dedicated file rather than the control
-//! socket or the forwards JSON: a Unix socket file persists after a crash and
-//! offers no kernel-enforced liveness (probe-then-unlink-then-bind is a TOCTOU
-//! race), and the forwards file is rewritten via temp+rename, which replaces
-//! the locked inode on every save. An advisory lock on a stable file has
-//! neither problem and is auto-released on crash.
+//! socket: a Unix socket file persists after a crash and offers no
+//! kernel-enforced liveness (probe-then-unlink-then-bind is a TOCTOU race). An
+//! advisory lock on a stable file has neither problem and is auto-released on
+//! crash.
 
 use anyhow::{Context, Result};
 use flextunnel_core::lock::InstanceLock;
