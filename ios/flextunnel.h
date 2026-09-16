@@ -147,7 +147,9 @@ int flextunnel_close_listeners(const FlextunnelHandle *handle);
  * Backgrounded, the core's app-level heartbeat — the connection's only periodic
  * traffic — slows from 10s to 60s so an idle session wakes the cellular radio
  * once a minute instead of six times; the foreground flip snaps it back and
- * sends any overdue beat immediately. Idempotent.
+ * sends any overdue beat immediately, and ends any reconnect backoff in
+ * progress (up to 5 min once a long outage has pushed it to the cap) so the
+ * next attempt runs at once with a fresh backoff series. Idempotent.
  *
  * Returns 1 on success and -1 for a NULL handle.
  */
@@ -166,8 +168,9 @@ int flextunnel_set_network_available(const FlextunnelHandle *handle, int availab
 
 /*
  * Liveness probe. Returns 1 while the connect/serve loop is running, 0 once it
- * has ended (gave up on a fatal error: bad node id, auth failure, or an
- * unreachable server on the first connect), and -1 for a NULL handle.
+ * has ended (gave up on a permanent error: a bad node id, a rejected key; an
+ * unreachable server keeps retrying with backoff, on the first attempt or
+ * after a drop), and -1 for a NULL handle.
  */
 int flextunnel_health(const FlextunnelHandle *handle);
 

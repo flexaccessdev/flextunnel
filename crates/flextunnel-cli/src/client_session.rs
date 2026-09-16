@@ -20,7 +20,7 @@ use flextunnel_core::forwards::{
 };
 use flextunnel_core::config::ForwardConfig;
 use flextunnel_core::iroh::SecretKey;
-use flextunnel_core::proxy::{ClientAuth, ClientConfig, ProxyClient, reserved};
+use flextunnel_core::proxy::{ClientAuth, ClientConfig, ProxyClient, ReconnectStatus, reserved};
 use flextunnel_core::transport::endpoint::{
     ClientEndpoint, RelayConfig, create_client_endpoint, create_quick_client_endpoint,
 };
@@ -259,7 +259,7 @@ async fn build_session(
         http_addr,
         ever_connected: false,
         connected_since: None,
-        last_error: None,
+        reconnect: ReconnectStatus::default(),
         disabled_reasons: HashMap::new(),
     };
 
@@ -346,6 +346,7 @@ async fn drive_session(
                     fwd_mgr.apply(&forwards);
                 }
                 state.observe_connection(routes.lock().map(|r| r.connected).unwrap_or(false));
+                state.reconnect = client.reconnect_status();
                 // The reconnect loop rebuilds the endpoint after repeated
                 // failures, which changes the (ephemeral) node id — keep the
                 // status display current.
@@ -448,7 +449,9 @@ struct SessionState {
     http_addr: Option<SocketAddr>,
     ever_connected: bool,
     connected_since: Option<Instant>,
-    last_error: Option<String>,
+    /// The core's reconnect progress (failed attempts, last error, next
+    /// attempt), polled by the ticker; all defaults while connected.
+    reconnect: ReconnectStatus,
     /// Bind-failure reasons of forwards switched off by the ticker, keyed by
     /// forward id, shown next to their rows for the rest of the session.
     disabled_reasons: HashMap<String, String>,
@@ -494,7 +497,12 @@ impl SessionState {
             socks_addr: self.socks_addr,
             http_addr: self.http_addr,
             status_page_host: reserved::STATUS_HOST.to_string(),
-            last_error: self.last_error.clone(),
+            failed_attempts: self.reconnect.failed_attempts,
+            next_attempt_secs: self
+                .reconnect
+                .next_attempt_at
+                .map(|at| at.saturating_duration_since(Instant::now()).as_secs()),
+            last_error: self.reconnect.last_error.clone(),
             routes: wire_routes(routes),
             forwards: forwards
                 .iter()

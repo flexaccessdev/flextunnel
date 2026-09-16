@@ -121,6 +121,13 @@ pub struct StatusSnapshot {
     pub http_addr: Option<SocketAddr>,
     /// Reserved host that is always tunneled to the server's status page.
     pub status_page_host: String,
+    /// Consecutive failed connection attempts in the current outage (0 while
+    /// connected).
+    pub failed_attempts: u32,
+    /// Seconds until the next connection attempt is due while backing off;
+    /// `Some(0)` while an attempt is in progress, `None` when none is pending.
+    pub next_attempt_secs: Option<u64>,
+    /// What the last connection attempt failed with, while the tunnel is down.
     pub last_error: Option<String>,
     pub routes: WireRoutes,
     pub forwards: Vec<ForwardRow>,
@@ -599,6 +606,8 @@ mod tests {
             socks_addr: Some("127.0.0.1:1080".parse().unwrap()),
             http_addr: None,
             status_page_host: "flextunnel.internal".into(),
+            failed_attempts: 0,
+            next_attempt_secs: None,
             last_error: None,
             routes: WireRoutes {
                 domains: vec!["*.internal".into()],

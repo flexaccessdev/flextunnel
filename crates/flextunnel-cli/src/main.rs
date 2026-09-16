@@ -175,10 +175,10 @@ enum ClientAction {
         /// Force auto-reconnect on (overrides `auto_reconnect = false` in the config).
         #[arg(long, conflicts_with = "no_auto_reconnect")]
         auto_reconnect: bool,
-        /// Disable auto-reconnect (exit on the first disconnection).
+        /// Disable auto-reconnect (exit on the first failed connection attempt or drop).
         #[arg(long, conflicts_with = "auto_reconnect")]
         no_auto_reconnect: bool,
-        /// Cap on reconnect attempts between successful connections (unlimited if unset).
+        /// Cap on consecutive retries before giving up (unlimited if unset).
         #[arg(long)]
         max_reconnect_attempts: Option<NonZeroU32>,
         /// Ignore any saved config, print this client's EndpointId (enter it on

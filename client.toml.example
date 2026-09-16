@@ -47,8 +47,8 @@ auth_key_file = "~/.config/flextunnel/client.key"
 # custom relay_urls (rejected with the default iroh relays).
 # relay_urls = ["https://relay.example"]
 # relay_auth_token = "shared-relay-secret"
-# auto_reconnect = true                      # default: true. set false to exit on first disconnect
-# max_reconnect_attempts = 10                # default: unlimited (omit for no cap)
+# auto_reconnect = true                      # default: true. set false to exit on the first failed attempt or drop
+# max_reconnect_attempts = 10                # default: unlimited (omit for no cap). retries before giving up
 
 # The split-tunnel routed set (the "tunnel set") is configured on the server and
 # pushed to this client during the handshake — there is no client-side routed-set

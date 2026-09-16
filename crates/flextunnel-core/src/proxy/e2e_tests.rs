@@ -560,6 +560,96 @@ async fn reconnect_rebuilds_a_dead_endpoint() {
     let _ = std::fs::remove_file(bl_path);
 }
 
+/// A client started before its server is up keeps trying until the server
+/// appears: a failed first connection is retried like any later drop instead
+/// of ending the session (the boot-order case — a unit starting ahead of the
+/// server, or a server down for maintenance when the client comes up).
+///
+/// The stand-in for "not up yet" is the server's own endpoint with nothing
+/// serving on it: every accepted connection is closed on the spot, so an
+/// attempt fails fast (the alternative, a dead address, would sit out the
+/// full connect timeout per attempt). The server then comes up on that same
+/// endpoint — same identity, same address — exactly as a late-starting
+/// service would.
+#[tokio::test]
+async fn client_retries_first_connect_until_server_is_up() {
+    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
+    let server_id = server_ep.id();
+    let server_addr = EndpointAddr::new(server_id).with_ip_addr(server_ep.bound_sockets()[0]);
+    let bl_path = temp_blocklist("retry-first-connect");
+    let (routed_set, routed_cidrs) = loopback_cidr_set();
+    let params = ProxyServerParams {
+        routed_set,
+        routed_cidrs,
+        ..base_params(server_id, bl_path.clone())
+    };
+
+    let (up_tx, mut up_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn({
+        let server_ep = server_ep.clone();
+        async move {
+            loop {
+                // Only the accept wait is cancellable: an accepted connection
+                // is always answered (closed), never dropped on the floor.
+                let incoming = tokio::select! {
+                    incoming = server_ep.accept() => incoming,
+                    _ = up_rx.wait_for(|up| *up) => break,
+                };
+                let Some(incoming) = incoming else { return };
+                if let Ok(conn) = incoming.await {
+                    conn.close(0u32.into(), b"not up yet");
+                }
+            }
+            let server = ProxyServer::new(params);
+            if let Err(e) = server.run(&server_ep).await {
+                eprintln!("e2e retry test server task ended: {e}");
+            }
+        }
+    });
+
+    let client_ep = ClientEndpoint::from_parts(
+        loopback_endpoint_seeded(SecretKey::generate(), false, vec![server_addr]).await,
+        Arc::new(|| Box::pin(async { anyhow::bail!("no rebuild expected in this test") })),
+    );
+    let client = Arc::new(ProxyClient::new(ClientConfig {
+        server_node_id: server_id.to_string(),
+        auth: ClientAuth::Key(Box::new(test_client_key().clone())),
+        socks_listen: None,
+        http_listen: None,
+        relay_urls: Vec::new(),
+        relay_auth_token: None,
+        auto_reconnect: true,
+        max_reconnect_attempts: None,
+    }));
+    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let session = tokio::spawn({
+        let (client, ep) = (client.clone(), client_ep.clone());
+        async move { client.run_with_listener(&ep, socks_listener).await }
+    });
+
+    // The session survives its first failure and reports it, rather than
+    // ending with an error.
+    wait_until("the first attempt to fail", || {
+        client.reconnect_status().failed_attempts >= 1
+    })
+    .await;
+    assert!(!session.is_finished(), "the session ended on a failed first connect");
+    let status = client.reconnect_status();
+    assert!(status.last_error.is_some());
+    assert!(status.next_attempt_at.is_some());
+
+    // The server comes up; the next attempt (1s backoff) lands.
+    up_tx.send_replace(true);
+    let connected = || client.routes().lock().unwrap().connected;
+    wait_until("the client to connect once the server is up", connected).await;
+    let status = client.reconnect_status();
+    assert_eq!(status.failed_attempts, 0, "a connection clears the outage");
+    assert!(status.last_error.is_none());
+
+    session.abort();
+    let _ = std::fs::remove_file(bl_path);
+}
+
 /// Deploy-style connection holding: a SOCKS request for an on-list target
 /// arriving while the tunnel link is down is *held* for the client's own
 /// reconnect and then proceeds transparently on the fresh connection, instead
