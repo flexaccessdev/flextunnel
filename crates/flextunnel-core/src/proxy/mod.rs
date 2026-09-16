@@ -18,7 +18,9 @@ pub mod status_page;
 mod e2e_tests;
 
 pub use bridge::{BridgeUpstream, BridgeUpstreamConfig};
-pub use client::{ClientAuth, ClientConfig, ProxyClient, ServerForwarder, TunnelRoutes};
+pub use client::{
+    ClientAuth, ClientConfig, ProxyClient, ReconnectStatus, ServerForwarder, TunnelRoutes,
+};
 pub use dns_forward::DnsForwarder;
 pub use forward::{ForwardManager, ForwardSpec, ForwardState, ForwardStatus};
 pub use routed_set::RoutedSet;

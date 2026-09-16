@@ -416,8 +416,8 @@ Client auth keypairs are generated with the standalone
 | `--relay-url <URL>` | Custom relay URLs (repeatable; at least two distinct relays, the same set as the server). Configuring custom relays disables n0 internet discovery (the server is reached via relay hints); mDNS local discovery stays on. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
 | `--auto-reconnect` | Force auto-reconnect on (overrides `auto_reconnect = false` in the config). |
-| `--no-auto-reconnect` | Exit on the first disconnection instead of reconnecting. |
-| `--max-reconnect-attempts <N>` | Cap reconnect attempts between successful connections (unlimited if unset). |
+| `--no-auto-reconnect` | Exit on the first failed connection attempt or drop instead of retrying. |
+| `--max-reconnect-attempts <N>` | Cap consecutive retries before giving up (unlimited if unset). |
 | `--quick` | Self-contained ephemeral session (pairs with `server start --quick`): ignore any saved config, print this client's EndpointId (enter it at the quick server's prompt — that allowlist entry is the credential; no auth keypair), prompt for the server EndpointId, then run the live control panel in this terminal. Needs an interactive terminal. Takes no lock and opens no control socket; quitting the panel disconnects. Nothing is persisted. Conflicts with `-c`/`--auth-key(-file)`. |
 
 `flextunnel client start` needs at least one flag — run with no arguments and it
@@ -616,13 +616,21 @@ Auto-reconnect is **enabled by default** (`auto_reconnect = true`); pass
 `--no-auto-reconnect` (or set `auto_reconnect = false`) to disable it, and
 `--auto-reconnect` to force it on over a config that disabled it.
 
-- The **first** connection must succeed. If it fails — bad node id, wrong
-  relay, server down, or a rejected token — the client **exits immediately**
-  rather than retrying blindly.
-- Once connected at least once, a transient drop triggers reconnection with
-  **exponential backoff + jitter** (1s → 60s), indefinitely, unless
-  `--max-reconnect-attempts` caps it or auto-reconnect is disabled.
-- A permanent error (auth/config) never retries.
+- A failed connection attempt — the **first one included** — or a lost
+  connection is retried with **exponential backoff + jitter** (1s doubling to
+  5 min), indefinitely, unless `--max-reconnect-attempts` caps it or
+  auto-reconnect is disabled. A server that is down, or not up yet, is the
+  ordinary case, not a reason to exit: the client waits it out and connects
+  when the server appears.
+- A long outage is cheap to sit through: once the backoff reaches its cap the
+  client makes one bounded connect attempt every five minutes. Repeated
+  failures escalate to rebuilding the iroh endpoint from scratch after the
+  third one, and then at most every 30 minutes for as long as the outage
+  lasts (see [`docs/architecture.md`](docs/architecture.md#reconnect-policy-client)).
+- A permanent error (a rejected key, a malformed config) never retries; that
+  is the only kind of error the client exits on.
+- The control panel shows the outage's progress: failed attempts so far, the
+  last error, and when the next attempt is due.
 - The local proxy listeners stay bound across reconnects. Off-list targets keep
   connecting directly; on-list requests are held for the reconnect (up to 45s)
   and only then fail with a network-unreachable reply.

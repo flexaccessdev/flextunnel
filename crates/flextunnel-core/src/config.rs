@@ -150,9 +150,11 @@ pub struct ClientConfig {
     /// Shared bearer token sent to every custom relay's WebSocket upgrade. Only
     /// valid with custom `relay_urls`; rejected with the default iroh relays.
     pub relay_auth_token: Option<String>,
-    /// Reconnect with backoff on a transient drop (default true).
+    /// Retry failed connection attempts and lost connections with backoff
+    /// (default true; `false` exits on the first failure of either kind).
     pub auto_reconnect: Option<bool>,
-    /// Cap on reconnect attempts between successful connections.
+    /// Cap on consecutive retries before the client gives up (default
+    /// unlimited).
     pub max_reconnect_attempts: Option<NonZeroU32>,
     /// Server-direct port forwards (`[[forwards]]` tables). Config-file only —
     /// there is no CLI flag.

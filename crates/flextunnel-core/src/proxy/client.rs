@@ -18,25 +18,43 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::{Semaphore, watch};
 
-/// Reconnect backoff: base 1s, doubling per attempt, capped at 60s.
-const RECONNECT_BACKOFF_MAX: u64 = 60;
-/// Escalate to a full endpoint rebuild every this many consecutive failed
-/// reconnect attempts. The early attempts get the cheap `network_change()`
-/// nudge, which repairs dead UDP sockets; a wedge that survives the nudge plus
-/// two full connect timeouts is endpoint state a rebind cannot fix — a relay
-/// link lost to a ping timeout and never re-established, stale cached paths
-/// for the server — which only a fresh endpoint repairs (observed as "restart
-/// the client process and it connects instantly"; the rebuild is that restart,
-/// in-process). Rebuilding every Nth attempt (not once) keeps a long outage
-/// retrying from fresh state without paying the rebuild on every backoff.
+/// Reconnect backoff: base 1s, doubling per consecutive failed attempt, capped
+/// here. The early steps (1s, 2s, 4s, …) catch a server restart within a
+/// minute or two; past them the doubling runs on up to the cap, so a server
+/// that stays down for hours or days is probed once every five minutes for as
+/// long as it takes. Each probe is one bounded connect ([`CONNECT_TIMEOUT`])
+/// on the endpoint the client already holds, so an outage of any length is
+/// cheap to sit through — at the price of noticing the server's return up to
+/// five minutes late. Events that make an earlier attempt worthwhile cut the
+/// wait short (see [`ProxyClient::wait_backoff`]).
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// Escalate to a full endpoint rebuild once this many consecutive attempts of
+/// an outage have failed. The attempts before it get the cheap
+/// `network_change()` nudge, which repairs dead UDP sockets; a wedge that
+/// survives the nudge plus two full connect timeouts is endpoint state a
+/// rebind cannot fix — a relay link lost to a ping timeout and never
+/// re-established, stale cached paths for the server — which only a fresh
+/// endpoint repairs (observed as "restart the client process and it connects
+/// instantly"; the rebuild is that restart, in-process).
 const REBUILD_ENDPOINT_ATTEMPTS: u32 = 3;
+/// After an outage's first rebuild, rebuild again no more often than this for
+/// as long as the outage lasts. The rebuild is the expensive step — fresh
+/// sockets and relay connections, a new ephemeral identity the relay has to
+/// learn, the old endpoint's close — and it repairs a wedged *endpoint*; a
+/// freshly built endpoint that still cannot connect has ruled that out, and
+/// no amount of rebuilding brings back a server (or a network) that is down.
+/// The nudge still runs before every attempt, so a network that changes
+/// mid-outage is picked up without a rebuild; this is only the backstop for a
+/// wedge that develops during a long outage. The budget is per outage: a
+/// successful connection resets it.
+const REBUILD_ENDPOINT_MIN_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Max jitter (ms) added to each backoff to avoid thundering reconnects.
 const RECONNECT_JITTER_MAX_MS: u64 = 500;
 /// Deadline for the server's handshake response. The QUIC keep-alive keeps the
@@ -175,9 +193,12 @@ pub struct ClientConfig {
     /// Shared bearer token sent to every custom relay's WebSocket upgrade.
     /// Only valid alongside custom `relay_urls`; ignored with the default relays.
     pub relay_auth_token: Option<String>,
-    /// Reconnect with backoff on a transient failure instead of exiting.
+    /// Retry a failed connection attempt or a lost connection with backoff
+    /// instead of ending the session (`false`: the first failure of either
+    /// kind ends it — including a server that is merely not up yet).
     pub auto_reconnect: bool,
-    /// Cap on reconnect attempts between successful connections (unlimited if None).
+    /// Cap on consecutive retries — attempts after a failure, before the next
+    /// success — after which the session ends (unlimited if `None`).
     pub max_reconnect_attempts: Option<NonZeroU32>,
 }
 
@@ -234,10 +255,45 @@ impl ServerForwarder {
 /// Shared with [`crate::proxy::bridge`], whose reconnect policy mirrors the
 /// client's.
 pub(crate) fn calculate_backoff(attempt: u32) -> Duration {
-    let shift = attempt.saturating_sub(1).min(6); // cap the doubling at 2^6 = 64
-    let secs = (1u64 << shift).min(RECONNECT_BACKOFF_MAX);
+    // 2^(attempt-1) seconds; the shift is bounded well past where the cap
+    // takes over, so it can never overflow.
+    let shift = attempt.saturating_sub(1).min(16);
+    let secs = (1u64 << shift).min(RECONNECT_BACKOFF_MAX.as_secs());
     let jitter = rand::rng().random_range(0..=RECONNECT_JITTER_MAX_MS);
     Duration::from_secs(secs) + Duration::from_millis(jitter)
+}
+
+/// Whether the reconnect loop should rebuild the endpoint before its next
+/// attempt: the outage has reached [`REBUILD_ENDPOINT_ATTEMPTS`] consecutive
+/// failures, and it either has not rebuilt yet or last did so at least
+/// [`REBUILD_ENDPOINT_MIN_INTERVAL`] ago.
+fn rebuild_due(attempt: u32, last_rebuild: Option<Instant>) -> bool {
+    attempt >= REBUILD_ENDPOINT_ATTEMPTS
+        && last_rebuild.is_none_or(|at| at.elapsed() >= REBUILD_ENDPOINT_MIN_INTERVAL)
+}
+
+/// An event that cuts a reconnect backoff short (see
+/// [`ProxyClient::wait_backoff`]).
+enum BackoffWake {
+    /// The device lost its network path mid-sleep: park until it returns.
+    PathLost,
+    /// The embedding app came to the foreground: attempt right away.
+    Foregrounded,
+}
+
+/// What the reconnect loop is doing while the tunnel is down, for status
+/// displays (the CLI panel). All fields are at their defaults while connected.
+#[derive(Clone, Debug, Default)]
+pub struct ReconnectStatus {
+    /// Consecutive failed connection attempts in the current outage: 0 while
+    /// connected, or before the first attempt has failed.
+    pub failed_attempts: u32,
+    /// What the most recent attempt failed with.
+    pub last_error: Option<String>,
+    /// When the next attempt is due. Already in the past while an attempt is
+    /// in progress (bounded by [`CONNECT_TIMEOUT`] + [`HANDSHAKE_TIMEOUT`]);
+    /// `None` when there is no attempt to wait for.
+    pub next_attempt_at: Option<Instant>,
 }
 
 /// Snapshot of what the tunnel currently forwards: the split-tunnel set the
@@ -313,6 +369,9 @@ pub struct ProxyClient {
     /// timers at all — retrying into a dead path is pure battery burn — and a
     /// flip back to available reconnects immediately with a fresh backoff.
     network_available: watch::Sender<bool>,
+    /// The reconnect loop's progress through the current outage, for status
+    /// displays ([`Self::reconnect_status`]).
+    reconnect: Mutex<ReconnectStatus>,
 }
 
 impl ProxyClient {
@@ -327,14 +386,18 @@ impl ProxyClient {
             local_close: watch::Sender::new(false),
             background: watch::Sender::new(false),
             network_available: watch::Sender::new(true),
+            reconnect: Mutex::new(ReconnectStatus::default()),
         }
     }
 
     /// Report the embedding app's scene state. Backgrounded, the heartbeat
     /// slows to [`HEARTBEAT_INTERVAL_IDLE`] (one radio wake a minute instead of
     /// six); foregrounded, it snaps back to [`HEARTBEAT_INTERVAL`] — a beat
-    /// already overdue at the faster cadence is sent immediately. Safe to call
-    /// repeatedly with the same value.
+    /// already overdue at the faster cadence is sent immediately — and a
+    /// reconnect backoff in progress ends early: the next attempt runs at
+    /// once, with a fresh backoff series (the user is looking, and a long
+    /// backoff step sized for an unattended outage should not keep them
+    /// waiting). Safe to call repeatedly with the same value.
     pub fn set_background(&self, background: bool) {
         self.background.send_replace(background);
     }
@@ -451,17 +514,36 @@ impl ProxyClient {
         }
     }
 
+    /// A snapshot of the reconnect loop's progress through the current outage
+    /// (all defaults while connected).
+    pub fn reconnect_status(&self) -> ReconnectStatus {
+        self.reconnect
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+
+    fn set_reconnect_status(&self, status: ReconnectStatus) {
+        if let Ok(mut s) = self.reconnect.lock() {
+            *s = status;
+        }
+    }
+
     /// Bind the local SOCKS5 listener (and the optional HTTP listener) once, then
-    /// connect to the server and serve them. Reconnect policy (matching ezvpn):
-    /// the **first** connection must succeed — if it fails, exit immediately (a
-    /// bad node id, wrong relay, or down server is not worth retrying blindly).
-    /// Once connected at least once, transient drops are retried with exponential
-    /// backoff, indefinitely (unless `--max-reconnect-attempts` caps it or
-    /// `--no-auto-reconnect` is set). The listeners stay bound across reconnects:
-    /// off-list targets keep connecting directly, while on-list requests are held
-    /// for the reconnect (failing with network-unreachable only after
-    /// [`TUNNEL_RECOVERY_HOLD`]). Reconnects that keep failing escalate to a
-    /// full endpoint rebuild every [`REBUILD_ENDPOINT_ATTEMPTS`] attempts.
+    /// connect to the server and serve them. Reconnect policy: every
+    /// recoverable failure — a connection attempt that fails, the first one
+    /// included, or an established connection that drops — is retried with
+    /// exponential backoff (1s doubling to [`RECONNECT_BACKOFF_MAX`]),
+    /// indefinitely, unless `--max-reconnect-attempts` caps it or
+    /// `--no-auto-reconnect` is set. A server that is down, or not up yet, is
+    /// the ordinary case, not an error to exit on; only a permanent error (a
+    /// rejected credential, a malformed config) ends the session. The
+    /// listeners stay bound across reconnects: off-list targets keep
+    /// connecting directly, while on-list requests are held for the reconnect
+    /// (failing with network-unreachable only after [`TUNNEL_RECOVERY_HOLD`]).
+    /// An outage that reaches [`REBUILD_ENDPOINT_ATTEMPTS`] failures escalates
+    /// to a full endpoint rebuild, repeated at most every
+    /// [`REBUILD_ENDPOINT_MIN_INTERVAL`] for as long as the outage lasts.
     pub async fn run(&self, endpoint: &ClientEndpoint) -> ProxyResult<()> {
         let socks = match self.config.socks_listen {
             Some(addr) => Some(TcpListener::bind(addr).await?),
@@ -636,35 +718,41 @@ impl ProxyClient {
     }
 
     /// Maintain the server connection: (re)establish + authenticate, publish the
-    /// live connection and tunnel set for the accept loop, and reconnect with
-    /// backoff on drops. Reconnect policy is unchanged: the **first** connection
-    /// must succeed (fail fast); once connected, transient drops are retried.
+    /// live connection and tunnel set for the accept loop, and retry with
+    /// backoff when an attempt fails or the connection drops (see
+    /// [`Self::handle_failure`] for what is retried and [`Self::run`] for the
+    /// policy).
     async fn manage_connection(
         &self,
         endpoint: &ClientEndpoint,
         current: &SharedConn,
         routed_set_shared: &SharedRoutedSet,
     ) -> ProxyResult<()> {
-        let mut ever_connected = false;
+        // Consecutive failed attempts in the current outage; 0 once connected.
         let mut attempt: u32 = 0;
-        // Set when the last backoff resumed from a parked (path-lost) state:
-        // the backoff series was reset, but the endpoint still needs the rebind
-        // nudge below — the network genuinely changed underneath it. Every
-        // retry passes through `wait_backoff`, which reassigns it.
+        // When the current outage last rebuilt the endpoint (`None`: not yet).
+        let mut last_rebuild: Option<Instant> = None;
+        // Set when the last backoff was cut short by an event that reset the
+        // series (a restored network path, a foregrounded app): the endpoint
+        // still needs the rebind nudge below — the network may well have
+        // changed underneath it. Every retry passes through `wait_backoff`,
+        // which reassigns it.
         let mut path_returned = false;
         loop {
             // Until (re)authenticated, nothing is being forwarded.
             self.set_connected(false);
             current.send_replace(None);
 
-            if attempt > 0 && attempt.is_multiple_of(REBUILD_ENDPOINT_ATTEMPTS) {
+            if rebuild_due(attempt, last_rebuild) {
                 // Escalation: the nudge below wasn't enough — rebuild the
-                // endpoint from scratch (see [`REBUILD_ENDPOINT_ATTEMPTS`]).
-                // On a rebuild failure (e.g. no route to bind on a dead
-                // network) the current endpoint stays in place and this
-                // attempt proceeds with it — the next multiple retries the
-                // rebuild.
-                log::warn!("Reconnect still failing after {attempt} attempts; rebuilding the endpoint from scratch");
+                // endpoint from scratch (see [`REBUILD_ENDPOINT_ATTEMPTS`] and
+                // [`REBUILD_ENDPOINT_MIN_INTERVAL`]). On a rebuild failure
+                // (e.g. no route to bind on a dead network) the current
+                // endpoint stays in place and this attempt proceeds with it;
+                // the failed rebuild still counts against the interval — a
+                // network that dead is a matter for the per-attempt nudge.
+                log::warn!("Still failing after {attempt} attempts; rebuilding the endpoint from scratch");
+                last_rebuild = Some(Instant::now());
                 if let Err(e) = endpoint.rebuild().await {
                     log::warn!("Endpoint rebuild failed ({e:#}); retrying with the current endpoint");
                 }
@@ -687,11 +775,13 @@ impl ProxyClient {
                 .await
             {
                 Ok(established) => {
-                    ever_connected = true;
-                    attempt = 0; // reset backoff on a successful connection
+                    // Connected: the outage, if there was one, is over.
+                    attempt = 0;
+                    last_rebuild = None;
+                    self.set_reconnect_status(ReconnectStatus::default());
                     established
                 }
-                Err(e) => match self.handle_failure(e, ever_connected, &mut attempt) {
+                Err(e) => match self.handle_failure(e, &mut attempt) {
                     Ok(backoff) => {
                         path_returned = self.wait_backoff(backoff, &mut attempt).await;
                         continue;
@@ -716,7 +806,7 @@ impl ProxyClient {
             self.set_connected(false);
             current.send_replace(None);
             if let Err(e) = maintained {
-                match self.handle_failure(e, ever_connected, &mut attempt) {
+                match self.handle_failure(e, &mut attempt) {
                     Ok(backoff) => {
                         path_returned = self.wait_backoff(backoff, &mut attempt).await;
                         continue;
@@ -729,34 +819,38 @@ impl ProxyClient {
         }
     }
 
-    /// Decide what to do with a connection error: `Ok(backoff)` to retry after
-    /// the given delay, or `Err(e)` to give up.
+    /// Decide what to do with a failed attempt or a lost connection:
+    /// `Ok(backoff)` to retry after that delay, or `Err(e)` to end the session.
     ///
-    /// Gives up when: the first connection never succeeded (`!ever_connected` —
-    /// fail fast), auto-reconnect is disabled, the error is permanent
-    /// (auth/config), or an explicit attempt cap was reached. Otherwise retries.
-    fn handle_failure(
-        &self,
-        e: ProxyError,
-        ever_connected: bool,
-        attempt: &mut u32,
-    ) -> Result<Duration, ProxyError> {
-        if !ever_connected || !self.config.auto_reconnect || !e.is_recoverable() {
+    /// Every recoverable error (`ProxyError::is_recoverable`: a connect that
+    /// failed or timed out, a dropped connection) is retried, on the first
+    /// attempt exactly as after a year connected — a server that is down, or
+    /// not up yet, is the ordinary case — unless auto-reconnect is off or the
+    /// retry cap is reached. A permanent error (a rejected credential, a
+    /// malformed config) ends the session: the same credential and config
+    /// would fail the same way every time.
+    fn handle_failure(&self, e: ProxyError, attempt: &mut u32) -> Result<Duration, ProxyError> {
+        if !self.config.auto_reconnect || !e.is_recoverable() {
             return Err(e);
         }
         *attempt += 1;
         if let Some(max) = self.config.max_reconnect_attempts
             && *attempt > max.get()
         {
-            log::error!("Giving up after {} reconnect attempt(s): {e}", max.get());
+            log::error!("Giving up after {} retries: {e}", max.get());
             return Err(e);
         }
         let backoff = calculate_backoff(*attempt);
         log::warn!(
-            "Connection lost ({e}); reconnecting in {:.1}s (attempt {})",
+            "{e}; retrying in {:.1}s (attempt {})",
             backoff.as_secs_f64(),
             *attempt
         );
+        self.set_reconnect_status(ReconnectStatus {
+            failed_attempts: *attempt,
+            last_error: Some(e.to_string()),
+            next_attempt_at: Some(Instant::now() + backoff),
+        });
         Ok(backoff)
     }
 
@@ -766,33 +860,68 @@ impl ProxyClient {
     /// nothing) and return as soon as the path comes back — resetting the
     /// backoff series so the restored network gets an immediate, fresh
     /// reconnect. While the path is up this is a plain backoff sleep, except
-    /// that a mid-sleep loss switches to parking.
+    /// that a mid-sleep loss switches to parking, and that the embedding app
+    /// coming to the foreground ends the sleep the same way a restored path
+    /// does — a backoff step sized for an unattended outage (up to
+    /// [`RECONNECT_BACKOFF_MAX`]) must not keep a user who is looking waiting.
     ///
-    /// Returns whether the wait resumed from a parked state — i.e. the network
-    /// went away and came back — so the caller can nudge
-    /// `Endpoint::network_change()` even though the attempt counter was reset.
+    /// Returns whether the wait was cut short by one of those events (the
+    /// backoff series was reset), so the caller can nudge
+    /// `Endpoint::network_change()` even though the attempt counter is 0.
     async fn wait_backoff(&self, backoff: Duration, attempt: &mut u32) -> bool {
         let mut available = self.network_available.subscribe();
         if !*available.borrow() {
-            log::info!("Network unavailable; pausing reconnects until a path returns");
-            // The sender lives in self, so this cannot error while we run.
-            let _ = available.wait_for(|a| *a).await;
-            log::info!("Network available again; reconnecting now");
-            *attempt = 0;
+            self.park_until_path_returns(&mut available, attempt).await;
             return true;
         }
-        let lost_mid_sleep = tokio::select! {
-            _ = tokio::time::sleep(backoff) => false,
-            r = available.wait_for(|a| !*a) => r.is_ok(),
+        // A foreground flip only matters if the app is backgrounded right now;
+        // otherwise this branch stays inert. The senders live in self, so
+        // `wait_for` cannot error while we run.
+        let mut background = self.background.subscribe();
+        let foregrounded = async {
+            if *background.borrow() && background.wait_for(|b| !*b).await.is_ok() {
+                return;
+            }
+            std::future::pending::<()>().await
         };
-        if lost_mid_sleep {
-            log::info!("Network unavailable; pausing reconnects until a path returns");
-            let _ = available.wait_for(|a| *a).await;
-            log::info!("Network available again; reconnecting now");
-            *attempt = 0;
-            return true;
+        let cut_short = tokio::select! {
+            _ = tokio::time::sleep(backoff) => None,
+            r = available.wait_for(|a| !*a) => r.is_ok().then_some(BackoffWake::PathLost),
+            _ = foregrounded => Some(BackoffWake::Foregrounded),
+        };
+        match cut_short {
+            None => false,
+            Some(BackoffWake::PathLost) => {
+                self.park_until_path_returns(&mut available, attempt).await;
+                true
+            }
+            Some(BackoffWake::Foregrounded) => {
+                log::info!("App foregrounded; reconnecting now");
+                self.reset_backoff(attempt);
+                true
+            }
         }
-        false
+    }
+
+    /// Park (no timers) until the device reports a usable path again, then
+    /// reset the backoff series for an immediate, fresh attempt.
+    async fn park_until_path_returns(
+        &self,
+        available: &mut watch::Receiver<bool>,
+        attempt: &mut u32,
+    ) {
+        log::info!("Network unavailable; pausing reconnects until a path returns");
+        let _ = available.wait_for(|a| *a).await;
+        log::info!("Network available again; reconnecting now");
+        self.reset_backoff(attempt);
+    }
+
+    /// Start a fresh backoff series with an attempt due right now.
+    fn reset_backoff(&self, attempt: &mut u32) {
+        *attempt = 0;
+        if let Ok(mut s) = self.reconnect.lock() {
+            s.next_attempt_at = Some(Instant::now());
+        }
     }
 
     /// Connect to the server and complete the auth handshake, returning the
@@ -1990,6 +2119,159 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(200));
         assert_eq!(attempt, 3);
         assert!(!resumed, "an uninterrupted sleep saw no path return");
+    }
+
+    /// The app coming to the foreground ends a backoff sleep early, with the
+    /// series reset and the cut-short reported, so a user who is looking never
+    /// waits out a step sized for an unattended outage.
+    #[tokio::test]
+    async fn backoff_ends_early_when_app_foregrounded() {
+        let client = Arc::new(test_client());
+        client.set_background(true);
+        let c = client.clone();
+        let task = tokio::spawn(async move {
+            let mut attempt = 9;
+            let cut_short = c.wait_backoff(Duration::from_secs(300), &mut attempt).await;
+            (attempt, cut_short)
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!task.is_finished(), "backoff ended while still backgrounded");
+        client.set_background(false);
+        let (attempt, cut_short) = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("backoff did not end on the foreground flip")
+            .unwrap();
+        assert_eq!(attempt, 0, "a foreground flip should reset the backoff series");
+        assert!(cut_short);
+        assert_eq!(
+            client.reconnect_status().next_attempt_at.map(|t| t <= Instant::now()),
+            Some(true),
+            "the next attempt reads as due now"
+        );
+    }
+
+    /// A foreground flip while the device has no path changes nothing: the
+    /// wait stays parked (there is nothing to attempt into) until the path
+    /// returns.
+    #[tokio::test]
+    async fn parked_backoff_ignores_foreground_flip() {
+        let client = Arc::new(test_client());
+        client.set_background(true);
+        client.set_network_available(false);
+        let c = client.clone();
+        let task = tokio::spawn(async move {
+            let mut attempt = 5;
+            c.wait_backoff(Duration::from_millis(50), &mut attempt).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        client.set_background(false);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!task.is_finished(), "a parked backoff resumed without a path");
+        client.set_network_available(true);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("backoff did not resume on path return")
+                .unwrap()
+        );
+    }
+
+    /// The backoff doubles from 1s and settles at the cap, jitter aside.
+    #[test]
+    fn backoff_doubles_to_the_cap() {
+        let jitter = Duration::from_millis(RECONNECT_JITTER_MAX_MS);
+        for (attempt, secs) in [(0, 1), (1, 1), (2, 2), (3, 4), (7, 64), (9, 256)] {
+            let b = calculate_backoff(attempt);
+            let base = Duration::from_secs(secs);
+            assert!(b >= base && b <= base + jitter, "attempt {attempt}: {b:?}");
+        }
+        for attempt in [10, 11, 20, u32::MAX] {
+            let b = calculate_backoff(attempt);
+            assert!(
+                b >= RECONNECT_BACKOFF_MAX && b <= RECONNECT_BACKOFF_MAX + jitter,
+                "attempt {attempt}: {b:?}"
+            );
+        }
+    }
+
+    /// An outage's first rebuild comes after the third consecutive failure;
+    /// later ones are spaced by the minimum interval, however many attempts
+    /// fail in between.
+    #[test]
+    fn rebuild_after_third_failure_then_at_most_every_interval() {
+        assert!(!rebuild_due(0, None));
+        assert!(!rebuild_due(REBUILD_ENDPOINT_ATTEMPTS - 1, None));
+        assert!(rebuild_due(REBUILD_ENDPOINT_ATTEMPTS, None));
+        assert!(rebuild_due(REBUILD_ENDPOINT_ATTEMPTS + 7, None));
+
+        let just_now = Some(Instant::now());
+        assert!(!rebuild_due(REBUILD_ENDPOINT_ATTEMPTS, just_now));
+        assert!(!rebuild_due(REBUILD_ENDPOINT_ATTEMPTS * 4, just_now));
+
+        let long_ago = Instant::now().checked_sub(REBUILD_ENDPOINT_MIN_INTERVAL);
+        assert!(long_ago.is_some(), "test host has been up for over an hour");
+        assert!(rebuild_due(REBUILD_ENDPOINT_ATTEMPTS, long_ago));
+        assert!(!rebuild_due(REBUILD_ENDPOINT_ATTEMPTS - 1, long_ago));
+    }
+
+    /// A recoverable failure is retried from the very first attempt — a server
+    /// that is not up yet is not a reason to exit — and the reconnect status
+    /// reflects it; a permanent error, or auto-reconnect being off, ends the
+    /// session on that same first failure.
+    #[test]
+    fn first_failure_is_retried_unless_permanent_or_reconnect_is_off() {
+        let client = test_client();
+        let mut attempt = 0;
+        let backoff = client
+            .handle_failure(ProxyError::Signaling("server not up yet".into()), &mut attempt)
+            .expect("a transient first failure is retried");
+        assert!(backoff >= Duration::from_secs(1));
+        assert_eq!(attempt, 1);
+        let status = client.reconnect_status();
+        assert_eq!(status.failed_attempts, 1);
+        assert!(status.last_error.unwrap().contains("server not up yet"));
+        assert!(status.next_attempt_at.is_some());
+
+        assert!(
+            client
+                .handle_failure(ProxyError::AuthenticationFailed("rejected".into()), &mut attempt)
+                .is_err(),
+            "a permanent error is never retried"
+        );
+
+        let no_retry = ProxyClient::new(ClientConfig {
+            auto_reconnect: false,
+            ..test_client().config
+        });
+        let mut attempt = 0;
+        assert!(
+            no_retry
+                .handle_failure(ProxyError::ConnectionLost("dropped".into()), &mut attempt)
+                .is_err()
+        );
+    }
+
+    /// `max_reconnect_attempts` caps consecutive retries: that many are
+    /// granted, the next failure ends the session.
+    #[test]
+    fn retry_cap_ends_the_session_after_that_many_retries() {
+        let client = ProxyClient::new(ClientConfig {
+            max_reconnect_attempts: NonZeroU32::new(2),
+            ..test_client().config
+        });
+        let mut attempt = 0;
+        for _ in 0..2 {
+            assert!(
+                client
+                    .handle_failure(ProxyError::ConnectionLost("dropped".into()), &mut attempt)
+                    .is_ok()
+            );
+        }
+        assert!(
+            client
+                .handle_failure(ProxyError::ConnectionLost("dropped".into()), &mut attempt)
+                .is_err()
+        );
     }
 
     /// While the tunnel stays down a held request must wait out the full

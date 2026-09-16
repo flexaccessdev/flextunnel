@@ -105,6 +105,17 @@ fn header_lines(s: &StatusSnapshot) -> Vec<Line<'static>> {
     if let Some(secs) = s.connected_secs {
         first.push(Span::styled(format!("  for {}", format_uptime(secs)), DIM));
     }
+    // While down, say how far the retry loop has got and when it tries again,
+    // so a backoff step of minutes reads as waiting, not stuck.
+    if s.failed_attempts > 0 {
+        let next = match s.next_attempt_secs {
+            Some(secs) if secs > 0 => format!("next in {}", format_uptime(secs)),
+            _ => "trying now".to_string(),
+        };
+        let n = s.failed_attempts;
+        let s_ = if n == 1 { "" } else { "s" };
+        first.push(Span::styled(format!("  {n} failed attempt{s_}, {next}"), DIM));
+    }
 
     let proxy = |name: &str, addr: Option<std::net::SocketAddr>| match addr {
         Some(addr) => Span::raw(format!("{name} {addr}")),

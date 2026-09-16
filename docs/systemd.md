@@ -55,25 +55,29 @@ loginctl enable-linger "$USER"
 
 The client already supervises itself where it matters:
 
-- After the **first** successful connection, auto-reconnect (on by default)
-  retries transient drops internally with exponential backoff, indefinitely.
-  Reconnects that keep failing escalate every third attempt to rebuilding the
-  iroh endpoint from scratch — the in-process equivalent of a unit restart,
-  covering wedges (a dead relay link, stale path state) that only a fresh
-  endpoint repairs. The process does not exit, so systemd never gets involved.
-  Don't disable `auto_reconnect` or set `max_reconnect_attempts` under
-  systemd — that just replaces the client's backoff with unit restarts, which
-  re-bind listeners and drop held proxy requests.
-- The client **exits nonzero** when the *first* connection fails (server down,
-  network not up yet at boot) and on permanent auth/config errors.
-  `Restart=on-failure` + `RestartSec` covers the boot-time window where the
-  network isn't ready — there's no user-manager `network-online.target` to
-  order against, and none is needed.
-
-The one wrinkle: a **permanent** error (bad node id, rejected key, malformed
-config) also exits nonzero, so systemd will keep retrying it every
-`RestartSec`. That's harmless but noisy — if an instance is flapping, read the
-reason with `journalctl --user -u flextunnel-client@<name>`.
+- Auto-reconnect (on by default) retries every failed connection attempt and
+  every lost connection internally with exponential backoff (1s doubling to
+  5 min), indefinitely — the first attempt included. A server that is down
+  when the unit starts, or a network that isn't up yet at boot, is waited
+  out, not exited on: the client connects when the server appears, and there
+  is no user-manager `network-online.target` to order against nor any need
+  for one. A long outage costs one bounded connect attempt every five
+  minutes. Reconnects that keep failing escalate to rebuilding the iroh
+  endpoint from scratch (after the third failure, then at most every 30
+  minutes) — the in-process equivalent of a unit restart, covering wedges (a
+  dead relay link, stale path state) that only a fresh endpoint repairs. The
+  process does not exit, so systemd never gets involved. Don't disable
+  `auto_reconnect` or set `max_reconnect_attempts` under systemd — that just
+  replaces the client's backoff with unit restarts, which re-bind listeners
+  and drop held proxy requests.
+- The client **exits nonzero** only on a permanent error: a rejected key, a
+  bad node id, a malformed config, a proxy port taken by another process.
+  `Restart=on-failure` + `RestartSec` will keep retrying that every
+  `RestartSec` — harmless but noisy, and it never fixes itself. If an
+  instance is flapping, read the reason with
+  `journalctl --user -u flextunnel-client@<name>`; a client that is merely
+  waiting for its server is not flapping, it is running, and
+  `flextunnel client control` shows how far its retry loop has got.
 
 ## Interacting with a running instance
 

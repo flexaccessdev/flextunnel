@@ -11,7 +11,7 @@
 //!    instance may run at a time (a process-global guard rejects a second).
 //! 2. [`flextunnel_set_forwards`] — reconcile server-direct local forwards.
 //! 3. [`flextunnel_health`] — cheap liveness probe: is the serve loop still
-//!    running, or did it give up (bad node id / auth / unreachable server)?
+//!    running, or did it give up (a rejected key, a malformed config)?
 //! 4. [`flextunnel_routes`] — snapshot the server-pushed split-tunnel set for UI.
 //! 5. [`flextunnel_conn_path`] — snapshot the live iroh path(s) (relay/direct)
 //!    for an on-demand "connection path" status readout.
@@ -551,8 +551,11 @@ pub unsafe extern "C" fn flextunnel_close_listeners(handle: *const FlextunnelHan
 /// is backgrounded, `0` when foregrounded. Backgrounded, the app-level
 /// heartbeat — the connection's only periodic traffic — slows from 10s to 60s,
 /// keeping the cellular radio in its low-power state almost the whole time; the
-/// foreground flip snaps it back and sends any overdue beat immediately.
-/// Idempotent; safe to call with the same value repeatedly.
+/// foreground flip snaps it back and sends any overdue beat immediately, and if
+/// the core is sitting out a reconnect backoff (up to 5 min once a long outage
+/// has pushed it to the cap) it ends that wait and attempts at once with a
+/// fresh backoff series. Idempotent; safe to call with the same value
+/// repeatedly.
 ///
 /// Returns 1 on success and -1 for a null handle.
 ///
@@ -615,9 +618,9 @@ pub unsafe extern "C" fn flextunnel_stop(handle: *mut FlextunnelHandle) {
 /// Liveness probe for the running proxy.
 ///
 /// Returns `1` while the connect/serve loop is still running, `0` once it has
-/// ended (it gives up on a fatal error — bad node id, auth failure, or an
-/// unreachable server on the *first* connect; transient drops after a successful
-/// connect keep retrying and stay `1`), and `-1` for a null handle.
+/// ended (it gives up only on a permanent error — a bad node id, a rejected
+/// key; an unreachable server, on the first attempt or after a drop, keeps
+/// retrying with backoff and stays `1`), and `-1` for a null handle.
 ///
 /// # Safety
 /// `handle` must be a valid pointer returned by [`flextunnel_start`] and not yet

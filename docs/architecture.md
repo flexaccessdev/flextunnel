@@ -222,24 +222,39 @@ atomically (temp + rename) and loaded at startup.
 
 Implemented in `ProxyClient::run` / `handle_failure`:
 
-- The **first** connection must succeed; if it fails (even a transient error),
-  the client exits — a bad node id, wrong relay, or down server is not worth
-  retrying blindly.
-- After at least one success, transient drops (`ConnectionLost` / `Network` /
-  `Signaling` — see `ProxyError::is_recoverable`) are retried with **exponential
-  backoff + jitter** (1s → 60s), indefinitely, unless `--max-reconnect-attempts`
-  caps it or `--no-auto-reconnect` disables it.
-- Permanent errors (`AuthenticationFailed` / `Config`) never retry.
-- Every **third** consecutive failure escalates to a **full endpoint rebuild**
-  (`ClientEndpoint::rebuild`); the other retries nudge
-  `Endpoint::network_change()` (rebinds dead UDP sockets) instead. The rebuild
-  swaps in a freshly bound endpoint — new sockets, new
+- Every recoverable failure (`ConnectionLost` / `Network` / `Signaling` — see
+  `ProxyError::is_recoverable`) is retried with **exponential backoff +
+  jitter** (1s doubling to `RECONNECT_BACKOFF_MAX`, 5 min), indefinitely,
+  unless `--max-reconnect-attempts` caps it or `--no-auto-reconnect` disables
+  it. The first attempt is no different from any later one: a server that is
+  down or not up yet is the ordinary case (boot order, maintenance), not an
+  error to exit on. A bad node id or relay URL is a `Config` error and still
+  fails on the first attempt.
+- Permanent errors (`AuthenticationFailed` / `Config`) never retry — the same
+  credential and config would fail the same way every time.
+- A long outage costs one bounded connect (`CONNECT_TIMEOUT`) per attempt on
+  the endpoint the client already holds, once every five minutes at the cap.
+  Two events cut a backoff step short with a fresh series: the device
+  reporting its network path back (`set_network_available`) and the embedding
+  app coming to the foreground (`set_background(false)`), so a user who is
+  looking never waits out a step sized for an unattended outage.
+- An outage's **third** consecutive failure escalates to a **full endpoint
+  rebuild** (`ClientEndpoint::rebuild`), repeated at most every
+  `REBUILD_ENDPOINT_MIN_INTERVAL` (30 min) for as long as the outage lasts; the
+  other retries nudge `Endpoint::network_change()` (rebinds dead UDP sockets)
+  instead. The rebuild swaps in a freshly bound endpoint — new sockets, new
   relay connections, fresh discovery — and closes the wedged one in the
-  background. This is the in-process equivalent of restarting the
-  client, for wedges a rebind can't fix (a relay link lost to a ping timeout
-  and never re-established, stale cached paths for the server). The rebuild
-  skips the startup per-relay probe and tolerates the online-wait failing, so
-  a partial outage never blocks recovery.
+  background. This is the in-process equivalent of restarting the client, for
+  wedges a rebind can't fix (a relay link lost to a ping timeout and never
+  re-established, stale cached paths for the server). It is the expensive step
+  and it repairs the *endpoint*; a rebuilt endpoint that still cannot connect
+  has ruled that out, which is why it is rate-limited rather than repeated on
+  every third failure. The rebuild skips the startup per-relay probe and
+  tolerates the online-wait failing, so a partial outage never blocks
+  recovery. A successful connection resets the budget.
+- The loop publishes its progress (`ProxyClient::reconnect_status`: failed
+  attempts, last error, next attempt due) for status displays; the CLI panel
+  shows it on the phase line.
 - The local proxy listeners stay bound across reconnects. Off-list targets keep
   connecting directly; on-list requests are held for the reconnect — up to 45s
   (`TUNNEL_RECOVERY_HOLD`), deploy-style connection holding — and only then fail
@@ -354,7 +369,8 @@ defenses.
 | `TUNNEL_OPEN_TIMEOUT` | 30s | `proxy/client.rs` |
 | `CONNECT_TIMEOUT` (server dial) | 10s | `proxy/dial.rs` |
 | `MAX_CONCURRENT_CONNECTIONS` | 1024 | `proxy/server.rs` |
-| reconnect backoff | 1s → 60s + ≤500ms jitter | `proxy/client.rs` |
+| reconnect backoff | 1s → 5 min + ≤500ms jitter | `proxy/client.rs` |
+| `REBUILD_ENDPOINT_ATTEMPTS` / `REBUILD_ENDPOINT_MIN_INTERVAL` (client endpoint rebuild) | 3rd failure, then ≥30 min apart | `proxy/client.rs` |
 | `MAX_HANDSHAKE_SIZE` | 64 KiB | `proxy/signaling.rs` |
 | `MAX_CONTROL_MSG_SIZE` | 16 KiB | `proxy/signaling.rs` |
 | `MAX_HTTP_HEADER` | 64 KiB | `proxy/http.rs` |
