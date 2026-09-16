@@ -148,7 +148,7 @@ int flextunnel_close_listeners(const FlextunnelHandle *handle);
  * traffic — slows from 10s to 60s so an idle session wakes the cellular radio
  * once a minute instead of six times; the foreground flip snaps it back and
  * sends any overdue beat immediately, and ends any reconnect backoff in
- * progress (up to 5 min once a long outage has pushed it to the cap) so the
+ * progress (up to 60s on iOS once an outage has pushed it to the cap) so the
  * next attempt runs at once with a fresh backoff series. Idempotent.
  *
  * Returns 1 on success and -1 for a NULL handle.

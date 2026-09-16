@@ -34,7 +34,16 @@ use tokio::sync::{Semaphore, watch};
 /// cheap to sit through — at the price of noticing the server's return up to
 /// five minutes late. Events that make an earlier attempt worthwhile cut the
 /// wait short (see [`ProxyClient::wait_backoff`]).
+///
+/// That cap is sized for the CLI and desktop clients, which run unattended
+/// for days. An iOS session is temporary by nature — it lives only as long
+/// as the app, and the user who started it is typically looking at it — so
+/// a wait of minutes between attempts would read as a hang; the iOS build
+/// caps at 60s instead.
+#[cfg(not(target_os = "ios"))]
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(300);
+#[cfg(target_os = "ios")]
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Escalate to a full endpoint rebuild once this many consecutive attempts of
 /// an outage have failed. The attempts before it get the cheap
 /// `network_change()` nudge, which repairs dead UDP sockets; a wedge that
@@ -255,10 +264,16 @@ impl ServerForwarder {
 /// Shared with [`crate::proxy::bridge`], whose reconnect policy mirrors the
 /// client's.
 pub(crate) fn calculate_backoff(attempt: u32) -> Duration {
-    // 2^(attempt-1) seconds; the shift is bounded well past where the cap
+    bounded_backoff(attempt, RECONNECT_BACKOFF_MAX)
+}
+
+/// [`calculate_backoff`] with the cap as a parameter, so tests cover the cap
+/// of every platform from any host.
+fn bounded_backoff(attempt: u32, cap: Duration) -> Duration {
+    // 2^(attempt-1) seconds; the shift is bounded well past where any cap
     // takes over, so it can never overflow.
     let shift = attempt.saturating_sub(1).min(16);
-    let secs = (1u64 << shift).min(RECONNECT_BACKOFF_MAX.as_secs());
+    let secs = (1u64 << shift).min(cap.as_secs());
     let jitter = rand::rng().random_range(0..=RECONNECT_JITTER_MAX_MS);
     Duration::from_secs(secs) + Duration::from_millis(jitter)
 }
@@ -2176,22 +2191,34 @@ mod tests {
         );
     }
 
-    /// The backoff doubles from 1s and settles at the cap, jitter aside.
+    /// The backoff doubles from 1s and settles at the cap, jitter aside —
+    /// checked for both platform caps (5 min unattended, 60s on iOS) since a
+    /// test host only ever compiles one of them into `calculate_backoff`.
     #[test]
     fn backoff_doubles_to_the_cap() {
         let jitter = Duration::from_millis(RECONNECT_JITTER_MAX_MS);
-        for (attempt, secs) in [(0, 1), (1, 1), (2, 2), (3, 4), (7, 64), (9, 256)] {
-            let b = calculate_backoff(attempt);
-            let base = Duration::from_secs(secs);
-            assert!(b >= base && b <= base + jitter, "attempt {attempt}: {b:?}");
+        let five_min = Duration::from_secs(300);
+        let one_min = Duration::from_secs(60);
+        for (attempt, secs) in [(0, 1), (1, 1), (2, 2), (3, 4), (6, 32)] {
+            for cap in [five_min, one_min] {
+                let b = bounded_backoff(attempt, cap);
+                let base = Duration::from_secs(secs);
+                assert!(b >= base && b <= base + jitter, "attempt {attempt}: {b:?}");
+            }
         }
+        // 2^8 = 256s is under the unattended cap but over the iOS one.
+        let b = bounded_backoff(9, five_min);
+        assert!(b >= Duration::from_secs(256) && b <= Duration::from_secs(256) + jitter);
+        let b = bounded_backoff(9, one_min);
+        assert!(b >= one_min && b <= one_min + jitter);
         for attempt in [10, 11, 20, u32::MAX] {
-            let b = calculate_backoff(attempt);
-            assert!(
-                b >= RECONNECT_BACKOFF_MAX && b <= RECONNECT_BACKOFF_MAX + jitter,
-                "attempt {attempt}: {b:?}"
-            );
+            for cap in [five_min, one_min] {
+                let b = bounded_backoff(attempt, cap);
+                assert!(b >= cap && b <= cap + jitter, "attempt {attempt}: {b:?}");
+            }
         }
+        // The platform constant is one of the two.
+        assert!([five_min, one_min].contains(&RECONNECT_BACKOFF_MAX));
     }
 
     /// An outage's first rebuild comes after the third consecutive failure;

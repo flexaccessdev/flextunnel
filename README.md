@@ -618,12 +618,15 @@ Auto-reconnect is **enabled by default** (`auto_reconnect = true`); pass
 
 - A failed connection attempt — the **first one included** — or a lost
   connection is retried with **exponential backoff + jitter** (1s doubling to
-  5 min), indefinitely, unless `--max-reconnect-attempts` caps it or
+  5 min; 60s on iOS, where a session is temporary by nature and a wait of
+  minutes would read as a hang), indefinitely, unless
+  `--max-reconnect-attempts` caps it or
   auto-reconnect is disabled. A server that is down, or not up yet, is the
   ordinary case, not a reason to exit: the client waits it out and connects
   when the server appears.
 - A long outage is cheap to sit through: once the backoff reaches its cap the
-  client makes one bounded connect attempt every five minutes. Repeated
+  CLI or desktop client makes one bounded connect attempt every five
+  minutes. Repeated
   failures escalate to rebuilding the iroh endpoint from scratch after the
   third one, and then at most every 30 minutes for as long as the outage
   lasts (see [`docs/architecture.md`](docs/architecture.md#reconnect-policy-client)).
