@@ -64,6 +64,18 @@ auth_key_file = "~/.config/flextunnel/client.key"
 # instead. A forward whose local port cannot bind is switched off with the
 # reason shown next to its row. Local ports must be unique and nonzero. label
 # is optional (display only).
+#
+# Unlike `ssh -L`, the server's loopback is NOT reachable by default: a
+# loopback remote must be on the server's routed set too. `127.0.0.1`/`::1`
+# need a loopback CIDR in routed_cidrs (e.g. "127.0.0.0/8", "::1"), while
+# `localhost` is a hostname and needs "localhost" (or "*") in routed_domains.
+# Otherwise the server rejects the stream ("connection not allowed").
+# [[forwards]]
+# label = "local-web"
+# local_port = 8080
+# remote_host = "127.0.0.1"   # needs "127.0.0.0/8" in the server's routed_cidrs
+# remote_port = 80
+#
 # [[forwards]]
 # label = "db"
 # local_port = 5432

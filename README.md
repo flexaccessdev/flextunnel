@@ -444,6 +444,25 @@ enforces its routed set and resolves the host). They are validated at startup
 client. There is no CLI flag and nothing can be changed live: to change the
 set, edit the config and restart the client.
 
+**Forwarding to the server's loopback works differently from `ssh -L`.** With
+ssh, `-L 8080:localhost:80` always reaches the remote's own port 80. A
+flextunnel forward is checked against the server's routed set first, like any
+other tunneled target, and loopback is **not** allowed by default. What the
+server needs depends on how `remote_host` is written:
+
+| `remote_host` | Checked against | Server config needed |
+| --- | --- | --- |
+| `127.0.0.1` / `::1` | `routed_cidrs` | a loopback CIDR, e.g. `routed_cidrs = ["127.0.0.0/8", "::1"]` |
+| `localhost` | `routed_domains` (it is a hostname) | `"localhost"` (or `"*"`) in `routed_domains` |
+| a `[host_aliases]` name, e.g. `server.internal` → `127.0.0.1` | `routed_domains`, before aliasing | the alias name in `routed_domains` |
+
+When the check passes, `localhost` and loopback literals are dialed on both
+`127.0.0.1` and `::1`, so a service bound to only one of them is still reached.
+When it fails, nothing is dialed: the client logs
+`Forward localhost:<port>: server rejected target: connection not allowed`
+and the local connection closes. Covering loopback in the routed set also opens the server's loopback to
+SOCKS5/HTTP proxy users of that server, not just to forwards.
+
 With neither `--socks-port` nor `--http-port` (nor the config keys) the
 client runs in **port-forward-only mode**: it holds the tunnel and serves only
 the control panel and the port forwards.
