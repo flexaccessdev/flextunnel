@@ -1919,8 +1919,8 @@ dependencies = [
 
 [[package]]
 name = "flexaccess-iroh"
-version = "0.0.10"
-source = "git+https://github.com/flexaccessdev/flexaccess-iroh?tag=v0.0.10#9ddeed7640d640c6275b0e3240f4c24448800266"
+version = "0.0.11"
+source = "git+https://github.com/flexaccessdev/flexaccess-iroh?tag=v0.0.11#d3e863a6b2493817e425087e654ed86e8a11ef0d"
 dependencies = [
  "anyhow",
  "base64",
@@ -1945,7 +1945,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-cli"
-version = "0.0.81"
+version = "0.0.82"
 dependencies = [
  "anyhow",
  "clap",
@@ -1961,7 +1961,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-core"
-version = "0.0.81"
+version = "0.0.82"
 dependencies = [
  "anyhow",
  "askama",
@@ -1992,7 +1992,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-desktop"
-version = "0.0.81"
+version = "0.0.82"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2021,7 +2021,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-ffi"
-version = "0.0.81"
+version = "0.0.82"
 dependencies = [
  "flextunnel-core",
  "iroh",
@@ -3446,9 +3446,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-mdns-address-lookup"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cad3dfcaddd5c3681bf0a42606498fc6e8891de793408dfbc46a9fbe76f370b3"
+version = "0.6.0"
+source = "git+https://github.com/flexaccessdev/iroh-address-lookups?tag=iroh-mdns-address-lookup-v0.6.0-flexaccess.1#aff0d3b5583bdfd49cb229cf6d8b37c8fb82676c"
 dependencies = [
  "data-encoding",
  "derive_more",
@@ -6724,9 +6723,8 @@ checksum = "0193cc4331cfd2f3d2011ef287590868599a2f33c3e69bc22c1a3d3acf9e02fb"
 
 [[package]]
 name = "swarm-discovery"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "767b9081b45ad2fd1d31b80d08d64f4208a35cef860505f9ec7478081fa06c77"
+version = "0.6.3"
+source = "git+https://github.com/rkuhn/swarm-discovery?rev=b41dbcc431f419ad0cd91f786d4d7c71ec6be9ce#b41dbcc431f419ad0cd91f786d4d7c71ec6be9ce"
 dependencies = [
  "acto",
  "hickory-proto",
