@@ -33,7 +33,10 @@ hickory-resolver = { version = "0.26", default-features = false, features = ["to
 # local-network discovery on every endpoint (compiled out on iOS by the crate).
 flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.12", features = ["mdns"] }
 iroh = "1.4.0"
-libc = "0.2"
+# Held at 0.2.189: 0.2.190 gates `in6_ifreq` to macOS only, but netdev
+# (iroh → netwatch) uses it on every Apple target, which breaks the iOS build.
+# Lift once netdev or libc fixes it.
+libc = "=0.2.189"
 log = "0.4"
 n0-future = "0.3"
 rand = "0.10"
