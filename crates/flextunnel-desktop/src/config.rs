@@ -317,11 +317,11 @@ fn open_key_secrets(
         .decode(sealed)
         .context("The sealed_keys blob is not base64")?;
     let (nonce, ciphertext) = blob
-        .split_at_checked(12)
+        .split_first_chunk::<12>()
         .context("The sealed_keys blob is too short")?;
     let cipher = Aes256Gcm::new(master.into());
     let plain = cipher
-        .decrypt(aes_gcm::Nonce::from_slice(nonce), ciphertext)
+        .decrypt(nonce.into(), ciphertext)
         .map_err(|_| anyhow::anyhow!("Failed to decrypt the sealed secret keys"))?;
     serde_json::from_slice(&plain).context("Failed to parse the unsealed secret keys")
 }

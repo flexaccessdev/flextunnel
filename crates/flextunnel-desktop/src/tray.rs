@@ -109,9 +109,14 @@ fn make_icon(state: TrayState) -> Result<tray_icon::Icon> {
 impl Tray {
     pub fn new() -> Result<Self> {
         let status = MenuItem::with_id("status", "Disconnected", false, None);
-        let tray = TrayIconBuilder::new()
-            .with_icon(make_icon(TrayState::Idle)?)
-            .with_icon_as_template(icon::is_template())
+        let idle = make_icon(TrayState::Idle)?;
+        // macOS draws the alpha-only glyph as a template image so it adapts
+        // to the menu bar, light or dark.
+        #[cfg(target_os = "macos")]
+        let builder = TrayIconBuilder::new().with_icon_templated(idle);
+        #[cfg(not(target_os = "macos"))]
+        let builder = TrayIconBuilder::new().with_icon(idle);
+        let tray = builder
             .with_menu(Box::new(Menu::new()))
             .with_tooltip("flextunnel — disconnected")
             // Windows convention: left click toggles the window (handled via
@@ -267,10 +272,11 @@ impl Tray {
         {
             // `set_icon` alone re-sets the macOS image as non-template
             // (rendering it solid black instead of adapting to the menu
-            // bar), so pass the template flag through explicitly.
-            let _ = self
-                .tray
-                .set_icon_with_as_template(Some(icon), icon::is_template());
+            // bar), so keep it a template there.
+            #[cfg(target_os = "macos")]
+            let _ = self.tray.set_icon_templated(Some(icon));
+            #[cfg(not(target_os = "macos"))]
+            let _ = self.tray.set_icon(Some(icon));
         }
         let _ = self.tray.set_tooltip(Some(format!("flextunnel — {line}")));
     }

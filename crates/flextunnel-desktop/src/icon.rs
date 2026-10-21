@@ -266,11 +266,6 @@ fn to_rgba(pixmap: Pixmap) -> Vec<u8> {
         .collect()
 }
 
-/// Whether the tray icon should be flagged as a macOS template image.
-pub fn is_template() -> bool {
-    cfg!(target_os = "macos")
-}
-
 /// RGBA pixels for the tray icon in the given state.
 pub fn tray_rgba(state: TrayState) -> (Vec<u8>, u32, u32) {
     #[cfg(target_os = "macos")]
