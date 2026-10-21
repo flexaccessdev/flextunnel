@@ -11,7 +11,7 @@ use crate::transport::{HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL_IDLE, liveness_win
 use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
-use rand::Rng;
+use rand::RngExt;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;

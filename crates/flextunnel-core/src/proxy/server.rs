@@ -15,7 +15,7 @@ use crate::proxy::{dial, reserved, DnsForwarder, RoutedSet};
 use crate::transport::LIVENESS_WINDOW;
 use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointId};
-use rand::Rng;
+use rand::RngExt;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
