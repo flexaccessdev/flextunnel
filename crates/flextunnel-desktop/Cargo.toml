@@ -6,6 +6,7 @@ name = "flextunnel-desktop"
 version.workspace = true
 edition.workspace = true
 description = "Tray GUI for the flextunnel client (macOS and Windows)"
+license.workspace = true
 
 [dependencies]
 flextunnel-core = { workspace = true }

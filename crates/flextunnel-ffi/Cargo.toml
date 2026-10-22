@@ -3,6 +3,7 @@ name = "flextunnel-ffi"
 version.workspace = true
 edition.workspace = true
 description.workspace = true
+license.workspace = true
 
 # `name = "flextunnel"` so the static archive is `libflextunnel.a`, the name the
 # iOS Xcode project (../flextunnel-ios) links against.
