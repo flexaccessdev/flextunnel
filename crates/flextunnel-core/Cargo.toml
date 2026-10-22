@@ -3,6 +3,7 @@ name = "flextunnel-core"
 version.workspace = true
 edition.workspace = true
 description.workspace = true
+license.workspace = true
 
 [lib]
 name = "flextunnel_core"

@@ -715,3 +715,7 @@ reusing its iroh transport and secret-key identity (client access control is
 flextunnel's own ed25519 keypair scheme). The difference: ezvpn creates a TUN device and ships IP packets over
 unreliable QUIC datagrams (and needs root); flextunnel exposes SOCKS5/HTTP proxy
 listeners and tunnels TCP over reliable QUIC streams (and needs no root).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

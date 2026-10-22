@@ -13,6 +13,7 @@ default-members = [
 version = "0.0.84"
 edition = "2024"
 description = "SOCKS5/HTTP proxy and port forwards over QUIC — split tunnel via iroh P2P"
+license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
