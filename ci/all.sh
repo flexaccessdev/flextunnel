@@ -9,7 +9,7 @@
 #   linux    natively on Linux, else the FLEXTUNNEL_UNIXCI_HOST alias
 #            (default 'workstation-wsl')        ci/unix/{ci,remote}.sh
 #   windows  the FLEXTUNNEL_WINCI_HOST alias
-#            (default 'winsandbox')             ci/windows/remote.sh
+#            (default 'windows-ci-build')       ci/windows/remote.sh
 #
 #   ci/all.sh                  # all three
 #   ci/all.sh linux windows    # only these

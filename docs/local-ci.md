@@ -19,7 +19,7 @@ over ssh by alias, each with an override for pointing at a different machine:
 | --- | --- | --- | --- |
 | macOS | `macwork` | `FLEXTUNNEL_MACCI_HOST`, or `ci/unix/remote.sh -H <host>` | `ci/unix/ci.sh` natively on a Mac, `ci/unix/remote.sh` otherwise |
 | Linux | `workstation-wsl` | `FLEXTUNNEL_UNIXCI_HOST`, or `-H` | `ci/unix/ci.sh` natively on Linux, `ci/unix/remote.sh` otherwise |
-| Windows | `winsandbox` | `FLEXTUNNEL_WINCI_HOST` | `ci/windows/remote.sh` |
+| Windows | `windows-ci-build` | `FLEXTUNNEL_WINCI_HOST` | `ci/windows/remote.sh` |
 
 ```sh
 ci/all.sh                  # all three, concurrently
@@ -95,7 +95,7 @@ there and still being compiled), while `CARGO_TARGET_DIR` points *outside* the
 workspace so the build cache survives the swap. That is what makes a warm run
 fast and a cold one slow.
 
-| | Unix remotes (`workstation-wsl`, `macwork`, …) | Windows (`winsandbox`) |
+| | Unix remotes (`workstation-wsl`, `macwork`, …) | Windows (`windows-ci-build`) |
 | --- | --- | --- |
 | workspace | `~/codes/staging-area/flextunnel` | `C:\ci-workspaces\flextunnel` |
 | build cache | `~/codes/staging-area/flextunnel-cargo-target` | `C:\ci-cache\flextunnel-target` |
@@ -127,7 +127,7 @@ that name. It needs rustup (with clippy) and a C toolchain and nothing else —
 the desktop crate, which is what would drag in dbus and a tray, is excluded on
 Linux. `ci/unix/remote.sh doctor` reports what is there.
 
-**`winsandbox`** is a Hyper-V guest running Windows Server 2025 with the VS Build
+**`windows-ci-build`** is a Hyper-V guest running Windows Server 2025 with the VS Build
 Tools and rustup installed **machine-wide** — a per-profile rustup install would
 be invisible over ssh. How that VM was built, provisioned and hardened is
 written up once, in the sibling repo that first used it:

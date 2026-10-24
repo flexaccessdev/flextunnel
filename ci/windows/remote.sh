@@ -6,7 +6,7 @@
 #   ci/windows/remote.sh doctor           # report on the VM, change nothing
 #   ci/windows/remote.sh clean            # drop the VM's cargo target cache
 #
-# The far end is the 'winsandbox' ssh alias: a Hyper-V guest running Windows
+# The far end is the 'windows-ci-build' ssh alias: a Hyper-V guest running Windows
 # Server 2025 with rustup and the MSVC build tools installed machine-wide.
 # ci/windows/ci.ps1 is the half that runs over there. How that VM was built and
 # provisioned is written up once, in the sibling repo that first used it —
@@ -22,7 +22,7 @@
 # uncommitted changes included.
 #
 # Overrides:
-#   FLEXTUNNEL_WINCI_HOST        ssh target     (default: the 'winsandbox' alias)
+#   FLEXTUNNEL_WINCI_HOST        ssh target     (default: the 'windows-ci-build' alias)
 #   FLEXTUNNEL_WINCI_REMOTE_DIR  workspace      (default: C:\ci-workspaces\flextunnel)
 #   FLEXTUNNEL_WINCI_TARGET_DIR  CARGO_TARGET_DIR (default: C:\ci-cache\flextunnel-target)
 set -euo pipefail
@@ -34,7 +34,7 @@ case $command in ci|shell|doctor|clean) ;; *) usage ;; esac
 
 info() { echo "[winci] $*"; }
 
-target=${FLEXTUNNEL_WINCI_HOST:-winsandbox}
+target=${FLEXTUNNEL_WINCI_HOST:-windows-ci-build}
 remote_dir=${FLEXTUNNEL_WINCI_REMOTE_DIR:-'C:\ci-workspaces\flextunnel'}
 # Not the machine-wide C:\ci-cache\target the VM sets — that one belongs to the
 # other repo driven onto this same VM, and two workspaces sharing a target
