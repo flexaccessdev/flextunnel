@@ -6,9 +6,12 @@
 //! snapshots the UI polls each frame. Each session owns its `ProxyClient`
 //! future, so dropping it (disconnect/shutdown) tears down the accept loops
 //! and the connection manager together, followed by a graceful endpoint
-//! close.
+//! close. The app's server ([`crate::server_session`]) is routed through the
+//! same supervisor, so one controller owns every session and one shutdown
+//! stops them all.
 
-use crate::config::Profile;
+use crate::config::{Profile, ServerConfig};
+use crate::server_session::{self, ServerCmd, ServerHandle, ServerSnapshot, SharedServerSnapshot};
 use flextunnel_core::forwards::{ForwardManager, ForwardStatus, PortForward};
 use flextunnel_core::proxy::{ClientAuth, ClientConfig, ProxyClient, TunnelRoutes};
 use flextunnel_core::transport::endpoint::{RelayConfig, create_client_endpoint};
@@ -88,6 +91,12 @@ enum Command {
     /// no session is running. A `std` channel (not tokio `oneshot`) so the GUI
     /// caller can wait with a bounded [`std::sync::mpsc::Receiver::recv_timeout`].
     QueryConnPath(ProfileId, std::sync::mpsc::Sender<ConnectionSnapshot>),
+    /// Start the server session (its identity secret travels inside).
+    StartServer(Box<ServerConfig>),
+    StopServer,
+    /// Stop the server and reset its snapshot once it has stopped (the
+    /// server was deleted).
+    RemoveServer,
     Shutdown,
 }
 
@@ -121,6 +130,7 @@ impl SnapshotSlot {
 pub struct Controller {
     tx: mpsc::Sender<Command>,
     shared: SharedSnapshots,
+    server_shared: SharedServerSnapshot,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -129,13 +139,15 @@ impl Controller {
         let (tx, rx) = mpsc::channel(16);
         let shared: SharedSnapshots = Arc::new(Mutex::new(HashMap::new()));
         let worker_shared = shared.clone();
+        let server_shared: SharedServerSnapshot = Arc::default();
+        let worker_server_shared = server_shared.clone();
         // The supervisor only routes commands; sessions get their own
         // runtimes, so a single-threaded one suffices here.
         let thread = std::thread::Builder::new()
             .name("tunnel".into())
             .spawn(move || {
                 match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                    Ok(rt) => rt.block_on(run_loop(rx, worker_shared)),
+                    Ok(rt) => rt.block_on(run_loop(rx, worker_shared, worker_server_shared)),
                     Err(e) => log::error!("Failed to build the Tokio runtime: {e:#}"),
                 }
             })
@@ -143,6 +155,7 @@ impl Controller {
         Self {
             tx,
             shared,
+            server_shared,
             thread: Some(thread),
         }
     }
@@ -152,6 +165,25 @@ impl Controller {
             .lock()
             .map(|s| s.clone())
             .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    pub fn server_snapshot(&self) -> ServerSnapshot {
+        self.server_shared
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    pub fn start_server(&self, server: ServerConfig) {
+        let _ = self.tx.blocking_send(Command::StartServer(Box::new(server)));
+    }
+
+    pub fn stop_server(&self) {
+        let _ = self.tx.blocking_send(Command::StopServer);
+    }
+
+    pub fn remove_server(&self) {
+        let _ = self.tx.blocking_send(Command::RemoveServer);
     }
 
     pub fn connect(&self, profile: Profile, auth_key: String) {
@@ -283,14 +315,50 @@ fn spawn_session(
     }
 }
 
-/// Supervisor: routes profile-scoped commands to per-profile sessions.
-async fn run_loop(mut rx: mpsc::Receiver<Command>, shared: SharedSnapshots) {
+/// Supervisor: routes profile-scoped commands to per-profile sessions and
+/// server commands to the server session.
+async fn run_loop(
+    mut rx: mpsc::Receiver<Command>,
+    shared: SharedSnapshots,
+    server_shared: SharedServerSnapshot,
+) {
     let mut sessions: HashMap<ProfileId, SessionHandle> = HashMap::new();
+    let mut server: Option<ServerHandle> = None;
     loop {
         let cmd = rx.recv().await;
         // An ended session drops its receiver, closing the sender.
         sessions.retain(|_, handle| !handle.tx.is_closed());
+        if server.as_ref().is_some_and(|handle| handle.tx.is_closed()) {
+            server = None;
+        }
         match cmd {
+            Some(Command::StartServer(config)) => {
+                // Includes a server still stopping: it holds the identity and
+                // the per-user lock until its endpoint is closed.
+                if server.is_some() {
+                    log::warn!("The server is still running");
+                    continue;
+                }
+                server = server_session::spawn_server(*config, &server_shared);
+            }
+            Some(Command::StopServer) => {
+                if let Some(handle) = &server {
+                    let _ = handle.tx.send(ServerCmd::Stop).await;
+                }
+            }
+            Some(Command::RemoveServer) => match &server {
+                // The handle stays until the session ends, so a server set up
+                // again meanwhile can't start while this one still holds the
+                // lock; the session resets the snapshot as its final write.
+                Some(handle) => {
+                    // A closed channel means the session already made its
+                    // final write (it holds the receiver until then).
+                    if handle.tx.send(ServerCmd::Remove).await.is_err() {
+                        reset_server_snapshot(&server_shared);
+                    }
+                }
+                None => reset_server_snapshot(&server_shared),
+            },
             Some(Command::Connect(profile, auth_key)) => {
                 if sessions.contains_key(&profile.id) {
                     log::warn!("Profile \"{}\" is already running a session", profile.name);
@@ -366,10 +434,24 @@ async fn run_loop(mut rx: mpsc::Receiver<Command>, shared: SharedSnapshots) {
     for handle in sessions.values() {
         let _ = handle.tx.send(SessionCmd::Shutdown).await;
     }
+    if let Some(handle) = &server {
+        let _ = handle.tx.send(ServerCmd::Shutdown).await;
+    }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     for (_, handle) in sessions {
         let _ = tokio::time::timeout_at(deadline, handle.done).await;
     }
+    if let Some(handle) = server {
+        let _ = tokio::time::timeout_at(deadline, handle.done).await;
+    }
+}
+
+fn reset_server_snapshot(shared: &SharedServerSnapshot) {
+    let mut snapshot = match shared.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *snapshot = ServerSnapshot::default();
 }
 
 fn remove_slot(shared: &SharedSnapshots, id: &str) {

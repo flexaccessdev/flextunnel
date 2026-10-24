@@ -33,4 +33,5 @@ pub mod forwards;
 pub mod lock;
 pub mod proxy;
 pub mod secret;
+pub mod server;
 pub mod transport;

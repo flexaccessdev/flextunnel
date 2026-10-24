@@ -1,5 +1,6 @@
 //! System tray icon + menu: an aggregate status line plus one submenu per
-//! profile (status, Connect, Disconnect, Copy SOCKS5 Address). Created and
+//! profile (status, Connect, Disconnect, Copy SOCKS5 Address) and one for the
+//! server, when configured (status, Start, Stop, Copy Endpoint ID). Created and
 //! mutated only on the main thread (from the iced update loop); the tray-icon
 //! event handlers installed by the tray subscription merely forward events and
 //! wake the runtime, since they may fire off the main thread.
@@ -7,8 +8,9 @@
 //! Per-profile menu item ids carry the profile id after a prefix
 //! (`connect:<id>`), parsed by `App::handle_menu_event`.
 
-use crate::config::{AuthKey, Profile};
+use crate::config::{AuthKey, Profile, ServerConfig};
 use crate::icon::{self, TrayState};
+use crate::server_session::{ServerPhase, ServerSnapshot};
 use crate::tunnel::{Phase, Snapshot};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -20,6 +22,9 @@ pub const MENU_QUIT: &str = "quit";
 pub const MENU_CONNECT_PREFIX: &str = "connect:";
 pub const MENU_DISCONNECT_PREFIX: &str = "disconnect:";
 pub const MENU_COPY_SOCKS_PREFIX: &str = "copy-socks:";
+pub const MENU_START_SERVER: &str = "start-server";
+pub const MENU_STOP_SERVER: &str = "stop-server";
+pub const MENU_COPY_SERVER_ID: &str = "copy-server-id";
 
 pub fn status_line(phase: Phase) -> &'static str {
     match phase {
@@ -31,8 +36,29 @@ pub fn status_line(phase: Phase) -> &'static str {
     }
 }
 
+pub fn server_status_line(phase: ServerPhase) -> &'static str {
+    match phase {
+        ServerPhase::Stopped => "Stopped",
+        ServerPhase::Starting => "Starting…",
+        ServerPhase::Running => "Running",
+        ServerPhase::Stopping => "Stopping…",
+        ServerPhase::Failed => "Failed to start",
+    }
+}
+
 fn profile_phase(snapshots: &HashMap<String, Snapshot>, id: &str) -> Phase {
     snapshots.get(id).map(|s| s.phase).unwrap_or(Phase::Idle)
+}
+
+/// A server's phase in the icon's terms: running counts as connected, the
+/// transitions as in progress.
+fn server_as_phase(phase: ServerPhase) -> Phase {
+    match phase {
+        ServerPhase::Stopped => Phase::Idle,
+        ServerPhase::Starting | ServerPhase::Stopping => Phase::Connecting,
+        ServerPhase::Running => Phase::Connected,
+        ServerPhase::Failed => Phase::Failed,
+    }
 }
 
 /// The icon reflects the worst/most-notable state across profiles: a failure
@@ -61,11 +87,23 @@ fn aggregate_state(phases: &[Phase]) -> TrayState {
     }
 }
 
-fn aggregate_line(phases: &[Phase]) -> String {
-    let connected = phases.iter().filter(|p| **p == Phase::Connected).count();
+/// The status line: the profiles' aggregate, then the server when running.
+fn aggregate_line(phases: &[Phase], server_running: bool) -> String {
+    match (profiles_line(phases), server_running) {
+        (Some(profiles), true) => format!("{profiles} · server running"),
+        (Some(profiles), false) => profiles,
+        (None, true) => "Server running".into(),
+        (None, false) => "No profiles".into(),
+    }
+}
+
+/// The client profiles' part of the status line; `None` without profiles.
+fn profiles_line(phases: &[Phase]) -> Option<String> {
     if phases.is_empty() {
-        "No profiles".into()
-    } else if connected > 0 {
+        return None;
+    }
+    let connected = phases.iter().filter(|p| **p == Phase::Connected).count();
+    Some(if connected > 0 {
         format!("{connected} of {} connected", phases.len())
     } else if phases.contains(&Phase::Failed) {
         "Connection failed".into()
@@ -76,7 +114,7 @@ fn aggregate_line(phases: &[Phase]) -> String {
         "Connecting…".into()
     } else {
         "Disconnected".into()
-    }
+    })
 }
 
 /// Retained handles into one profile's submenu, mutated in place on phase
@@ -88,16 +126,34 @@ struct ProfileItems {
     copy_socks: MenuItem,
 }
 
+/// Retained handles into the server's submenu (see [`ProfileItems`]).
+struct ServerItems {
+    status: MenuItem,
+    start: MenuItem,
+    stop: MenuItem,
+}
+
 /// Everything `sync` reacts to; native calls only happen when it changes.
-type SyncKey = (TrayState, String, Vec<(String, String, Phase, bool, bool)>);
+type SyncKey = (
+    TrayState,
+    String,
+    Vec<(String, String, Phase, bool, bool)>,
+    Option<(ServerPhase, bool)>,
+);
+
+/// What a menu is built from: the profiles' `(id, name)` list, and whether
+/// the server submenu is shown.
+type MenuShape = (Vec<(String, String)>, bool);
 
 pub struct Tray {
     tray: TrayIcon,
     status: MenuItem,
     items: HashMap<String, ProfileItems>,
-    /// The `(id, name)` list the current menu was built from; a change (added,
-    /// removed, renamed or reordered profile) rebuilds the menu.
-    menu_profiles: Vec<(String, String)>,
+    server_items: Option<ServerItems>,
+    /// The shape the current menu was built from; a change (added, removed,
+    /// renamed or reordered profile, server added or removed) rebuilds the
+    /// menu.
+    menu_shape: MenuShape,
     synced: Option<SyncKey>,
 }
 
@@ -129,14 +185,15 @@ impl Tray {
             tray,
             status,
             items: HashMap::new(),
-            menu_profiles: Vec::new(),
+            server_items: None,
+            menu_shape: MenuShape::default(),
             synced: None,
         };
-        this.rebuild_menu(&[])?;
+        this.rebuild_menu(&[], None)?;
         Ok(this)
     }
 
-    fn rebuild_menu(&mut self, profiles: &[Profile]) -> Result<()> {
+    fn rebuild_menu(&mut self, profiles: &[Profile], server: Option<&ServerConfig>) -> Result<()> {
         let menu = Menu::new();
         menu.append(&MenuItem::with_id(MENU_OPEN, "Open flextunnel…", true, None))?;
         menu.append(&PredefinedMenuItem::separator())?;
@@ -185,6 +242,21 @@ impl Tray {
             menu.append(&PredefinedMenuItem::separator())?;
         }
 
+        self.server_items = None;
+        if server.is_some() {
+            let status = MenuItem::with_id("server-status", "…", false, None);
+            let start = MenuItem::with_id(MENU_START_SERVER, "Start Server", false, None);
+            let stop = MenuItem::with_id(MENU_STOP_SERVER, "Stop Server", false, None);
+            // The endpoint id is public and known even while stopped, so
+            // copying it is always available.
+            let copy_id = MenuItem::with_id(MENU_COPY_SERVER_ID, "Copy Endpoint ID", true, None);
+            let submenu =
+                Submenu::with_items("Server", true, &[&status, &start, &stop, &copy_id])?;
+            menu.append(&submenu)?;
+            menu.append(&PredefinedMenuItem::separator())?;
+            self.server_items = Some(ServerItems { status, start, stop });
+        }
+
         menu.append(&MenuItem::with_id(
             "version",
             concat!("flextunnel v", env!("CARGO_PKG_VERSION")),
@@ -193,10 +265,7 @@ impl Tray {
         ))?;
         menu.append(&MenuItem::with_id(MENU_QUIT, "Quit flextunnel", true, None))?;
         self.tray.set_menu(Some(Box::new(menu)));
-        self.menu_profiles = profiles
-            .iter()
-            .map(|p| (p.id.clone(), p.name.clone()))
-            .collect();
+        self.menu_shape = menu_shape(profiles, server);
         Ok(())
     }
 
@@ -207,13 +276,21 @@ impl Tray {
         profiles: &[Profile],
         keys: &[AuthKey],
         snapshots: &HashMap<String, Snapshot>,
+        server: Option<&ServerConfig>,
+        server_snapshot: &ServerSnapshot,
     ) {
         let phases: Vec<Phase> = profiles
             .iter()
             .map(|p| profile_phase(snapshots, &p.id))
             .collect();
-        let state = aggregate_state(&phases);
-        let line = aggregate_line(&phases);
+        let server_phase = server.map(|_| server_snapshot.phase);
+        let icon_phases: Vec<Phase> = phases
+            .iter()
+            .copied()
+            .chain(server_phase.map(server_as_phase))
+            .collect();
+        let state = aggregate_state(&icon_phases);
+        let line = aggregate_line(&phases, server_phase == Some(ServerPhase::Running));
         let key: SyncKey = (
             state,
             line.clone(),
@@ -227,6 +304,7 @@ impl Tray {
                     (p.id.clone(), p.name.clone(), *phase, p.is_ready(keys), copyable)
                 })
                 .collect(),
+            server.zip(server_phase).map(|(s, phase)| (phase, s.is_ready())),
         );
         if self.synced.as_ref() == Some(&key) {
             return;
@@ -234,12 +312,8 @@ impl Tray {
         let icon_changed = self.synced.as_ref().map(|(s, ..)| *s) != Some(state);
         self.synced = Some(key);
 
-        let names: Vec<(String, String)> = profiles
-            .iter()
-            .map(|p| (p.id.clone(), p.name.clone()))
-            .collect();
-        if names != self.menu_profiles
-            && let Err(e) = self.rebuild_menu(profiles)
+        if menu_shape(profiles, server) != self.menu_shape
+            && let Err(e) = self.rebuild_menu(profiles, server)
         {
             log::error!("Failed to rebuild the tray menu: {e:#}");
             return;
@@ -267,6 +341,16 @@ impl Tray {
             );
         }
 
+        if let (Some(items), Some(server), Some(phase)) = (&self.server_items, server, server_phase) {
+            items.status.set_text(server_status_line(phase));
+            items.start.set_enabled(
+                matches!(phase, ServerPhase::Stopped | ServerPhase::Failed) && server.is_ready(),
+            );
+            items
+                .stop
+                .set_enabled(matches!(phase, ServerPhase::Starting | ServerPhase::Running));
+        }
+
         if icon_changed
             && let Ok(icon) = make_icon(state)
         {
@@ -282,9 +366,30 @@ impl Tray {
     }
 }
 
+fn menu_shape(profiles: &[Profile], server: Option<&ServerConfig>) -> MenuShape {
+    (
+        profiles
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone()))
+            .collect(),
+        server.is_some(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_line_counts_profiles_then_the_server() {
+        assert_eq!(aggregate_line(&[], false), "No profiles");
+        assert_eq!(aggregate_line(&[], true), "Server running");
+        assert_eq!(aggregate_line(&[Phase::Idle], false), "Disconnected");
+        assert_eq!(
+            aggregate_line(&[Phase::Connected, Phase::Idle], true),
+            "1 of 2 connected · server running"
+        );
+    }
 
     #[test]
     fn all_connected_only_without_in_progress_profiles() {

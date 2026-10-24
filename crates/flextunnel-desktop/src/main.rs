@@ -16,6 +16,7 @@ mod app;
 mod config;
 mod icon;
 mod logging;
+mod server_session;
 mod style;
 mod tray;
 mod tunnel;

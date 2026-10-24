@@ -1,24 +1,28 @@
-//! The iced daemon state machine: a sidebar of connection profiles plus a
-//! detail pane, driven alongside the system tray. Each profile can run its own
-//! tunnel session concurrently (its optional proxy ports and direct forwards).
-//! The daemon
+//! The iced daemon state machine: a sidebar of connection profiles and the
+//! optional server plus a detail pane, driven alongside the system tray. Each
+//! profile can run its own tunnel session concurrently (its optional proxy
+//! ports and direct forwards); the server runs a flextunnel server in-process
+//! (there is only one: the per-user server lock is shared with the CLI). The
+//! daemon
 //! owns all state, so closing the window (which destroys it) loses nothing —
 //! the tray re-opens it on demand. Tray/menu events are forwarded from
 //! tray-icon's handlers into a channel drained by a [`Subscription`], so a
 //! tray click wakes the runtime even while no window exists; a 500 ms tick
 //! keeps the snapshots and the tray state fresh the rest of the time.
 
-use crate::config::{self, AuthKey, Profile, DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT};
+use crate::config::{self, AuthKey, Profile, ServerConfig, DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT};
 use flextunnel_core::forwards::{
     PortForward, disable_failed_forwards, parse_port, validate_label, validate_remote_host,
 };
 use crate::icon;
 use crate::logging;
+use crate::server_session::{self, ServerPhase, ServerSnapshot};
 use crate::tray::{self, Tray};
 use crate::tunnel::{Controller, Phase, ProfileId, Snapshot};
 use crate::view;
 use flextunnel_core::transport::paths::ConnectionSnapshot;
 use iced::futures::Stream;
+use iced::widget::text_editor;
 use iced::{window, Element, Size, Subscription, Task};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -29,6 +33,7 @@ use tray_icon::TrayIconEvent;
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Selection {
     Profile(ProfileId),
+    Server,
     Keys,
     Logs,
 }
@@ -119,14 +124,60 @@ pub enum Message {
     FormEnabledToggled(bool),
     FormSave,
     FormCancel,
+    // Server
+    SetUpServer,
+    EditServer,
+    DeleteServer,
+    StartServer,
+    StopServer,
+    ServerSecretChanged(String),
+    /// Fill the server form's identity field with a freshly generated key.
+    ServerGenerateSecret,
+    ServerAuthorizedKeysEdited(text_editor::Action),
+    /// Append one of the app's own auth keys to the authorized keys (for a
+    /// client profile in this same app, or to copy a key over by hand).
+    ServerAddOwnKey(KeyChoice),
+    ServerRoutedDomainsChanged(String),
+    ServerRoutedCidrsChanged(String),
+    ServerRelayUrlsChanged(String),
+    ServerRelayAuthTokenChanged(String),
+    ServerFormSave,
+    ServerFormCancel,
     // Logs
-    LogFilterChanged(String),
+    LogFilterChanged(LogFilter),
     OpenLogFolder,
     CopyLogs,
 }
 
-/// Sentinel option shown in the Logs pane's profile filter.
-pub const LOG_FILTER_ALL: &str = "All profiles";
+/// The Logs pane's filter: everything, one profile's session threads
+/// (`[tunnel-<name>]`), or the server's (`[server]`).
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub enum LogFilter {
+    #[default]
+    All,
+    Profile(String),
+    Server,
+}
+
+impl std::fmt::Display for LogFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogFilter::All => f.write_str("All"),
+            LogFilter::Profile(name) => f.write_str(name),
+            LogFilter::Server => f.write_str("Server"),
+        }
+    }
+}
+
+/// A comma-separated list field, trimmed, empty entries dropped.
+fn split_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
 
 /// Human description of what already occupies a local port, across every
 /// profile — profiles can run concurrently, so all local ports share one
@@ -357,13 +408,7 @@ impl ProfileForm {
         } else {
             None
         };
-        let relay_urls: Vec<String> = self
-            .relay_urls
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .collect();
+        let relay_urls = split_list(&self.relay_urls);
         let relay_auth_token = {
             let token = self.relay_auth_token.trim();
             (!token.is_empty()).then(|| token.to_string())
@@ -480,6 +525,127 @@ pub fn validate_key_name(
         return Err(format!("Another key is already named \"{name}\""));
     }
     Ok(name)
+}
+
+/// Editable buffers for the server (the server add/edit form).
+#[derive(Default)]
+pub struct ServerForm {
+    /// Editing the existing server rather than adding it.
+    editing: bool,
+    /// The iroh identity secret (base64), masked in the form.
+    pub secret: String,
+    /// The authorized-keys document, one `ed25519-pub:...` per line.
+    pub authorized_keys: text_editor::Content,
+    pub routed_domains: String,
+    pub routed_cidrs: String,
+    pub relay_urls: String,
+    pub relay_auth_token: String,
+}
+
+/// A fresh iroh identity secret, base64 — the secret line of a
+/// `flextunnel generate-iroh-key` file.
+pub fn generate_server_secret() -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .encode(flextunnel_core::iroh::SecretKey::generate().to_bytes())
+}
+
+impl ServerForm {
+    pub fn is_edit(&self) -> bool {
+        self.editing
+    }
+
+    fn add() -> Self {
+        Self {
+            secret: generate_server_secret(),
+            ..Self::default()
+        }
+    }
+
+    fn edit(server: &ServerConfig) -> Self {
+        Self {
+            editing: true,
+            secret: server.secret.clone(),
+            authorized_keys: text_editor::Content::with_text(&server.authorized_keys),
+            routed_domains: server.routed_domains.join(", "),
+            routed_cidrs: server.routed_cidrs.join(", "),
+            relay_urls: server.relay_urls.join(", "),
+            relay_auth_token: server.relay_auth_token.clone().unwrap_or_default(),
+        }
+    }
+
+    /// The endpoint id the form's secret gives the server, when it parses —
+    /// what clients enter as the server node id.
+    pub fn endpoint_id(&self) -> Option<String> {
+        flextunnel_core::secret::load_secret_from_string(self.secret.trim())
+            .ok()
+            .map(|secret| secret.public().to_string())
+    }
+
+    /// Append `line` to the authorized keys unless its key is already listed.
+    fn add_authorized_key(&mut self, public_key: &str, comment: &str) {
+        let text = self.authorized_keys.text();
+        if text
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some(public_key))
+        {
+            return;
+        }
+        let mut text = text.trim_end().to_string();
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!("{public_key} {comment}\n"));
+        self.authorized_keys = text_editor::Content::with_text(&text);
+    }
+
+    pub fn validate(&self) -> Result<ServerConfig, String> {
+        let secret = self.secret.trim();
+        if secret.is_empty() {
+            return Err("Identity key is required (generate one, or paste a server key)".into());
+        }
+        let endpoint_id = flextunnel_core::secret::load_secret_from_string(secret)
+            .map_err(|e| format!("Invalid identity key: {e:#}"))?
+            .public()
+            .to_string();
+        let authorized_keys = self.authorized_keys.text();
+        let parsed = flextunnel_core::flexaccess_keys::parse_authorized_keys(
+            &authorized_keys,
+            "authorized keys",
+        )
+        .map_err(|e| format!("{e:#}"))?;
+        if parsed.is_empty() {
+            return Err("Add at least one authorized client key".into());
+        }
+        let routed_domains = split_list(&self.routed_domains);
+        let routed_cidrs = split_list(&self.routed_cidrs);
+        let routed_set = flextunnel_core::proxy::RoutedSet::new(&routed_domains, &routed_cidrs)
+            .map_err(|e| format!("Invalid tunnel set: {e:#}"))?;
+        if routed_set.is_empty() {
+            return Err(
+                "A tunnel set is required: routed domains and/or CIDRs (\"*\" plus \
+                 0.0.0.0/0, ::/0 tunnels everything)"
+                    .into(),
+            );
+        }
+        let relay_urls = split_list(&self.relay_urls);
+        let relay_auth_token = {
+            let token = self.relay_auth_token.trim();
+            (!token.is_empty()).then(|| token.to_string())
+        };
+        if relay_auth_token.is_some() && relay_urls.is_empty() {
+            return Err("A relay auth token requires at least one relay URL".into());
+        }
+        Ok(ServerConfig {
+            endpoint_id,
+            secret: secret.into(),
+            authorized_keys,
+            routed_domains,
+            routed_cidrs,
+            relay_urls,
+            relay_auth_token,
+        })
+    }
 }
 
 /// Editable add/edit buffers for one port forward, mirroring the iOS sheet.
@@ -623,16 +789,23 @@ pub struct App {
     pub profiles: Vec<Profile>,
     /// The shared auth keys profiles reference into; persisted alongside.
     pub keys: Vec<AuthKey>,
+    /// The app's one server, when configured; persisted alongside.
+    pub server: Option<ServerConfig>,
     pub selection: Selection,
     pub profile_form: Option<ProfileForm>,
     /// The Keys pane's open add/edit form.
     pub key_form: Option<KeyForm>,
+    /// The open server add/edit form (replaces the detail pane, like the
+    /// profile form).
+    pub server_form: Option<ServerForm>,
     /// The open forward form and the profile it belongs to.
     pub forward_form: Option<(ProfileId, ForwardForm)>,
     /// Two-click delete guard: the profile whose Delete was clicked once.
     pub confirm_delete: Option<ProfileId>,
     /// Two-click delete guard for the Keys pane.
     pub confirm_delete_key: Option<String>,
+    /// Two-click delete guard for the server.
+    pub confirm_delete_server: bool,
     /// Two-click export guard for the Keys pane: the key whose Export was
     /// clicked once; the second click copies its secret to the clipboard.
     pub confirm_export_key: Option<String>,
@@ -652,15 +825,16 @@ pub struct App {
     /// that profile's pushed domains/CIDRs change.
     pub routed_caches: HashMap<ProfileId, view::RoutedCache>,
     log_revision: u64,
-    /// Logs-pane profile filter: only lines from that profile's session
-    /// threads (`[tunnel-<name>]`); `None` shows everything.
-    pub log_filter: Option<String>,
+    /// Logs-pane filter (see [`LogFilter`]).
+    pub log_filter: LogFilter,
     /// The in-memory log ring, filtered and joined for the Logs pane;
     /// rebuilt on revision or filter change only.
     pub log_text: String,
     clipboard: Option<arboard::Clipboard>,
     /// Refreshed by [`App::refresh`] on every tick, rendered by `view`.
     pub snapshots: HashMap<ProfileId, Snapshot>,
+    /// The server session's snapshot, refreshed alongside.
+    pub server_snapshot: ServerSnapshot,
 }
 
 impl App {
@@ -678,9 +852,11 @@ impl App {
             .profiles
             .first()
             .map(|p| Selection::Profile(p.id.clone()))
+            .or_else(|| store.server.as_ref().map(|_| Selection::Server))
             .unwrap_or(Selection::Logs);
         // First run: go straight to creating a profile.
-        let profile_form = store.profiles.is_empty().then(|| ProfileForm::add(&[]));
+        let profile_form = (store.profiles.is_empty() && store.server.is_none())
+            .then(|| ProfileForm::add(&[]));
 
         let mut app = Self {
             controller,
@@ -688,12 +864,15 @@ impl App {
             window: None,
             profiles: store.profiles,
             keys: store.keys,
+            server: store.server,
             selection,
             profile_form,
             key_form: None,
+            server_form: None,
             forward_form: None,
             confirm_delete: None,
             confirm_delete_key: None,
+            confirm_delete_server: false,
             confirm_export_key: None,
             notice: None,
             conn_path_modal: None,
@@ -702,10 +881,11 @@ impl App {
             routed_caches: HashMap::new(),
             // MAX so the first refresh always builds the log text.
             log_revision: u64::MAX,
-            log_filter: None,
+            log_filter: LogFilter::All,
             log_text: String::new(),
             clipboard: None,
             snapshots: HashMap::new(),
+            server_snapshot: ServerSnapshot::default(),
         };
         let open = app.open_window();
         // The tray is created via a task so it lands on the main thread with
@@ -783,9 +963,11 @@ impl App {
                 self.selection = selection;
                 self.profile_form = None;
                 self.key_form = None;
+                self.server_form = None;
                 self.forward_form = None;
                 self.confirm_delete = None;
                 self.confirm_delete_key = None;
+                self.confirm_delete_server = false;
                 self.confirm_export_key = None;
                 self.notice = None;
                 self.conn_path_modal = None;
@@ -813,6 +995,7 @@ impl App {
             Message::AddProfile => {
                 self.profile_form = Some(ProfileForm::add(&self.profiles));
                 self.key_form = None;
+                self.server_form = None;
                 self.forward_form = None;
                 self.confirm_delete = None;
                 self.notice = None;
@@ -822,6 +1005,7 @@ impl App {
                 if let Some(profile) = self.profiles.iter().find(|p| p.id == id) {
                     self.profile_form = Some(ProfileForm::edit(profile));
                     self.key_form = None;
+                    self.server_form = None;
                     self.forward_form = None;
                     self.notice = None;
                 }
@@ -1096,8 +1280,98 @@ impl App {
                 self.forward_form = None;
                 Task::none()
             }
-            Message::LogFilterChanged(value) => {
-                self.log_filter = (value != LOG_FILTER_ALL).then_some(value);
+            Message::SetUpServer => {
+                // There is only one server: the sidebar offers setup only
+                // while none is configured.
+                if self.server.is_none() {
+                    self.server_form = Some(ServerForm::add());
+                    self.profile_form = None;
+                    self.key_form = None;
+                    self.forward_form = None;
+                    self.confirm_delete_server = false;
+                    self.notice = None;
+                }
+                Task::none()
+            }
+            Message::EditServer => {
+                if let Some(server) = &self.server {
+                    self.server_form = Some(ServerForm::edit(server));
+                    self.profile_form = None;
+                    self.key_form = None;
+                    self.forward_form = None;
+                    self.notice = None;
+                }
+                Task::none()
+            }
+            Message::DeleteServer => {
+                self.delete_server();
+                Task::none()
+            }
+            Message::StartServer => self.start_server(),
+            Message::StopServer => {
+                self.controller.stop_server();
+                Task::none()
+            }
+            Message::ServerSecretChanged(value) => {
+                if let Some(form) = &mut self.server_form {
+                    form.secret = value;
+                }
+                Task::none()
+            }
+            Message::ServerGenerateSecret => {
+                if let Some(form) = &mut self.server_form {
+                    form.secret = generate_server_secret();
+                }
+                Task::none()
+            }
+            Message::ServerAuthorizedKeysEdited(action) => {
+                if let Some(form) = &mut self.server_form {
+                    form.authorized_keys.perform(action);
+                }
+                Task::none()
+            }
+            Message::ServerAddOwnKey(choice) => {
+                if let Some(form) = &mut self.server_form
+                    && let Some(key) = config::find_key(&self.keys, &choice.id)
+                {
+                    form.add_authorized_key(&key.public_key, &key.name);
+                }
+                Task::none()
+            }
+            Message::ServerRoutedDomainsChanged(value) => {
+                if let Some(form) = &mut self.server_form {
+                    form.routed_domains = value;
+                }
+                Task::none()
+            }
+            Message::ServerRoutedCidrsChanged(value) => {
+                if let Some(form) = &mut self.server_form {
+                    form.routed_cidrs = value;
+                }
+                Task::none()
+            }
+            Message::ServerRelayUrlsChanged(value) => {
+                if let Some(form) = &mut self.server_form {
+                    form.relay_urls = value;
+                }
+                Task::none()
+            }
+            Message::ServerRelayAuthTokenChanged(value) => {
+                if let Some(form) = &mut self.server_form {
+                    form.relay_auth_token = value;
+                }
+                Task::none()
+            }
+            Message::ServerFormSave => {
+                self.save_server_form();
+                Task::none()
+            }
+            Message::ServerFormCancel => {
+                self.server_form = None;
+                Task::none()
+            }
+            Message::LogFilterChanged(filter) => {
+                self.log_filter = filter;
                 self.rebuild_log_text();
                 Task::none()
             }
@@ -1197,8 +1471,8 @@ impl App {
         self.routed_caches.remove(&id);
         self.snapshots.remove(&id);
         self.forward_form = None;
-        if self.log_filter.as_deref() == Some(removed.name.as_str()) {
-            self.log_filter = None;
+        if self.log_filter == LogFilter::Profile(removed.name) {
+            self.log_filter = LogFilter::All;
             self.rebuild_log_text();
         }
         self.persist_store();
@@ -1214,12 +1488,91 @@ impl App {
         }
     }
 
+    fn start_server(&mut self) -> Task<Message> {
+        let Some(server) = self.server.clone() else {
+            return Task::none();
+        };
+        if server.is_ready() {
+            self.controller.start_server(server);
+            return Task::none();
+        }
+        // The identity secret was lost from the keychain — re-enter it (or
+        // generate a new identity, which changes the endpoint id).
+        self.selection = Selection::Server;
+        self.server_form = Some(ServerForm::edit(&server));
+        self.profile_form = None;
+        self.notice = Some("Re-enter the server's identity key to start it.".into());
+        self.show_window()
+    }
+
+    fn delete_server(&mut self) {
+        if !self.confirm_delete_server {
+            self.confirm_delete_server = true;
+            return;
+        }
+        self.confirm_delete_server = false;
+        if self.server.take().is_none() {
+            return;
+        }
+        self.controller.remove_server();
+        self.server_snapshot = ServerSnapshot::default();
+        if self.log_filter == LogFilter::Server {
+            self.log_filter = LogFilter::All;
+            self.rebuild_log_text();
+        }
+        // The sealed blob is rebuilt without the server, so this also erases
+        // its identity secret.
+        self.persist_store();
+        if self.selection == Selection::Server {
+            self.selection = self
+                .profiles
+                .first()
+                .map(|p| Selection::Profile(p.id.clone()))
+                .unwrap_or(Selection::Logs);
+        }
+    }
+
+    fn save_server_form(&mut self) {
+        let Some(form) = &self.server_form else {
+            return;
+        };
+        let Ok(server) = form.validate() else {
+            return;
+        };
+        let running = matches!(
+            self.server_snapshot.phase,
+            ServerPhase::Starting | ServerPhase::Running
+        );
+        self.server = Some(server);
+        self.persist_store();
+        if self.notice.is_none() {
+            self.notice = Some(if running {
+                "Saved — restart the server to apply.".into()
+            } else {
+                "Saved.".into()
+            });
+        }
+        self.selection = Selection::Server;
+        self.server_form = None;
+    }
+
     fn handle_menu_event(&mut self, id: &str) -> Task<Message> {
         match id {
             tray::MENU_OPEN => self.show_window(),
             tray::MENU_QUIT => {
                 self.controller.shutdown();
                 iced::exit()
+            }
+            tray::MENU_START_SERVER => self.start_server(),
+            tray::MENU_STOP_SERVER => {
+                self.controller.stop_server();
+                Task::none()
+            }
+            tray::MENU_COPY_SERVER_ID => {
+                if let Some(endpoint_id) = self.server.as_ref().map(|s| s.endpoint_id.clone()) {
+                    self.copy_text(endpoint_id);
+                }
+                Task::none()
             }
             _ => {
                 if let Some(profile_id) = id.strip_prefix(tray::MENU_CONNECT_PREFIX) {
@@ -1242,6 +1595,7 @@ impl App {
     /// after the tray is created.
     fn refresh(&mut self) {
         self.snapshots = self.controller.snapshots();
+        self.server_snapshot = self.controller.server_snapshot();
 
         // Runs every tick so a forward whose setup failed snaps back to
         // stopped promptly, per profile.
@@ -1276,7 +1630,13 @@ impl App {
         }
 
         if let Some(tray) = &mut self.tray {
-            tray.sync(&self.profiles, &self.keys, &self.snapshots);
+            tray.sync(
+                &self.profiles,
+                &self.keys,
+                &self.snapshots,
+                self.server.as_ref(),
+                &self.server_snapshot,
+            );
         }
     }
 
@@ -1295,11 +1655,11 @@ impl App {
             Some(pos) => {
                 // Follow a rename with the log filter (new lines carry the
                 // new thread name; old lines keep matching by text only).
-                let filter_renamed = self.log_filter.as_deref()
-                    == Some(self.profiles[pos].name.as_str())
+                let filter_renamed = self.log_filter
+                    == LogFilter::Profile(self.profiles[pos].name.clone())
                     && self.profiles[pos].name != profile.name;
                 if filter_renamed {
-                    self.log_filter = Some(profile.name.clone());
+                    self.log_filter = LogFilter::Profile(profile.name.clone());
                     self.rebuild_log_text();
                 }
                 self.profiles[pos] = profile;
@@ -1482,12 +1842,17 @@ impl App {
     }
 
     /// Re-join the log ring for the Logs pane, keeping only the filtered
-    /// profile's session-thread lines (`[tunnel-<name>]`) when a filter is on.
+    /// profile's or the server's session-thread lines (`[tunnel-<name>]` /
+    /// `[server]`) when a filter is on.
     fn rebuild_log_text(&mut self) {
         let lines = logging::recent_lines();
-        self.log_text = match &self.log_filter {
-            Some(name) => {
-                let tag = format!("[tunnel-{name}]");
+        let tag = match &self.log_filter {
+            LogFilter::All => None,
+            LogFilter::Profile(name) => Some(format!("[tunnel-{name}]")),
+            LogFilter::Server => Some(format!("[{}]", server_session::THREAD_NAME)),
+        };
+        self.log_text = match tag {
+            Some(tag) => {
                 lines
                     .iter()
                     .filter(|line| line.contains(&tag))
@@ -1500,7 +1865,7 @@ impl App {
     }
 
     fn persist_store(&mut self) {
-        if let Err(e) = config::save_store(&self.keys, &self.profiles) {
+        if let Err(e) = config::save_store(&self.keys, &self.profiles, self.server.as_ref()) {
             log::error!("Failed to save profiles: {e:#}");
             self.notice = Some(format!("Failed to save profiles: {e:#}"));
         }
@@ -1881,6 +2246,69 @@ mod tests {
             secret,
         };
         assert!(readd.validate(&existing_pair).is_err());
+    }
+
+    fn valid_server_form() -> ServerForm {
+        let client = flextunnel_core::auth::ClientKey::generate().unwrap();
+        ServerForm {
+            editing: false,
+            secret: format!(" {} ", generate_server_secret()),
+            authorized_keys: text_editor::Content::with_text(&format!(
+                "# laptop\n{} laptop\n",
+                client.public_str()
+            )),
+            routed_domains: " *.internal ,, example.com ".into(),
+            routed_cidrs: "10.0.0.0/8".into(),
+            relay_urls: String::new(),
+            relay_auth_token: String::new(),
+        }
+    }
+
+    #[test]
+    fn server_form_trims_and_builds() {
+        let form = valid_server_form();
+        let server = form.validate().expect("valid");
+        assert_eq!(server.secret, form.secret.trim());
+        assert_eq!(Some(server.endpoint_id.clone()), form.endpoint_id());
+        assert_eq!(server.routed_domains, ["*.internal", "example.com"]);
+        assert_eq!(server.routed_cidrs, ["10.0.0.0/8"]);
+        assert!(server.authorized_keys.contains("laptop"));
+    }
+
+    #[test]
+    fn server_form_rejects_bad_input() {
+        let mut form = valid_server_form();
+        form.secret = "not base64!".into();
+        assert!(form.validate().is_err());
+
+        let mut form = valid_server_form();
+        form.authorized_keys = text_editor::Content::with_text("# nothing but comments\n");
+        assert!(form.validate().is_err(), "no client keys");
+        form.authorized_keys = text_editor::Content::with_text("ed25519-pub:nope\n");
+        assert!(form.validate().is_err(), "malformed key");
+
+        let mut form = valid_server_form();
+        form.routed_domains = String::new();
+        form.routed_cidrs = " , ".into();
+        assert!(form.validate().is_err(), "empty tunnel set");
+        form.routed_cidrs = "10.0.0.0/33".into();
+        assert!(form.validate().is_err(), "bad CIDR");
+
+        let mut form = valid_server_form();
+        form.relay_auth_token = "psk".into();
+        assert!(form.validate().is_err(), "token without relays");
+    }
+
+    #[test]
+    fn adding_an_own_key_appends_once() {
+        let mut form = ServerForm::default();
+        form.add_authorized_key("ed25519-pub:abc", "work laptop");
+        form.add_authorized_key("ed25519-pub:abc", "work laptop");
+        form.add_authorized_key("ed25519-pub:def", "home");
+        assert_eq!(
+            form.authorized_keys.text(),
+            "ed25519-pub:abc work laptop\ned25519-pub:def home\n"
+        );
     }
 
     #[test]
