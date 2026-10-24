@@ -465,6 +465,57 @@ async fn server_direct_forward_relays_and_server_rejects_off_list_target() {
     let _ = std::fs::remove_file(bl_path);
 }
 
+/// The shared startup path ([`crate::server::prepare`], used by the CLI and
+/// the desktop app) yields a server that accepts an authorized client and
+/// tunnels an on-list target; dropping `serve` stops it.
+#[tokio::test]
+async fn prepared_server_serves_an_authorized_client() {
+    let bl_path = temp_blocklist("prepared-server");
+    let secret = SecretKey::generate();
+    let (_, routed_cidrs) = loopback_cidr_set();
+    let prepared = crate::server::prepare(crate::server::ServerOptions {
+        secret_key: secret.clone(),
+        authorized_keys: test_authorized_keys(),
+        quick_client: None,
+        first_client: None,
+        relay_urls: Vec::new(),
+        relay_auth_token: None,
+        host_aliases: HashMap::new(),
+        routed_domains: Vec::new(),
+        routed_cidrs,
+        dns_forwards: HashMap::new(),
+        bridges: HashMap::new(),
+        allowed_bridge_servers: Vec::new(),
+        blocklist_file: bl_path.clone(),
+    })
+    .unwrap();
+    assert_eq!(prepared.own_id(), secret.public());
+
+    let server_ep = loopback_endpoint(secret, true).await;
+    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
+    let running = prepared.bind_on(server_ep);
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let served = tokio::spawn(async move {
+        tokio::select! {
+            res = running.serve() => res.map(|()| false),
+            _ = stop_rx => Ok(true),
+        }
+        .map(|stopped| (stopped, running))
+    });
+
+    let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
+    let (conn, _ctrl_send, _ctrl_recv, response) =
+        client_handshake(&client_ep, server_addr, 77, false).await;
+    assert!(response.accepted, "authorized client accepted");
+    assert_echo_roundtrip(&conn, spawn_echo().await).await;
+
+    stop_tx.send(()).unwrap();
+    let (stopped, running) = with_timeout(served).await.unwrap().unwrap();
+    assert!(stopped, "serve ran until stopped");
+    running.endpoint().close().await;
+    let _ = std::fs::remove_file(bl_path);
+}
+
 /// Endpoint-rebuild escalation: when reconnect attempts keep failing on an
 /// endpoint that is broken beyond repair (here: closed out from under the
 /// session — the loopback stand-in for a wedged endpoint whose relay link or

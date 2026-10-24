@@ -1,13 +1,13 @@
-//! Per-user single-instance locks: one `flextunnel` server per user, and one
-//! client per (user, target server) — the client lock is keyed by the
-//! server-id prefix (see `instance.rs`), so two clients for the same server
-//! cannot run at once, while clients for different servers coexist.
+//! Per-user client single-instance locks: one client per (user, target
+//! server) — keyed by the server-id prefix (see `instance.rs`), so two clients
+//! for the same server cannot run at once, while clients for different servers
+//! coexist. (The one-server-per-user lock is shared with the desktop app and
+//! lives in [`flextunnel_core::server::acquire_server_lock`].)
 //!
 //! The lock files live under the user's own config dir
-//! (`~/.config/flextunnel/`), so each user gets independent locks — two
-//! different users can each run a server, but one user cannot start a second.
-//! This guards against the accidental misconfiguration of launching two
-//! processes with the same identity. The locking mechanics live in
+//! (`~/.config/flextunnel/`), so each user gets independent locks. This guards
+//! against the accidental misconfiguration of launching two processes with
+//! the same identity. The locking mechanics live in
 //! [`flextunnel_core::lock`]; this module only picks the per-user paths.
 //!
 //! The client lock is deliberately a dedicated file rather than the control
@@ -18,33 +18,8 @@
 
 use anyhow::{Context, Result};
 use flextunnel_core::lock::InstanceLock;
-use std::path::PathBuf;
 
 use crate::instance;
-
-/// The per-user lock path (`~/.config/flextunnel/server.lock`), matching the
-/// config-file convention in [`flextunnel_core::config`]. `None` if the home dir
-/// is unknown.
-///
-/// There is deliberately no temp-dir fallback: if the home dir is unavailable the
-/// server fails fast rather than silently narrowing the guarantee to a fallback
-/// lock that a second process could sidestep.
-fn user_lock_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".config").join("flextunnel").join("server.lock"))
-}
-
-/// Acquire the per-user single-instance lock, held for the process lifetime.
-pub fn acquire() -> Result<InstanceLock> {
-    let path = user_lock_path().context(
-        "Could not determine the home directory, so the single-instance lock \
-         (~/.config/flextunnel/server.lock) cannot be enforced",
-    )?;
-    InstanceLock::acquire(
-        &path,
-        "Another flextunnel server is already running for this user. \
-         Only one server per user is allowed.",
-    )
-}
 
 /// Acquire the per-(user, server) client lock
 /// (`~/.config/flextunnel/client-<key>.lock`, keyed by the server-id prefix),
