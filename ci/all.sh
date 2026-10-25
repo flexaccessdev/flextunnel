@@ -9,7 +9,7 @@
 #   linux    natively on Linux, else the FLEXTUNNEL_UNIXCI_HOST alias
 #            (default 'workstation-wsl')        ci/unix/{ci,remote}.sh
 #   windows  the FLEXTUNNEL_WINCI_HOST alias
-#            (default 'windows-ci-build')       ci/windows/remote.sh
+#            (default 'windows-ci-build')       ci/windows/remote.ps1 (pwsh 7)
 #
 #   ci/all.sh                  # all three
 #   ci/all.sh linux windows    # only these
@@ -41,7 +41,7 @@ run_job() {
         linux)
             if [ "$native" = Linux ]; then ./ci/unix/ci.sh
             else ./ci/unix/remote.sh ci; fi ;;
-        windows) ./ci/windows/remote.sh ci ;;
+        windows) pwsh -NoProfile -File ./ci/windows/remote.ps1 ci ;;
     esac
 }
 
