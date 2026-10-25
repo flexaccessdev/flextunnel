@@ -1241,8 +1241,14 @@ fn server_detail<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
         }
     }
     tunnel = tunnel.push(indented_label("always routed:"));
-    tunnel = tunnel.push(indented_item(reserved::STATUS_HOST));
-    tunnel = tunnel.push(indented_item(reserved::LOCALHOST_HOST));
+    tunnel = tunnel.push(indented_note_item(
+        reserved::STATUS_HOST,
+        "this server's status page",
+    ));
+    tunnel = tunnel.push(indented_note_item(
+        reserved::LOCALHOST_HOST,
+        "this machine's localhost, on any port",
+    ));
     col = col.push(section_label("TUNNEL SET"));
     col = col.push(container(tunnel).padding([12, 14]).width(Fill).style(style::card));
     col = col.push(
@@ -1729,6 +1735,18 @@ fn indented_item<'a>(value: &str) -> Element<'a, Message> {
         .spacing(6)
         .align_y(Center)
         .into()
+}
+
+/// An [`indented_item`] followed by a dimmed note saying what it is for.
+fn indented_note_item<'a>(value: &str, note: &'static str) -> Element<'a, Message> {
+    row![
+        space().width(32),
+        mono(format!("- {value}")),
+        text(format!("— {note}")).size(12).style(style::dim_text),
+    ]
+    .spacing(6)
+    .align_y(Center)
+    .into()
 }
 
 /// A monospace routing entry with a right-aligned Copy button. `trailing` is an
