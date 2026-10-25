@@ -1202,9 +1202,11 @@ async fn reserved_localhost_host_dials_server_loopback() {
     with_timeout(recv.read_exact(&mut buf)).await.unwrap();
     assert_eq!(&buf, b"HELLOping");
 
-    // A closed loopback port surfaces as a connect failure, not a 404 page.
+    // A connect failure surfaces as a failure reply, not a 404 page. Port 0 is
+    // unconnectable on every platform (nothing can listen on it), so this
+    // never depends on which loopback ports happen to be in use.
     let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
-    signaling::write_request(&mut send, &Target::Domain(reserved::LOCALHOST_HOST.to_string(), 1))
+    signaling::write_request(&mut send, &Target::Domain(reserved::LOCALHOST_HOST.to_string(), 0))
         .await
         .unwrap();
     send.flush().await.unwrap();
