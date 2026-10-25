@@ -37,9 +37,13 @@ apple-native-keyring-store = { version = "1", features = ["keychain"] }
 # directly on the shared NSApplication once the event loop is running.
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"] }
+# `getuid` for the LaunchAgent's launchd domain (see autostart.rs).
+libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-native-keyring-store = "1"
+# The HKCU Run / StartupApproved login-item registration (see autostart.rs).
+windows-registry = "0.6"
 
 [dev-dependencies]
 tempfile = { workspace = true }

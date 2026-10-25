@@ -46,6 +46,14 @@ its own **server-direct port forwards**. Connecting is always manual.
   custom-relay auth token is written to the export file. Importing over an
   existing profile — matched by server id — keeps that profile's secrets.)
 - **Auto-reconnect** — sessions re-establish the tunnel when the path drops.
+- **Start at login** — a checkbox in the tray menu ("Open at Login" on macOS,
+  "Start with Windows") registers the app as a per-user login item: a
+  LaunchAgent plist in `~/Library/LaunchAgents` on macOS, a
+  `HKCU\…\CurrentVersion\Run` value on Windows — the same registrations the
+  OS's own Login Items / Startup apps pages list and can switch off. Launched
+  that way, the app starts in the tray without opening its window.
+- **Server auto-start** — when a server is configured, it starts with the app
+  (at login or by hand); its tray submenu still stops and restarts it.
 
 ## Where settings live
 
@@ -103,6 +111,7 @@ src/main.rs     entry point; boots the iced daemon and the tray
    app.rs       the daemon state machine (sidebar + detail pane + tray glue)
    view.rs      the window UI (profile list, detail pane, modals)
    tray.rs      system-tray icon + per-profile menus
+   autostart.rs login-item registration (LaunchAgent / Run key)
    tunnel.rs    background controller: one session per connected profile
    config.rs    profile persistence (profiles.json + keychain tokens)
    icon.rs      tray glyph rendered at runtime

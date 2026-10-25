@@ -2017,6 +2017,7 @@ dependencies = [
  "flextunnel-core",
  "iced",
  "keyring-core",
+ "libc",
  "log",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
@@ -2029,6 +2030,7 @@ dependencies = [
  "tokio",
  "tray-icon",
  "windows-native-keyring-store",
+ "windows-registry",
 ]
 
 [[package]]

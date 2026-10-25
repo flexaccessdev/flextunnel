@@ -10,6 +10,7 @@
 //! tray click wakes the runtime even while no window exists; a 500 ms tick
 //! keeps the snapshots and the tray state fresh the rest of the time.
 
+use crate::autostart;
 use crate::config::{self, AuthKey, Profile, ServerConfig, DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT};
 use flextunnel_core::forwards::{
     PortForward, disable_failed_forwards, parse_port, validate_label, validate_remote_host,
@@ -835,6 +836,10 @@ pub struct App {
     pub snapshots: HashMap<ProfileId, Snapshot>,
     /// The server session's snapshot, refreshed alongside.
     pub server_snapshot: ServerSnapshot,
+    /// Whether the app is registered as a login item — the OS's answer
+    /// (`autostart::is_enabled`), re-read every tick so a change made in the
+    /// system settings shows in the tray checkbox.
+    pub launch_at_login: bool,
 }
 
 impl App {
@@ -857,6 +862,11 @@ impl App {
         // First run: go straight to creating a profile.
         let profile_form = (store.profiles.is_empty() && store.server.is_none())
             .then(|| ProfileForm::add(&[]));
+
+        let launch_at_login = autostart::is_enabled();
+        if let Err(e) = autostart::refresh() {
+            log::warn!("Failed to refresh the login item: {e:#}");
+        }
 
         let mut app = Self {
             controller,
@@ -886,8 +896,27 @@ impl App {
             clipboard: None,
             snapshots: HashMap::new(),
             server_snapshot: ServerSnapshot::default(),
+            launch_at_login,
         };
-        let open = app.open_window();
+        // A configured server is meant to be running: it starts with the app.
+        match &app.server {
+            Some(server) if server.is_ready() => {
+                log::info!("Starting the configured server");
+                app.controller.start_server(server.clone());
+            }
+            Some(_) => log::warn!(
+                "Not starting the server: its identity key is missing (re-enter it in the \
+                 Server pane)"
+            ),
+            None => {}
+        }
+        // Launched as a login item, the app stays in the tray; the window is
+        // a click away.
+        let open = if autostart::launched_at_login() {
+            Task::none()
+        } else {
+            app.open_window()
+        };
         // The tray is created via a task so it lands on the main thread with
         // the event loop already running (a macOS requirement).
         (app, Task::batch([Task::done(Message::SetupTray), open]))
@@ -924,7 +953,10 @@ impl App {
             Message::SetupTray => {
                 set_activation_policy(self.window.is_some());
                 match Tray::new() {
-                    Ok(tray) => self.tray = Some(tray),
+                    Ok(tray) => {
+                        tray.set_launch_at_login(self.launch_at_login);
+                        self.tray = Some(tray);
+                    }
                     Err(e) => log::error!("Failed to create the tray icon: {e:#}"),
                 }
                 self.refresh();
@@ -1574,6 +1606,15 @@ impl App {
                 }
                 Task::none()
             }
+            tray::MENU_LAUNCH_AT_LOGIN => {
+                let enable = !self.launch_at_login;
+                if let Err(e) = autostart::set_enabled(enable) {
+                    let verb = if enable { "enable" } else { "disable" };
+                    log::error!("Failed to {verb} start at login: {e:#}");
+                }
+                self.sync_launch_at_login(true);
+                Task::none()
+            }
             _ => {
                 if let Some(profile_id) = id.strip_prefix(tray::MENU_CONNECT_PREFIX) {
                     let profile_id = profile_id.to_string();
@@ -1596,6 +1637,7 @@ impl App {
     fn refresh(&mut self) {
         self.snapshots = self.controller.snapshots();
         self.server_snapshot = self.controller.server_snapshot();
+        self.sync_launch_at_login(false);
 
         // Runs every tick so a forward whose setup failed snaps back to
         // stopped promptly, per profile.
@@ -1862,6 +1904,18 @@ impl App {
             }
             None => lines.join("\n"),
         };
+    }
+
+    /// Re-read the login-item registration and push it to the tray checkbox
+    /// when it changed — or unconditionally (`force`) after a toggle attempt,
+    /// since the native checkbox flips on click even when the toggle failed.
+    fn sync_launch_at_login(&mut self, force: bool) {
+        let enabled = autostart::is_enabled();
+        let changed = enabled != self.launch_at_login;
+        self.launch_at_login = enabled;
+        if (changed || force) && let Some(tray) = &self.tray {
+            tray.set_launch_at_login(enabled);
+        }
     }
 
     fn persist_store(&mut self) {

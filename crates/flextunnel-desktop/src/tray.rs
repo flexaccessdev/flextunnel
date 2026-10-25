@@ -1,6 +1,7 @@
 //! System tray icon + menu: an aggregate status line plus one submenu per
 //! profile (status, Connect, Disconnect, Copy SOCKS5 Address) and one for the
-//! server, when configured (status, Start, Stop, Copy Endpoint ID). Created and
+//! server, when configured (status, Start, Stop, Copy Endpoint ID), then the
+//! "start at login" checkbox (see `autostart`). Created and
 //! mutated only on the main thread (from the iced update loop); the tray-icon
 //! event handlers installed by the tray subscription merely forward events and
 //! wake the runtime, since they may fire off the main thread.
@@ -14,7 +15,7 @@ use crate::server_session::{ServerPhase, ServerSnapshot};
 use crate::tunnel::{Phase, Snapshot};
 use anyhow::Result;
 use std::collections::HashMap;
-use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 pub const MENU_OPEN: &str = "open";
@@ -25,6 +26,15 @@ pub const MENU_COPY_SOCKS_PREFIX: &str = "copy-socks:";
 pub const MENU_START_SERVER: &str = "start-server";
 pub const MENU_STOP_SERVER: &str = "stop-server";
 pub const MENU_COPY_SERVER_ID: &str = "copy-server-id";
+pub const MENU_LAUNCH_AT_LOGIN: &str = "launch-at-login";
+
+/// The login-item checkbox, in each platform's own words for the feature.
+#[cfg(target_os = "macos")]
+const LAUNCH_AT_LOGIN_LABEL: &str = "Open at Login";
+#[cfg(windows)]
+const LAUNCH_AT_LOGIN_LABEL: &str = "Start with Windows";
+#[cfg(not(any(target_os = "macos", windows)))]
+const LAUNCH_AT_LOGIN_LABEL: &str = "Start at Login";
 
 pub fn status_line(phase: Phase) -> &'static str {
     match phase {
@@ -148,6 +158,9 @@ type MenuShape = (Vec<(String, String)>, bool);
 pub struct Tray {
     tray: TrayIcon,
     status: MenuItem,
+    /// Checked state owned by `App` (it mirrors the OS registration); set
+    /// through [`Tray::set_launch_at_login`], never derived here.
+    launch_at_login: CheckMenuItem,
     items: HashMap<String, ProfileItems>,
     server_items: Option<ServerItems>,
     /// The shape the current menu was built from; a change (added, removed,
@@ -165,6 +178,8 @@ fn make_icon(state: TrayState) -> Result<tray_icon::Icon> {
 impl Tray {
     pub fn new() -> Result<Self> {
         let status = MenuItem::with_id("status", "Disconnected", false, None);
+        let launch_at_login =
+            CheckMenuItem::with_id(MENU_LAUNCH_AT_LOGIN, LAUNCH_AT_LOGIN_LABEL, true, false, None);
         let idle = make_icon(TrayState::Idle)?;
         // macOS draws the alpha-only glyph as a template image so it adapts
         // to the menu bar, light or dark.
@@ -184,6 +199,7 @@ impl Tray {
         let mut this = Self {
             tray,
             status,
+            launch_at_login,
             items: HashMap::new(),
             server_items: None,
             menu_shape: MenuShape::default(),
@@ -257,6 +273,8 @@ impl Tray {
             self.server_items = Some(ServerItems { status, start, stop });
         }
 
+        menu.append(&self.launch_at_login)?;
+        menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&MenuItem::with_id(
             "version",
             concat!("flextunnel v", env!("CARGO_PKG_VERSION")),
@@ -267,6 +285,13 @@ impl Tray {
         self.tray.set_menu(Some(Box::new(menu)));
         self.menu_shape = menu_shape(profiles, server);
         Ok(())
+    }
+
+    /// Show the login-item registration's state. Called on every change and
+    /// after every toggle attempt: a click flips the native checkbox on its
+    /// own, so a failed toggle has to be snapped back.
+    pub fn set_launch_at_login(&self, enabled: bool) {
+        self.launch_at_login.set_checked(enabled);
     }
 
     /// Reflect the tunnel states in the icon/menu. Native calls only happen on
