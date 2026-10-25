@@ -113,10 +113,9 @@ struct FfiConfig {
     /// in the iOS keychain and passes it here at start.
     auth_key: String,
     /// Loopback SOCKS5 port to bind. `None` disables the SOCKS5 front-end;
-    /// `Some(0)` binds an OS-assigned ephemeral port. A nonzero port is a
-    /// preference: if it is already in use the start falls back to an
-    /// OS-assigned port instead of failing (the result JSON reports the port
-    /// actually bound).
+    /// `Some(0)` binds an OS-assigned ephemeral port (the result JSON reports
+    /// the port bound). A nonzero port is required: if it is already in use
+    /// the start fails.
     #[serde(default)]
     socks_port: Option<u16>,
     #[serde(default)]
@@ -285,19 +284,12 @@ pub unsafe extern "C" fn flextunnel_start(
 }
 
 /// Bind the browser's loopback SOCKS listener. A nonzero `requested` port is a
-/// *preference*, not a requirement: the app replays the previous session's
-/// OS-assigned port on relaunch so the WKWebView proxy config stays valid, but
-/// if another process took it while this one was suspended, an OS-assigned
-/// port beats failing the whole session — the caller reads the actual port
-/// from the result JSON either way.
+/// requirement, not a preference: the app replays its session's OS-assigned
+/// port on relaunch and the WKWebView proxy config names it for the session's
+/// lifetime, so a relaunch that lands elsewhere would leave the browser pointed
+/// at a dead port. If another process took it, the start fails instead.
 async fn bind_socks_listener(requested: u16) -> std::io::Result<TcpListener> {
-    match TcpListener::bind((Ipv4Addr::LOCALHOST, requested)).await {
-        Err(e) if requested != 0 && e.kind() == std::io::ErrorKind::AddrInUse => {
-            log::warn!("preferred SOCKS port {requested} is in use; binding an OS-assigned port");
-            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await
-        }
-        bound => bound,
-    }
+    TcpListener::bind((Ipv4Addr::LOCALHOST, requested)).await
 }
 
 fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
@@ -852,15 +844,15 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn preferred_socks_port_falls_back_when_taken() {
+    async fn requested_socks_port_fails_when_taken() {
         let occupier = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let taken = occupier.local_addr().unwrap().port();
-        let listener = bind_socks_listener(taken).await.unwrap();
-        assert_ne!(listener.local_addr().unwrap().port(), taken);
+        let err = bind_socks_listener(taken).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
     }
 
     #[tokio::test]
-    async fn preferred_socks_port_is_honored_when_free() {
+    async fn requested_socks_port_is_bound_when_free() {
         // Find a port that is free by binding-then-releasing an ephemeral one.
         let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let port = probe.local_addr().unwrap().port();

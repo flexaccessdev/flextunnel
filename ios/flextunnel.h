@@ -24,10 +24,9 @@
  *   4. flextunnel_stop(handle)                            (on teardown)
  *
  * Pass a numeric "socks_port" to bind the browser's loopback SOCKS5 listener
- * (0 requests an OS-assigned port; a nonzero port is a preference — if it is
- * in use the start binds an OS-assigned port instead of failing, so always
- * read the bound port from the result JSON). Pass null or omit it for a
- * forwarding-only session with no SOCKS5 listener.
+ * (0 requests an OS-assigned port, read back from the result JSON; a nonzero
+ * port is required — if it is in use the start fails). Pass null or omit it
+ * for a forwarding-only session with no SOCKS5 listener.
  *
  * All functions are NULL-safe and never unwind into Swift.
  */
@@ -80,8 +79,8 @@ int flextunnel_client_public_key(const char *secret_key, char *out_buf, size_t o
  *   or `flexaccess-keys generate-auth-key`); its public half must be on the
  *   server's authorized_keys_file.
  *   socks_port is optional; null/omitted disables SOCKS5, 0 requests an
- *   OS-assigned port, and a nonzero port is a preference (an in-use port falls
- *   back to OS-assigned). Read the bound port from the result JSON.
+ *   OS-assigned port (read the bound port from the result JSON), and a nonzero
+ *   port is required (an in-use port fails the start).
  *   relay_auth_token is
  *   optional: a shared bearer token sent to every custom relay's WebSocket
  *   upgrade; it is only valid with custom relay_urls (rejected with the default
