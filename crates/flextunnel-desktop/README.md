@@ -54,8 +54,8 @@ its own **server-direct port forwards**. Connecting is always manual.
   switch off), and a checkbox in the tray menu ("Open at Login" on macOS,
   "Start with Windows") toggles it afterwards. Launched that way, the app
   starts in the tray without opening its window. A dev store
-  (`FLEXTUNNEL_DEV_CONFIG`) never registers, so a debug binary doesn't become
-  a login item.
+  (`FLEXTUNNEL_DEV_CONFIG`) never touches the login item, so a debug binary
+  neither becomes one nor re-points a real install's at itself.
 - **Server auto-start** — when a server is configured, it starts with the app
   (at login or by hand); its tray submenu still stops and restarts it.
 

@@ -848,11 +848,14 @@ impl App {
     pub fn boot() -> (Self, Task<Message>) {
         let controller = Controller::start();
 
-        let store = match config::load_store() {
-            Ok(store) => store,
+        // A store that fails to load is replaced by an empty one for this run
+        // only: nothing below may write it back over data the user could
+        // still recover.
+        let (store, store_loaded) = match config::load_store() {
+            Ok(store) => (store, true),
             Err(e) => {
                 log::error!("{e:#}");
-                config::Store::default()
+                (config::Store::default(), false)
             }
         };
         let selection = store
@@ -899,19 +902,23 @@ impl App {
         // First launch of an install: start at login by default, as tray
         // apps do on both platforms. The OS registration is the truth from
         // then on, so a checkbox the user cleared is never re-ticked. A dev
-        // store (`FLEXTUNNEL_DEV_CONFIG`) skips it so a debug binary never
-        // becomes a login item.
-        if !app.login_item_set_up {
-            if config::dev_store() {
-                log::info!("Dev store: not registering the login item");
-            } else {
+        // store (`FLEXTUNNEL_DEV_CONFIG`) never touches the login item, so a
+        // debug binary neither becomes one nor re-points a real install's.
+        if config::dev_store() {
+            log::info!("Dev store: leaving the login item alone");
+        } else if !app.login_item_set_up {
+            if store_loaded {
                 match autostart::set_enabled(true) {
                     Ok(()) => log::info!("First launch: registered as a login item"),
                     Err(e) => log::error!("Failed to register as a login item: {e:#}"),
                 }
+                app.login_item_set_up = true;
+                app.persist_store();
+            } else {
+                log::warn!(
+                    "The store failed to load: login-item setup waits for a launch that loads it"
+                );
             }
-            app.login_item_set_up = true;
-            app.persist_store();
         } else if let Err(e) = autostart::refresh() {
             log::warn!("Failed to refresh the login item: {e:#}");
         }
