@@ -50,19 +50,11 @@ const SAFE_STORAGE_USER: &str = "Flextunnel";
 /// Development only — see the module docs.
 const DEV_CONFIG_ENV: &str = "FLEXTUNNEL_DEV_CONFIG";
 
-/// Chosen once by `init_store`; `File` when the dev env var is set, otherwise
-/// `profiles.json` with its secrets sealed under the Safe Storage master key
-/// held by the platform keychain via `keyring-core`.
-enum Backend {
-    /// Only ever built on macOS/Windows (see `init_store`); on any other host
-    /// the dev file path is the only reachable one, so the variant is dead
-    /// there and `-D warnings` would reject it.
-    #[cfg_attr(not(any(target_os = "macos", windows)), expect(dead_code))]
-    Keychain,
-    File(PathBuf),
-}
-
-static BACKEND: OnceLock<Backend> = OnceLock::new();
+/// The plaintext dev file, set once by `init_store` when `FLEXTUNNEL_DEV_CONFIG`
+/// is set. Unset, the store is `profiles.json` with its secrets sealed under
+/// the Safe Storage master key held by the platform keychain via
+/// `keyring-core`.
+static DEV_FILE: OnceLock<PathBuf> = OnceLock::new();
 
 /// One named client auth keypair, shared across profiles: any number of
 /// profiles can pick the same key to authenticate with (its public half then
@@ -180,7 +172,8 @@ pub struct ServerConfig {
     /// blank lines ignored.
     #[serde(default)]
     pub authorized_keys: String,
-    /// The tunnel set (the combined set must be non-empty).
+    /// The tunnel set; may be empty (the reserved `flextunnel.internal`
+    /// namespace is always routed).
     #[serde(default)]
     pub routed_domains: Vec<String>,
     #[serde(default)]
@@ -296,44 +289,28 @@ fn profiles_path() -> Result<PathBuf> {
 
 /// Whether the plaintext dev file backend is in use (`FLEXTUNNEL_DEV_CONFIG`).
 pub fn dev_store() -> bool {
-    matches!(BACKEND.get(), Some(Backend::File(_)))
+    DEV_FILE.get().is_some()
 }
 
-/// Choose the storage backend. Must run before any load/save; returns false
-/// when no store is available.
-pub fn init_store() -> bool {
+/// Choose the storage backend: the dev file when `FLEXTUNNEL_DEV_CONFIG` is
+/// set, else the platform keychain (the macOS Keychain, Windows Credential
+/// Manager). Must run before any load/save.
+pub fn init_store() -> Result<()> {
     if let Some(path) = dev_config_path() {
         log::warn!(
             "{DEV_CONFIG_ENV} set: storing profiles (secret keys included) UNENCRYPTED at {} \
              (development only)",
             path.display()
         );
-        let _ = BACKEND.set(Backend::File(path));
-        return true;
+        let _ = DEV_FILE.set(path);
+        return Ok(());
     }
     #[cfg(target_os = "macos")]
-    {
-        match apple_native_keyring_store::keychain::Store::new() {
-            Ok(store) => {
-                keyring_core::set_default_store(store);
-                let _ = BACKEND.set(Backend::Keychain);
-                return true;
-            }
-            Err(e) => log::error!("Failed to open the macOS keychain store: {e}"),
-        }
-    }
+    let store = apple_native_keyring_store::keychain::Store::new();
     #[cfg(windows)]
-    {
-        match windows_native_keyring_store::Store::new() {
-            Ok(store) => {
-                keyring_core::set_default_store(store);
-                let _ = BACKEND.set(Backend::Keychain);
-                return true;
-            }
-            Err(e) => log::error!("Failed to open the Windows credential store: {e}"),
-        }
-    }
-    false
+    let store = windows_native_keyring_store::Store::new();
+    keyring_core::set_default_store(store.context("Failed to open the system keychain")?);
+    Ok(())
 }
 
 /// The Safe Storage master key: read from its keychain entry, generated (and
@@ -522,13 +499,13 @@ fn drop_invalid(profiles: Vec<Profile>) -> Vec<Profile> {
 /// `drop_invalid*` backstops); a profile referencing an unknown key is kept
 /// but can't connect until a key is picked.
 pub fn load_store() -> Result<Store> {
-    let mut store = match BACKEND.get() {
-        Some(Backend::File(path)) => {
+    let mut store = match DEV_FILE.get() {
+        Some(path) => {
             let mut store = load_dev_file(path)?;
             store.keys = drop_invalid_keys(store.keys);
             store
         }
-        _ => {
+        None => {
             let mut store: Store = read_json(&profiles_path()?)?.unwrap_or_default();
             store.keys = drop_invalid_keys(store.keys);
             // No sealed blob → nothing to unseal, and crucially no keychain
@@ -592,11 +569,9 @@ pub fn save_store(
     server: Option<&ServerConfig>,
     login_item_set_up: bool,
 ) -> Result<()> {
-    match BACKEND.get() {
-        Some(Backend::File(path)) => {
-            save_dev_file(path, keys, profiles, server, login_item_set_up)
-        }
-        _ => {
+    match DEV_FILE.get() {
+        Some(path) => save_dev_file(path, keys, profiles, server, login_item_set_up),
+        None => {
             let sealed_keys = if secret_entries(keys, server).all(|(_, s)| s.is_empty()) {
                 String::new()
             } else {

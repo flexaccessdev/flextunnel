@@ -289,7 +289,7 @@ pub fn tray_rgba(state: TrayState) -> (Vec<u8>, u32, u32) {
         }
         (to_rgba(pixmap), 44, 44)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     {
         let (blue, alpha) = match state {
             TrayState::Connected | TrayState::AllConnected => (true, 1.0),

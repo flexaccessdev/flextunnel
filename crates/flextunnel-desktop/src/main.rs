@@ -27,8 +27,8 @@ fn main() -> iced::Result {
     logging::init();
     flextunnel_core::app::log_version(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     flextunnel_core::app::raise_fd_limit();
-    if !config::init_store() {
-        log::error!("No system keychain available; settings cannot be loaded or saved");
+    if let Err(e) = config::init_store() {
+        log::error!("No system keychain available; settings cannot be loaded or saved: {e:#}");
     }
 
     iced::daemon(app::App::boot, app::App::update, app::App::view)

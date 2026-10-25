@@ -38,11 +38,10 @@ pub fn refresh_routed_cache(cache: &mut RoutedCache, routes: &TunnelRoutes) {
     }
 }
 
-/// Everything is tunneled when the server pushes no routed set at all, a
-/// wildcard domain, or an all-covering CIDR (mirrors the iOS derivation).
+/// Everything is tunneled when the server pushes a wildcard domain or an
+/// all-covering CIDR. An empty set tunnels nothing but the reserved hosts.
 fn is_full_tunnel(routes: &TunnelRoutes) -> bool {
-    (routes.domains.is_empty() && routes.cidrs.is_empty())
-        || routes.domains.iter().any(|d| d == "*")
+    routes.domains.iter().any(|d| d == "*")
         || routes.cidrs.iter().any(|c| c == "0.0.0.0/0" || c == "::/0")
 }
 
@@ -1241,6 +1240,9 @@ fn server_detail<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
             tunnel = tunnel.push(indented_item(cidr));
         }
     }
+    tunnel = tunnel.push(indented_label("always routed:"));
+    tunnel = tunnel.push(indented_item(reserved::STATUS_HOST));
+    tunnel = tunnel.push(indented_item(reserved::LOCALHOST_HOST));
     col = col.push(section_label("TUNNEL SET"));
     col = col.push(container(tunnel).padding([12, 14]).width(Fill).style(style::card));
     col = col.push(
@@ -1336,7 +1338,7 @@ fn server_form_view<'a>(app: &'a App, form: &'a ServerForm) -> Element<'a, Messa
         form_row(
             "Routed domains",
             input(
-                "comma-separated, e.g. *.internal — * for all",
+                "optional, comma-separated, e.g. *.internal — * for all",
                 &form.routed_domains,
                 Message::ServerRoutedDomainsChanged,
             ),
@@ -1344,7 +1346,7 @@ fn server_form_view<'a>(app: &'a App, form: &'a ServerForm) -> Element<'a, Messa
         form_row(
             "Routed CIDRs",
             input(
-                "comma-separated, e.g. 10.0.0.0/8 — 0.0.0.0/0, ::/0 for all",
+                "optional, comma-separated, e.g. 10.0.0.0/8 — 0.0.0.0/0, ::/0 for all",
                 &form.routed_cidrs,
                 Message::ServerRoutedCidrsChanged,
             ),
@@ -1401,7 +1403,10 @@ fn server_form_view<'a>(app: &'a App, form: &'a ServerForm) -> Element<'a, Messa
                 "The identity key is the server's permanent identity (its endpoint id); it \
                  lives in the system keychain. Paste the secret line of a `flextunnel \
                  generate-iroh-key` file to move an existing server here. The tunnel set \
-                 decides what clients may reach through this server.",
+                 decides what else clients may reach through this server; both lists are \
+                 optional, since flextunnel.internal (the status page) and \
+                 localhost.flextunnel.internal (this machine's localhost) are always \
+                 routed.",
             )
             .size(11)
             .style(style::faint_text),
@@ -1825,7 +1830,7 @@ mod tests {
     #[test]
     fn full_tunnel_derivation() {
         let mut routes = TunnelRoutes::default();
-        assert!(is_full_tunnel(&routes));
+        assert!(!is_full_tunnel(&routes), "an empty set tunnels only the reserved hosts");
         routes.domains = vec!["example.com".into()];
         assert!(!is_full_tunnel(&routes));
         routes.domains.push("*".into());

@@ -42,7 +42,7 @@ pub fn log_dir() -> Option<PathBuf> {
     {
         dirs::home_dir().map(|h| h.join("Library/Logs/flextunnel"))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     {
         dirs::data_local_dir().map(|d| d.join("flextunnel").join("logs"))
     }

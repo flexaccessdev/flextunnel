@@ -27,8 +27,6 @@ pub const MENU_LAUNCH_AT_LOGIN: &str = "launch-at-login";
 const LAUNCH_AT_LOGIN_LABEL: &str = "Open at Login";
 #[cfg(windows)]
 const LAUNCH_AT_LOGIN_LABEL: &str = "Start with Windows";
-#[cfg(not(any(target_os = "macos", windows)))]
-const LAUNCH_AT_LOGIN_LABEL: &str = "Start at Login";
 
 pub fn server_status_line(phase: ServerPhase) -> &'static str {
     match phase {
@@ -157,7 +155,7 @@ impl Tray {
         // to the menu bar, light or dark.
         #[cfg(target_os = "macos")]
         let builder = TrayIconBuilder::new().with_icon_templated(idle);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
         let builder = TrayIconBuilder::new().with_icon(idle);
         let tray = builder
             .with_menu(Box::new(Menu::new()))
@@ -280,7 +278,7 @@ impl Tray {
             // bar), so keep it a template there.
             #[cfg(target_os = "macos")]
             let _ = self.tray.set_icon_templated(Some(icon));
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(windows)]
             let _ = self.tray.set_icon(Some(icon));
         }
         let _ = self.tray.set_tooltip(Some(format!("flextunnel — {line}")));

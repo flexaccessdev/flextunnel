@@ -85,8 +85,9 @@ browser to avoid the quarantine / mark-of-the-web flag).
 ## Build from source
 
 macOS and Windows only — the crate depends on platform keychain and tray
-backends, and it is deliberately kept out of the workspace default members so a
-server-side `cargo build` on Linux is unaffected. Build it explicitly:
+backends, its dependencies are gated to those targets, and its `build.rs`
+refuses any other target. It is kept out of the workspace default members so a
+server-side `cargo build` on Linux never touches it. Build it explicitly:
 
 ```sh
 cargo build --release -p flextunnel-desktop

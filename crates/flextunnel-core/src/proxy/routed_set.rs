@@ -27,10 +27,11 @@
 //!   a default route (`0.0.0.0/0` / `::/0`) matches every IP of its family.
 //!
 //! The routed set is a VPN-style split-tunnel "included routes" set and is
-//! **required** — an empty routed set is rejected upstream (server startup /
-//! client handshake), never treated as "tunnel everything". To tunnel *all*
-//! traffic, use the catch-alls: `*` for hostnames and `0.0.0.0/0` (+ `::/0`) for
-//! IPs.
+//! **optional** — an empty routed set routes nothing, never "tunnel
+//! everything". The reserved `flextunnel.internal` namespace (the status page
+//! and `localhost.flextunnel.internal`, the server's own loopback) is always
+//! routed outside of it (see [`super::reserved`]). To tunnel *all* traffic, use
+//! the catch-alls: `*` for hostnames and `0.0.0.0/0` (+ `::/0`) for IPs.
 
 use crate::proxy::signaling::Target;
 use anyhow::{Context, Result, bail};
@@ -101,16 +102,6 @@ impl RoutedSet {
             cidrs: nets,
             domains_all,
         })
-    }
-
-    /// Whether no rule is configured. The routed set is required (a VPN-style
-    /// tunnel set), so callers reject an empty one upstream rather than treating
-    /// it as "no filtering".
-    pub fn is_empty(&self) -> bool {
-        !self.domains_all
-            && self.domains_exact.is_empty()
-            && self.domains_suffix.is_empty()
-            && self.cidrs.is_empty()
     }
 
     /// Whether `target` is in the routed set (i.e. should be tunneled). A
@@ -252,9 +243,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_is_empty_and_allows_nothing() {
+    fn empty_allows_nothing() {
         let w = RoutedSet::default();
-        assert!(w.is_empty());
         assert!(!w.allows(&domain("example.com")));
         assert!(!w.allows(&ip("1.2.3.4")));
     }
@@ -263,7 +253,6 @@ mod tests {
     fn star_domain_matches_all_hosts() {
         // `*` is the full-tunnel catch-all for hostnames.
         let w = rs(&["*"], &[]);
-        assert!(!w.is_empty());
         assert!(w.allows(&domain("anything.example")));
         assert!(w.allows(&domain("example.com")));
         // Domains and CIDRs are independent: `*` doesn't imply IP literals.
@@ -289,7 +278,6 @@ mod tests {
     #[test]
     fn exact_domain_matches_only_itself() {
         let w = rs(&["example.com"], &[]);
-        assert!(!w.is_empty());
         assert!(w.allows(&domain("example.com")));
         assert!(!w.allows(&domain("api.example.com")));
         assert!(!w.allows(&domain("notexample.com")));
