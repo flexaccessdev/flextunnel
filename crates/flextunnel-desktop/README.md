@@ -11,11 +11,11 @@ window loses nothing — the tray owns the lifecycle and re-opens it on demand.
 
 ```
 ┌── tray / menu bar ──┐        ┌──────────── window ────────────┐
-│ flextunnel          │        │  Profiles          Detail pane │
-│  ● home-lab   ▸     │        │  ● home-lab        SOCKS 1080   │
-│  ○ staging    ▸     │  ⇄     │  ○ staging         HTTP  18080  │
-│  Connect / Disconnect│        │  Logs              forwards…   │
-│  Copy SOCKS5 Address │        │  Export / Import   Conn. path  │
+│ Open flextunnel…     │        │  Profiles          Detail pane │
+│ 1 of 2 connected     │        │  ● home-lab        SOCKS 1080   │
+│ Server        ▸      │  ⇄     │  ○ staging         HTTP  18080  │
+│ ☑ Open at Login      │        │  Logs              forwards…   │
+│ Quit flextunnel      │        │  Export / Import   Conn. path  │
 └──────────────────────┘        └────────────────────────────────┘
 ```
 
@@ -34,9 +34,10 @@ its own **server-direct port forwards**. Connecting is always manual.
   the tunnel.
 - **Port forwards** — bind a local port to any `host:port` on the server's
   network so tools that can't use a proxy reach private services as if local.
-- **System tray control** — per-profile submenus for status, Connect,
-  Disconnect, and Copy SOCKS5 Address; the tray icon reflects the worst/most-
-  notable state across all profiles.
+- **System tray status** — the tray icon and its status line reflect the
+  worst/most-notable state across all profiles (profiles themselves are
+  connected from the window); the server gets a submenu with status, Start,
+  Stop, and Copy Endpoint ID.
 - **Connection path** — a modal that reports whether a connected profile is
   reaching the server directly (hole-punched) or via relay.
 - **Live logs** — an in-app Logs pane; every session's log lines (core internals
@@ -46,6 +47,17 @@ its own **server-direct port forwards**. Connecting is always manual.
   custom-relay auth token is written to the export file. Importing over an
   existing profile — matched by server id — keeps that profile's secrets.)
 - **Auto-reconnect** — sessions re-establish the tunnel when the path drops.
+- **Start at login** — on by default: the first launch registers the app as a
+  per-user login item (a LaunchAgent plist in `~/Library/LaunchAgents` on
+  macOS, a `HKCU\…\CurrentVersion\Run` value on Windows — the same
+  registrations the OS's own Login Items / Startup apps pages list and can
+  switch off), and a checkbox in the tray menu ("Open at Login" on macOS,
+  "Start with Windows") toggles it afterwards. Launched that way, the app
+  starts in the tray without opening its window. A dev store
+  (`FLEXTUNNEL_DEV_CONFIG`) never touches the login item, so a debug binary
+  neither becomes one nor re-points a real install's at itself.
+- **Server auto-start** — when a server is configured, it starts with the app
+  (at login or by hand); its tray submenu still stops and restarts it.
 
 ## Where settings live
 
@@ -102,7 +114,8 @@ Requires a recent Rust toolchain (edition 2024).
 src/main.rs     entry point; boots the iced daemon and the tray
    app.rs       the daemon state machine (sidebar + detail pane + tray glue)
    view.rs      the window UI (profile list, detail pane, modals)
-   tray.rs      system-tray icon + per-profile menus
+   tray.rs      system-tray icon + status/server menu
+   autostart.rs login-item registration (LaunchAgent / Run key)
    tunnel.rs    background controller: one session per connected profile
    config.rs    profile persistence (profiles.json + keychain tokens)
    icon.rs      tray glyph rendered at runtime

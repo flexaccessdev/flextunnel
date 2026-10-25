@@ -1957,7 +1957,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-cli"
-version = "0.0.86"
+version = "0.0.87"
 dependencies = [
  "anyhow",
  "clap",
@@ -1973,7 +1973,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-core"
-version = "0.0.86"
+version = "0.0.87"
 dependencies = [
  "anyhow",
  "askama",
@@ -2004,7 +2004,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-desktop"
-version = "0.0.86"
+version = "0.0.87"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
@@ -2017,9 +2017,11 @@ dependencies = [
  "flextunnel-core",
  "iced",
  "keyring-core",
+ "libc",
  "log",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
+ "plist",
  "rand 0.10.3",
  "rfd",
  "serde",
@@ -2029,11 +2031,12 @@ dependencies = [
  "tokio",
  "tray-icon",
  "windows-native-keyring-store",
+ "windows-registry",
 ]
 
 [[package]]
 name = "flextunnel-ffi"
-version = "0.0.86"
+version = "0.0.87"
 dependencies = [
  "flextunnel-core",
  "iroh",

@@ -1,40 +1,34 @@
-//! System tray icon + menu: an aggregate status line plus one submenu per
-//! profile (status, Connect, Disconnect, Copy SOCKS5 Address) and one for the
-//! server, when configured (status, Start, Stop, Copy Endpoint ID). Created and
-//! mutated only on the main thread (from the iced update loop); the tray-icon
-//! event handlers installed by the tray subscription merely forward events and
-//! wake the runtime, since they may fire off the main thread.
-//!
-//! Per-profile menu item ids carry the profile id after a prefix
-//! (`connect:<id>`), parsed by `App::handle_menu_event`.
+//! System tray icon + menu: an aggregate status line over the profiles (which
+//! are connected from the window, not listed here), a submenu for the server
+//! when configured (status, Start, Stop, Copy Endpoint ID), then the "start at
+//! login" checkbox (see `autostart`). Created and mutated only on the main
+//! thread (from the iced update loop); the tray-icon event handlers installed
+//! by the tray subscription merely forward events and wake the runtime, since
+//! they may fire off the main thread.
 
-use crate::config::{AuthKey, Profile, ServerConfig};
+use crate::config::{self, Profile, ServerConfig};
 use crate::icon::{self, TrayState};
 use crate::server_session::{ServerPhase, ServerSnapshot};
 use crate::tunnel::{Phase, Snapshot};
 use anyhow::Result;
 use std::collections::HashMap;
-use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 pub const MENU_OPEN: &str = "open";
 pub const MENU_QUIT: &str = "quit";
-pub const MENU_CONNECT_PREFIX: &str = "connect:";
-pub const MENU_DISCONNECT_PREFIX: &str = "disconnect:";
-pub const MENU_COPY_SOCKS_PREFIX: &str = "copy-socks:";
 pub const MENU_START_SERVER: &str = "start-server";
 pub const MENU_STOP_SERVER: &str = "stop-server";
 pub const MENU_COPY_SERVER_ID: &str = "copy-server-id";
+pub const MENU_LAUNCH_AT_LOGIN: &str = "launch-at-login";
 
-pub fn status_line(phase: Phase) -> &'static str {
-    match phase {
-        Phase::Idle => "Disconnected",
-        Phase::Connecting => "Connecting…",
-        Phase::Connected => "Connected",
-        Phase::Reconnecting => "Reconnecting…",
-        Phase::Failed => "Connection failed",
-    }
-}
+/// The login-item checkbox, in each platform's own words for the feature.
+#[cfg(target_os = "macos")]
+const LAUNCH_AT_LOGIN_LABEL: &str = "Open at Login";
+#[cfg(windows)]
+const LAUNCH_AT_LOGIN_LABEL: &str = "Start with Windows";
+#[cfg(not(any(target_os = "macos", windows)))]
+const LAUNCH_AT_LOGIN_LABEL: &str = "Start at Login";
 
 pub fn server_status_line(phase: ServerPhase) -> &'static str {
     match phase {
@@ -117,16 +111,9 @@ fn profiles_line(phases: &[Phase]) -> Option<String> {
     })
 }
 
-/// Retained handles into one profile's submenu, mutated in place on phase
-/// changes so the whole menu is only rebuilt when the profile set changes.
-struct ProfileItems {
-    status: MenuItem,
-    connect: MenuItem,
-    disconnect: MenuItem,
-    copy_socks: MenuItem,
-}
-
-/// Retained handles into the server's submenu (see [`ProfileItems`]).
+/// Retained handles into the server's submenu, mutated in place on phase
+/// changes so the whole menu is only rebuilt when the server is added or
+/// removed.
 struct ServerItems {
     status: MenuItem,
     start: MenuItem,
@@ -134,26 +121,17 @@ struct ServerItems {
 }
 
 /// Everything `sync` reacts to; native calls only happen when it changes.
-type SyncKey = (
-    TrayState,
-    String,
-    Vec<(String, String, Phase, bool, bool)>,
-    Option<(ServerPhase, bool)>,
-);
-
-/// What a menu is built from: the profiles' `(id, name)` list, and whether
-/// the server submenu is shown.
-type MenuShape = (Vec<(String, String)>, bool);
+type SyncKey = (TrayState, String, Option<(ServerPhase, bool)>);
 
 pub struct Tray {
     tray: TrayIcon,
     status: MenuItem,
-    items: HashMap<String, ProfileItems>,
+    /// Checked state owned by `App` (it mirrors the OS registration); set
+    /// through [`Tray::set_launch_at_login`], never derived here.
+    launch_at_login: CheckMenuItem,
+    /// `Some` while the menu was built with the server submenu; adding or
+    /// removing the server rebuilds the menu.
     server_items: Option<ServerItems>,
-    /// The shape the current menu was built from; a change (added, removed,
-    /// renamed or reordered profile, server added or removed) rebuilds the
-    /// menu.
-    menu_shape: MenuShape,
     synced: Option<SyncKey>,
 }
 
@@ -165,6 +143,15 @@ fn make_icon(state: TrayState) -> Result<tray_icon::Icon> {
 impl Tray {
     pub fn new() -> Result<Self> {
         let status = MenuItem::with_id("status", "Disconnected", false, None);
+        // Disabled on a dev store: a debug binary must neither take over nor
+        // remove a real install's login item.
+        let launch_at_login = CheckMenuItem::with_id(
+            MENU_LAUNCH_AT_LOGIN,
+            LAUNCH_AT_LOGIN_LABEL,
+            !config::dev_store(),
+            false,
+            None,
+        );
         let idle = make_icon(TrayState::Idle)?;
         // macOS draws the alpha-only glyph as a template image so it adapts
         // to the menu bar, light or dark.
@@ -184,63 +171,20 @@ impl Tray {
         let mut this = Self {
             tray,
             status,
-            items: HashMap::new(),
+            launch_at_login,
             server_items: None,
-            menu_shape: MenuShape::default(),
             synced: None,
         };
-        this.rebuild_menu(&[], None)?;
+        this.rebuild_menu(None)?;
         Ok(this)
     }
 
-    fn rebuild_menu(&mut self, profiles: &[Profile], server: Option<&ServerConfig>) -> Result<()> {
+    fn rebuild_menu(&mut self, server: Option<&ServerConfig>) -> Result<()> {
         let menu = Menu::new();
         menu.append(&MenuItem::with_id(MENU_OPEN, "Open flextunnel…", true, None))?;
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&self.status)?;
         menu.append(&PredefinedMenuItem::separator())?;
-
-        self.items.clear();
-        for profile in profiles {
-            let status =
-                MenuItem::with_id(format!("profile-status:{}", profile.id), "…", false, None);
-            let connect = MenuItem::with_id(
-                format!("{MENU_CONNECT_PREFIX}{}", profile.id),
-                "Connect",
-                false,
-                None,
-            );
-            let disconnect = MenuItem::with_id(
-                format!("{MENU_DISCONNECT_PREFIX}{}", profile.id),
-                "Disconnect",
-                false,
-                None,
-            );
-            let copy_socks = MenuItem::with_id(
-                format!("{MENU_COPY_SOCKS_PREFIX}{}", profile.id),
-                "Copy SOCKS5 Address",
-                false,
-                None,
-            );
-            let submenu = Submenu::with_items(
-                &profile.name,
-                true,
-                &[&status, &connect, &disconnect, &copy_socks],
-            )?;
-            menu.append(&submenu)?;
-            self.items.insert(
-                profile.id.clone(),
-                ProfileItems {
-                    status,
-                    connect,
-                    disconnect,
-                    copy_socks,
-                },
-            );
-        }
-        if !profiles.is_empty() {
-            menu.append(&PredefinedMenuItem::separator())?;
-        }
 
         self.server_items = None;
         if server.is_some() {
@@ -257,6 +201,8 @@ impl Tray {
             self.server_items = Some(ServerItems { status, start, stop });
         }
 
+        menu.append(&self.launch_at_login)?;
+        menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&MenuItem::with_id(
             "version",
             concat!("flextunnel v", env!("CARGO_PKG_VERSION")),
@@ -265,8 +211,14 @@ impl Tray {
         ))?;
         menu.append(&MenuItem::with_id(MENU_QUIT, "Quit flextunnel", true, None))?;
         self.tray.set_menu(Some(Box::new(menu)));
-        self.menu_shape = menu_shape(profiles, server);
         Ok(())
+    }
+
+    /// Show the login-item registration's state. Called on every change and
+    /// after every toggle attempt: a click flips the native checkbox on its
+    /// own, so a failed toggle has to be snapped back.
+    pub fn set_launch_at_login(&self, enabled: bool) {
+        self.launch_at_login.set_checked(enabled);
     }
 
     /// Reflect the tunnel states in the icon/menu. Native calls only happen on
@@ -274,7 +226,6 @@ impl Tray {
     pub fn sync(
         &mut self,
         profiles: &[Profile],
-        keys: &[AuthKey],
         snapshots: &HashMap<String, Snapshot>,
         server: Option<&ServerConfig>,
         server_snapshot: &ServerSnapshot,
@@ -294,16 +245,6 @@ impl Tray {
         let key: SyncKey = (
             state,
             line.clone(),
-            profiles
-                .iter()
-                .zip(&phases)
-                .map(|(p, phase)| {
-                    let copyable = snapshots
-                        .get(&p.id)
-                        .is_some_and(|s| s.socks_addr.is_some());
-                    (p.id.clone(), p.name.clone(), *phase, p.is_ready(keys), copyable)
-                })
-                .collect(),
             server.zip(server_phase).map(|(s, phase)| (phase, s.is_ready())),
         );
         if self.synced.as_ref() == Some(&key) {
@@ -312,34 +253,14 @@ impl Tray {
         let icon_changed = self.synced.as_ref().map(|(s, ..)| *s) != Some(state);
         self.synced = Some(key);
 
-        if menu_shape(profiles, server) != self.menu_shape
-            && let Err(e) = self.rebuild_menu(profiles, server)
+        if server.is_some() != self.server_items.is_some()
+            && let Err(e) = self.rebuild_menu(server)
         {
             log::error!("Failed to rebuild the tray menu: {e:#}");
             return;
         }
 
         self.status.set_text(&line);
-        for profile in profiles {
-            let Some(items) = self.items.get(&profile.id) else {
-                continue;
-            };
-            let phase = profile_phase(snapshots, &profile.id);
-            items.status.set_text(status_line(phase));
-            items.connect.set_enabled(
-                matches!(phase, Phase::Idle | Phase::Failed) && profile.is_ready(keys),
-            );
-            items.disconnect.set_enabled(matches!(
-                phase,
-                Phase::Connecting | Phase::Connected | Phase::Reconnecting
-            ));
-            items.copy_socks.set_enabled(
-                phase == Phase::Connected
-                    && snapshots
-                        .get(&profile.id)
-                        .is_some_and(|s| s.socks_addr.is_some()),
-            );
-        }
 
         if let (Some(items), Some(server), Some(phase)) = (&self.server_items, server, server_phase) {
             items.status.set_text(server_status_line(phase));
@@ -364,16 +285,6 @@ impl Tray {
         }
         let _ = self.tray.set_tooltip(Some(format!("flextunnel — {line}")));
     }
-}
-
-fn menu_shape(profiles: &[Profile], server: Option<&ServerConfig>) -> MenuShape {
-    (
-        profiles
-            .iter()
-            .map(|p| (p.id.clone(), p.name.clone()))
-            .collect(),
-        server.is_some(),
-    )
 }
 
 #[cfg(test)]

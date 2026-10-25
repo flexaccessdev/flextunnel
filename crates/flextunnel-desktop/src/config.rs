@@ -211,6 +211,18 @@ pub struct Store {
     pub profiles: Vec<Profile>,
     #[serde(default)]
     pub server: Option<ServerConfig>,
+    /// Whether the first-launch login-item registration has happened (see
+    /// `App::boot`). Set once and never cleared: from then on the OS
+    /// registration is the truth, so a user who switched it off is never
+    /// re-registered.
+    #[serde(default)]
+    pub login_item_set_up: bool,
+    /// Set when the sealed secrets could not be unsealed (the keychain entry
+    /// was replaced or lost): the secrets above are empty, and a save would
+    /// replace the sealed blob with nothing — unrecoverable even once the
+    /// keychain entry is restored. Never persisted.
+    #[serde(skip)]
+    pub unseal_failed: bool,
     /// The id → secret map (auth keys and the server identity), sealed under the
     /// Safe Storage master key: base64 of 12-byte nonce ‖ AES-256-GCM
     /// ciphertext. Empty when nothing has a secret (and always in dev file
@@ -225,6 +237,7 @@ struct StoreRef<'a> {
     keys: &'a [AuthKey],
     profiles: &'a [Profile],
     server: Option<&'a ServerConfig>,
+    login_item_set_up: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     sealed_keys: String,
 }
@@ -257,6 +270,8 @@ struct DevFile {
     profiles: Vec<Profile>,
     #[serde(default)]
     server: Option<StoredServer>,
+    #[serde(default)]
+    login_item_set_up: bool,
 }
 
 /// Path to the plaintext dev profiles file when `FLEXTUNNEL_DEV_CONFIG` is
@@ -277,6 +292,11 @@ fn profiles_path() -> Result<PathBuf> {
     dirs::data_local_dir()
         .map(|d| d.join("flextunnel").join("profiles.json"))
         .ok_or_else(|| anyhow::anyhow!("no local data directory to store profiles in"))
+}
+
+/// Whether the plaintext dev file backend is in use (`FLEXTUNNEL_DEV_CONFIG`).
+pub fn dev_store() -> bool {
+    matches!(BACKEND.get(), Some(Backend::File(_)))
 }
 
 /// Choose the storage backend. Must run before any load/save; returns false
@@ -523,6 +543,7 @@ pub fn load_store() -> Result<Store> {
                             "Failed to unseal the stored secrets (was the \
                              \"{SAFE_STORAGE_SERVICE}\" keychain entry replaced?): {e:#}"
                         );
+                        store.unseal_failed = true;
                         Default::default()
                     }
                 }
@@ -569,9 +590,12 @@ pub fn save_store(
     keys: &[AuthKey],
     profiles: &[Profile],
     server: Option<&ServerConfig>,
+    login_item_set_up: bool,
 ) -> Result<()> {
     match BACKEND.get() {
-        Some(Backend::File(path)) => save_dev_file(path, keys, profiles, server),
+        Some(Backend::File(path)) => {
+            save_dev_file(path, keys, profiles, server, login_item_set_up)
+        }
         _ => {
             let sealed_keys = if secret_entries(keys, server).all(|(_, s)| s.is_empty()) {
                 String::new()
@@ -584,6 +608,7 @@ pub fn save_store(
                     keys,
                     profiles,
                     server,
+                    login_item_set_up,
                     sealed_keys,
                 },
             )
@@ -673,6 +698,8 @@ fn load_dev_file(path: &Path) -> Result<Store> {
             secret: s.secret,
             ..s.server
         }),
+        login_item_set_up: stored.login_item_set_up,
+        unseal_failed: false,
         sealed_keys: String::new(),
     })
 }
@@ -682,6 +709,7 @@ fn save_dev_file(
     keys: &[AuthKey],
     profiles: &[Profile],
     server: Option<&ServerConfig>,
+    login_item_set_up: bool,
 ) -> Result<()> {
     let stored = DevFile {
         keys: keys
@@ -696,6 +724,7 @@ fn save_dev_file(
             secret: s.secret.clone(),
             server: s.clone(),
         }),
+        login_item_set_up,
     };
     write_json(path, &stored)
 }
@@ -797,6 +826,7 @@ mod tests {
             keys: &[key()],
             profiles: &[profile()],
             server: Some(&server()),
+            login_item_set_up: false,
             sealed_keys: String::new(),
         })
         .unwrap();
@@ -1030,7 +1060,7 @@ mod tests {
         let keys = vec![key()];
         let mut profiles = vec![profile()];
         let server = server();
-        save_dev_file(&path, &keys, &profiles, Some(&server)).unwrap();
+        save_dev_file(&path, &keys, &profiles, Some(&server), true).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(
             raw.contains("\"secret\": \"ftc-secret-authtok\""),
@@ -1047,5 +1077,6 @@ mod tests {
         assert_eq!(loaded.keys, keys);
         assert_eq!(loaded.profiles, profiles);
         assert_eq!(loaded.server, Some(server));
+        assert!(loaded.login_item_set_up);
     }
 }

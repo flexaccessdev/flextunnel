@@ -10,6 +10,7 @@
 //! tray click wakes the runtime even while no window exists; a 500 ms tick
 //! keeps the snapshots and the tray state fresh the rest of the time.
 
+use crate::autostart;
 use crate::config::{self, AuthKey, Profile, ServerConfig, DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT};
 use flextunnel_core::forwards::{
     PortForward, disable_failed_forwards, parse_port, validate_label, validate_remote_host,
@@ -835,17 +836,30 @@ pub struct App {
     pub snapshots: HashMap<ProfileId, Snapshot>,
     /// The server session's snapshot, refreshed alongside.
     pub server_snapshot: ServerSnapshot,
+    /// Whether the app is registered as a login item — the OS's answer
+    /// (`autostart::is_enabled`), re-read every tick so a change made in the
+    /// system settings shows in the tray checkbox.
+    pub launch_at_login: bool,
+    /// Persisted with the store; see `config::Store::login_item_set_up`.
+    login_item_set_up: bool,
 }
 
 impl App {
     pub fn boot() -> (Self, Task<Message>) {
         let controller = Controller::start();
 
-        let store = match config::load_store() {
-            Ok(store) => store,
+        // A store that fails to load is replaced by an empty one for this run
+        // only, and one whose secrets failed to unseal is left as it is on
+        // disk: nothing below may write either back over data the user could
+        // still recover (the sealed blob, once the keychain entry is restored).
+        let (store, store_intact) = match config::load_store() {
+            Ok(store) => {
+                let intact = !store.unseal_failed;
+                (store, intact)
+            }
             Err(e) => {
                 log::error!("{e:#}");
-                config::Store::default()
+                (config::Store::default(), false)
             }
         };
         let selection = store
@@ -886,8 +900,55 @@ impl App {
             clipboard: None,
             snapshots: HashMap::new(),
             server_snapshot: ServerSnapshot::default(),
+            launch_at_login: false,
+            login_item_set_up: store.login_item_set_up,
         };
-        let open = app.open_window();
+        // First launch of an install: start at login by default, as tray
+        // apps do on both platforms. The OS registration is the truth from
+        // then on, so a checkbox the user cleared is never re-ticked. A dev
+        // store (`FLEXTUNNEL_DEV_CONFIG`) never touches the login item, so a
+        // debug binary neither becomes one nor re-points a real install's.
+        if config::dev_store() {
+            log::info!("Dev store: leaving the login item alone");
+        } else if !app.login_item_set_up {
+            if !store_intact {
+                log::warn!(
+                    "The store did not load intact: login-item setup waits for a launch that does"
+                );
+            } else {
+                // Recorded only once it worked, so a failure is retried next launch.
+                match autostart::set_enabled(true) {
+                    Ok(()) => {
+                        log::info!("First launch: registered as a login item");
+                        app.login_item_set_up = true;
+                        app.persist_store();
+                    }
+                    Err(e) => log::error!("Failed to register as a login item: {e:#}"),
+                }
+            }
+        } else if let Err(e) = autostart::refresh() {
+            log::warn!("Failed to refresh the login item: {e:#}");
+        }
+        app.launch_at_login = autostart::is_enabled();
+        // A configured server is meant to be running: it starts with the app.
+        match &app.server {
+            Some(server) if server.is_ready() => {
+                log::info!("Starting the configured server");
+                app.controller.start_server(server.clone());
+            }
+            Some(_) => log::warn!(
+                "Not starting the server: its identity key is missing (re-enter it in the \
+                 Server pane)"
+            ),
+            None => {}
+        }
+        // Launched as a login item, the app stays in the tray; the window is
+        // a click away.
+        let open = if autostart::launched_at_login() {
+            Task::none()
+        } else {
+            app.open_window()
+        };
         // The tray is created via a task so it lands on the main thread with
         // the event loop already running (a macOS requirement).
         (app, Task::batch([Task::done(Message::SetupTray), open]))
@@ -924,7 +985,10 @@ impl App {
             Message::SetupTray => {
                 set_activation_policy(self.window.is_some());
                 match Tray::new() {
-                    Ok(tray) => self.tray = Some(tray),
+                    Ok(tray) => {
+                        tray.set_launch_at_login(self.launch_at_login);
+                        self.tray = Some(tray);
+                    }
                     Err(e) => log::error!("Failed to create the tray icon: {e:#}"),
                 }
                 self.refresh();
@@ -1574,20 +1638,21 @@ impl App {
                 }
                 Task::none()
             }
-            _ => {
-                if let Some(profile_id) = id.strip_prefix(tray::MENU_CONNECT_PREFIX) {
-                    let profile_id = profile_id.to_string();
-                    return self.connect_profile(&profile_id);
+            tray::MENU_LAUNCH_AT_LOGIN => {
+                // The dev store's checkbox is disabled; this is the backstop.
+                if config::dev_store() {
+                    log::warn!("Dev store: ignoring the start-at-login toggle");
+                    return Task::none();
                 }
-                if let Some(profile_id) = id.strip_prefix(tray::MENU_DISCONNECT_PREFIX) {
-                    self.controller.disconnect(profile_id);
-                } else if let Some(profile_id) = id.strip_prefix(tray::MENU_COPY_SOCKS_PREFIX)
-                    && let Some(addr) = self.snapshots.get(profile_id).and_then(|s| s.socks_addr)
-                {
-                    self.copy_text(format!("socks5://{addr}"));
+                let enable = !self.launch_at_login;
+                if let Err(e) = autostart::set_enabled(enable) {
+                    let verb = if enable { "enable" } else { "disable" };
+                    log::error!("Failed to {verb} start at login: {e:#}");
                 }
+                self.sync_launch_at_login(true);
                 Task::none()
             }
+            _ => Task::none(),
         }
     }
 
@@ -1596,6 +1661,7 @@ impl App {
     fn refresh(&mut self) {
         self.snapshots = self.controller.snapshots();
         self.server_snapshot = self.controller.server_snapshot();
+        self.sync_launch_at_login(false);
 
         // Runs every tick so a forward whose setup failed snaps back to
         // stopped promptly, per profile.
@@ -1632,7 +1698,6 @@ impl App {
         if let Some(tray) = &mut self.tray {
             tray.sync(
                 &self.profiles,
-                &self.keys,
                 &self.snapshots,
                 self.server.as_ref(),
                 &self.server_snapshot,
@@ -1864,8 +1929,25 @@ impl App {
         };
     }
 
+    /// Re-read the login-item registration and push it to the tray checkbox
+    /// when it changed — or unconditionally (`force`) after a toggle attempt,
+    /// since the native checkbox flips on click even when the toggle failed.
+    fn sync_launch_at_login(&mut self, force: bool) {
+        let enabled = autostart::is_enabled();
+        let changed = enabled != self.launch_at_login;
+        self.launch_at_login = enabled;
+        if (changed || force) && let Some(tray) = &self.tray {
+            tray.set_launch_at_login(enabled);
+        }
+    }
+
     fn persist_store(&mut self) {
-        if let Err(e) = config::save_store(&self.keys, &self.profiles, self.server.as_ref()) {
+        if let Err(e) = config::save_store(
+            &self.keys,
+            &self.profiles,
+            self.server.as_ref(),
+            self.login_item_set_up,
+        ) {
             log::error!("Failed to save profiles: {e:#}");
             self.notice = Some(format!("Failed to save profiles: {e:#}"));
         }
