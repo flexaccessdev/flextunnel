@@ -1,4 +1,4 @@
-- strict no backward compatibility
+- strict no backward compatibility or legacy code path no matter what
 - run cargo clippy and test after rust code changes
 - to run the CI workflow's clippy + test steps on all three host platforms against the working tree, use `ci/all.sh` — see `docs/local-ci.md`. Worth doing before a release, or after touching platform-gated code (`flextunnel-desktop`'s macOS/Windows backends), which Linux-only checks never compile. If host is Linux, run linux ci on the same host.
 - no cargo fmt
