@@ -139,7 +139,8 @@ length; domains ≤ 255 bytes).
 
 ### 4. Server-side resolve + connect
 The server reads the requested `Target`, enforces the routed-set whitelist on
-that requested target, handles reserved `flextunnel.internal` status routes,
+that requested target, handles the reserved `flextunnel.internal` namespace
+(status page; `localhost.flextunnel.internal` → the server's own `localhost`),
 then (bounded by `CONNECT_TIMEOUT` = 10s in `proxy/dial.rs`) either
 `TcpStream::connect`s a literal address or, for a domain, calls
 `tokio::net::lookup_host` and connects to the first address that accepts.

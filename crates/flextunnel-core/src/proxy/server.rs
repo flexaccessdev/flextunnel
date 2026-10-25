@@ -874,13 +874,21 @@ async fn handle_socks_stream(
 ) -> io::Result<()> {
     let requested = signaling::read_request(&mut recv).await?;
 
-    // Reserved `flextunnel.internal` namespace: handled by the server itself
-    // (a status page / reserved 404), bypassing the routed-set whitelist and
-    // host aliases. The client always tunnels these names, so no operator
-    // config is needed to reach them.
-    if let Target::Domain(host, _) = &requested
+    // Reserved `flextunnel.internal` namespace: handled by the server itself,
+    // bypassing the routed-set whitelist, bridges and host aliases. The client
+    // always tunnels these names, so no operator config is needed to reach
+    // them. `localhost.flextunnel.internal` is the server's own loopback (dialed
+    // exactly like `localhost`, dual-stack); the rest is a status page or a
+    // reserved 404.
+    if let Target::Domain(host, port) = &requested
         && reserved::is_reserved_host(host)
     {
+        if reserved::is_localhost_host(host) {
+            let target = Target::Domain("localhost".to_string(), *port);
+            log::debug!("Reserved loopback host {host} -> {target:?}");
+            return dial::connect_and_pipe(send, recv, &target, server.dns_forwarder.as_ref())
+                .await;
+        }
         return serve_reserved(send, recv, server, reserved::is_status_host(host)).await;
     }
 

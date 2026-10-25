@@ -115,6 +115,9 @@ curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.txt
 
 # flextunnel server status, as JSON
 curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.json
+
+# the server's own loopback (port 8000), no server config needed
+curl -sS -x socks5h://127.0.0.1:1080 http://localhost.flextunnel.internal:8000/
 ```
 
 You can also set it for a whole shell session via the standard proxy env vars
@@ -130,8 +133,10 @@ script-friendly text form; `/status.json` is the structured JSON form. The JSON
 response includes `version`, `server_node_id`, `routed_domains`,
 `routed_cidrs`, `host_aliases`, `dns_forwards`, `bridges`,
 `inbound_bridges`, and duplicate-id blocklist counts under
-`duplicate_id_blocklist`. These names are reserved by flextunnel and are always
-tunneled, even when they are not in the server's routed set. If the client is
+`duplicate_id_blocklist`. `localhost.flextunnel.internal:<port>` is the server's
+own `localhost:<port>`, bypassing the routed set and host aliases. These names
+are reserved by flextunnel and are always tunneled, even when they are not in
+the server's routed set. If the client is
 also running the HTTP proxy front-end, query the same endpoints through it
 instead:
 
@@ -268,6 +273,7 @@ Then add one **Include** pattern per routed name, e.g.:
 |---|---|---|
 | Include | Wildcard | `*.proxkube.internal` |
 | Include | Wildcard | `flextunnel.internal` |
+| Include | Wildcard | `*.flextunnel.internal` |
 
 Finally, **enable pattern mode**: click the FoxyProxy toolbar icon and select
 **Proxy by Patterns**. The extension starts out disabled — with it set to
@@ -277,7 +283,8 @@ consulted at all.
 `*.example.internal` matches the subdomains; add a second bare
 `example.internal` pattern if you also browse the apex name. A
 `flextunnel.internal` pattern is handy to keep the server status page
-(`http://flextunnel.internal/`) reachable. Requests that match no pattern
+(`http://flextunnel.internal/`) reachable, and `*.flextunnel.internal` covers
+the server's loopback (`localhost.flextunnel.internal`). Requests that match no pattern
 bypass the proxy entirely, so off-list browsing is untouched even before
 flextunnel's own routing decision.
 

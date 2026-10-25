@@ -32,7 +32,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         header_area,
     );
 
-    let routing = routing_lines(&s.routes, &s.status_page_host);
+    let routing = routing_lines(&s.routes, &s.status_page_host, &s.localhost_host);
     let max_scroll = (routing.len() as u16).saturating_sub(routing_area.height.saturating_sub(2));
     frame.render_widget(
         Paragraph::new(routing)
@@ -223,7 +223,7 @@ fn item(text: String) -> Line<'static> {
     Line::from(format!("  {text}"))
 }
 
-fn routing_lines(r: &WireRoutes, status_host: &str) -> Vec<Line<'static>> {
+fn routing_lines(r: &WireRoutes, status_host: &str, localhost_host: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     lines.push(section(format!(
@@ -291,6 +291,10 @@ fn routing_lines(r: &WireRoutes, status_host: &str) -> Vec<Line<'static>> {
     lines.push(Line::default());
     lines.push(section("Server status page — always tunneled:".to_string()));
     lines.push(item(status_host.to_string()));
+
+    lines.push(Line::default());
+    lines.push(section("Server loopback — always tunneled:".to_string()));
+    lines.push(item(localhost_host.to_string()));
 
     lines
 }
