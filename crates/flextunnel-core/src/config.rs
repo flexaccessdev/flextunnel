@@ -316,7 +316,8 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
         validate_alias_key(key, "host_aliases")?;
     }
     // The `flextunnel.internal` namespace is reserved by flextunnel itself (the
-    // server serves a status page there); it can't be used as an alias name.
+    // server serves a status page there, and `localhost.flextunnel.internal` is
+    // its own loopback); it can't be used as an alias name.
     for key in host_aliases.keys() {
         if crate::proxy::reserved::is_reserved_host(key) {
             anyhow::bail!(

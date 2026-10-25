@@ -330,10 +330,10 @@ quick client reads no config, so it has no port forwards.
 
 #### Server status page
 
-From a connected client, `flextunnel.internal` is reserved by flextunnel and is
-always tunneled to the server, regardless of the routed set. The browser view is
-HTML; `/status.txt` is plain text and `/status.json` is structured JSON for
-scripts:
+From a connected client, `flextunnel.internal` (and every `*.flextunnel.internal`
+subdomain) is reserved by flextunnel and is always tunneled to the server,
+regardless of the routed set. The browser view is HTML; `/status.txt` is plain
+text and `/status.json` is structured JSON for scripts:
 
 ```sh
 # plain-text status through the default SOCKS5 listener
@@ -351,6 +351,21 @@ The JSON response includes `version`, `server_node_id`, `routed_domains`,
 `routed_cidrs`, `host_aliases`, `dns_forwards`, `bridges`,
 `inbound_bridges`, and duplicate-id blocklist counts under
 `duplicate_id_blocklist`.
+
+#### Server loopback
+
+`localhost.flextunnel.internal` is the server's own `localhost`, with no server
+config needed: it bypasses the routed set, bridges and host aliases, and is
+dialed on both `127.0.0.1` and `::1`, so a service bound to only one of them is
+still reached. It works from the proxies and as a forward's `remote_host`:
+
+```sh
+# a web app listening on the server's loopback port 8000
+curl -sS -x socks5h://127.0.0.1:1080 http://localhost.flextunnel.internal:8000/
+```
+
+Only the exact name maps to loopback; other `*.flextunnel.internal` subdomains
+answer with an HTTP 404.
 
 For more ways to use the proxy — `curl`/`git`/browser recipes, `ssh` through the
 tunnel, and putting a plain local TCP port in front of it for apps that can't
@@ -445,13 +460,16 @@ client. There is no CLI flag and nothing can be changed live: to change the
 set, edit the config and restart the client.
 
 **Forwarding to the server's loopback works differently from `ssh -L`.** With
-ssh, `-L 8080:localhost:80` always reaches the remote's own port 80. A
-flextunnel forward is checked against the server's routed set first, like any
-other tunneled target, and loopback is **not** allowed by default. What the
-server needs depends on how `remote_host` is written:
+ssh, `-L 8080:localhost:80` always reaches the remote's own port 80. The
+flextunnel equivalent is `remote_host = "localhost.flextunnel.internal"`, a
+reserved name that always means the server's own loopback and needs no server
+config. Any other spelling is checked against the server's routed set first,
+like any other tunneled target, and loopback is **not** allowed by default.
+What the server needs depends on how `remote_host` is written:
 
 | `remote_host` | Checked against | Server config needed |
 | --- | --- | --- |
+| `localhost.flextunnel.internal` | nothing (reserved) | none |
 | `127.0.0.1` / `::1` | `routed_cidrs` | a loopback CIDR, e.g. `routed_cidrs = ["127.0.0.0/8", "::1"]` |
 | `localhost` | `routed_domains` (it is a hostname) | `"localhost"` (or `"*"`) in `routed_domains` |
 | a `[host_aliases]` name, e.g. `server.internal` → `127.0.0.1` | `routed_domains`, before aliasing | the alias name in `routed_domains` |
@@ -555,11 +573,13 @@ it to the value — an IP or another hostname — keeping the requested port, th
 resolves and connects like any other target. Only domain targets are aliased;
 literal IPs pass through unchanged.
 
-This is also the clean way around Firefox refusing to proxy literal
-`localhost` / `127.0.0.1`: alias `server.internal` → `127.0.0.1` on the server and
-browse to `http://server.internal:8000/`. Use `socks5h://` (or set Firefox's
-`network.proxy.socks_remote_dns = true`) so the name is resolved by the server,
-not locally.
+For the server's own loopback no alias is needed: the reserved
+`localhost.flextunnel.internal` (see [Server loopback](#server-loopback)) always
+maps there, which also sidesteps Firefox refusing to proxy literal
+`localhost` / `127.0.0.1`. Aliases are for other hosts on the server's network,
+or for giving loopback a name of your choosing. Either way, use `socks5h://` (or
+set Firefox's `network.proxy.socks_remote_dns = true`) so the name is resolved
+by the server, not locally.
 
 ## Routed-set split-tunneling
 

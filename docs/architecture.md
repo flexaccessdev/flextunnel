@@ -138,9 +138,13 @@ translation table. The header is parsed with `read_exact` (ATYP fixes the
 length; domains ≤ 255 bytes).
 
 ### 4. Server-side resolve + connect
-The server reads the requested `Target`, enforces the routed-set whitelist on
-that requested target, handles reserved `flextunnel.internal` status routes,
-then (bounded by `CONNECT_TIMEOUT` = 10s in `proxy/dial.rs`) either
+The server reads the requested `Target`. The reserved `flextunnel.internal`
+namespace is handled first, bypassing the routed-set whitelist, bridges and
+host aliases: `flextunnel.internal` is the status page and
+`localhost.flextunnel.internal` is dialed as the server's own `localhost`.
+Every other target is enforced against the routed-set whitelist (on the
+requested name, before aliasing), then (bounded by `CONNECT_TIMEOUT` = 10s in
+`proxy/dial.rs`) either
 `TcpStream::connect`s a literal address or, for a domain, calls
 `tokio::net::lookup_host` and connects to the first address that accepts.
 **DNS happens on the server** for tunneled domain targets, which is what lets

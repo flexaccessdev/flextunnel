@@ -20,7 +20,7 @@ use crate::proxy::signaling::{self, BridgeHello, Hello, HelloResponse, Target};
 use crate::proxy::dns_forward::DnsForwarder;
 use crate::proxy::{
     BridgeUpstream, BridgeUpstreamConfig, ClientAuth, ClientConfig, ForwardManager, ForwardSpec,
-    ProxyClient, ProxyServer, ProxyServerParams, RoutedSet, ServerForwarder,
+    ProxyClient, ProxyServer, ProxyServerParams, RoutedSet, ServerForwarder, reserved,
 };
 use crate::transport::endpoint::{AllowlistHook, ClientEndpoint, EndpointAllowlists};
 use crate::transport::{ALPN, BRIDGE_ALPN, QUICK_ALPN, build_quic_transport_config};
@@ -1162,6 +1162,58 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
 
 /// Open a tunnel stream for `host:80`, send a minimal HTTP request, and return
 /// the full response after consuming the per-stream success reply byte.
+/// End-to-end reserved loopback host: `localhost.flextunnel.internal:<port>`
+/// reaches `localhost:<port>` on the server with an empty routed set (deny-all)
+/// and no host alias — the built-in way to a server-side loopback service.
+#[tokio::test]
+async fn reserved_localhost_host_dials_server_loopback() {
+    let echo_port = spawn_echo().await;
+    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
+    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
+    spawn_server(server_ep, temp_blocklist("reserved-localhost"));
+
+    let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
+    let (conn, _cs, _cr, resp) = client_handshake(&client_ep, server_addr, 63, false).await;
+    assert!(resp.accepted, "client should be accepted");
+
+    // Plain `localhost` is off the (empty) routed set and must be refused...
+    let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
+    signaling::write_request(&mut send, &Target::Domain("localhost".to_string(), echo_port))
+        .await
+        .unwrap();
+    send.flush().await.unwrap();
+    let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
+    assert_eq!(rep, signaling::REP_NOT_ALLOWED, "bare localhost is subject to the routed set");
+
+    // ...while the reserved loopback host bypasses it (case-insensitively).
+    let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
+    signaling::write_request(
+        &mut send,
+        &Target::Domain("LocalHost.FlexTunnel.Internal".to_string(), echo_port),
+    )
+    .await
+    .unwrap();
+    send.flush().await.unwrap();
+    let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
+    assert_eq!(rep, signaling::REP_SUCCESS, "reserved loopback host should bypass the routed set");
+    send.write_all(b"ping").await.unwrap();
+    send.flush().await.unwrap();
+    let mut buf = [0u8; 9]; // "HELLO" + "ping"
+    with_timeout(recv.read_exact(&mut buf)).await.unwrap();
+    assert_eq!(&buf, b"HELLOping");
+
+    // A connect failure surfaces as a failure reply, not a 404 page. Port 0 is
+    // unconnectable on every platform (nothing can listen on it), so this
+    // never depends on which loopback ports happen to be in use.
+    let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
+    signaling::write_request(&mut send, &Target::Domain(reserved::LOCALHOST_HOST.to_string(), 0))
+        .await
+        .unwrap();
+    send.flush().await.unwrap();
+    let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
+    assert_ne!(rep, signaling::REP_SUCCESS, "closed loopback port must not reply success");
+}
+
 async fn fetch_reserved(conn: &Connection, host: &str) -> String {
     fetch_reserved_path(conn, host, "/").await
 }

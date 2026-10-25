@@ -938,11 +938,14 @@ fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
             }
         }
     }
-    // The reserved status host is always tunneled to the server, regardless of
-    // the routed set — surface it so it's discoverable (and copyable).
+    // The reserved hosts are always tunneled to the server, regardless of the
+    // routed set — surface them so they're discoverable (and copyable).
     col = col.push(space().height(8));
     col = col.push(text("Server status page — always tunneled:").size(12));
     col = col.push(route_row(reserved::STATUS_HOST.to_string(), None));
+    col = col.push(space().height(8));
+    col = col.push(text("Server loopback — always tunneled:").size(12));
+    col = col.push(route_row(reserved::LOCALHOST_HOST.to_string(), None));
     col.into()
 }
 

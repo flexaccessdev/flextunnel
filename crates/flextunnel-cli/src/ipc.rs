@@ -121,6 +121,8 @@ pub struct StatusSnapshot {
     pub http_addr: Option<SocketAddr>,
     /// Reserved host that is always tunneled to the server's status page.
     pub status_page_host: String,
+    /// Reserved host that is always tunneled to the server's own loopback.
+    pub localhost_host: String,
     /// Consecutive failed connection attempts in the current outage (0 while
     /// connected).
     pub failed_attempts: u32,
@@ -606,6 +608,7 @@ mod tests {
             socks_addr: Some("127.0.0.1:1080".parse().unwrap()),
             http_addr: None,
             status_page_host: "flextunnel.internal".into(),
+            localhost_host: "localhost.flextunnel.internal".into(),
             failed_attempts: 0,
             next_attempt_secs: None,
             last_error: None,

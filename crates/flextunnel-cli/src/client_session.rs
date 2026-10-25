@@ -497,6 +497,7 @@ impl SessionState {
             socks_addr: self.socks_addr,
             http_addr: self.http_addr,
             status_page_host: reserved::STATUS_HOST.to_string(),
+            localhost_host: reserved::LOCALHOST_HOST.to_string(),
             failed_attempts: self.reconnect.failed_attempts,
             next_attempt_secs: self
                 .reconnect
