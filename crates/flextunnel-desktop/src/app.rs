@@ -849,10 +849,14 @@ impl App {
         let controller = Controller::start();
 
         // A store that fails to load is replaced by an empty one for this run
-        // only: nothing below may write it back over data the user could
-        // still recover.
-        let (store, store_loaded) = match config::load_store() {
-            Ok(store) => (store, true),
+        // only, and one whose secrets failed to unseal is left as it is on
+        // disk: nothing below may write either back over data the user could
+        // still recover (the sealed blob, once the keychain entry is restored).
+        let (store, store_intact) = match config::load_store() {
+            Ok(store) => {
+                let intact = !store.unseal_failed;
+                (store, intact)
+            }
             Err(e) => {
                 log::error!("{e:#}");
                 (config::Store::default(), false)
@@ -907,17 +911,20 @@ impl App {
         if config::dev_store() {
             log::info!("Dev store: leaving the login item alone");
         } else if !app.login_item_set_up {
-            if store_loaded {
+            if !store_intact {
+                log::warn!(
+                    "The store did not load intact: login-item setup waits for a launch that does"
+                );
+            } else {
+                // Recorded only once it worked, so a failure is retried next launch.
                 match autostart::set_enabled(true) {
-                    Ok(()) => log::info!("First launch: registered as a login item"),
+                    Ok(()) => {
+                        log::info!("First launch: registered as a login item");
+                        app.login_item_set_up = true;
+                        app.persist_store();
+                    }
                     Err(e) => log::error!("Failed to register as a login item: {e:#}"),
                 }
-                app.login_item_set_up = true;
-                app.persist_store();
-            } else {
-                log::warn!(
-                    "The store failed to load: login-item setup waits for a launch that loads it"
-                );
             }
         } else if let Err(e) = autostart::refresh() {
             log::warn!("Failed to refresh the login item: {e:#}");
@@ -1632,6 +1639,11 @@ impl App {
                 Task::none()
             }
             tray::MENU_LAUNCH_AT_LOGIN => {
+                // The dev store's checkbox is disabled; this is the backstop.
+                if config::dev_store() {
+                    log::warn!("Dev store: ignoring the start-at-login toggle");
+                    return Task::none();
+                }
                 let enable = !self.launch_at_login;
                 if let Err(e) = autostart::set_enabled(enable) {
                     let verb = if enable { "enable" } else { "disable" };

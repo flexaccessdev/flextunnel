@@ -126,13 +126,35 @@ mod macos {
         )
     }
 
-    /// The plist's presence. A disable from System Settings ("Allow in the
-    /// Background") lives in launchd's disabled list, which has no cheap
-    /// read, so it is not reflected here; [`reenable`] clears it on the next
-    /// enable from the app instead.
+    /// launchd's per-user disabled-service list, where a switch-off from
+    /// System Settings (Login Items › "Allow in the Background") lands while
+    /// the plist stays put. World-readable, so it is read directly rather
+    /// than through `launchctl print-disabled` (a process per tick).
+    #[cfg(target_os = "macos")]
+    fn disabled_list_path() -> PathBuf {
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        PathBuf::from(format!("/var/db/com.apple.xpc.launchd/disabled.{uid}.plist"))
+    }
+
+    /// Whether `list` (the disabled-service plist: label → disabled) switches
+    /// the agent off. No entry, or no readable list, means enabled — launchd
+    /// treats an installed plist as enabled unless told otherwise.
+    #[cfg(target_os = "macos")]
+    pub fn disabled_in(list: Option<plist::Value>) -> bool {
+        list.as_ref()
+            .and_then(plist::Value::as_dictionary)
+            .and_then(|d| d.get(LABEL))
+            .and_then(plist::Value::as_boolean)
+            .unwrap_or(false)
+    }
+
+    /// The plist's presence, minus a switch-off from System Settings;
+    /// [`reenable`] clears the latter on the next enable from the app.
     #[cfg(target_os = "macos")]
     pub fn is_enabled() -> bool {
         plist_path().is_ok_and(|p| p.exists())
+            && !disabled_in(plist::Value::from_file(disabled_list_path()).ok())
     }
 
     #[cfg(target_os = "macos")]
@@ -277,6 +299,18 @@ mod tests {
         assert!(xml.contains(&format!("<string>{LOGIN_ITEM_ARG}</string>")));
         assert!(xml.contains("<key>RunAtLoad</key>\n\t<true/>"));
         assert!(!xml.contains("KeepAlive"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_disabled_list_switches_the_agent_off() {
+        let mut list = plist::Dictionary::new();
+        assert!(!macos::disabled_in(None));
+        assert!(!macos::disabled_in(Some(plist::Value::Dictionary(list.clone()))));
+        list.insert(macos::LABEL.into(), plist::Value::Boolean(false));
+        assert!(!macos::disabled_in(Some(plist::Value::Dictionary(list.clone()))));
+        list.insert(macos::LABEL.into(), plist::Value::Boolean(true));
+        assert!(macos::disabled_in(Some(plist::Value::Dictionary(list))));
     }
 
     #[test]

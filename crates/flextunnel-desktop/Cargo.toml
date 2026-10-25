@@ -39,6 +39,8 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"] }
 # `getuid` for the LaunchAgent's launchd domain (see autostart.rs).
 libc = { workspace = true }
+# Reading launchd's disabled-service list (see autostart.rs).
+plist = "1.10"
 
 [target.'cfg(windows)'.dependencies]
 windows-native-keyring-store = "1"

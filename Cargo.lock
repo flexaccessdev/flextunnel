@@ -2021,6 +2021,7 @@ dependencies = [
  "log",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
+ "plist",
  "rand 0.10.3",
  "rfd",
  "serde",

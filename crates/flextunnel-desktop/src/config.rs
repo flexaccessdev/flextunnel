@@ -217,6 +217,12 @@ pub struct Store {
     /// re-registered.
     #[serde(default)]
     pub login_item_set_up: bool,
+    /// Set when the sealed secrets could not be unsealed (the keychain entry
+    /// was replaced or lost): the secrets above are empty, and a save would
+    /// replace the sealed blob with nothing — unrecoverable even once the
+    /// keychain entry is restored. Never persisted.
+    #[serde(skip)]
+    pub unseal_failed: bool,
     /// The id → secret map (auth keys and the server identity), sealed under the
     /// Safe Storage master key: base64 of 12-byte nonce ‖ AES-256-GCM
     /// ciphertext. Empty when nothing has a secret (and always in dev file
@@ -537,6 +543,7 @@ pub fn load_store() -> Result<Store> {
                             "Failed to unseal the stored secrets (was the \
                              \"{SAFE_STORAGE_SERVICE}\" keychain entry replaced?): {e:#}"
                         );
+                        store.unseal_failed = true;
                         Default::default()
                     }
                 }
@@ -692,6 +699,7 @@ fn load_dev_file(path: &Path) -> Result<Store> {
             ..s.server
         }),
         login_item_set_up: stored.login_item_set_up,
+        unseal_failed: false,
         sealed_keys: String::new(),
     })
 }

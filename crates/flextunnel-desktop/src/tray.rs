@@ -6,7 +6,7 @@
 //! by the tray subscription merely forward events and wake the runtime, since
 //! they may fire off the main thread.
 
-use crate::config::{Profile, ServerConfig};
+use crate::config::{self, Profile, ServerConfig};
 use crate::icon::{self, TrayState};
 use crate::server_session::{ServerPhase, ServerSnapshot};
 use crate::tunnel::{Phase, Snapshot};
@@ -143,8 +143,15 @@ fn make_icon(state: TrayState) -> Result<tray_icon::Icon> {
 impl Tray {
     pub fn new() -> Result<Self> {
         let status = MenuItem::with_id("status", "Disconnected", false, None);
-        let launch_at_login =
-            CheckMenuItem::with_id(MENU_LAUNCH_AT_LOGIN, LAUNCH_AT_LOGIN_LABEL, true, false, None);
+        // Disabled on a dev store: a debug binary must neither take over nor
+        // remove a real install's login item.
+        let launch_at_login = CheckMenuItem::with_id(
+            MENU_LAUNCH_AT_LOGIN,
+            LAUNCH_AT_LOGIN_LABEL,
+            !config::dev_store(),
+            false,
+            None,
+        );
         let idle = make_icon(TrayState::Idle)?;
         // macOS draws the alpha-only glyph as a template image so it adapts
         // to the menu bar, light or dark.
