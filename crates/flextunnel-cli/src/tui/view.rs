@@ -233,7 +233,7 @@ fn routing_lines(r: &WireRoutes, status_host: &str, localhost_host: &str) -> Vec
     )));
     if r.domains.is_empty() && r.cidrs.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  (none — the server routes everything through the tunnel)",
+            "  (none — only the server status page and loopback below are tunneled)",
             DIM,
         )));
     }

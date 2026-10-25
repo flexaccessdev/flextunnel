@@ -19,7 +19,7 @@ over ssh by alias, each with an override for pointing at a different machine:
 | --- | --- | --- | --- |
 | macOS | `macwork` | `FLEXTUNNEL_MACCI_HOST`, or `ci/unix/remote.sh -H <host>` | `ci/unix/ci.sh` natively on a Mac, `ci/unix/remote.sh` otherwise |
 | Linux | `workstation-wsl` | `FLEXTUNNEL_UNIXCI_HOST`, or `-H` | `ci/unix/ci.sh` natively on Linux, `ci/unix/remote.sh` otherwise |
-| Windows | `windows-ci-build` | `FLEXTUNNEL_WINCI_HOST` | `ci/windows/remote.sh` |
+| Windows | `windows-ci-build` | `FLEXTUNNEL_WINCI_HOST` | `ci/windows/remote.ps1` (PowerShell 7) |
 
 ```sh
 ci/all.sh                  # all three, concurrently
@@ -43,8 +43,11 @@ Each remote platform is two scripts, and the split is the point:
   nothing and change no machine state, so either can also be run directly on a
   dev box — running `ci/unix/ci.sh` on the machine you are sitting at *is* that
   machine's row of the table above.
-- `ci/unix/remote.sh` and `ci/windows/remote.sh` run **here**. They pack the
-  working tree, ship it over ssh, and invoke the script above.
+- `ci/unix/remote.sh` and `ci/windows/remote.ps1` run **here**. Both are thin
+  wrappers over the shared drivers in the sibling `../devtools` repo
+  (`ci/unix/remote.sh`, `ci/windows/remote.ps1`), parameterized by this repo's
+  `.devtools.conf`. They pack the working tree, ship it over ssh, and invoke the
+  script above.
 
 When a `ci.*` script and the workflow disagree, the workflow is right and the
 script is stale. Keep them in step by hand; nothing enforces it.
@@ -56,6 +59,8 @@ ci/unix/remote.sh            # or: ci ...  clippy + test over there
 ci/unix/remote.sh shell      # interactive shell in the remote workspace
 ci/unix/remote.sh doctor     # report on the machine, change nothing
 ci/unix/remote.sh clean      # drop the machine's cargo target cache
+
+pwsh -File ci/windows/remote.ps1 [ci|shell|doctor|clean]   # the same, on Windows
 ```
 
 `ci/unix/remote.sh -H some-other-host` points the Unix driver at a different ssh
@@ -98,14 +103,14 @@ fast and a cold one slow.
 | | Unix remotes (`workstation-wsl`, `macwork`, …) | Windows (`windows-ci-build`) |
 | --- | --- | --- |
 | workspace | `~/codes/staging-area/flextunnel` | `C:\ci-workspaces\flextunnel` |
-| build cache | `~/codes/staging-area/flextunnel-cargo-target` | `C:\ci-cache\flextunnel-target` |
+| build cache | `~/codes/staging-area/flextunnel-cargo-target` | `C:\ci-workspaces\cargo-target` |
 | lock | `~/codes/staging-area/flextunnel.lock` | `C:\ci-workspaces\flextunnel.lock` |
-| overrides | `FLEXTUNNEL_UNIXCI_HOST`, `FLEXTUNNEL_UNIXCI_STAGING` | `FLEXTUNNEL_WINCI_HOST`, `FLEXTUNNEL_WINCI_REMOTE_DIR`, `FLEXTUNNEL_WINCI_TARGET_DIR` |
+| overrides | `FLEXTUNNEL_UNIXCI_HOST`, `FLEXTUNNEL_UNIXCI_STAGING` | `FLEXTUNNEL_WINCI_HOST`, `FLEXTUNNEL_WINCI_STAGING`, `FLEXTUNNEL_WINCI_CACHE_DIR` |
 
 Both staging areas are shared with other repos driven onto the same boxes, which
-is why every path under them is named for this one — including the Windows build
-cache, which deliberately is *not* the machine-wide `C:\ci-cache\target` that VM
-sets.
+is why every workspace under them is named for this one. The Windows build
+cache is the exception: it is the VM's machine-wide `CARGO_TARGET_DIR`, shared
+by every Rust repo driven onto it, so everything stays under `C:\ci-workspaces`.
 
 **One run per machine at a time.** The workspace and the build cache are single
 and shared, so a second run starting mid-build would delete the tree the first
@@ -138,10 +143,12 @@ sshd captures its environment when the service starts, so a machine-scoped
 and the guest needs a page file, or parallel `rustc` processes exhaust the commit
 limit and fail with what looks like a corrupted toolchain.
 
-The Windows driver is bash rather than PowerShell because the driving machine is
-always a Unix box. The far end is still `cmd.exe`, so remote paths are kept free of
-spaces and quotes and are validated against that shape before use — they get
-interpolated into command lines that include `rmdir /s /q`.
+The Windows driver is PowerShell 7 on both ends, over PowerShell remoting's SSH
+transport (`Invoke-Command -HostName windows-ci-build -SSHTransport`) — never
+WinRM. Script blocks cross intact, so nothing is quoted through `cmd.exe`. It
+needs `pwsh` on the driving machine and PowerShell 7 plus a `Subsystem
+powershell` line in the VM's `sshd_config`; the shared driver's header in
+`../devtools` covers the setup.
 
 ## Where this is not the real runner
 

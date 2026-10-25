@@ -300,8 +300,9 @@ pub struct ReconnectStatus {
 /// Snapshot of what the tunnel currently forwards: the split-tunnel set the
 /// server pushed on the last successful handshake, plus whether a connection is
 /// live right now. Shared with the FFI so the app can display the routed
-/// domains/CIDRs. An empty set while `connected` is true means the server runs
-/// no routed set and everything is tunneled.
+/// domains/CIDRs. An empty set while `connected` is true means the server routes
+/// nothing but the reserved `flextunnel.internal` namespace, which is always
+/// tunneled.
 #[derive(Clone, Default)]
 pub struct TunnelRoutes {
     pub connected: bool,
@@ -1054,16 +1055,10 @@ impl ProxyClient {
         // Build the tunnel set from the server's pushed list. The server
         // validated these rules at startup, so a parse failure here is not
         // expected; surface it as a signaling error rather than panicking.
+        // An empty set is valid: only the reserved `flextunnel.internal`
+        // namespace is then tunneled, everything else connects directly.
         let routed_set = RoutedSet::new(&response.routed_domains, &response.routed_cidrs)
             .map_err(|e| ProxyError::Signaling(format!("server pushed an invalid routed set: {e}")))?;
-        // The tunnel set is required. The server validates this at startup, but
-        // guard here too so a misconfigured/old server surfaces clearly instead of
-        // the client silently direct-connecting everything.
-        if routed_set.is_empty() {
-            return Err(ProxyError::Signaling(
-                "server pushed an empty tunnel set (configure a routed set, or \"*\" + 0.0.0.0/0 for full tunnel)".into(),
-            ));
-        }
         log::info!(
             "Server tunnel set: {} domain rule(s), {} CIDR(s) — off-list targets connect directly",
             response.routed_domains.len(),

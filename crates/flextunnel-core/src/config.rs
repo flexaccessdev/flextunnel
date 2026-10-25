@@ -68,9 +68,10 @@ pub struct ServerConfig {
     pub host_aliases: Option<HashMap<String, String>>,
     /// Domains routed through the tunnel (the tunnel set). Exact (`example.com`),
     /// wildcard (`*.example.com`, subdomains only), or `*` to match every host
-    /// (full tunnel). The tunnel set is required — a server with an empty set
-    /// refuses to start. Off-list targets are rejected server-side and
-    /// direct-connected client-side. Keep in sync with `routed_cidrs`.
+    /// (full tunnel). Optional — the reserved `flextunnel.internal` and
+    /// `localhost.flextunnel.internal` (the server's own loopback) are always
+    /// routed. Off-list targets are rejected server-side and direct-connected
+    /// client-side. Keep in sync with `routed_cidrs`.
     pub routed_domains: Option<Vec<String>>,
     /// CIDRs / bare IPs routed through the tunnel (matched against IP targets).
     /// A default route (`0.0.0.0/0` / `::/0`) matches every IP. See

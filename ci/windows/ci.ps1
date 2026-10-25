@@ -4,18 +4,17 @@
 # CI is asked.
 #
 # This runs natively on whatever Windows machine it is invoked on: the CI VM
-# (see ci/windows/remote.sh) or a dev box. It installs nothing and changes no
+# (see ci/windows/remote.ps1) or a dev box. It installs nothing and changes no
 # machine state, so running it locally is safe.
 #
 # Not covered here, on purpose: the release-profile build and the .msi
 # packaging, both of which belong to release.yml.
 #
-# Windows PowerShell 5.1 does not fail on a non-zero exit from a native command,
-# whatever $ErrorActionPreference says, so every step checks $LASTEXITCODE by
-# hand.
+# PowerShell does not fail on a non-zero exit from a native command, whatever
+# $ErrorActionPreference says, so every step checks $LASTEXITCODE by hand.
 $ErrorActionPreference = 'Stop'
 
-# Invoked over ssh the working directory is the login user's home, not the
+# Invoked over remoting the working directory is the login user's home, not the
 # checkout, so anchor to the repo root this script sits in.
 Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 

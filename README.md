@@ -243,9 +243,11 @@ All commands above accept `--json` for machine-readable output (QA automation).
 
 ### 2. Configure and run the server (no root needed)
 
-The routed set is required and is configured in `server.toml`. This example is a
-full tunnel; narrow it later with specific domains/CIDRs if you want split
-tunneling.
+The routed set is configured in `server.toml`. It is optional:
+`flextunnel.internal` (the status page) and `localhost.flextunnel.internal` (the
+server's own `localhost`) are always routed, so a server with no routed set
+still serves those. This example is a full tunnel; narrow it later with
+specific domains/CIDRs if you want split tunneling.
 
 ```toml
 secret_file = "./server.key"
@@ -588,7 +590,7 @@ list that decides which destinations traverse the tunnel. Targets not on it are
 **not** rejected — the client falls back to a direct connection for them. It is
 useful when a client must send *all* its traffic to the local SOCKS5 proxy (e.g.
 an iOS WebView, whose proxy config is global) but only some hosts should actually
-be tunneled. It is **required** and configured on the **server only** (config-file
+be tunneled. It is **optional** and configured on the **server only** (config-file
 only — there is no CLI flag); the client configures nothing:
 
 ```toml
@@ -597,10 +599,13 @@ routed_domains = ["*.example.com", "httpbin.org"]
 routed_cidrs   = ["10.0.0.0/8", "192.168.1.5"]
 ```
 
-The tunnel set is required: a server started with an empty set **refuses to
-start**, and a client that receives an empty set from a (misconfigured or old)
-server **aborts the handshake** rather than silently direct-connecting
-everything. To route **all** traffic through the tunnel (full tunnel), use the
+The reserved `flextunnel.internal` namespace is **always routed**, independent
+of the tunnel set: `flextunnel.internal` (the [status page](#server-status-page))
+and `localhost.flextunnel.internal` (the server's own `localhost`, see
+[Server loopback](#server-loopback)). So a server with an empty tunnel set (both
+lists omitted) is valid — clients reach just those two names through it and
+connect everything else directly. An empty set never means "tunnel
+everything". To route **all** traffic through the tunnel (full tunnel), use the
 catch-alls:
 
 ```toml
@@ -634,9 +639,8 @@ Hostnames are matched only against `routed_domains` and IPs only against
 when a client sends it in hostname form (SOCKS5 `ATYP_DOMAIN`), so `*` never lets
 a raw IP through — it can only route real hostnames.
 
-Only the **combined** set must be non-empty — setting just one list is fine. The
-two never cross: an omitted/empty list means that whole category is off-list and
-always direct-connected. So `routed_domains` alone (no `routed_cidrs`)
+Either list, or both, may be omitted. The two never cross: an omitted/empty
+list means that whole category is off-list and always direct-connected. So `routed_domains` alone (no `routed_cidrs`)
 tunnels those hostnames but direct-connects every bare-IP target, and
 `routed_cidrs` alone tunnels those IPs but direct-connects every hostname.
 

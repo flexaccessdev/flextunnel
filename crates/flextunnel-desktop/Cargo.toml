@@ -1,6 +1,8 @@
 # Tray GUI for the flextunnel client. macOS and Windows only (keychain +
-# tray backends); not in the workspace default-members so server-side
-# `cargo build` on Linux stays unaffected — build with `-p flextunnel-desktop`.
+# tray backends): every dependency is gated to those targets and build.rs
+# refuses any other target. Not in the workspace default-members, so a
+# server-side `cargo build` on Linux never touches it — build with
+# `-p flextunnel-desktop`.
 [package]
 name = "flextunnel-desktop"
 version.workspace = true
@@ -8,7 +10,9 @@ edition.workspace = true
 description = "Tray GUI for the flextunnel client (macOS and Windows)"
 license.workspace = true
 
-[dependencies]
+# Gated so a stray Linux build fails fast in build.rs instead
+# of first building tray-icon/iced/rfd's GTK and X11 stacks.
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
 flextunnel-core = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }

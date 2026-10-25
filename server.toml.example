@@ -42,15 +42,20 @@ authorized_keys_file = "./authorized_keys"
 # detects it is a duplicate server; on the next start it refuses to run if its
 # id is listed. Delete the offending entry after resolving the conflict.
 
-# Routed set (the "tunnel set") — REQUIRED. This is a VPN-style split-tunnel
+# Routed set (the "tunnel set") — optional. This is a VPN-style split-tunnel
 # "included routes" list and the single source of truth: it is pushed to every
 # client during the handshake (clients tunnel on-list targets and direct-connect
 # off-list ones) AND enforced here as a defense-in-depth whitelist — the server
 # REJECTS any tunnel request whose target is not on the list (SOCKS5 reply 0x02,
 # "connection not allowed by ruleset"). Note the asymmetry: clients fall back to
 # a direct connection for off-list targets, whereas the server rejects them
-# outright. The server refuses to start with an empty tunnel set. Clients
-# configure no routed set of their own.
+# outright. Clients configure no routed set of their own.
+#
+# Both lists are optional: `flextunnel.internal` (the status page) and
+# `localhost.flextunnel.internal` (this server's own `localhost`) are ALWAYS
+# routed, independent of the set. With both lists omitted, clients reach just
+# those two names through the tunnel and direct-connect everything else (an
+# empty set never means "tunnel everything").
 #
 # Domain entries are exact (`example.com`), wildcard (`*.example.com`, subdomains
 # only — not the bare apex), or `*` to match every hostname; case-insensitive.
@@ -60,9 +65,8 @@ authorized_keys_file = "./authorized_keys"
 # IP literal is always gated by `routed_cidrs` even if a client sends it in
 # hostname form, so `*` never lets a raw IP through.
 #
-# Only the COMBINED set must be non-empty — setting just one list is fine. The
-# two never cross: an omitted/empty list means that whole category is off-list
-# and always direct-connected. So `routed_domains` alone (no `routed_cidrs`)
+# Either list may be set alone. The two never cross: an omitted/empty list means
+# that whole category is off-list and always direct-connected. So `routed_domains` alone (no `routed_cidrs`)
 # tunnels those hostnames but direct-connects every bare-IP target, and
 # `routed_cidrs` alone tunnels those IPs but direct-connects every hostname.
 # If you use `host_aliases`, add the alias name itself to the routed set here:

@@ -58,25 +58,6 @@ pub use macos::{is_enabled, reenable, register, unregister};
 #[cfg(windows)]
 pub use windows::{is_enabled, reenable, register, unregister};
 
-/// Only ever built on macOS/Windows (see the crate manifest); the stub keeps
-/// `cargo check` on another host honest about what it cannot do.
-#[cfg(not(any(target_os = "macos", windows)))]
-mod unsupported {
-    use super::*;
-    pub fn is_enabled() -> bool {
-        false
-    }
-    pub fn register(_exe: &std::path::Path) -> Result<()> {
-        anyhow::bail!("Start at login is not supported on this platform")
-    }
-    pub fn unregister() -> Result<()> {
-        Ok(())
-    }
-    pub fn reenable() {}
-}
-#[cfg(not(any(target_os = "macos", windows)))]
-pub use unsupported::{is_enabled, reenable, register, unregister};
-
 #[cfg(any(target_os = "macos", test))]
 mod macos {
     use super::*;

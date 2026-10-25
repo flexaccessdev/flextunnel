@@ -42,7 +42,10 @@ Those names usually **do not resolve on the client at all**.
 The tunnel set is pushed to the client during the handshake. Anything outside
 that set is direct-connected from the client, so add every internal hostname or
 alias you intend to route to `routed_domains`; add literal IP destinations to
-`routed_cidrs` only when you really want those IPs tunneled.
+`routed_cidrs` only when you really want those IPs tunneled. Both lists are
+optional: `flextunnel.internal` (the status page) and
+`localhost.flextunnel.internal` (the server's own `localhost`) are always
+routed, whatever the set holds.
 
 By default the server resolves those names through its own system resolver. If
 some internal names are only known to a specific (e.g. internal) DNS server, add

@@ -46,7 +46,8 @@ pub struct ServerOptions {
     pub relay_auth_token: Option<String>,
     /// Server-side host aliases, keys lowercased.
     pub host_aliases: HashMap<String, String>,
-    /// The tunnel set; the combined set must be non-empty.
+    /// The tunnel set; may be empty (the reserved `flextunnel.internal`
+    /// namespace is always routed).
     pub routed_domains: Vec<String>,
     pub routed_cidrs: Vec<String>,
     /// Conditional DNS-forwarding rules, suffix keys lowercased.
@@ -163,16 +164,11 @@ pub fn prepare(opts: ServerOptions) -> Result<PreparedServer> {
         );
     }
 
+    // The tunnel set may be empty: the reserved `flextunnel.internal` namespace
+    // (the status page and `localhost.flextunnel.internal`, the server's own
+    // loopback) is always routed regardless of it.
     let routed_set = RoutedSet::new(&routed_domains, &routed_cidrs)
         .context("Invalid routed-set configuration")?;
-    // The tunnel set is required (VPN-style split tunnel): decide explicitly what
-    // is routed through the tunnel. Use "*" (and 0.0.0.0/0, ::/0) for full tunnel.
-    if routed_set.is_empty() {
-        anyhow::bail!(
-            "a tunnel set is required: configure routed_domains / routed_cidrs \
-             (use \"*\" plus 0.0.0.0/0 and ::/0 to tunnel all traffic)"
-        );
-    }
 
     let dns_forwarder = DnsForwarder::new(&dns_forwards)
         .context("Invalid dns_forwards configuration")?;
@@ -437,12 +433,11 @@ mod tests {
     }
 
     #[test]
-    fn prepare_requires_a_tunnel_set() {
+    fn prepare_accepts_an_empty_tunnel_set() {
         let dir = tempfile::tempdir().unwrap();
         let mut opts = options(dir.path());
         opts.routed_domains.clear();
-        let err = prepare(opts).err().expect("empty tunnel set");
-        assert!(err.to_string().contains("tunnel set is required"), "{err}");
+        assert!(prepare(opts).is_ok(), "the reserved namespace is always routed");
     }
 
     #[test]

@@ -620,15 +620,8 @@ impl ServerForm {
         }
         let routed_domains = split_list(&self.routed_domains);
         let routed_cidrs = split_list(&self.routed_cidrs);
-        let routed_set = flextunnel_core::proxy::RoutedSet::new(&routed_domains, &routed_cidrs)
+        flextunnel_core::proxy::RoutedSet::new(&routed_domains, &routed_cidrs)
             .map_err(|e| format!("Invalid tunnel set: {e:#}"))?;
-        if routed_set.is_empty() {
-            return Err(
-                "A tunnel set is required: routed domains and/or CIDRs (\"*\" plus \
-                 0.0.0.0/0, ::/0 tunnels everything)"
-                    .into(),
-            );
-        }
         let relay_urls = split_list(&self.relay_urls);
         let relay_auth_token = {
             let token = self.relay_auth_token.trim();
@@ -733,8 +726,6 @@ fn open_log_folder() {
     let result = std::process::Command::new("open").arg(&dir).spawn();
     #[cfg(windows)]
     let result = std::process::Command::new("explorer").arg(&dir).spawn();
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let result = std::process::Command::new("xdg-open").arg(&dir).spawn();
     if let Err(e) = result {
         log::error!("Failed to open the log folder {}: {e}", dir.display());
     }
@@ -768,7 +759,7 @@ fn set_activation_policy(regular: bool) {
             None => log::warn!("Not on the main thread; leaving the activation policy alone"),
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     let _ = regular;
 }
 
@@ -998,7 +989,7 @@ impl App {
             Message::TrayIcon(event) => {
                 // Windows convention: left click on the tray icon toggles the
                 // window. On macOS the left click opens the menu natively.
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(windows)]
                 if let TrayIconEvent::Click {
                     button: tray_icon::MouseButton::Left,
                     button_state: tray_icon::MouseButtonState::Up,
@@ -2358,6 +2349,16 @@ mod tests {
     }
 
     #[test]
+    fn server_form_accepts_an_empty_tunnel_set() {
+        let mut form = valid_server_form();
+        form.routed_domains = String::new();
+        form.routed_cidrs = " , ".into();
+        let server = form.validate().expect("the reserved namespace is always routed");
+        assert!(server.routed_domains.is_empty());
+        assert!(server.routed_cidrs.is_empty());
+    }
+
+    #[test]
     fn server_form_rejects_bad_input() {
         let mut form = valid_server_form();
         form.secret = "not base64!".into();
@@ -2370,9 +2371,6 @@ mod tests {
         assert!(form.validate().is_err(), "malformed key");
 
         let mut form = valid_server_form();
-        form.routed_domains = String::new();
-        form.routed_cidrs = " , ".into();
-        assert!(form.validate().is_err(), "empty tunnel set");
         form.routed_cidrs = "10.0.0.0/33".into();
         assert!(form.validate().is_err(), "bad CIDR");
 
