@@ -840,6 +840,8 @@ pub struct App {
     /// (`autostart::is_enabled`), re-read every tick so a change made in the
     /// system settings shows in the tray checkbox.
     pub launch_at_login: bool,
+    /// Persisted with the store; see `config::Store::login_item_set_up`.
+    login_item_set_up: bool,
 }
 
 impl App {
@@ -862,11 +864,6 @@ impl App {
         // First run: go straight to creating a profile.
         let profile_form = (store.profiles.is_empty() && store.server.is_none())
             .then(|| ProfileForm::add(&[]));
-
-        let launch_at_login = autostart::is_enabled();
-        if let Err(e) = autostart::refresh() {
-            log::warn!("Failed to refresh the login item: {e:#}");
-        }
 
         let mut app = Self {
             controller,
@@ -896,8 +893,29 @@ impl App {
             clipboard: None,
             snapshots: HashMap::new(),
             server_snapshot: ServerSnapshot::default(),
-            launch_at_login,
+            launch_at_login: false,
+            login_item_set_up: store.login_item_set_up,
         };
+        // First launch of an install: start at login by default, as tray
+        // apps do on both platforms. The OS registration is the truth from
+        // then on, so a checkbox the user cleared is never re-ticked. A dev
+        // store (`FLEXTUNNEL_DEV_CONFIG`) skips it so a debug binary never
+        // becomes a login item.
+        if !app.login_item_set_up {
+            if config::dev_store() {
+                log::info!("Dev store: not registering the login item");
+            } else {
+                match autostart::set_enabled(true) {
+                    Ok(()) => log::info!("First launch: registered as a login item"),
+                    Err(e) => log::error!("Failed to register as a login item: {e:#}"),
+                }
+            }
+            app.login_item_set_up = true;
+            app.persist_store();
+        } else if let Err(e) = autostart::refresh() {
+            log::warn!("Failed to refresh the login item: {e:#}");
+        }
+        app.launch_at_login = autostart::is_enabled();
         // A configured server is meant to be running: it starts with the app.
         match &app.server {
             Some(server) if server.is_ready() => {
@@ -1615,20 +1633,7 @@ impl App {
                 self.sync_launch_at_login(true);
                 Task::none()
             }
-            _ => {
-                if let Some(profile_id) = id.strip_prefix(tray::MENU_CONNECT_PREFIX) {
-                    let profile_id = profile_id.to_string();
-                    return self.connect_profile(&profile_id);
-                }
-                if let Some(profile_id) = id.strip_prefix(tray::MENU_DISCONNECT_PREFIX) {
-                    self.controller.disconnect(profile_id);
-                } else if let Some(profile_id) = id.strip_prefix(tray::MENU_COPY_SOCKS_PREFIX)
-                    && let Some(addr) = self.snapshots.get(profile_id).and_then(|s| s.socks_addr)
-                {
-                    self.copy_text(format!("socks5://{addr}"));
-                }
-                Task::none()
-            }
+            _ => Task::none(),
         }
     }
 
@@ -1674,7 +1679,6 @@ impl App {
         if let Some(tray) = &mut self.tray {
             tray.sync(
                 &self.profiles,
-                &self.keys,
                 &self.snapshots,
                 self.server.as_ref(),
                 &self.server_snapshot,
@@ -1919,7 +1923,12 @@ impl App {
     }
 
     fn persist_store(&mut self) {
-        if let Err(e) = config::save_store(&self.keys, &self.profiles, self.server.as_ref()) {
+        if let Err(e) = config::save_store(
+            &self.keys,
+            &self.profiles,
+            self.server.as_ref(),
+            self.login_item_set_up,
+        ) {
             log::error!("Failed to save profiles: {e:#}");
             self.notice = Some(format!("Failed to save profiles: {e:#}"));
         }
