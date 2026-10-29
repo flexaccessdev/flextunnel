@@ -100,7 +100,7 @@ dimmed while it is down, a **dot** while it is starting or stopping, and a
 and the server pane); client connections don't change it then. Without a
 server, or with a disabled one, the app is client-only: the icon is at full
 strength (dark on macOS) while a connection is up and dimmed otherwise, with no
-badge — except a **minus** for a disabled server while no connection is up.
+badge — except an **empty circle** for a disabled server while no connection is up.
 
 - **Live logs** — an in-app Logs pane; every session's log lines (core
   internals included) are attributed to the server or their profile.

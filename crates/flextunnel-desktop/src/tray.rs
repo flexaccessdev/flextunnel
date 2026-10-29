@@ -91,7 +91,7 @@ fn connections_line(phases: &[Phase]) -> Option<String> {
 /// checkmark while it runs) — client connections never change it then.
 /// Without a server, or with a disabled one, the app is client-only, and the
 /// icon shows by opacity alone whether a connection is up (the badge means the
-/// server); a disabled server with no connection up shows a minus.
+/// server); a disabled server with no connection up shows an empty circle.
 fn tray_state(
     server: Option<(&ServerConfig, &ServerSnapshot)>,
     client_phases: &[Phase],
@@ -378,7 +378,7 @@ mod tests {
         let state = |phase, connections: &[Phase]| {
             tray_state(Some((&off, &snapshot(phase, 0))), connections)
         };
-        assert_eq!(state(ServerPhase::Stopped, &[]), TrayState::Disabled, "minus badge");
+        assert_eq!(state(ServerPhase::Stopped, &[]), TrayState::Disabled, "empty-circle badge");
         assert_eq!(state(ServerPhase::Failed, &[Phase::Connecting]), TrayState::Disabled);
         assert_eq!(
             state(ServerPhase::Stopped, &[Phase::Connected, Phase::Idle]),
