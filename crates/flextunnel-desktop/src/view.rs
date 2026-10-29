@@ -6,7 +6,7 @@
 
 use crate::app::{
     format_duration, App, ClientForm, ForwardForm, IdentityChoice, KeyChoice, KeyForm, LogFilter,
-    Message, ProfileForm, Selection, ServerForm,
+    Message, ProfileForm, Selection, ServerForm, StoreReset,
 };
 use crate::config::{self, AuthKey, AuthorizedClient, Profile, ServerConfig};
 use crate::server_session::ServerPhase;
@@ -146,8 +146,8 @@ pub fn root(app: &App) -> Element<'_, Message> {
     let base: Element<'_, Message> = row![sidebar(app), detail_pane(app)].into();
     // The reset warning must be answered, so it sits above everything and
     // its backdrop does nothing.
-    if let Some(version) = app.secrets_reset_from {
-        return modal(base, secrets_reset_modal(version), None);
+    if let Some(reset) = &app.store_reset {
+        return modal(base, store_reset_modal(reset), None);
     }
     match &app.conn_path_modal {
         Some(snapshot) => {
@@ -176,27 +176,58 @@ fn modal<'a>(
     stack![base.into(), opaque(backdrop)].into()
 }
 
-/// The startup warning when this build cannot read the stored secrets'
-/// sealed format (`version` is the one they were sealed under): quit with
-/// them left on disk, or start fresh and re-enter them.
-fn secrets_reset_modal<'a>(version: u32) -> Element<'a, Message> {
-    let sealed_by = match version {
-        0 => "an earlier version of flextunnel".to_string(),
-        v => format!("format version {v}"),
+/// The store reset warning (see [`App::store_reset`]): what could not be
+/// read and why, then quit with it left on disk, or start fresh without it.
+fn store_reset_modal(reset: &StoreReset) -> Element<'_, Message> {
+    const SECRETS: &str = "The auth-key secrets, the server identity key and the relay auth \
+                           tokens will all be empty and must be re-entered.";
+    let (title, why, keep, lost) = match reset {
+        StoreReset::Version(version) => {
+            let sealed_by = match version {
+                0 => "an earlier version of flextunnel".to_string(),
+                v => format!("format version {v}"),
+            };
+            (
+                "Saved secrets can't be read",
+                format!(
+                    "Your secrets were saved by {sealed_by}, which this version stores \
+                     differently. {SECRETS}"
+                ),
+                "the previous version of flextunnel can still read them, for example to \
+                 export the keys first.",
+                "deletes them",
+            )
+        }
+        StoreReset::Unsealable => (
+            "Saved secrets can't be read",
+            format!(
+                "Your secrets are sealed in profiles.json under a master key kept in the \
+                 system keychain (\"Flextunnel Safe Storage\"), and the key there no \
+                 longer opens them: the entry was deleted or replaced. {SECRETS}"
+            ),
+            "they open again once the original keychain entry is restored, for example \
+             from a backup.",
+            "deletes them",
+        ),
+        StoreReset::Unreadable(error) => (
+            "Saved settings can't be read",
+            format!(
+                "flextunnel couldn't load its settings: {error}. It is running with none: \
+                 no connections, keys or server."
+            ),
+            "fix the cause (for example, allow flextunnel to read its \"Flextunnel Safe \
+             Storage\" keychain entry) and open flextunnel again.",
+            "replaces them with empty settings, deleting every connection, key and the \
+             server",
+        ),
     };
     let card = column![
-        text("Saved secrets can't be read").size(15).font(semibold()),
+        text(title).size(15).font(semibold()),
+        text(why).size(12),
         text(format!(
-            "Your secrets were saved by {sealed_by}, which this version stores \
-             differently. The auth-key secrets, the server identity key and the \
-             relay auth tokens will all be empty and must be re-entered."
+            "Quit now to leave them on disk untouched — {keep} Starting fresh {lost} for \
+             good."
         ))
-        .size(12),
-        text(
-            "Quit now to leave them on disk untouched — the previous version of \
-             flextunnel can still read them, for example to export the keys first. \
-             Starting fresh deletes them for good."
-        )
         .size(12)
         .color(AMBER),
         row![
@@ -204,11 +235,11 @@ fn secrets_reset_modal<'a>(version: u32) -> Element<'a, Message> {
             button(text("Quit").size(12))
                 .padding([5, 14])
                 .style(style::ghost)
-                .on_press(Message::SecretsResetQuit),
+                .on_press(Message::StoreResetQuit),
             button(text("Start fresh").size(12))
                 .padding([5, 14])
                 .style(style::primary)
-                .on_press(Message::SecretsResetContinue),
+                .on_press(Message::StoreResetContinue),
         ]
         .spacing(8)
         .align_y(Center),

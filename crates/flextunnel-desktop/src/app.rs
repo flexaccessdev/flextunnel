@@ -31,6 +31,23 @@ use std::time::Duration;
 use tray_icon::menu::MenuEvent;
 use tray_icon::TrayIconEvent;
 
+/// Why the saved store could not be used whole at launch (see
+/// [`App::store_reset`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum StoreReset {
+    /// Sealed under another sealed format version (see
+    /// `config::Store::sealed_reset_from`), which this build discards.
+    Version(u32),
+    /// The blob does not open under the keychain's current master key (see
+    /// `config::Store::unseal_failed`): the Safe Storage entry was deleted or
+    /// replaced. Restoring it makes them readable again.
+    Unsealable,
+    /// The store did not load at all (the keychain could not be read, or
+    /// `profiles.json` is unreadable): the app runs on an empty one, which a
+    /// save would write over the whole file. The error, for the warning.
+    Unreadable(String),
+}
+
 /// What the detail pane shows (the sidebar's selected row).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Selection {
@@ -78,11 +95,11 @@ pub enum Message {
     ShowConnPath,
     /// Close the connection-path modal.
     DismissConnPath,
-    /// Answers to the sealed-secrets reset warning (see
-    /// [`App::secrets_reset_from`]): quit with the old secrets left on disk,
-    /// or start fresh, saving the store without them.
-    SecretsResetQuit,
-    SecretsResetContinue,
+    /// Answers to the store reset warning (see [`App::store_reset`]): quit
+    /// with what is on disk left untouched, or start fresh, saving the store
+    /// without what could not be read.
+    StoreResetQuit,
+    StoreResetContinue,
     // Profiles
     AddProfile,
     EditProfile(ProfileId),
@@ -934,11 +951,12 @@ pub struct App {
     pub conn_path_modal: Option<ConnectionSnapshot>,
     /// Transient export/import result shown in the sidebar.
     pub io_notice: Option<String>,
-    /// The sealed format version this launch's secrets were discarded from
-    /// (see `config::Store::sealed_reset_from`), until the user answers the
-    /// warning modal. Nothing is saved meanwhile, so quitting leaves the old
-    /// secrets on disk for the build that sealed them.
-    pub secrets_reset_from: Option<u32>,
+    /// Why this launch's store is not what is on disk — its sealed secrets
+    /// all empty, or the whole store — until the user answers the warning
+    /// modal. Nothing is saved meanwhile — a save would replace what is on
+    /// disk with only what was entered since — so quitting leaves it there,
+    /// for the build that sealed it or for once the cause is fixed.
+    pub store_reset: Option<StoreReset>,
     /// Setup-failure reason per forward id, retained after the failed forward
     /// is auto-stopped (see [`disable_failed_forwards`]) so the row can keep
     /// showing why; cleared when the forward is started again or removed.
@@ -970,22 +988,26 @@ impl App {
     pub fn boot() -> (Self, Task<Message>) {
         let controller = Controller::start();
 
-        // A store that fails to load is replaced by an empty one for this run
-        // only, and one whose secrets failed to unseal is left as it is on
-        // disk: nothing below may write either back over data the user could
-        // still recover (the sealed blob, once the keychain entry is restored).
-        // Secrets discarded for a sealed version change are not written over
-        // either until the user chooses to start fresh.
-        let (store, store_intact) = match config::load_store() {
+        // A store that fails to load is replaced by an empty one, one whose
+        // secrets failed to unseal or were sealed under another version runs
+        // without them: nothing may be written back over what is on disk —
+        // still recoverable, once the cause is fixed — until the user
+        // chooses to start fresh (see `store_reset`).
+        let (store, store_reset) = match config::load_store() {
             Ok(store) => {
-                let intact = !store.unseal_failed && store.sealed_reset_from.is_none();
-                (store, intact)
+                let reset = match (store.sealed_reset_from, store.unseal_failed) {
+                    (Some(version), _) => Some(StoreReset::Version(version)),
+                    (None, true) => Some(StoreReset::Unsealable),
+                    (None, false) => None,
+                };
+                (store, reset)
             }
             Err(e) => {
                 log::error!("{e:#}");
-                (config::Store::default(), false)
+                (config::Store::default(), Some(StoreReset::Unreadable(format!("{e:#}"))))
             }
         };
+        let store_intact = store_reset.is_none();
         // The first connection, else the server — or, with neither, the
         // empty pane pointing at the sidebar.
         let selection = match (store.profiles.first(), &store.server) {
@@ -1018,7 +1040,7 @@ impl App {
             notice: None,
             conn_path_modal: None,
             io_notice: None,
-            secrets_reset_from: store.sealed_reset_from,
+            store_reset,
             forward_errors: HashMap::new(),
             routed_caches: HashMap::new(),
             // MAX so the first refresh always builds the log text.
@@ -1069,8 +1091,8 @@ impl App {
             app.resume_server();
         }
         // Launched as a login item, the app stays in the tray; the window is
-        // a click away — unless the secrets reset warning needs answering.
-        let open = if autostart::launched_at_login() && app.secrets_reset_from.is_none() {
+        // a click away — unless the store reset warning needs answering.
+        let open = if autostart::launched_at_login() && app.store_reset.is_none() {
             Task::none()
         } else {
             app.open_window()
@@ -1175,12 +1197,12 @@ impl App {
                 self.conn_path_modal = None;
                 Task::none()
             }
-            Message::SecretsResetQuit => {
+            Message::StoreResetQuit => {
                 self.controller.shutdown();
                 iced::exit()
             }
-            Message::SecretsResetContinue => {
-                self.secrets_reset_from = None;
+            Message::StoreResetContinue => {
+                self.store_reset = None;
                 self.persist_store();
                 Task::none()
             }
@@ -2327,10 +2349,10 @@ impl App {
     }
 
     fn persist_store(&mut self) {
-        // Backstop: the reset modal blocks the window, but nothing may drop
-        // the old secrets before the user chooses to.
-        if self.secrets_reset_from.is_some() {
-            log::warn!("Not saving: the sealed secrets reset is not confirmed yet");
+        // Backstop: the reset modal blocks the window, but nothing may write
+        // over what is on disk before the user chooses to.
+        if self.store_reset.is_some() {
+            log::warn!("Not saving: the store reset is not confirmed yet");
             return;
         }
         if let Err(e) = config::save_store(

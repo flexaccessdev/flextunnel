@@ -133,7 +133,12 @@ the one entry kept in the system keychain (**macOS Keychain** or the **Windows
 Credential Manager**), named "Flextunnel Safe Storage". The sealed secrets
 carry a format version: an update that changes what is sealed bumps it, and
 then starts every secret fresh — re-enter the auth-key secrets, the server
-identity and the relay tokens — rather than loading some and not others.
+identity and the relay tokens — rather than loading some and not others. Either
+way — and when the keychain entry was deleted or replaced so the master key no
+longer opens them, or when the settings can't be loaded at all (the keychain
+can't be read, or `profiles.json` is unreadable) — the app first asks: *Quit*
+leaves what is on disk untouched (for the older build, or for once the cause is
+fixed), *Start fresh* drops it for good. Nothing is saved until then.
 
 > **Development escape hatch:** setting `FLEXTUNNEL_DEV_CONFIG` (to `1` or to an
 > explicit file path) stores everything, tokens included, in a single plaintext
