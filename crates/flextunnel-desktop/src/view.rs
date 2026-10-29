@@ -1238,7 +1238,8 @@ fn server_welcome() -> Element<'static, Message> {
             "1",
             "An identity",
             "This computer gets a permanent endpoint id — the address clients enter when \
-             adding a connection. Its key stays sealed in the system keychain.",
+             adding a connection. Its key is sealed in profiles.json under a master \
+             key kept in the system keychain.",
         ),
         step(
             "2",
@@ -1634,7 +1635,8 @@ fn endpoint_card<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
         text(
             "Share this with your clients: they enter it as the server node id when \
              adding a connection. It is public — the identity key behind it is sealed in \
-             the system keychain and never shown.",
+             profiles.json under a master key kept in the system keychain, and never \
+             shown.",
         )
         .size(11)
         .style(style::faint_text),
@@ -1890,8 +1892,8 @@ fn server_setup_card<'a>(app: &'a App, identity: &'a IdentityChoice) -> Element<
              computer (or the secret line of a `flextunnel generate-iroh-key` file), so \
              its clients keep their endpoint id. Then stop the old server."
         } else {
-            "A new identity for this computer. Its key stays sealed in the system \
-             keychain."
+            "A new identity for this computer. Its key is sealed in profiles.json under \
+             a master key kept in the system keychain."
         })
         .size(11)
         .style(style::faint_text),
