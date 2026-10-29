@@ -334,10 +334,16 @@ async fn run_loop(
     // A restart's config, started once the old session has ended: until its
     // endpoint is closed it holds the identity and the per-user server lock.
     let mut pending_start: Option<ServerConfig> = None;
+    // Whether the current server session was told to stop (or remove): a
+    // start meanwhile waits for it in `pending_start` instead of being dropped.
+    let mut stopping = false;
     loop {
         // An ended session drops its receiver, closing the sender.
         if server.as_ref().is_some_and(|handle| handle.tx.is_closed()) {
             server = None;
+        }
+        if server.is_none() {
+            stopping = false;
         }
         if server.is_none()
             && let Some(config) = pending_start.take()
@@ -356,20 +362,24 @@ async fn run_loop(
         sessions.retain(|_, handle| !handle.tx.is_closed());
         if server.as_ref().is_some_and(|handle| handle.tx.is_closed()) {
             server = None;
+            stopping = false;
         }
         match cmd {
             Some(Command::StartServer(config)) => {
-                // Includes a server still stopping: it holds the identity and
-                // the per-user lock until its endpoint is closed.
-                if server.is_some() {
-                    log::warn!("The server is still running");
-                    continue;
+                match &server {
+                    // A server still stopping holds the identity and the
+                    // per-user lock until its endpoint is closed: start once
+                    // it has (e.g. disabled and enabled again in quick
+                    // succession).
+                    Some(_) if stopping => pending_start = Some(*config),
+                    Some(_) => log::warn!("The server is still running"),
+                    None => server = server_session::spawn_server(*config, &server_shared),
                 }
-                server = server_session::spawn_server(*config, &server_shared);
             }
             Some(Command::RestartServer(config)) => match &server {
                 Some(handle) => {
                     let _ = handle.tx.send(ServerCmd::Stop).await;
+                    stopping = true;
                     pending_start = Some(*config);
                 }
                 None => server = server_session::spawn_server(*config, &server_shared),
@@ -379,10 +389,12 @@ async fn run_loop(
                 pending_start = None;
                 if let Some(handle) = &server {
                     let _ = handle.tx.send(ServerCmd::Stop).await;
+                    stopping = true;
                 }
             }
             Some(Command::RemoveServer) => {
                 pending_start = None;
+                stopping = server.is_some();
                 match &server {
                     // The handle stays until the session ends, so a server set up
                     // again meanwhile can't start while this one still holds the

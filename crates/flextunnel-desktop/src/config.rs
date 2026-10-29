@@ -300,17 +300,21 @@ fn drop_invalid_clients(clients: Vec<AuthorizedClient>) -> Vec<AuthorizedClient>
                 );
                 return false;
             }
-            if !names.insert(c.name.clone()) {
+            // Both checked before either is reserved: a dropped entry must
+            // not shadow a later valid one sharing its name or key.
+            if names.contains(&c.name) {
                 log::error!("Ignoring an authorized client: duplicate name \"{}\"", c.name);
                 return false;
             }
-            if !publics.insert(c.public_key.clone()) {
+            if publics.contains(&c.public_key) {
                 log::error!(
                     "Ignoring authorized client \"{}\": another client already holds its key",
                     c.name
                 );
                 return false;
             }
+            names.insert(c.name.clone());
+            publics.insert(c.public_key.clone());
             true
         })
         .collect()
@@ -1197,7 +1201,8 @@ mod tests {
         let kept = drop_invalid_clients(vec![
             client("laptop", &a_key),
             client("laptop", &b_key),
-            client("again", &a_key),
+            // Dropped for its key, so it doesn't reserve "phone".
+            client("phone", &a_key),
             client(" padded", &b_key),
             client("garbage", "ed25519-pub:nope"),
             client("spaced", &format!(" {b_key}")),

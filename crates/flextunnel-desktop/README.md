@@ -28,9 +28,6 @@ With nothing set up, the window opens on a short intro of both roles with a
 single *Continue*: there is no role to pick. Either is then set up from the
 sidebar whenever wanted — "+" next to Connections, or "Set up server…".
 
-```
-```
-
 ## Client connections
 
 Each **connection profile** is the desktop equivalent of a `client.toml` — a
@@ -88,8 +85,10 @@ to move a server here, either way showing the endpoint id it gives — then
 - **Tunnel set & relays** — the routed domains/CIDRs pushed to clients and
   enforced here, plus custom relays; optional, and edited any time.
 - **Restart to apply** — the server runs with the settings it started with;
-  after a change (a client authorized or removed, the tunnel set edited, a new
-  identity) its pane offers *Restart now*.
+  after a change (a client authorized, the tunnel set edited, a new identity)
+  its pane offers *Restart now*. Removing a client applies at once: the server
+  restarts without it (or stops, when it was the last one), so a revoked
+  client can't keep connecting.
 
 ## Tray
 

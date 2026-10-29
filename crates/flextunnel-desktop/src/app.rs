@@ -1486,8 +1486,12 @@ impl App {
                         self.controller.restart_server(server.clone());
                         self.server_applied = Some(server);
                     }
-                    // E.g. the last client was removed: it would not start again.
-                    Some(blocker) => self.notice = Some(blocker.into()),
+                    // E.g. the identity was lost: it would not start again, so
+                    // stop the stale session rather than leave it running.
+                    Some(blocker) => {
+                        self.controller.stop_server();
+                        self.notice = Some(blocker.into());
+                    }
                 }
                 Task::none()
             }
@@ -1923,9 +1927,25 @@ impl App {
         };
         let before = server.authorized_clients.len();
         server.authorized_clients.retain(|c| c.public_key != public_key);
-        if server.authorized_clients.len() != before {
-            self.notice = None;
-            self.persist_store();
+        if server.authorized_clients.len() == before {
+            return;
+        }
+        self.notice = None;
+        self.persist_store();
+        // A revocation can't wait for a restart: the running server still
+        // lets the removed client in. Restart it without the client, or stop
+        // it when no client is left (it starts again once one is added).
+        if matches!(
+            self.controller.server_snapshot().phase,
+            ServerPhase::Starting | ServerPhase::Running
+        ) && let Some(server) = self.server.clone()
+        {
+            if server.is_ready() {
+                self.controller.restart_server(server.clone());
+                self.server_applied = Some(server);
+            } else {
+                self.controller.stop_server();
+            }
         }
     }
 
