@@ -266,6 +266,12 @@ pub struct Store {
     /// keychain entry is restored. Never persisted.
     #[serde(skip)]
     pub unseal_failed: bool,
+    /// Set when the sealed secrets were discarded for having been sealed under
+    /// another [`SEALED_VERSION`]: the version they were sealed under (0 for
+    /// before there was one). They are still on disk until the next save,
+    /// which drops them for good. Never persisted.
+    #[serde(skip)]
+    pub sealed_reset_from: Option<u32>,
     /// The id → secret map (auth keys, the server identity and the relay auth
     /// tokens), sealed under the Safe Storage master key: base64 of 12-byte nonce ‖ AES-256-GCM
     /// ciphertext. Empty when nothing has a secret (and always in dev file
@@ -626,7 +632,7 @@ fn drop_invalid(profiles: Vec<Profile>) -> Vec<Profile> {
 /// The id → secret map of a loaded sealed store. Empty with no keychain access
 /// when there is no blob (a store without secrets never prompts) or it was
 /// sealed under another [`SEALED_VERSION`]: those secrets are discarded
-/// whole, and the next save drops the blob. Empty with `unseal_failed` set
+/// whole (`sealed_reset_from` set), and the next save drops the blob. Empty with `unseal_failed` set
 /// when the blob will not open under the current master key.
 fn unseal_store(store: &mut Store) -> Result<std::collections::HashMap<String, String>> {
     if store.sealed_keys.is_empty() {
@@ -638,6 +644,7 @@ fn unseal_store(store: &mut Store) -> Result<std::collections::HashMap<String, S
              {SEALED_VERSION}: starting fresh, every secret must be re-entered",
             store.sealed_version
         );
+        store.sealed_reset_from = Some(store.sealed_version);
         return Ok(Default::default());
     }
     match open_secrets(&safe_storage_key()?, &store.sealed_keys) {
@@ -833,6 +840,7 @@ fn load_dev_file(path: &Path) -> Result<Store> {
         }),
         login_item_set_up: stored.login_item_set_up,
         unseal_failed: false,
+        sealed_reset_from: None,
         sealed_keys: String::new(),
         sealed_version: 0,
     })
@@ -1047,6 +1055,7 @@ mod tests {
             let secrets = unseal_store(&mut store).unwrap();
             assert!(secrets.is_empty(), "version {version}: {secrets:?}");
             assert!(!store.unseal_failed, "version {version}");
+            assert_eq!(store.sealed_reset_from, Some(version));
         }
         let unversioned: Store = serde_json::from_str(r#"{"sealed_keys":"AAAA"}"#).unwrap();
         assert_eq!(unversioned.sealed_version, 0);
