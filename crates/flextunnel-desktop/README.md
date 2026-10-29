@@ -54,8 +54,9 @@ its own **server-direct port forwards**. Connecting is always manual.
   switch off), and a checkbox in the tray menu ("Open at Login" on macOS,
   "Start with Windows") toggles it afterwards. Launched that way, the app
   starts in the tray without opening its window. A dev store
-  (`FLEXTUNNEL_DEV_CONFIG`) never touches the login item, so a debug binary
-  neither becomes one nor re-points a real install's at itself.
+  (`FLEXTUNNEL_DEV_CONFIG` or `FLEXTUNNEL_KEYCHAIN=mock`) never touches the
+  login item, so a debug or test binary neither becomes one nor re-points a
+  real install's at itself.
 - **Server auto-start** — when a server is configured, it starts with the app
   (at login or by hand); its tray submenu still stops and restarts it.
 
@@ -71,6 +72,14 @@ Keychain** or the **Windows Credential Manager** — one entry per profile.
 > JSON file, so an unsigned rebuild loop doesn't trigger the keychain access
 > prompt on every launch. **Never set it for a real install** — the tokens are
 > stored unencrypted.
+
+> **Mock keychain for end-to-end tests:** `FLEXTUNNEL_KEYCHAIN=mock` keeps the
+> real sealed store but holds its master key in an in-memory keychain instead
+> of the system one, so an e2e or QA run never blocks on a keychain prompt
+> (macOS asks again after every unsigned rebuild). The key is gone when the app
+> quits, so the run uses a `mock-profiles.json` of its own, emptied at every
+> start; the real keychain and `profiles.json` are never touched. Any other
+> value is refused, and it can't be combined with `FLEXTUNNEL_DEV_CONFIG`.
 
 ## Install
 

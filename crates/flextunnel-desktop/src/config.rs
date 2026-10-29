@@ -21,6 +21,14 @@
 //! above for a single plaintext JSON file with the secrets inline, so a rebuild
 //! loop doesn't hit the macOS keychain access prompt on every unsigned binary.
 //! Never set it for a real install — the secrets are stored unencrypted.
+//!
+//! `FLEXTUNNEL_KEYCHAIN=mock` keeps the sealed store but puts the Safe Storage
+//! master key in keyring-core's in-memory store instead of the platform
+//! keychain, for an end-to-end test or a QA run on a machine whose keychain
+//! would answer with a system prompt (an unsigned build meets it again after
+//! every rebuild). The master key is generated at start and gone at exit, so
+//! the store is sealed into a `mock-profiles.json` of its own, emptied at start:
+//! the account's keychain and `profiles.json` are never read or written.
 
 use flextunnel_core::forwards::PortForward;
 use aes_gcm::aead::Aead;
@@ -50,11 +58,25 @@ const SAFE_STORAGE_USER: &str = "Flextunnel";
 /// Development only — see the module docs.
 const DEV_CONFIG_ENV: &str = "FLEXTUNNEL_DEV_CONFIG";
 
-/// The plaintext dev file, set once by `init_store` when `FLEXTUNNEL_DEV_CONFIG`
-/// is set. Unset, the store is `profiles.json` with its secrets sealed under
-/// the Safe Storage master key held by the platform keychain via
-/// `keyring-core`.
-static DEV_FILE: OnceLock<PathBuf> = OnceLock::new();
+/// The variable that, set to `mock`, keeps the Safe Storage master key in
+/// memory rather than in the platform keychain. See the module docs.
+const KEYCHAIN_ENV: &str = "FLEXTUNNEL_KEYCHAIN";
+
+/// Where the store lives, set once by `init_store`. Unset (a refused
+/// `FLEXTUNNEL_KEYCHAIN`, or both escape hatches at once), loads and saves fail
+/// rather than reach the account's real store.
+static BACKEND: OnceLock<Backend> = OnceLock::new();
+
+enum Backend {
+    /// `profiles.json`, its secrets sealed under the Safe Storage master key
+    /// held by the platform keychain via `keyring-core`.
+    Keychain,
+    /// `mock-profiles.json`, sealed the same way under a master key kept in
+    /// keyring-core's in-memory mock store (`FLEXTUNNEL_KEYCHAIN=mock`).
+    MockKeychain,
+    /// The plaintext dev file (`FLEXTUNNEL_DEV_CONFIG`).
+    DevFile(PathBuf),
+}
 
 /// One named client auth keypair, shared across profiles: any number of
 /// profiles can pick the same key to authenticate with (its public half then
@@ -281,30 +303,81 @@ fn dev_config_path() -> Option<PathBuf> {
     }
 }
 
-fn profiles_path() -> Result<PathBuf> {
+/// Whether `FLEXTUNNEL_KEYCHAIN` asks for the in-memory mock keychain. It takes
+/// `mock` or nothing: any other value is refused rather than read as the real
+/// keychain.
+fn mock_keychain(value: Option<&std::ffi::OsStr>) -> Result<bool> {
+    match value {
+        None => Ok(false),
+        Some(value) if value == "mock" => Ok(true),
+        Some(value) => {
+            anyhow::bail!("{KEYCHAIN_ENV} is {value:?}; the only value it takes is \"mock\"")
+        }
+    }
+}
+
+/// The sealed store's file: `profiles.json`, or `mock-profiles.json` for the
+/// mock keychain, whose secrets no other run's master key opens.
+fn sealed_path(mock: bool) -> Result<PathBuf> {
+    let name = if mock { "mock-profiles.json" } else { "profiles.json" };
     dirs::data_local_dir()
-        .map(|d| d.join("flextunnel").join("profiles.json"))
+        .map(|d| d.join("flextunnel").join(name))
         .ok_or_else(|| anyhow::anyhow!("no local data directory to store profiles in"))
 }
 
-/// Whether the plaintext dev file backend is in use (`FLEXTUNNEL_DEV_CONFIG`).
+fn backend() -> Result<&'static Backend> {
+    BACKEND
+        .get()
+        .context("No settings store: see the startup error in the log")
+}
+
+/// Whether a development store is in use — the plaintext dev file
+/// (`FLEXTUNNEL_DEV_CONFIG`) or the mock keychain (`FLEXTUNNEL_KEYCHAIN=mock`)
+/// — or none could be set up: no real install's state (its login item) is
+/// touched then.
 pub fn dev_store() -> bool {
-    DEV_FILE.get().is_some()
+    !matches!(BACKEND.get(), Some(Backend::Keychain))
 }
 
 /// Choose the storage backend: the dev file when `FLEXTUNNEL_DEV_CONFIG` is
-/// set, else the platform keychain (the macOS Keychain, Windows Credential
-/// Manager). Must run before any load/save.
+/// set, the mock keychain when `FLEXTUNNEL_KEYCHAIN=mock`, else the platform
+/// keychain (the macOS Keychain, Windows Credential Manager). Must run before
+/// any load/save.
 pub fn init_store() -> Result<()> {
+    let mock = mock_keychain(std::env::var_os(KEYCHAIN_ENV).as_deref())?;
     if let Some(path) = dev_config_path() {
+        anyhow::ensure!(!mock, "{DEV_CONFIG_ENV} and {KEYCHAIN_ENV}=mock are both set; pick one");
         log::warn!(
             "{DEV_CONFIG_ENV} set: storing profiles (secret keys included) UNENCRYPTED at {} \
              (development only)",
             path.display()
         );
-        let _ = DEV_FILE.set(path);
+        let _ = BACKEND.set(Backend::DevFile(path));
         return Ok(());
     }
+    if mock {
+        // The master key dies with the process, so the last mock run's file
+        // could never be unsealed: every mock run starts empty.
+        let path = sealed_path(true)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("Failed to empty {}", path.display())),
+        }
+        log::warn!(
+            "{KEYCHAIN_ENV}=mock: the Safe Storage key lives in memory and the store at {} \
+             is emptied each run (testing only)",
+            path.display()
+        );
+        keyring_core::set_default_store(
+            keyring_core::mock::Store::new().context("Failed to open the mock keychain")?,
+        );
+        let _ = BACKEND.set(Backend::MockKeychain);
+        return Ok(());
+    }
+    // Set before the keychain opens: a store without secrets still loads and
+    // saves when it won't (see `load_store`).
+    let _ = BACKEND.set(Backend::Keychain);
     #[cfg(target_os = "macos")]
     let store = apple_native_keyring_store::keychain::Store::new();
     #[cfg(windows)]
@@ -499,14 +572,15 @@ fn drop_invalid(profiles: Vec<Profile>) -> Vec<Profile> {
 /// `drop_invalid*` backstops); a profile referencing an unknown key is kept
 /// but can't connect until a key is picked.
 pub fn load_store() -> Result<Store> {
-    let mut store = match DEV_FILE.get() {
-        Some(path) => {
+    let mut store = match backend()? {
+        Backend::DevFile(path) => {
             let mut store = load_dev_file(path)?;
             store.keys = drop_invalid_keys(store.keys);
             store
         }
-        None => {
-            let mut store: Store = read_json(&profiles_path()?)?.unwrap_or_default();
+        backend => {
+            let mock = matches!(backend, Backend::MockKeychain);
+            let mut store: Store = read_json(&sealed_path(mock)?)?.unwrap_or_default();
             store.keys = drop_invalid_keys(store.keys);
             // No sealed blob → nothing to unseal, and crucially no keychain
             // access: a store without secrets never prompts.
@@ -569,16 +643,16 @@ pub fn save_store(
     server: Option<&ServerConfig>,
     login_item_set_up: bool,
 ) -> Result<()> {
-    match DEV_FILE.get() {
-        Some(path) => save_dev_file(path, keys, profiles, server, login_item_set_up),
-        None => {
+    match backend()? {
+        Backend::DevFile(path) => save_dev_file(path, keys, profiles, server, login_item_set_up),
+        backend => {
             let sealed_keys = if secret_entries(keys, server).all(|(_, s)| s.is_empty()) {
                 String::new()
             } else {
                 seal_secrets(&safe_storage_key()?, secret_entries(keys, server))?
             };
             write_json(
-                &profiles_path()?,
+                &sealed_path(matches!(backend, Backend::MockKeychain))?,
                 &StoreRef {
                     keys,
                     profiles,
@@ -1053,5 +1127,33 @@ mod tests {
         assert_eq!(loaded.profiles, profiles);
         assert_eq!(loaded.server, Some(server));
         assert!(loaded.login_item_set_up);
+    }
+
+    /// `FLEXTUNNEL_KEYCHAIN` takes `mock` or nothing: a typo is not the real
+    /// keychain.
+    #[test]
+    fn the_mock_keychain_is_asked_for_by_name_only() {
+        use std::ffi::OsStr;
+        assert!(!mock_keychain(None).unwrap());
+        assert!(mock_keychain(Some(OsStr::new("mock"))).unwrap());
+        for wrong in ["", "Mock", "memory", "1"] {
+            let e = mock_keychain(Some(OsStr::new(wrong))).unwrap_err();
+            assert!(format!("{e:#}").contains("only value it takes"), "{wrong:?}: {e:#}");
+        }
+    }
+
+    /// On the mock keychain the Safe Storage key is generated on first use,
+    /// kept in the store's entry, and sealed secrets open under it — the
+    /// path a `FLEXTUNNEL_KEYCHAIN=mock` run takes. The only test that installs
+    /// a keychain store, so the process-wide store and key cache are its own.
+    #[test]
+    fn the_mock_keychain_holds_the_safe_storage_key() {
+        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        let master = safe_storage_key().unwrap();
+        let entry = keyring_core::Entry::new(SAFE_STORAGE_SERVICE, SAFE_STORAGE_USER).unwrap();
+        assert_eq!(entry.get_password().unwrap(), BASE64.encode(master));
+        let sealed = seal(&master, &[key()]);
+        let opened = open_secrets(&safe_storage_key().unwrap(), &sealed).unwrap();
+        assert_eq!(opened["key1"], "ftc-secret-authtok");
     }
 }

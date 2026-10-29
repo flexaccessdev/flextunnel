@@ -897,8 +897,9 @@ impl App {
         // First launch of an install: start at login by default, as tray
         // apps do on both platforms. The OS registration is the truth from
         // then on, so a checkbox the user cleared is never re-ticked. A dev
-        // store (`FLEXTUNNEL_DEV_CONFIG`) never touches the login item, so a
-        // debug binary neither becomes one nor re-points a real install's.
+        // store (`FLEXTUNNEL_DEV_CONFIG` or `FLEXTUNNEL_KEYCHAIN=mock`) never
+        // touches the login item, so a debug or test binary neither becomes
+        // one nor re-points a real install's.
         if config::dev_store() {
             log::info!("Dev store: leaving the login item alone");
         } else if !app.login_item_set_up {
