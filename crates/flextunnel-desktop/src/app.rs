@@ -4,9 +4,7 @@
 //! own tunnel session concurrently (its optional proxy ports and direct
 //! forwards); the server is a flextunnel server run in-process (there is only
 //! one: the per-user server lock is shared with the CLI), started with the app
-//! and kept running unless stopped. A first launch shows a short intro of both
-//! (see [`App::intro`]). The daemon
-//! owns all state, so closing the window (which destroys it) loses nothing —
+//! and kept running unless stopped. The daemon owns all state, so closing the window (which destroys it) loses nothing —
 //! the tray re-opens it on demand. Tray/menu events are forwarded from
 //! tray-icon's handlers into a channel drained by a [`Subscription`], so a
 //! tray click wakes the runtime even while no window exists; a 500 ms tick
@@ -36,7 +34,12 @@ use tray_icon::TrayIconEvent;
 /// What the detail pane shows (the sidebar's selected row).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Selection {
+    /// Nothing set up yet: the pane points at the sidebar, offering neither
+    /// role as the one to pick.
+    Empty,
     Profile(ProfileId),
+    /// The server pane — or, with no server set up, its welcome, whose
+    /// buttons open the setup form.
     Server,
     Keys,
     Logs,
@@ -137,9 +140,12 @@ pub enum Message {
     FormSave,
     FormCancel,
     // Server
+    /// Show the server's welcome (or the server, once set up): the sidebar's
+    /// "Set up server…" and the tray's.
     SetUpServer,
-    /// Leave the first-run intro for the server setup form.
-    IntroContinue,
+    /// Open the setup form from the welcome: a new identity, or (`true`) one
+    /// imported to move a server here.
+    BeginServerSetup(bool),
     /// Open the server's settings form (tunnel set and relays).
     EditServer,
     DeleteServer,
@@ -174,7 +180,10 @@ pub enum Message {
     /// Copy the identity secret to the clipboard (two-click), to move the
     /// server to another computer.
     ExportServerSecret,
-    ReplaceIdentity,
+    /// Open the identity form: a new identity, or (`true`) an imported key —
+    /// how a lost identity is restored, or replaced when its key is gone for
+    /// good.
+    ReplaceIdentity(bool),
     IdentityImportToggled(bool),
     IdentitySecretChanged(String),
     IdentityFormSave,
@@ -638,9 +647,13 @@ pub struct ServerForm {
 }
 
 impl ServerForm {
-    fn add() -> Self {
+    fn add(import: bool) -> Self {
         Self {
-            identity: Some(IdentityChoice::new()),
+            identity: Some(if import {
+                IdentityChoice::importing()
+            } else {
+                IdentityChoice::new()
+            }),
             ..Self::default()
         }
     }
@@ -916,10 +929,6 @@ pub struct App {
     pub confirm_export_key: Option<String>,
     /// Transient status line in the detail pane (save results/failures).
     pub notice: Option<String>,
-    /// First run (nothing set up yet): the window shows the intro of both
-    /// roles, whose one Continue opens the window — no role to pick there;
-    /// either is set up from the sidebar any time.
-    pub intro: bool,
     /// Open connection-path modal: a point-in-time path snapshot (`ezvpn
     /// status`-style), overlaid until dismissed. `None` when closed.
     pub conn_path_modal: Option<ConnectionSnapshot>,
@@ -977,14 +986,13 @@ impl App {
                 (config::Store::default(), false)
             }
         };
-        let first_run = store.server.is_none() && store.profiles.is_empty();
         // The first connection, else the server — or, with neither, the
-        // empty pane pointing at the sidebar (the unset server's slot).
-        let selection = store
-            .profiles
-            .first()
-            .map(|p| Selection::Profile(p.id.clone()))
-            .unwrap_or(Selection::Server);
+        // empty pane pointing at the sidebar.
+        let selection = match (store.profiles.first(), &store.server) {
+            (Some(profile), _) => Selection::Profile(profile.id.clone()),
+            (None, Some(_)) => Selection::Server,
+            (None, None) => Selection::Empty,
+        };
 
         let mut app = Self {
             controller,
@@ -997,7 +1005,6 @@ impl App {
             profile_form: None,
             key_form: None,
             server_form: None,
-            intro: first_run,
             client_form: None,
             identity_form: None,
             confirm_remove_client: None,
@@ -1460,8 +1467,12 @@ impl App {
                 Task::none()
             }
             Message::SetUpServer => self.set_up_server(),
-            Message::IntroContinue => {
-                self.intro = false;
+            Message::BeginServerSetup(import) => {
+                if self.server.is_none() {
+                    self.close_forms();
+                    self.selection = Selection::Server;
+                    self.server_form = Some(ServerForm::add(import));
+                }
                 Task::none()
             }
             Message::EditServer => {
@@ -1588,10 +1599,8 @@ impl App {
                 self.export_server_secret();
                 Task::none()
             }
-            Message::ReplaceIdentity => {
-                // A lost identity is restored by importing it, not replaced.
-                let lost = self.server.as_ref().is_some_and(|s| s.secret.is_empty());
-                self.identity_form = Some(if lost {
+            Message::ReplaceIdentity(import) => {
+                self.identity_form = Some(if import {
                     IdentityChoice::importing()
                 } else {
                     IdentityChoice::new()
@@ -1754,15 +1763,15 @@ impl App {
         self.notice = None;
     }
 
+    /// Show the server pane: with no server yet, its welcome — what a server
+    /// is for and how setup goes — whose buttons open the setup form. There
+    /// is only one server, so once set up this just selects it.
     fn set_up_server(&mut self) -> Task<Message> {
-        // There is only one server: setup is offered only while none is
-        // configured.
-        if self.server.is_some() {
-            self.selection = Selection::Server;
-            return self.show_window();
+        // Already showing it (a setup form half filled in, say): left as is.
+        if self.selection != Selection::Server || self.profile_form.is_some() {
+            self.close_forms();
         }
-        self.close_forms();
-        self.server_form = Some(ServerForm::add());
+        self.selection = Selection::Server;
         self.show_window()
     }
 
@@ -1821,14 +1830,12 @@ impl App {
             self.server_applied = Some(server);
             return Task::none();
         }
-        // Show what is missing, with its form open: the identity secret was
-        // lost from the keychain (import it again), or no client is
-        // authorized yet.
+        // Show what is missing: the identity secret was lost from the
+        // keychain (the pane offers importing it or a new identity), or no
+        // client is authorized yet (its form open).
         self.selection = Selection::Server;
         self.close_forms();
-        if server.secret.is_empty() {
-            self.identity_form = Some(IdentityChoice::importing());
-        } else {
+        if !server.secret.is_empty() {
             self.client_form = Some(ClientForm::default());
         }
         self.notice = server.start_blocker().map(String::from);
@@ -2718,7 +2725,7 @@ mod tests {
         ServerForm {
             routed_domains: " *.internal ,, example.com ".into(),
             routed_cidrs: "10.0.0.0/8".into(),
-            ..ServerForm::add()
+            ..ServerForm::add(false)
         }
     }
 
@@ -2736,8 +2743,8 @@ mod tests {
         assert_eq!(server.routed_cidrs, ["10.0.0.0/8"]);
         assert!(server.authorized_clients.is_empty(), "clients come after setup");
         assert_ne!(
-            ServerForm::add().validate(None).unwrap().endpoint_id,
-            ServerForm::add().validate(None).unwrap().endpoint_id,
+            ServerForm::add(false).validate(None).unwrap().endpoint_id,
+            ServerForm::add(false).validate(None).unwrap().endpoint_id,
             "every setup generates its own identity"
         );
     }

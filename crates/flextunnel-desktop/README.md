@@ -24,9 +24,10 @@ window loses nothing — the tray owns the lifecycle and re-opens it on demand.
 
 ## First launch
 
-With nothing set up, the window opens on a short intro of both roles with a
-single *Continue*: there is no role to pick. Either is then set up from the
-sidebar whenever wanted — "+" next to Connections, or "Set up server…".
+With nothing set up, the window opens with nothing selected, pointing at the
+sidebar: there is no role to pick. Either is set up from there whenever wanted
+— "+" next to Connections, or "Set up server…", which opens the server's
+welcome first.
 
 ## Client connections
 
@@ -55,10 +56,13 @@ its own **server-direct port forwards**. Connecting is always manual.
 ## The server
 
 The app hosts one server per user — the per-user server lock is shared with the
-CLI, so a `flextunnel server` running on the same account counts too. Setup
-is one step, the identity — a fresh one generated, or an existing one imported
-to move a server here, either way showing the endpoint id it gives — then
-*Create server* goes straight on to authorizing the first client.
+CLI, so a `flextunnel server` running on the same account counts too. Until
+one is set up, "Set up server…" (in the sidebar or the tray) opens a welcome:
+what a server is for and the three steps ahead — an identity, authorized
+clients, what they reach — with *Set up server* and *Move a server here…*.
+Setup is then one step, the identity — a fresh one generated, or an existing
+one imported to move a server here, either way showing the endpoint id it
+gives — and *Create server* goes straight on to authorizing the first client.
 
 - **Enabled** — the server's only on/off control: a switch in the server
   pane (and *Enable/Disable Server* in the tray); there is no separate
@@ -81,7 +85,9 @@ to move a server here, either way showing the endpoint id it gives — then
   imports another, warning first that clients must then switch to the new
   endpoint id, and *Export key…* copies it to the clipboard (two clicks) to move
   the server to another computer. If the keychain loses it, the same place
-  imports it back.
+  offers both ways on: *Import key…* to restore it and keep the endpoint id,
+  or *Generate new identity…* when it is gone for good (clients then switch to
+  the new endpoint id).
 - **Tunnel set & relays** — the routed domains/CIDRs pushed to clients and
   enforced here, plus custom relays; optional, and edited any time.
 - **Restart to apply** — the server runs with the settings it started with;

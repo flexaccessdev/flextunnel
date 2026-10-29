@@ -255,7 +255,10 @@ impl ServerConfig {
     /// is authorized yet (the core refuses a server nobody may use).
     pub fn start_blocker(&self) -> Option<&'static str> {
         if self.secret.is_empty() {
-            Some("The identity key is missing from the keychain — import it under Identity.")
+            Some(
+                "The identity key is missing from the keychain — import it, or generate a new \
+                 identity, under Endpoint ID.",
+            )
         } else if self.authorized_clients.is_empty() {
             Some("Authorize at least one client to start the server.")
         } else {
