@@ -6,12 +6,14 @@
 //! server ids, ports, forwards, the server's tunnel set and authorized keys)
 //! lives in a plaintext `profiles.json` under the local data dir — same
 //! treatment as the iOS app's `forwards.json`. The secrets (auth-key secret
-//! halves and the server's identity key) ride in the same file, sealed the way
+//! halves, the server's identity key, and the profiles' and server's custom
+//! relay auth tokens) ride in the same file, sealed the way
 //! Chrome/Slack/Notion store their secrets: a single keychain entry
 //! ("Flextunnel Safe Storage", macOS Keychain / Windows Credential Manager)
-//! holds a random 256-bit master key, and the id → secret map (key ids plus
-//! the reserved [`SERVER_SECRET_ID`]) is AES-256-GCM-encrypted with it into
-//! the file's `sealed_keys` blob. The
+//! holds a random 256-bit master key, and the id → secret map (key ids, the
+//! reserved [`SERVER_SECRET_ID`] and [`SERVER_RELAY_SECRET_ID`], and a
+//! [`PROFILE_RELAY_PREFIX`]ed id per profile relay token) is
+//! AES-256-GCM-encrypted with it into the file's `sealed_keys` blob. The
 //! keychain holds one small fixed-size entry regardless of how many keys
 //! exist, so a fresh install (or a rebuilt, differently-signed binary)
 //! triggers at most one macOS keychain prompt per run — and none at all
@@ -21,6 +23,14 @@
 //! above for a single plaintext JSON file with the secrets inline, so a rebuild
 //! loop doesn't hit the macOS keychain access prompt on every unsigned binary.
 //! Never set it for a real install — the secrets are stored unencrypted.
+//!
+//! `FLEXTUNNEL_KEYCHAIN=mock` keeps the sealed store but puts the Safe Storage
+//! master key in keyring-core's in-memory store instead of the platform
+//! keychain, for an end-to-end test or a QA run on a machine whose keychain
+//! would answer with a system prompt (an unsigned build meets it again after
+//! every rebuild). The master key is generated at start and gone at exit, so
+//! the store is sealed into a `mock-profiles.json` of its own, emptied at start:
+//! the account's keychain and `profiles.json` are never read or written.
 
 use flextunnel_core::forwards::PortForward;
 use aes_gcm::aead::Aead;
@@ -45,16 +55,39 @@ pub const DEFAULT_HTTP_PORT: u16 = 18080;
 const SAFE_STORAGE_SERVICE: &str = "Flextunnel Safe Storage";
 const SAFE_STORAGE_USER: &str = "Flextunnel";
 
+/// The format of what is sealed into `sealed_keys`: which secrets it holds,
+/// their ids in the map, and their encoding. Bump it on any change a store
+/// sealed before would only half match, and a store sealed under another
+/// version (or none) then loads with every sealed secret empty, to be
+/// re-entered — one fresh start instead of some secrets loading and others
+/// silently missing. The master key is not versioned: it is random bytes
+/// whatever the format.
+const SEALED_VERSION: u32 = 1;
+
 /// Set this (to `1`/`true` for the default dev path, or to an explicit file
 /// path) to store profiles as plaintext JSON instead of the system keychain.
 /// Development only — see the module docs.
 const DEV_CONFIG_ENV: &str = "FLEXTUNNEL_DEV_CONFIG";
 
-/// The plaintext dev file, set once by `init_store` when `FLEXTUNNEL_DEV_CONFIG`
-/// is set. Unset, the store is `profiles.json` with its secrets sealed under
-/// the Safe Storage master key held by the platform keychain via
-/// `keyring-core`.
-static DEV_FILE: OnceLock<PathBuf> = OnceLock::new();
+/// The variable that, set to `mock`, keeps the Safe Storage master key in
+/// memory rather than in the platform keychain. See the module docs.
+const KEYCHAIN_ENV: &str = "FLEXTUNNEL_KEYCHAIN";
+
+/// Where the store lives, set once by `init_store`. Unset (a refused
+/// `FLEXTUNNEL_KEYCHAIN`, or both escape hatches at once), loads and saves fail
+/// rather than reach the account's real store.
+static BACKEND: OnceLock<Backend> = OnceLock::new();
+
+enum Backend {
+    /// `profiles.json`, its secrets sealed under the Safe Storage master key
+    /// held by the platform keychain via `keyring-core`.
+    Keychain,
+    /// `mock-profiles.json`, sealed the same way under a master key kept in
+    /// keyring-core's in-memory mock store (`FLEXTUNNEL_KEYCHAIN=mock`).
+    MockKeychain,
+    /// The plaintext dev file (`FLEXTUNNEL_DEV_CONFIG`).
+    DevFile(PathBuf),
+}
 
 /// One named client auth keypair, shared across profiles: any number of
 /// profiles can pick the same key to authenticate with (its public half then
@@ -125,9 +158,10 @@ pub struct Profile {
     #[serde(default)]
     pub relay_urls: Vec<String>,
     /// Shared bearer token sent to every custom relay (custom relays only).
-    /// TODO(keychain): stored in the profile for now; move to the keychain when
-    /// all secrets migrate there (see the iOS roadmap note).
-    #[serde(default)]
+    /// A secret, so never serialized here: in keychain mode it rides in the
+    /// store's encrypted `sealed_keys` blob; the dev file backend re-adds it
+    /// via [`StoredProfile`]. Never exported or imported either.
+    #[serde(skip)]
     pub relay_auth_token: Option<String>,
     #[serde(default)]
     pub forwards: Vec<PortForward>,
@@ -148,9 +182,23 @@ impl Profile {
 }
 
 /// The server's entry in the sealed id → secret map. Key ids are 16 hex
-/// digits (see `random_id`), so this can only clash with a hand-edited key id,
-/// which `drop_invalid_keys` rejects.
+/// digits (see `random_id`), so this and the other reserved ids below can only
+/// clash with a hand-edited key id, which `drop_invalid_keys` rejects.
 const SERVER_SECRET_ID: &str = "server";
+/// The server's custom relay auth token in the sealed map.
+const SERVER_RELAY_SECRET_ID: &str = "server-relay";
+/// A profile's custom relay auth token is sealed under this prefix plus the
+/// profile id.
+const PROFILE_RELAY_PREFIX: &str = "relay:";
+
+fn profile_relay_secret_id(profile_id: &str) -> String {
+    format!("{PROFILE_RELAY_PREFIX}{profile_id}")
+}
+
+/// Whether a key id would collide with a non-key entry of the sealed map.
+fn is_reserved_secret_id(id: &str) -> bool {
+    id == SERVER_SECRET_ID || id == SERVER_RELAY_SECRET_ID || id.starts_with(PROFILE_RELAY_PREFIX)
+}
 
 /// The app's one server — the desktop equivalent of a `server.toml`, core
 /// settings only: an iroh identity, the authorized client keys, the tunnel set
@@ -181,7 +229,9 @@ pub struct ServerConfig {
     #[serde(default)]
     pub relay_urls: Vec<String>,
     /// Shared bearer token sent to every custom relay (custom relays only).
-    #[serde(default)]
+    /// Sealed like [`Profile::relay_auth_token`]; the dev file re-adds it via
+    /// [`StoredServer`].
+    #[serde(skip)]
     pub relay_auth_token: Option<String>,
 }
 
@@ -216,12 +266,21 @@ pub struct Store {
     /// keychain entry is restored. Never persisted.
     #[serde(skip)]
     pub unseal_failed: bool,
-    /// The id → secret map (auth keys and the server identity), sealed under the
-    /// Safe Storage master key: base64 of 12-byte nonce ‖ AES-256-GCM
+    /// Set when the sealed secrets were discarded for having been sealed under
+    /// another [`SEALED_VERSION`]: the version they were sealed under (0 for
+    /// before there was one). They are still on disk until the next save,
+    /// which drops them for good. Never persisted.
+    #[serde(skip)]
+    pub sealed_reset_from: Option<u32>,
+    /// The id → secret map (auth keys, the server identity and the relay auth
+    /// tokens), sealed under the Safe Storage master key: base64 of 12-byte nonce ‖ AES-256-GCM
     /// ciphertext. Empty when nothing has a secret (and always in dev file
     /// mode, where secrets are inline).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     sealed_keys: String,
+    /// The [`SEALED_VERSION`] `sealed_keys` was sealed under; 0 when absent.
+    #[serde(default)]
+    sealed_version: u32,
 }
 
 /// Borrowing twin of [`Store`] so saves don't clone the app state.
@@ -233,6 +292,7 @@ struct StoreRef<'a> {
     login_item_set_up: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     sealed_keys: String,
+    sealed_version: u32,
 }
 
 /// Serialization wrapper for the dev file backend only: the secret rides along
@@ -245,11 +305,23 @@ struct StoredKey {
     key: AuthKey,
 }
 
-/// Dev file twin of [`StoredKey`] for a server identity secret.
+/// Dev file twin of [`StoredKey`] for a profile's relay auth token.
+#[derive(Serialize, Deserialize)]
+struct StoredProfile {
+    #[serde(default)]
+    relay_auth_token: Option<String>,
+    #[serde(flatten)]
+    profile: Profile,
+}
+
+/// Dev file twin of [`StoredKey`] for the server's identity secret and relay
+/// auth token.
 #[derive(Serialize, Deserialize)]
 struct StoredServer {
     #[serde(default)]
     secret: String,
+    #[serde(default)]
+    relay_auth_token: Option<String>,
     #[serde(flatten)]
     server: ServerConfig,
 }
@@ -260,7 +332,7 @@ struct DevFile {
     #[serde(default)]
     keys: Vec<StoredKey>,
     #[serde(default)]
-    profiles: Vec<Profile>,
+    profiles: Vec<StoredProfile>,
     #[serde(default)]
     server: Option<StoredServer>,
     #[serde(default)]
@@ -281,30 +353,81 @@ fn dev_config_path() -> Option<PathBuf> {
     }
 }
 
-fn profiles_path() -> Result<PathBuf> {
+/// Whether `FLEXTUNNEL_KEYCHAIN` asks for the in-memory mock keychain. It takes
+/// `mock` or nothing: any other value is refused rather than read as the real
+/// keychain.
+fn mock_keychain(value: Option<&std::ffi::OsStr>) -> Result<bool> {
+    match value {
+        None => Ok(false),
+        Some(value) if value == "mock" => Ok(true),
+        Some(value) => {
+            anyhow::bail!("{KEYCHAIN_ENV} is {value:?}; the only value it takes is \"mock\"")
+        }
+    }
+}
+
+/// The sealed store's file: `profiles.json`, or `mock-profiles.json` for the
+/// mock keychain, whose secrets no other run's master key opens.
+fn sealed_path(mock: bool) -> Result<PathBuf> {
+    let name = if mock { "mock-profiles.json" } else { "profiles.json" };
     dirs::data_local_dir()
-        .map(|d| d.join("flextunnel").join("profiles.json"))
+        .map(|d| d.join("flextunnel").join(name))
         .ok_or_else(|| anyhow::anyhow!("no local data directory to store profiles in"))
 }
 
-/// Whether the plaintext dev file backend is in use (`FLEXTUNNEL_DEV_CONFIG`).
+fn backend() -> Result<&'static Backend> {
+    BACKEND
+        .get()
+        .context("No settings store: see the startup error in the log")
+}
+
+/// Whether a development store is in use — the plaintext dev file
+/// (`FLEXTUNNEL_DEV_CONFIG`) or the mock keychain (`FLEXTUNNEL_KEYCHAIN=mock`)
+/// — or none could be set up: no real install's state (its login item) is
+/// touched then.
 pub fn dev_store() -> bool {
-    DEV_FILE.get().is_some()
+    !matches!(BACKEND.get(), Some(Backend::Keychain))
 }
 
 /// Choose the storage backend: the dev file when `FLEXTUNNEL_DEV_CONFIG` is
-/// set, else the platform keychain (the macOS Keychain, Windows Credential
-/// Manager). Must run before any load/save.
+/// set, the mock keychain when `FLEXTUNNEL_KEYCHAIN=mock`, else the platform
+/// keychain (the macOS Keychain, Windows Credential Manager). Must run before
+/// any load/save.
 pub fn init_store() -> Result<()> {
+    let mock = mock_keychain(std::env::var_os(KEYCHAIN_ENV).as_deref())?;
     if let Some(path) = dev_config_path() {
+        anyhow::ensure!(!mock, "{DEV_CONFIG_ENV} and {KEYCHAIN_ENV}=mock are both set; pick one");
         log::warn!(
             "{DEV_CONFIG_ENV} set: storing profiles (secret keys included) UNENCRYPTED at {} \
              (development only)",
             path.display()
         );
-        let _ = DEV_FILE.set(path);
+        let _ = BACKEND.set(Backend::DevFile(path));
         return Ok(());
     }
+    if mock {
+        // The master key dies with the process, so the last mock run's file
+        // could never be unsealed: every mock run starts empty.
+        let path = sealed_path(true)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("Failed to empty {}", path.display())),
+        }
+        log::warn!(
+            "{KEYCHAIN_ENV}=mock: the Safe Storage key lives in memory and the store at {} \
+             is emptied each run (testing only)",
+            path.display()
+        );
+        keyring_core::set_default_store(
+            keyring_core::mock::Store::new().context("Failed to open the mock keychain")?,
+        );
+        let _ = BACKEND.set(Backend::MockKeychain);
+        return Ok(());
+    }
+    // Set before the keychain opens: a store without secrets still loads and
+    // saves when it won't (see `load_store`).
+    let _ = BACKEND.set(Backend::Keychain);
     #[cfg(target_os = "macos")]
     let store = apple_native_keyring_store::keychain::Store::new();
     #[cfg(windows)]
@@ -346,26 +469,41 @@ fn safe_storage_key() -> Result<[u8; 32]> {
     Ok(key)
 }
 
-/// The `(id, secret)` pairs sealed into `sealed_keys`: every auth key, plus
-/// the server identity under [`SERVER_SECRET_ID`].
+/// The `(id, secret)` pairs sealed into `sealed_keys`: every auth key, every
+/// profile's relay auth token, plus the server identity under
+/// [`SERVER_SECRET_ID`] and its relay auth token under
+/// [`SERVER_RELAY_SECRET_ID`].
 fn secret_entries<'a>(
     keys: &'a [AuthKey],
+    profiles: &'a [Profile],
     server: Option<&'a ServerConfig>,
-) -> impl Iterator<Item = (&'a str, &'a str)> {
+) -> impl Iterator<Item = (String, &'a str)> {
+    let relay = |token: &'a Option<String>| token.as_deref().unwrap_or_default();
     keys.iter()
-        .map(|k| (k.id.as_str(), k.secret.as_str()))
-        .chain(server.map(|s| (SERVER_SECRET_ID, s.secret.as_str())))
+        .map(|k| (k.id.clone(), k.secret.as_str()))
+        .chain(
+            profiles
+                .iter()
+                .map(move |p| (profile_relay_secret_id(&p.id), relay(&p.relay_auth_token))),
+        )
+        .chain(server.into_iter().flat_map(move |s| {
+            [
+                (SERVER_SECRET_ID.to_owned(), s.secret.as_str()),
+                (SERVER_RELAY_SECRET_ID.to_owned(), relay(&s.relay_auth_token)),
+            ]
+        }))
 }
 
 /// Seal the id → secret map of `entries` into the `sealed_keys` blob.
-/// Secretless entries (lost secrets) are left out so a later load warns about
-/// them again instead of loading an empty secret; an all-secretless list
-/// seals to the empty string, which `open_secrets` never sees.
+/// Secretless entries (lost secrets, profiles without a relay token) are left
+/// out so a later load warns about them again instead of loading an empty
+/// secret; an all-secretless list seals to the empty string, which
+/// `open_secrets` never sees.
 fn seal_secrets<'a>(
     master: &[u8; 32],
-    entries: impl Iterator<Item = (&'a str, &'a str)>,
+    entries: impl Iterator<Item = (String, &'a str)>,
 ) -> Result<String> {
-    let map: std::collections::BTreeMap<&str, &str> =
+    let map: std::collections::BTreeMap<String, &str> =
         entries.filter(|(_, secret)| !secret.is_empty()).collect();
     if map.is_empty() {
         return Ok(String::new());
@@ -420,7 +558,7 @@ fn drop_invalid_keys(keys: Vec<AuthKey>) -> Vec<AuthKey> {
                 log::error!("Ignoring key \"{}\": duplicate key id {}", k.name, k.id);
                 return false;
             }
-            if k.id == SERVER_SECRET_ID {
+            if is_reserved_secret_id(&k.id) {
                 log::error!("Ignoring key \"{}\": reserved key id {}", k.name, k.id);
                 return false;
             }
@@ -491,40 +629,57 @@ fn drop_invalid(profiles: Vec<Profile>) -> Vec<Profile> {
         .collect()
 }
 
+/// The id → secret map of a loaded sealed store. Empty with no keychain access
+/// when there is no blob (a store without secrets never prompts) or it was
+/// sealed under another [`SEALED_VERSION`]: those secrets are discarded
+/// whole (`sealed_reset_from` set), and the next save drops the blob. Empty with `unseal_failed` set
+/// when the blob will not open under the current master key.
+fn unseal_store(store: &mut Store) -> Result<std::collections::HashMap<String, String>> {
+    if store.sealed_keys.is_empty() {
+        return Ok(Default::default());
+    }
+    if store.sealed_version != SEALED_VERSION {
+        log::warn!(
+            "The stored secrets were sealed by format version {}, this build reads version \
+             {SEALED_VERSION}: starting fresh, every secret must be re-entered",
+            store.sealed_version
+        );
+        store.sealed_reset_from = Some(store.sealed_version);
+        return Ok(Default::default());
+    }
+    match open_secrets(&safe_storage_key()?, &store.sealed_keys) {
+        Ok(map) => Ok(map),
+        Err(e) => {
+            log::error!(
+                "Failed to unseal the stored secrets (was the \
+                 \"{SAFE_STORAGE_SERVICE}\" keychain entry replaced?): {e:#}"
+            );
+            store.unseal_failed = true;
+            Ok(Default::default())
+        }
+    }
+}
+
 /// Load the whole store; empty when nothing has been saved yet. In keychain
-/// mode each key's and the server's secret is filled from the unsealed
+/// mode each key's and the server's secret, and every relay auth token, is
+/// filled from the unsealed
 /// `sealed_keys` blob — a missing secret (or a blob the current Safe Storage
 /// key can't decrypt) loads as an empty secret with a warning instead of
 /// failing. Structurally invalid keys and profiles are ignored (see the
 /// `drop_invalid*` backstops); a profile referencing an unknown key is kept
 /// but can't connect until a key is picked.
 pub fn load_store() -> Result<Store> {
-    let mut store = match DEV_FILE.get() {
-        Some(path) => {
+    let mut store = match backend()? {
+        Backend::DevFile(path) => {
             let mut store = load_dev_file(path)?;
             store.keys = drop_invalid_keys(store.keys);
             store
         }
-        None => {
-            let mut store: Store = read_json(&profiles_path()?)?.unwrap_or_default();
+        backend => {
+            let mock = matches!(backend, Backend::MockKeychain);
+            let mut store: Store = read_json(&sealed_path(mock)?)?.unwrap_or_default();
             store.keys = drop_invalid_keys(store.keys);
-            // No sealed blob → nothing to unseal, and crucially no keychain
-            // access: a store without secrets never prompts.
-            let secrets = if store.sealed_keys.is_empty() {
-                Default::default()
-            } else {
-                match open_secrets(&safe_storage_key()?, &store.sealed_keys) {
-                    Ok(map) => map,
-                    Err(e) => {
-                        log::error!(
-                            "Failed to unseal the stored secrets (was the \
-                             \"{SAFE_STORAGE_SERVICE}\" keychain entry replaced?): {e:#}"
-                        );
-                        store.unseal_failed = true;
-                        Default::default()
-                    }
-                }
-            };
+            let secrets = unseal_store(&mut store)?;
             for key in &mut store.keys {
                 match secrets.get(&key.id) {
                     Some(secret) => key.secret = secret.clone(),
@@ -534,6 +689,11 @@ pub fn load_store() -> Result<Store> {
                     ),
                 }
             }
+            // A relay token is optional, so a missing one is not lost.
+            for profile in &mut store.profiles {
+                profile.relay_auth_token =
+                    secrets.get(&profile_relay_secret_id(&profile.id)).cloned();
+            }
             if let Some(server) = &mut store.server {
                 match secrets.get(SERVER_SECRET_ID) {
                     Some(secret) => server.secret = secret.clone(),
@@ -541,6 +701,7 @@ pub fn load_store() -> Result<Store> {
                         "No keychain secret for the server; its identity key must be re-entered"
                     ),
                 }
+                server.relay_auth_token = secrets.get(SERVER_RELAY_SECRET_ID).cloned();
             }
             store
         }
@@ -569,35 +730,33 @@ pub fn save_store(
     server: Option<&ServerConfig>,
     login_item_set_up: bool,
 ) -> Result<()> {
-    match DEV_FILE.get() {
-        Some(path) => save_dev_file(path, keys, profiles, server, login_item_set_up),
-        None => {
-            let sealed_keys = if secret_entries(keys, server).all(|(_, s)| s.is_empty()) {
-                String::new()
-            } else {
-                seal_secrets(&safe_storage_key()?, secret_entries(keys, server))?
-            };
+    match backend()? {
+        Backend::DevFile(path) => save_dev_file(path, keys, profiles, server, login_item_set_up),
+        backend => {
+            let sealed_keys =
+                if secret_entries(keys, profiles, server).all(|(_, s)| s.is_empty()) {
+                    String::new()
+                } else {
+                    seal_secrets(&safe_storage_key()?, secret_entries(keys, profiles, server))?
+                };
             write_json(
-                &profiles_path()?,
+                &sealed_path(matches!(backend, Backend::MockKeychain))?,
                 &StoreRef {
                     keys,
                     profiles,
                     server,
                     login_item_set_up,
                     sealed_keys,
+                    sealed_version: SEALED_VERSION,
                 },
             )
         }
     }
 }
 
-/// Field holding the second secret. Unlike `auth_key` it has to serialize
-/// (it lives in `profiles.json`), so export/import strip it by hand instead.
-const RELAY_TOKEN_FIELD: &str = "relay_auth_token";
-
 /// Export all profiles to a user-chosen file. Non-secrets only, whatever the
-/// backend: no secret ever lives in a `Profile`, and the relay auth token is
-/// removed here. Profile ids, forward ids, and the auth-key reference are
+/// backend: a profile's one secret, its relay auth token, never serializes.
+/// Profile ids, forward ids, and the auth-key reference are
 /// stripped too — they are app-local keys that mean nothing in another
 /// install, not part of the portable data.
 pub fn export_profiles(path: &Path, profiles: &[Profile]) -> Result<()> {
@@ -606,7 +765,6 @@ pub fn export_profiles(path: &Path, profiles: &[Profile]) -> Result<()> {
         if let Some(profile) = entry.as_object_mut() {
             profile.remove("id");
             profile.remove("auth_key_id");
-            profile.remove(RELAY_TOKEN_FIELD);
             for forward in forwards_of(profile) {
                 forward.remove("id");
             }
@@ -620,9 +778,9 @@ pub fn export_profiles(path: &Path, profiles: &[Profile]) -> Result<()> {
 /// caller merges the result into the current profiles and assigns final ids;
 /// missing ids (the normal export shape) get placeholders here so the entries
 /// deserialize. No secret or key reference is imported: neither is ever in an
-/// export, and a hand-written relay auth token or auth-key reference is
-/// dropped rather than trusted, so imported entries come back with all three
-/// empty.
+/// export, and a hand-written auth-key reference is dropped rather than
+/// trusted (a hand-written relay auth token never deserializes), so imported
+/// entries come back with both empty.
 pub fn import_profiles(path: &Path) -> Result<Vec<Profile>> {
     let mut values: serde_json::Value = read_json(path)?
         .ok_or_else(|| anyhow::anyhow!("{} does not exist", path.display()))?;
@@ -632,7 +790,6 @@ pub fn import_profiles(path: &Path) -> Result<Vec<Profile>> {
                 .entry("id")
                 .or_insert_with(|| Profile::new_id().into());
             profile.remove("auth_key_id");
-            profile.remove(RELAY_TOKEN_FIELD);
             for forward in forwards_of(profile) {
                 forward
                     .entry("id")
@@ -668,14 +825,24 @@ fn load_dev_file(path: &Path) -> Result<Store> {
                 ..s.key
             })
             .collect(),
-        profiles: stored.profiles,
+        profiles: stored
+            .profiles
+            .into_iter()
+            .map(|s| Profile {
+                relay_auth_token: s.relay_auth_token,
+                ..s.profile
+            })
+            .collect(),
         server: stored.server.map(|s| ServerConfig {
             secret: s.secret,
+            relay_auth_token: s.relay_auth_token,
             ..s.server
         }),
         login_item_set_up: stored.login_item_set_up,
         unseal_failed: false,
+        sealed_reset_from: None,
         sealed_keys: String::new(),
+        sealed_version: 0,
     })
 }
 
@@ -694,9 +861,16 @@ fn save_dev_file(
                 key: k.clone(),
             })
             .collect(),
-        profiles: profiles.to_vec(),
+        profiles: profiles
+            .iter()
+            .map(|p| StoredProfile {
+                relay_auth_token: p.relay_auth_token.clone(),
+                profile: p.clone(),
+            })
+            .collect(),
         server: server.map(|s| StoredServer {
             secret: s.secret.clone(),
+            relay_auth_token: s.relay_auth_token.clone(),
             server: s.clone(),
         }),
         login_item_set_up,
@@ -752,13 +926,13 @@ mod tests {
             authorized_keys: "ed25519-pub:abc work laptop\n".into(),
             routed_domains: vec!["*.internal".into()],
             routed_cidrs: vec!["10.0.0.0/8".into()],
-            relay_urls: Vec::new(),
-            relay_auth_token: None,
+            relay_urls: vec!["https://relay.example".into()],
+            relay_auth_token: Some("ftc-secret-serverpsk".into()),
         }
     }
 
     fn seal(master: &[u8; 32], keys: &[AuthKey]) -> String {
-        seal_secrets(master, secret_entries(keys, None)).unwrap()
+        seal_secrets(master, secret_entries(keys, &[], None)).unwrap()
     }
 
     fn profile() -> Profile {
@@ -803,6 +977,7 @@ mod tests {
             server: Some(&server()),
             login_item_set_up: false,
             sealed_keys: String::new(),
+            sealed_version: SEALED_VERSION,
         })
         .unwrap();
         assert!(!json.contains("ftc-secret-authtok"), "secret leaked: {json}");
@@ -816,25 +991,37 @@ mod tests {
         assert!(json.contains("\"auth_key_id\":\"key1\""), "reference dropped: {json}");
         // `enabled` is runtime-only on forwards and must not leak either.
         assert!(!json.contains("enabled"), "enabled leaked: {json}");
-        // The relay token is a secret too, but it has no keychain home yet, so
-        // it must stay in this serialization (`profiles.json`). Export/import
-        // strip it explicitly — see `export_profiles`.
-        assert!(
-            json.contains("ftc-secret-relaypsk"),
-            "relay token must persist in profiles.json: {json}"
-        );
+        // The relay tokens are secrets: sealed, never plaintext.
+        assert!(!json.contains("relay_auth_token"), "relay token field leaked: {json}");
+        assert!(!json.contains("ftc-secret-relaypsk"), "profile relay token leaked: {json}");
+        assert!(!json.contains("ftc-secret-serverpsk"), "server relay token leaked: {json}");
     }
 
     #[test]
     fn sealed_secrets_roundtrip_without_leaking_plaintext() {
         let master = [7u8; 32];
-        let sealed = seal_secrets(&master, secret_entries(&[key()], Some(&server()))).unwrap();
+        let mut no_relay = profile();
+        no_relay.id = "00000000feedface".into();
+        no_relay.relay_auth_token = None;
+        let (keys, profiles, server) = ([key()], [profile(), no_relay], server());
+        let sealed =
+            seal_secrets(&master, secret_entries(&keys, &profiles, Some(&server))).unwrap();
         assert!(!sealed.contains("ftc-secret-authtok"), "secret leaked: {sealed}");
         assert!(!sealed.contains("ftc-secret-identity"), "server secret leaked: {sealed}");
+        assert!(!sealed.contains("ftc-secret-relaypsk"), "relay token leaked: {sealed}");
         let map = open_secrets(&master, &sealed).unwrap();
-        assert_eq!(map.len(), 2);
+        // The profile without a relay token seals nothing.
+        assert_eq!(map.len(), 4);
         assert_eq!(map.get("key1").map(String::as_str), Some("ftc-secret-authtok"));
         assert_eq!(map.get(SERVER_SECRET_ID).map(String::as_str), Some("ftc-secret-identity"));
+        assert_eq!(
+            map.get(SERVER_RELAY_SECRET_ID).map(String::as_str),
+            Some("ftc-secret-serverpsk")
+        );
+        assert_eq!(
+            map.get(&profile_relay_secret_id(&profile().id)).map(String::as_str),
+            Some("ftc-secret-relaypsk")
+        );
     }
 
     /// Secretless keys stay out of the seal (so a load warns about them),
@@ -852,6 +1039,26 @@ mod tests {
         let sealed = seal(&master, &[lost, other]);
         let map = open_secrets(&master, &sealed).unwrap();
         assert_eq!(map.keys().collect::<Vec<_>>(), ["key2"]);
+    }
+
+    /// A blob sealed under another format version — or before there was one —
+    /// is discarded whole, before the keychain is asked for the master key:
+    /// no secret loads, and it is not an unseal failure.
+    #[test]
+    fn a_blob_of_another_sealed_version_starts_fresh() {
+        for version in [0, SEALED_VERSION + 1] {
+            let mut store = Store {
+                sealed_keys: seal(&[7u8; 32], &[key()]),
+                sealed_version: version,
+                ..Default::default()
+            };
+            let secrets = unseal_store(&mut store).unwrap();
+            assert!(secrets.is_empty(), "version {version}: {secrets:?}");
+            assert!(!store.unseal_failed, "version {version}");
+            assert_eq!(store.sealed_reset_from, Some(version));
+        }
+        let unversioned: Store = serde_json::from_str(r#"{"sealed_keys":"AAAA"}"#).unwrap();
+        assert_eq!(unversioned.sealed_version, 0);
     }
 
     /// A blob sealed under a different master key (a replaced Safe Storage
@@ -905,6 +1112,15 @@ mod tests {
         reserved_id.id = SERVER_SECRET_ID.into();
         reserved_id.name = "reserved".into();
         reserved_id.public_key = "ed25519-pub:pqr".into();
+        // The relay tokens' slots: the server's and a profile's.
+        let mut server_relay_id = key();
+        server_relay_id.id = SERVER_RELAY_SECRET_ID.into();
+        server_relay_id.name = "server relay".into();
+        server_relay_id.public_key = "ed25519-pub:stu".into();
+        let mut profile_relay_id = key();
+        profile_relay_id.id = profile_relay_secret_id("00000000deadbeef");
+        profile_relay_id.name = "profile relay".into();
+        profile_relay_id.public_key = "ed25519-pub:vwx".into();
         let mut unique = key();
         unique.id = "key5".into();
         unique.name = "home".into();
@@ -918,6 +1134,8 @@ mod tests {
             bad_name,
             empty_id,
             reserved_id,
+            server_relay_id,
+            profile_relay_id,
             unique.clone(),
         ]);
         assert_eq!(kept, vec![a, unique]);
@@ -1045,6 +1263,14 @@ mod tests {
             raw.contains("\"secret\": \"ftc-secret-identity\""),
             "server secret missing: {raw}"
         );
+        assert!(
+            raw.contains("\"relay_auth_token\": \"ftc-secret-relaypsk\""),
+            "profile relay token missing: {raw}"
+        );
+        assert!(
+            raw.contains("\"relay_auth_token\": \"ftc-secret-serverpsk\""),
+            "server relay token missing: {raw}"
+        );
 
         // Forward `enabled` is runtime-only: comes back off.
         profiles[0].forwards[0].enabled = false;
@@ -1053,5 +1279,33 @@ mod tests {
         assert_eq!(loaded.profiles, profiles);
         assert_eq!(loaded.server, Some(server));
         assert!(loaded.login_item_set_up);
+    }
+
+    /// `FLEXTUNNEL_KEYCHAIN` takes `mock` or nothing: a typo is not the real
+    /// keychain.
+    #[test]
+    fn the_mock_keychain_is_asked_for_by_name_only() {
+        use std::ffi::OsStr;
+        assert!(!mock_keychain(None).unwrap());
+        assert!(mock_keychain(Some(OsStr::new("mock"))).unwrap());
+        for wrong in ["", "Mock", "memory", "1"] {
+            let e = mock_keychain(Some(OsStr::new(wrong))).unwrap_err();
+            assert!(format!("{e:#}").contains("only value it takes"), "{wrong:?}: {e:#}");
+        }
+    }
+
+    /// On the mock keychain the Safe Storage key is generated on first use,
+    /// kept in the store's entry, and sealed secrets open under it — the
+    /// path a `FLEXTUNNEL_KEYCHAIN=mock` run takes. The only test that installs
+    /// a keychain store, so the process-wide store and key cache are its own.
+    #[test]
+    fn the_mock_keychain_holds_the_safe_storage_key() {
+        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        let master = safe_storage_key().unwrap();
+        let entry = keyring_core::Entry::new(SAFE_STORAGE_SERVICE, SAFE_STORAGE_USER).unwrap();
+        assert_eq!(entry.get_password().unwrap(), BASE64.encode(master));
+        let sealed = seal(&master, &[key()]);
+        let opened = open_secrets(&safe_storage_key().unwrap(), &sealed).unwrap();
+        assert_eq!(opened["key1"], "ftc-secret-authtok");
     }
 }

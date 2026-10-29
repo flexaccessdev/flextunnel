@@ -69,6 +69,11 @@ pub enum Message {
     ShowConnPath,
     /// Close the connection-path modal.
     DismissConnPath,
+    /// Answers to the sealed-secrets reset warning (see
+    /// [`App::secrets_reset_from`]): quit with the old secrets left on disk,
+    /// or start fresh, saving the store without them.
+    SecretsResetQuit,
+    SecretsResetContinue,
     // Profiles
     AddProfile,
     EditProfile(ProfileId),
@@ -808,6 +813,11 @@ pub struct App {
     pub conn_path_modal: Option<ConnectionSnapshot>,
     /// Transient export/import result shown in the sidebar.
     pub io_notice: Option<String>,
+    /// The sealed format version this launch's secrets were discarded from
+    /// (see `config::Store::sealed_reset_from`), until the user answers the
+    /// warning modal. Nothing is saved meanwhile, so quitting leaves the old
+    /// secrets on disk for the build that sealed them.
+    pub secrets_reset_from: Option<u32>,
     /// Setup-failure reason per forward id, retained after the failed forward
     /// is auto-stopped (see [`disable_failed_forwards`]) so the row can keep
     /// showing why; cleared when the forward is started again or removed.
@@ -843,9 +853,11 @@ impl App {
         // only, and one whose secrets failed to unseal is left as it is on
         // disk: nothing below may write either back over data the user could
         // still recover (the sealed blob, once the keychain entry is restored).
+        // Secrets discarded for a sealed version change are not written over
+        // either until the user chooses to start fresh.
         let (store, store_intact) = match config::load_store() {
             Ok(store) => {
-                let intact = !store.unseal_failed;
+                let intact = !store.unseal_failed && store.sealed_reset_from.is_none();
                 (store, intact)
             }
             Err(e) => {
@@ -882,6 +894,7 @@ impl App {
             notice: None,
             conn_path_modal: None,
             io_notice: None,
+            secrets_reset_from: store.sealed_reset_from,
             forward_errors: HashMap::new(),
             routed_caches: HashMap::new(),
             // MAX so the first refresh always builds the log text.
@@ -897,8 +910,9 @@ impl App {
         // First launch of an install: start at login by default, as tray
         // apps do on both platforms. The OS registration is the truth from
         // then on, so a checkbox the user cleared is never re-ticked. A dev
-        // store (`FLEXTUNNEL_DEV_CONFIG`) never touches the login item, so a
-        // debug binary neither becomes one nor re-points a real install's.
+        // store (`FLEXTUNNEL_DEV_CONFIG` or `FLEXTUNNEL_KEYCHAIN=mock`) never
+        // touches the login item, so a debug or test binary neither becomes
+        // one nor re-points a real install's.
         if config::dev_store() {
             log::info!("Dev store: leaving the login item alone");
         } else if !app.login_item_set_up {
@@ -934,8 +948,8 @@ impl App {
             None => {}
         }
         // Launched as a login item, the app stays in the tray; the window is
-        // a click away.
-        let open = if autostart::launched_at_login() {
+        // a click away — unless the secrets reset warning needs answering.
+        let open = if autostart::launched_at_login() && app.secrets_reset_from.is_none() {
             Task::none()
         } else {
             app.open_window()
@@ -1045,6 +1059,15 @@ impl App {
             }
             Message::DismissConnPath => {
                 self.conn_path_modal = None;
+                Task::none()
+            }
+            Message::SecretsResetQuit => {
+                self.controller.shutdown();
+                iced::exit()
+            }
+            Message::SecretsResetContinue => {
+                self.secrets_reset_from = None;
+                self.persist_store();
                 Task::none()
             }
             Message::AddProfile => {
@@ -1933,6 +1956,12 @@ impl App {
     }
 
     fn persist_store(&mut self) {
+        // Backstop: the reset modal blocks the window, but nothing may drop
+        // the old secrets before the user chooses to.
+        if self.secrets_reset_from.is_some() {
+            log::warn!("Not saving: the sealed secrets reset is not confirmed yet");
+            return;
+        }
         if let Err(e) = config::save_store(
             &self.keys,
             &self.profiles,

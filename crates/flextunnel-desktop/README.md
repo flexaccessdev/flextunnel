@@ -54,23 +54,38 @@ its own **server-direct port forwards**. Connecting is always manual.
   switch off), and a checkbox in the tray menu ("Open at Login" on macOS,
   "Start with Windows") toggles it afterwards. Launched that way, the app
   starts in the tray without opening its window. A dev store
-  (`FLEXTUNNEL_DEV_CONFIG`) never touches the login item, so a debug binary
-  neither becomes one nor re-points a real install's at itself.
+  (`FLEXTUNNEL_DEV_CONFIG` or `FLEXTUNNEL_KEYCHAIN=mock`) never touches the
+  login item, so a debug or test binary neither becomes one nor re-points a
+  real install's at itself.
 - **Server auto-start** — when a server is configured, it starts with the app
   (at login or by hand); its tray submenu still stops and restarts it.
 
 ## Where settings live
 
-Non-secret profile data (name, server id, ports, forwards) is stored as a
-plaintext `profiles.json` in the platform's local data directory. The **auth
-token is the only secret** and is kept in the system keychain — **macOS
-Keychain** or the **Windows Credential Manager** — one entry per profile.
+Everything is stored in one `profiles.json` in the platform's local data
+directory. Non-secret data (names, server ids, ports, forwards, relay URLs,
+public keys) is plaintext. The **secrets** — auth-key secrets, the server's
+identity key, and the custom-relay auth tokens of profiles and the server —
+are sealed in the same file with AES-256-GCM under a random master key that is
+the one entry kept in the system keychain (**macOS Keychain** or the **Windows
+Credential Manager**), named "Flextunnel Safe Storage". The sealed secrets
+carry a format version: an update that changes what is sealed bumps it, and
+then starts every secret fresh — re-enter the auth-key secrets, the server
+identity and the relay tokens — rather than loading some and not others.
 
 > **Development escape hatch:** setting `FLEXTUNNEL_DEV_CONFIG` (to `1` or to an
 > explicit file path) stores everything, tokens included, in a single plaintext
 > JSON file, so an unsigned rebuild loop doesn't trigger the keychain access
 > prompt on every launch. **Never set it for a real install** — the tokens are
 > stored unencrypted.
+
+> **Mock keychain for end-to-end tests:** `FLEXTUNNEL_KEYCHAIN=mock` keeps the
+> real sealed store but holds its master key in an in-memory keychain instead
+> of the system one, so an e2e or QA run never blocks on a keychain prompt
+> (macOS asks again after every unsigned rebuild). The key is gone when the app
+> quits, so the run uses a `mock-profiles.json` of its own, emptied at every
+> start; the real keychain and `profiles.json` are never touched. Any other
+> value is refused, and it can't be combined with `FLEXTUNNEL_DEV_CONFIG`.
 
 ## Install
 

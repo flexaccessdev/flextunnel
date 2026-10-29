@@ -142,30 +142,81 @@ fn phase_label(phase: Phase) -> &'static str {
 
 pub fn root(app: &App) -> Element<'_, Message> {
     let base = row![sidebar(app), detail_pane(app)];
+    // The reset warning must be answered, so it sits above everything and
+    // its backdrop does nothing.
+    if let Some(version) = app.secrets_reset_from {
+        return modal(base, secrets_reset_modal(version), None);
+    }
     match &app.conn_path_modal {
-        Some(snapshot) => modal(base, conn_path_modal(snapshot)),
+        Some(snapshot) => {
+            modal(base, conn_path_modal(snapshot), Some(Message::DismissConnPath))
+        }
         None => base.into(),
     }
 }
 
 /// Overlay `content`, centered on a dimmed backdrop, as a stack layer above
-/// `base` — so it never touches `base`'s layout. Clicking the backdrop
-/// dismisses; the content card swallows its own clicks.
+/// `base` — so it never touches `base`'s layout. Clicking the backdrop sends
+/// `dismiss`, if any; the content card swallows its own clicks.
 fn modal<'a>(
     base: impl Into<Element<'a, Message>>,
     content: impl Into<Element<'a, Message>>,
+    dismiss: Option<Message>,
 ) -> Element<'a, Message> {
-    stack![
-        base.into(),
-        opaque(
-            mouse_area(center(opaque(content)).style(|_theme| container::Style {
-                background: Some(Color { a: 0.7, ..Color::BLACK }.into()),
-                ..container::Style::default()
-            }))
-            .on_press(Message::DismissConnPath),
-        ),
+    let backdrop = mouse_area(center(opaque(content)).style(|_theme| container::Style {
+        background: Some(Color { a: 0.7, ..Color::BLACK }.into()),
+        ..container::Style::default()
+    }));
+    let backdrop = match dismiss {
+        Some(message) => backdrop.on_press(message),
+        None => backdrop,
+    };
+    stack![base.into(), opaque(backdrop)].into()
+}
+
+/// The startup warning when this build cannot read the stored secrets'
+/// sealed format (`version` is the one they were sealed under): quit with
+/// them left on disk, or start fresh and re-enter them.
+fn secrets_reset_modal<'a>(version: u32) -> Element<'a, Message> {
+    let sealed_by = match version {
+        0 => "an earlier version of flextunnel".to_string(),
+        v => format!("format version {v}"),
+    };
+    let card = column![
+        text("Saved secrets can't be read").size(15).font(semibold()),
+        text(format!(
+            "Your secrets were saved by {sealed_by}, which this version stores \
+             differently. The auth-key secrets, the server identity key and the \
+             relay auth tokens will all be empty and must be re-entered."
+        ))
+        .size(12),
+        text(
+            "Quit now to leave them on disk untouched — the previous version of \
+             flextunnel can still read them, for example to export the keys first. \
+             Starting fresh deletes them for good."
+        )
+        .size(12)
+        .color(AMBER),
+        row![
+            space().width(Fill),
+            button(text("Quit").size(12))
+                .padding([5, 14])
+                .style(style::ghost)
+                .on_press(Message::SecretsResetQuit),
+            button(text("Start fresh").size(12))
+                .padding([5, 14])
+                .style(style::primary)
+                .on_press(Message::SecretsResetContinue),
+        ]
+        .spacing(8)
+        .align_y(Center),
     ]
-    .into()
+    .spacing(10);
+    container(card)
+        .padding([16, 18])
+        .max_width(480)
+        .style(style::card)
+        .into()
 }
 
 /// The connection-path modal card: a point-in-time snapshot of how the profile
