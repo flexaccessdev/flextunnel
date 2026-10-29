@@ -15,7 +15,7 @@ window loses nothing — the tray owns the lifecycle and re-opens it on demand.
 │ Open flextunnel…                    │   │ CONNECTIONS   +   home-lab ● conn.  │
 │ Connections: 1 of 2 connected       │   │ ● home-lab        SOCKS 1080        │
 │ Server running · 2 clients connected│ ⇄ │ ○ staging         PORT FORWARDS     │
-│ Stop Server                         │   │ SERVER            ● db  5432        │
+│ Disable Server                      │   │ SERVER            ● db  5432        │
 │ Copy Endpoint ID                    │   │ ● This computer                     │
 │ ☑ Open at Login                     │   │ Keys · Logs                         │
 │ Quit flextunnel                     │   │                                     │
@@ -58,28 +58,34 @@ its own **server-direct port forwards**. Connecting is always manual.
 ## The server
 
 The app hosts one server per user — the per-user server lock is shared with the
-CLI, so a `flextunnel server` running on the same account counts too. Setting
-it up generates a fresh identity (or imports an existing one, to move a server
-here), then the pane asks for the first client to authorize. A configured
-server starts with the app (at login or by hand) and stays meant to
-be running until stopped from the window or the tray; while it is, authorizing
-its first client or re-importing a lost identity starts it.
+CLI, so a `flextunnel server` running on the same account counts too. Setup
+is one step, the identity — a fresh one generated, or an existing one imported
+to move a server here, either way showing the endpoint id it gives — then
+*Create server* goes straight on to authorizing the first client.
+
+- **Enabled** — a switch in the server pane (and *Enable/Disable Server* in
+  the tray). An enabled server starts with the app (at login or by hand), and
+  as soon as it becomes startable — its first client authorized, a lost
+  identity re-imported; after a failure, *Retry* starts it again. Disabling
+  stops it and keeps it stopped across launches until it is enabled again;
+  *Delete server…* removes it and its identity for good.
 
 - **Endpoint ID** — the server's public identity, shown in full at the top of
-  its pane with a Copy button (and "Copy Endpoint ID" in the tray): it is what
-  clients enter as the server node id.
+  its pane in a selectable field with a Copy button (and "Copy Endpoint ID" in
+  the tray): it is what clients enter as the server node id.
 - **Authorized clients** — a named list of client public keys
   (`ed25519-pub:…`, never a secret). Paste a key — or a whole authorized-key
   entry as `flexaccess-keys show-auth-key` prints it, whose comment then names
   the client — or pick one of this app's own keys. While the server runs, each
   client shows whether it is connected.
 - **Identity** — the secret behind the endpoint id is generated at setup and
-  never shown. *Export key…* copies it to the clipboard (two clicks) to move the
-  server to another computer; *Replace identity…* generates or imports another,
-  warning first that clients must then switch to the new endpoint id. If the
-  keychain loses it, the same section imports it back.
+  never shown. Right under the endpoint id, *Replace identity…* generates or
+  imports another, warning first that clients must then switch to the new
+  endpoint id, and *Export key…* copies it to the clipboard (two clicks) to move
+  the server to another computer. If the keychain loses it, the same place
+  imports it back.
 - **Tunnel set & relays** — the routed domains/CIDRs pushed to clients and
-  enforced here, plus custom relays.
+  enforced here, plus custom relays; optional, and edited any time.
 - **Restart to apply** — the server runs with the settings it started with;
   after a change (a client authorized or removed, the tunnel set edited, a new
   identity) its pane offers *Restart now*.
@@ -87,13 +93,14 @@ its first client or re-importing a lost identity starts it.
 ## Tray
 
 The menu shows the connections' aggregate line, then the server's status line
-with Start/Stop and Copy Endpoint ID (or "Set Up Server…" while there is
-none). The icon's badge shows the server's state — dimmed while stopped, a
-**dot** while it is starting or stopping, and a **checkmark** while it runs
-(how many clients are connected shows in the menu and the server pane);
-client connections don't change it while there is a server. Without one, the
-icon shows by its opacity alone whether a connection is up (no badge — the
-badge means the server).
+with Enable/Disable Server and Copy Endpoint ID (or "Set Up Server…" while
+there is none). With an enabled server, the icon shows the server's state —
+dimmed while it is down, a **dot** while it is starting or stopping, and a
+**checkmark** while it runs (how many clients are connected shows in the menu
+and the server pane); client connections don't change it then. Without a
+server, or with a disabled one, the app is client-only: the icon is at full
+strength (dark on macOS) while a connection is up and dimmed otherwise, with no
+badge — except a **minus** for a disabled server while no connection is up.
 
 - **Live logs** — an in-app Logs pane; every session's log lines (core
   internals included) are attributed to the server or their profile.

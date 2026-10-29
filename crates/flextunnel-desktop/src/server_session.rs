@@ -289,6 +289,7 @@ mod tests {
             routed_cidrs: Vec::new(),
             relay_urls: Vec::new(),
             relay_auth_token: None,
+            enabled: true,
         }
     }
 

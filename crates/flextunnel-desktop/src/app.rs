@@ -67,6 +67,9 @@ pub enum Message {
     WindowClosed(window::Id),
     Select(Selection),
     CopyText(String),
+    /// An edit attempt on a read-only field (shown in a text input only so
+    /// its value can be selected and copied by hand): ignored.
+    ReadOnlyEdited,
     /// Fetch the current iroh connection path (relay/direct) once and open the
     /// modal showing it.
     ShowConnPath,
@@ -140,8 +143,12 @@ pub enum Message {
     /// Open the server's settings form (tunnel set and relays).
     EditServer,
     DeleteServer,
-    StartServer,
-    StopServer,
+    /// The server pane's Enabled switch and the tray's Enable/Disable item:
+    /// whether the server is meant to run — persisted, so a disabled server
+    /// stays stopped across launches.
+    SetServerEnabled(bool),
+    /// Start an enabled server that is down (it failed, or could not start).
+    RetryServer,
     /// Restart the running server so changed settings take effect.
     RestartServer,
     /// The setup form's identity: import an existing key (`true`) or use the
@@ -618,10 +625,13 @@ impl IdentityChoice {
 /// Editable buffers for the server's setup form and its settings form. The
 /// identity is chosen at setup only (afterwards it is replaced through its own
 /// form, see [`IdentityChoice`]), and the authorized clients are managed on
-/// the server pane, not here.
+/// the server pane, not here. Which form it is follows whether the server
+/// has an identity yet: without one, setup chooses it (`identity` is `Some`)
+/// and creates the server; with one, it edits the tunnel set and relays.
 #[derive(Default)]
 pub struct ServerForm {
-    /// `Some` when setting up the server; `None` when editing its settings.
+    /// `Some` when setting up (choosing the identity); `None` when editing the
+    /// settings.
     pub identity: Option<IdentityChoice>,
     pub routed_domains: String,
     pub routed_cidrs: String,
@@ -630,10 +640,6 @@ pub struct ServerForm {
 }
 
 impl ServerForm {
-    pub fn is_edit(&self) -> bool {
-        self.identity.is_none()
-    }
-
     fn add() -> Self {
         Self {
             identity: Some(IdentityChoice::new()),
@@ -654,15 +660,17 @@ impl ServerForm {
     /// The server this form describes: a new one (no clients yet) when
     /// setting up, else `current` with the form's settings.
     pub fn validate(&self, current: Option<&ServerConfig>) -> Result<ServerConfig, String> {
-        let (secret, endpoint_id, authorized_clients) = match (&self.identity, current) {
+        let (secret, endpoint_id, authorized_clients, enabled) = match (&self.identity, current) {
+            // A new server is enabled: it starts once it has a client.
             (Some(identity), _) => {
                 let (secret, endpoint_id) = identity.resolve()?;
-                (secret, endpoint_id, Vec::new())
+                (secret, endpoint_id, Vec::new(), true)
             }
             (None, Some(current)) => (
                 current.secret.clone(),
                 current.endpoint_id.clone(),
                 current.authorized_clients.clone(),
+                current.enabled,
             ),
             (None, None) => return Err("The server was deleted".into()),
         };
@@ -686,6 +694,7 @@ impl ServerForm {
             routed_cidrs,
             relay_urls,
             relay_auth_token,
+            enabled,
         })
     }
 }
@@ -896,11 +905,6 @@ pub struct App {
     /// The config the server session was last started with, so the pane can
     /// tell when the saved settings differ from the running ones.
     server_applied: Option<ServerConfig>,
-    /// Whether the server is meant to be running: set at launch (a configured
-    /// server starts with the app) and by Start, cleared by Stop. While set, a
-    /// change that makes a stopped server startable — the first client
-    /// authorized, a lost identity re-imported — starts it.
-    server_wanted: bool,
     /// The open forward form and the profile it belongs to.
     pub forward_form: Option<(ProfileId, ForwardForm)>,
     /// Two-click delete guard: the profile whose Delete was clicked once.
@@ -1001,7 +1005,6 @@ impl App {
             confirm_remove_client: None,
             confirm_export_server_secret: false,
             server_applied: None,
-            server_wanted: true,
             forward_form: None,
             confirm_delete: None,
             confirm_delete_key: None,
@@ -1054,6 +1057,7 @@ impl App {
         // A configured server is meant to be running: it starts with the app.
         if let Some(server) = &app.server {
             match server.start_blocker() {
+                _ if !server.enabled => log::info!("The server is disabled; not starting it"),
                 None => log::info!("Starting the configured server"),
                 Some(blocker) => log::warn!("Not starting the server yet: {blocker}"),
             }
@@ -1146,6 +1150,7 @@ impl App {
                 self.conn_path_modal = None;
                 Task::none()
             }
+            Message::ReadOnlyEdited => Task::none(),
             Message::CopyText(text) => {
                 self.copy_text(text);
                 Task::none()
@@ -1473,16 +1478,12 @@ impl App {
                 self.delete_server();
                 Task::none()
             }
-            Message::StartServer => self.start_server(),
-            Message::StopServer => {
-                self.stop_server();
-                Task::none()
-            }
+            Message::SetServerEnabled(enabled) => self.set_server_enabled(enabled),
+            Message::RetryServer => self.start_server(),
             Message::RestartServer => {
                 let Some(server) = self.server.clone() else {
                     return Task::none();
                 };
-                self.server_wanted = true;
                 match server.start_blocker() {
                     None => {
                         self.controller.restart_server(server.clone());
@@ -1767,33 +1768,57 @@ impl App {
     /// Whether the running server was started with other settings than the
     /// saved ones, so a restart is needed to apply them.
     pub fn server_needs_restart(&self) -> bool {
+        // A server just disabled is stopping, not waiting for a restart.
         matches!(
             self.server_snapshot.phase,
             ServerPhase::Starting | ServerPhase::Running
-        ) && self.server_applied.as_ref() != self.server.as_ref()
+        ) && self.server.as_ref().is_some_and(|s| s.enabled)
+            && self.server_applied.as_ref() != self.server.as_ref()
     }
 
-    /// Start the server if it is meant to run, is down, and can start: at
-    /// launch, and after a change that may have made it startable.
+    /// Start the server if it is enabled, down, and can start: at launch, and
+    /// after a change that may have made it startable — the first client
+    /// authorized, a lost identity re-imported.
     fn resume_server(&mut self) {
         let down = matches!(
             self.controller.server_snapshot().phase,
             ServerPhase::Stopped | ServerPhase::Failed
         );
-        if self.server_wanted
-            && down
-            && let Some(server) = self.server.clone().filter(ServerConfig::is_ready)
+        if down
+            && let Some(server) = self
+                .server
+                .clone()
+                .filter(|s| s.enabled && s.is_ready())
         {
             self.controller.start_server(server.clone());
             self.server_applied = Some(server);
         }
     }
 
-    fn start_server(&mut self) -> Task<Message> {
-        let Some(server) = self.server.clone() else {
+    /// Enable or disable the server, persisted: enabling starts it (or shows
+    /// what it is missing), disabling stops it and keeps it stopped.
+    fn set_server_enabled(&mut self, enabled: bool) -> Task<Message> {
+        let Some(server) = &mut self.server else {
             return Task::none();
         };
-        self.server_wanted = true;
+        if server.enabled != enabled {
+            server.enabled = enabled;
+            self.notice = None;
+            self.persist_store();
+        }
+        if enabled {
+            self.start_server()
+        } else {
+            self.controller.stop_server();
+            Task::none()
+        }
+    }
+
+    /// Start the (enabled) server now, or show what keeps it from starting.
+    fn start_server(&mut self) -> Task<Message> {
+        let Some(server) = self.server.clone().filter(|s| s.enabled) else {
+            return Task::none();
+        };
         if server.is_ready() {
             self.controller.start_server(server.clone());
             self.server_applied = Some(server);
@@ -1811,11 +1836,6 @@ impl App {
         }
         self.notice = server.start_blocker().map(String::from);
         self.show_window()
-    }
-
-    fn stop_server(&mut self) {
-        self.server_wanted = false;
-        self.controller.stop_server();
     }
 
     fn delete_server(&mut self) {
@@ -1847,6 +1867,11 @@ impl App {
         }
     }
 
+    /// Save the server form: setup creates the server with the chosen identity
+    /// (no tunnel set, relays or clients yet — the tunnel set and relays are
+    /// optional and edited any time), the settings form updates it. Either way
+    /// a server without clients goes straight on to authorizing the first; it
+    /// starts once there is one.
     fn save_server_form(&mut self) {
         let Some(form) = &self.server_form else {
             return;
@@ -1861,17 +1886,17 @@ impl App {
         self.persist_store();
         self.selection = Selection::Server;
         self.server_form = None;
-        if setting_up {
-            // A new server has no clients yet and cannot start without one:
-            // go straight on to authorizing the first. It starts once there is.
-            self.server_wanted = true;
+        if self.notice.is_some() {
+            return;
+        }
+        if self.server.as_ref().is_some_and(|s| s.authorized_clients.is_empty()) {
             self.client_form = Some(ClientForm::default());
-            if self.notice.is_none() {
-                self.notice = Some(
-                    "Server created. Authorize the first client to start it.".into(),
-                );
-            }
-        } else if self.notice.is_none() {
+            self.notice = Some(if setting_up {
+                "Server created. Authorize the first client to start it.".into()
+            } else {
+                "Saved. Authorize a client to start the server.".into()
+            });
+        } else {
             self.notice = Some("Saved.".into());
         }
     }
@@ -1969,13 +1994,9 @@ impl App {
                 self.controller.shutdown();
                 iced::exit()
             }
-            tray::MENU_TOGGLE_SERVER => match self.server_snapshot.phase {
-                ServerPhase::Starting | ServerPhase::Running => {
-                    self.stop_server();
-                    Task::none()
-                }
-                ServerPhase::Stopped | ServerPhase::Failed => self.start_server(),
-                ServerPhase::Stopping => Task::none(),
+            tray::MENU_TOGGLE_SERVER => match &self.server {
+                Some(server) => self.set_server_enabled(!server.enabled),
+                None => Task::none(),
             },
             tray::MENU_SET_UP_SERVER => self.set_up_server(),
             tray::MENU_COPY_SERVER_ID => {
@@ -2733,7 +2754,7 @@ mod tests {
             public_key: client_key(),
         });
         let mut form = ServerForm::edit(&current);
-        assert!(form.is_edit());
+        assert!(form.identity.is_none());
         form.routed_domains = String::new();
         form.routed_cidrs = " , ".into();
         let edited = form.validate(Some(&current)).expect("an empty tunnel set is fine");

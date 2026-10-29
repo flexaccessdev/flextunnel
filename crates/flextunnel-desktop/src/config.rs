@@ -242,6 +242,11 @@ pub struct ServerConfig {
     /// [`StoredServer`].
     #[serde(skip)]
     pub relay_auth_token: Option<String>,
+    /// Whether the server is meant to run: an enabled server starts with the
+    /// app, and once it becomes startable; a disabled one stays stopped, at
+    /// every launch, until enabled again.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 impl ServerConfig {
@@ -1007,6 +1012,7 @@ mod tests {
             routed_cidrs: vec!["10.0.0.0/8".into()],
             relay_urls: vec!["https://relay.example".into()],
             relay_auth_token: Some("ftc-secret-serverpsk".into()),
+            enabled: true,
         }
     }
 
@@ -1068,8 +1074,12 @@ mod tests {
         // reference to it.
         assert!(json.contains("ed25519-pub:abc"), "public key dropped: {json}");
         assert!(json.contains("\"auth_key_id\":\"key1\""), "reference dropped: {json}");
-        // `enabled` is runtime-only on forwards and must not leak either.
-        assert!(!json.contains("enabled"), "enabled leaked: {json}");
+        // `enabled` is runtime-only on forwards and must not leak either; the
+        // server's is its persisted intent.
+        let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let forward = &doc["profiles"][0]["forwards"][0];
+        assert!(forward.get("enabled").is_none(), "forward enabled leaked: {json}");
+        assert_eq!(doc["server"]["enabled"], true, "server enabled dropped: {json}");
         // The relay tokens are secrets: sealed, never plaintext.
         assert!(!json.contains("relay_auth_token"), "relay token field leaked: {json}");
         assert!(!json.contains("ftc-secret-relaypsk"), "profile relay token leaked: {json}");

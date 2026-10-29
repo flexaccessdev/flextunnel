@@ -4,8 +4,8 @@
 //! bare glyph as a template image — the OS adapts it to light/dark menu bars,
 //! matching the iOS "tinted" appearance — with the server's state shown by
 //! opacity plus a corner status badge: a plain dot while it is starting or
-//! stopping, upgrading to a checkmark once it is running. The badge is the
-//! server's alone; an app with client connections only shows them by opacity.
+//! stopping, upgrading to a checkmark once it is running, and a minus while it
+//! is disabled. The badge is the server's alone; an app with client connections only shows them by opacity.
 //! The badge stays monochrome on macOS so
 //! the icon remains a crisp template (a colored icon renders as a blurry
 //! non-template image in the menu bar); on Windows it is green on the full-color
@@ -29,6 +29,8 @@ pub enum TrayState {
     Changing,
     /// The server is running — a status checkmark instead of the dot.
     Running,
+    /// The server is disabled — dimmed, with a minus on the dot.
+    Disabled,
 }
 
 // Geometry from icon.svg, in its 1024x1024 viewBox.
@@ -105,14 +107,23 @@ fn draw_glyph(pixmap: &mut Pixmap, paint: &Paint, fill: f32) {
     }
 }
 
-/// Overlay a "connected" status badge: a filled dot in the bottom-right,
+/// What the status dot carries: nothing (starting/stopping), a check
+/// (running), or a minus (disabled).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    None,
+    Check,
+    Minus,
+}
+
+/// Overlay the server's status badge: a filled dot in the bottom-right,
 /// separated from the glyph behind it by a ring. `ring` is the ring's fill
 /// color, or `None` to punch a transparent gap (used by the macOS template,
-/// where only alpha matters). When `checkmark` is set, a check is stroked over
-/// the dot in the ring's treatment (the ring color, or a transparent punch on
-/// the template) to signal that the server is running. Drawn last, so it sits
-/// on top.
-fn draw_status_dot(pixmap: &mut Pixmap, dot: Color, ring: Option<Color>, checkmark: bool) {
+/// where only alpha matters). A `mark` is stroked over the dot in the ring's
+/// treatment (the ring color, or a transparent punch on
+/// the template): a check while the server runs, a minus while it is
+/// disabled. Drawn last, so it sits on top.
+fn draw_status_dot(pixmap: &mut Pixmap, dot: Color, ring: Option<Color>, mark: Mark) {
     let s = pixmap.width() as f32;
     let (cx, cy) = (s * 0.70, s * 0.70);
     let dot_r = s * 0.24;
@@ -144,16 +155,16 @@ fn draw_status_dot(pixmap: &mut Pixmap, dot: Color, ring: Option<Color>, checkma
         pixmap.fill_path(&path, &dot_paint, FillRule::Winding, id, None);
     }
 
-    if checkmark {
-        draw_checkmark(pixmap, cx, cy, dot_r, ring);
+    if mark != Mark::None {
+        draw_mark(pixmap, cx, cy, dot_r, ring, mark);
     }
 }
 
-/// Stroke a checkmark centered on the status dot at `(cx, cy)` with radius
-/// `dot_r`. It contrasts against the dot the same way the ring does: the ring's
+/// Stroke a check or a minus centered on the status dot at `(cx, cy)` with
+/// radius `dot_r`. It contrasts against the dot the same way the ring does: the ring's
 /// color on the full-color badge, or a transparent Clear punch on the macOS
 /// template (so the check reads as a cut-out once the OS tints the mask).
-fn draw_checkmark(pixmap: &mut Pixmap, cx: f32, cy: f32, dot_r: f32, ring: Option<Color>) {
+fn draw_mark(pixmap: &mut Pixmap, cx: f32, cy: f32, dot_r: f32, ring: Option<Color>, mark: Mark) {
     let mut check_paint = Paint {
         anti_alias: true,
         ..Paint::default()
@@ -162,11 +173,16 @@ fn draw_checkmark(pixmap: &mut Pixmap, cx: f32, cy: f32, dot_r: f32, ring: Optio
         Some(color) => check_paint.set_color(color),
         None => check_paint.blend_mode = BlendMode::Clear,
     }
-    // A check: left arm down to the low vertex, then up to the long tip.
     let mut pb = PathBuilder::new();
-    pb.move_to(cx - dot_r * 0.45, cy + dot_r * 0.02);
-    pb.line_to(cx - dot_r * 0.10, cy + dot_r * 0.38);
-    pb.line_to(cx + dot_r * 0.50, cy - dot_r * 0.40);
+    if mark == Mark::Check {
+        // Left arm down to the low vertex, then up to the long tip.
+        pb.move_to(cx - dot_r * 0.45, cy + dot_r * 0.02);
+        pb.line_to(cx - dot_r * 0.10, cy + dot_r * 0.38);
+        pb.line_to(cx + dot_r * 0.50, cy - dot_r * 0.40);
+    } else {
+        pb.move_to(cx - dot_r * 0.48, cy);
+        pb.line_to(cx + dot_r * 0.48, cy);
+    }
     if let Some(path) = pb.finish() {
         let stroke = Stroke {
             width: dot_r * 0.30,
@@ -268,6 +284,16 @@ fn to_rgba(pixmap: Pixmap) -> Vec<u8> {
         .collect()
 }
 
+/// The status badge's mark in the given state; `None` without a badge.
+fn mark(state: TrayState) -> Option<Mark> {
+    match state {
+        TrayState::Changing => Some(Mark::None),
+        TrayState::Running => Some(Mark::Check),
+        TrayState::Disabled => Some(Mark::Minus),
+        TrayState::Off | TrayState::Busy | TrayState::Active => None,
+    }
+}
+
 /// RGBA pixels for the tray icon in the given state.
 pub fn tray_rgba(state: TrayState) -> (Vec<u8>, u32, u32) {
     #[cfg(target_os = "macos")]
@@ -276,18 +302,14 @@ pub fn tray_rgba(state: TrayState) -> (Vec<u8>, u32, u32) {
         let alpha = match state {
             TrayState::Active | TrayState::Changing | TrayState::Running => 1.0,
             TrayState::Busy => 0.6,
-            TrayState::Off => 0.35,
+            TrayState::Off | TrayState::Disabled => 0.35,
         };
         let mut pixmap = glyph_only(44, alpha);
-        if matches!(state, TrayState::Changing | TrayState::Running) {
+        if let Some(mark) = mark(state) {
             // Monochrome so the icon stays a crisp template; the transparent
-            // ring/check reads as a gap once the OS tints the mask.
-            draw_status_dot(
-                &mut pixmap,
-                Color::from_rgba8(0, 0, 0, 255),
-                None,
-                state == TrayState::Running,
-            );
+            // ring/mark reads as a gap once the OS tints the mask. A disabled
+            // server's dot stays solid on the dimmed glyph.
+            draw_status_dot(&mut pixmap, Color::from_rgba8(0, 0, 0, 255), None, mark);
         }
         (to_rgba(pixmap), 44, 44)
     }
@@ -296,18 +318,19 @@ pub fn tray_rgba(state: TrayState) -> (Vec<u8>, u32, u32) {
         let (blue, alpha) = match state {
             TrayState::Active | TrayState::Changing | TrayState::Running => (true, 1.0),
             TrayState::Busy => (true, 0.6),
-            TrayState::Off => (false, 1.0),
+            TrayState::Off | TrayState::Disabled => (false, 1.0),
         };
         let mut pixmap = badge(32, blue, alpha);
-        if matches!(state, TrayState::Changing | TrayState::Running) {
-            // Green dot with a white ring to stand out against the blue badge;
-            // a white check on top once the server is running.
-            draw_status_dot(
-                &mut pixmap,
-                Color::from_rgba8(52, 199, 89, 255),
-                Some(Color::from_rgba8(255, 255, 255, 255)),
-                state == TrayState::Running,
-            );
+        if let Some(mark) = mark(state) {
+            // A white-ringed dot to stand out against the badge: green while
+            // starting/stopping (plain) or running (white check), gray with a
+            // white minus on the gray badge while disabled.
+            let dot = if state == TrayState::Disabled {
+                Color::from_rgba8(138, 147, 160, 255)
+            } else {
+                Color::from_rgba8(52, 199, 89, 255)
+            };
+            draw_status_dot(&mut pixmap, dot, Some(Color::from_rgba8(255, 255, 255, 255)), mark);
         }
         (to_rgba(pixmap), 32, 32)
     }
@@ -337,6 +360,7 @@ mod tests {
             TrayState::Active,
             TrayState::Changing,
             TrayState::Running,
+            TrayState::Disabled,
         ];
         let icons: Vec<_> = states.iter().map(|s| tray_rgba(*s).0).collect();
         for (i, a) in icons.iter().enumerate() {

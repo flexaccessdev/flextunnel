@@ -1,6 +1,6 @@
 //! System tray icon + menu: the client connections' aggregate line when there
 //! are any (they are connected from the window, not listed here), then the
-//! server's status line and controls (Start/Stop, Copy Endpoint ID — or "Set
+//! server's status line and controls (Enable/Disable, Copy Endpoint ID — or "Set
 //! Up Server…" while there is none), then the "start at login" checkbox (see
 //! `autostart`). The icon's badge is the server's (see [`tray_state`]). Created
 //! and mutated only on the main thread (from the iced update loop); the
@@ -18,7 +18,7 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 
 pub const MENU_OPEN: &str = "open";
 pub const MENU_QUIT: &str = "quit";
-/// Start or Stop, by the server's phase (see [`server_toggle`]).
+/// Enable or Disable, by whether the server is enabled (see [`server_toggle`]).
 pub const MENU_TOGGLE_SERVER: &str = "toggle-server";
 pub const MENU_COPY_SERVER_ID: &str = "copy-server-id";
 pub const MENU_SET_UP_SERVER: &str = "set-up-server";
@@ -45,6 +45,7 @@ fn server_line(server: Option<(&ServerConfig, &ServerSnapshot)>) -> String {
         return "No server set up".into();
     };
     match snapshot.phase {
+        ServerPhase::Stopped if !server.enabled => "Server disabled".into(),
         ServerPhase::Running => format!(
             "Server running · {}",
             clients_connected(snapshot.connected_clients.len())
@@ -59,14 +60,11 @@ fn server_line(server: Option<(&ServerConfig, &ServerSnapshot)>) -> String {
     }
 }
 
-/// The server toggle's label and whether it is clickable: Stop while it runs
-/// (or starts), Start while it is down and could start.
+/// The server toggle's label and whether it is clickable: Disable while
+/// enabled, Enable while disabled — not while the server is still stopping.
 fn server_toggle(server: &ServerConfig, phase: ServerPhase) -> (&'static str, bool) {
-    match phase {
-        ServerPhase::Starting | ServerPhase::Running => ("Stop Server", true),
-        ServerPhase::Stopping => ("Stop Server", false),
-        ServerPhase::Stopped | ServerPhase::Failed => ("Start Server", server.is_ready()),
-    }
+    let label = if server.enabled { "Disable Server" } else { "Enable Server" };
+    (label, phase != ServerPhase::Stopping)
 }
 
 /// The client connections' aggregate line; `None` without profiles.
@@ -89,18 +87,32 @@ fn connections_line(phases: &[Phase]) -> Option<String> {
     })
 }
 
-/// The icon: the server's state when there is a server (a dot while it starts
-/// or stops, a checkmark while it runs) — client connections never change it
-/// then. An app with client connections only shows whether one is up, by
-/// opacity alone: the badge means the server.
-fn tray_state(server: Option<&ServerSnapshot>, client_phases: &[Phase]) -> TrayState {
+/// The icon: an enabled server's state (a dot while it starts or stops, a
+/// checkmark while it runs) — client connections never change it then.
+/// Without a server, or with a disabled one, the app is client-only, and the
+/// icon shows by opacity alone whether a connection is up (the badge means the
+/// server); a disabled server with no connection up shows a minus.
+fn tray_state(
+    server: Option<(&ServerConfig, &ServerSnapshot)>,
+    client_phases: &[Phase],
+) -> TrayState {
+    let connected = client_phases.contains(&Phase::Connected);
     match server {
-        Some(snapshot) => match snapshot.phase {
+        // Just disabled: shown as stopping until it has.
+        Some((_, snapshot)) if snapshot.phase == ServerPhase::Stopping => TrayState::Changing,
+        Some((server, _)) if !server.enabled => {
+            if connected {
+                TrayState::Active
+            } else {
+                TrayState::Disabled
+            }
+        }
+        Some((_, snapshot)) => match snapshot.phase {
             ServerPhase::Running => TrayState::Running,
             ServerPhase::Starting | ServerPhase::Stopping => TrayState::Changing,
             ServerPhase::Stopped | ServerPhase::Failed => TrayState::Off,
         },
-        None if client_phases.contains(&Phase::Connected) => TrayState::Active,
+        None if connected => TrayState::Active,
         None if client_phases
             .iter()
             .any(|p| matches!(p, Phase::Connecting | Phase::Reconnecting)) =>
@@ -199,7 +211,7 @@ impl Tray {
         let server_status = MenuItem::with_id("server-status", "", false, None);
         menu.append(&server_status)?;
         let server_toggle = if has_server {
-            let toggle = MenuItem::with_id(MENU_TOGGLE_SERVER, "Start Server", false, None);
+            let toggle = MenuItem::with_id(MENU_TOGGLE_SERVER, "Disable Server", false, None);
             menu.append(&toggle)?;
             // The endpoint id is public and known even while stopped, so
             // copying it is always available.
@@ -270,7 +282,7 @@ impl Tray {
             self.synced = None;
         }
 
-        let state = tray_state(server.map(|_| server_snapshot), &phases);
+        let state = tray_state(server.map(|s| (s, server_snapshot)), &phases);
         let key: SyncKey = (
             state,
             server_line(server.map(|s| (s, server_snapshot))),
@@ -324,27 +336,57 @@ mod tests {
         }
     }
 
+    fn server(enabled: bool) -> ServerConfig {
+        ServerConfig {
+            endpoint_id: "e".into(),
+            secret: "s".into(),
+            authorized_clients: Vec::new(),
+            routed_domains: Vec::new(),
+            routed_cidrs: Vec::new(),
+            relay_urls: Vec::new(),
+            relay_auth_token: None,
+            enabled,
+        }
+    }
+
     #[test]
     fn the_icon_follows_the_server_alone() {
+        let on = server(true);
+        let state = |phase, clients, connections: &[Phase]| {
+            tray_state(Some((&on, &snapshot(phase, clients))), connections)
+        };
         let connected = [Phase::Connected, Phase::Failed];
         assert_eq!(
-            tray_state(Some(&snapshot(ServerPhase::Running, 0)), &connected),
+            state(ServerPhase::Running, 0, &connected),
             TrayState::Running,
             "checkmark: running, with or without clients — client connections don't count"
         );
-        assert_eq!(tray_state(Some(&snapshot(ServerPhase::Running, 2)), &[]), TrayState::Running);
+        assert_eq!(state(ServerPhase::Running, 2, &[]), TrayState::Running);
+        assert_eq!(state(ServerPhase::Starting, 0, &connected), TrayState::Changing, "dot");
+        assert_eq!(state(ServerPhase::Stopping, 0, &[]), TrayState::Changing);
         assert_eq!(
-            tray_state(Some(&snapshot(ServerPhase::Starting, 0)), &connected),
-            TrayState::Changing,
-            "dot: starting"
-        );
-        assert_eq!(tray_state(Some(&snapshot(ServerPhase::Stopping, 0)), &[]), TrayState::Changing);
-        assert_eq!(
-            tray_state(Some(&snapshot(ServerPhase::Stopped, 0)), &connected),
+            state(ServerPhase::Stopped, 0, &connected),
             TrayState::Off,
-            "a stopped server dims the icon whatever the connections do"
+            "an enabled server that is down dims the icon whatever the connections do"
         );
-        assert_eq!(tray_state(Some(&snapshot(ServerPhase::Failed, 0)), &[]), TrayState::Off);
+        assert_eq!(state(ServerPhase::Failed, 0, &[]), TrayState::Off);
+    }
+
+    #[test]
+    fn a_disabled_server_is_client_only() {
+        let off = server(false);
+        let state = |phase, connections: &[Phase]| {
+            tray_state(Some((&off, &snapshot(phase, 0))), connections)
+        };
+        assert_eq!(state(ServerPhase::Stopped, &[]), TrayState::Disabled, "minus badge");
+        assert_eq!(state(ServerPhase::Failed, &[Phase::Connecting]), TrayState::Disabled);
+        assert_eq!(
+            state(ServerPhase::Stopped, &[Phase::Connected, Phase::Idle]),
+            TrayState::Active,
+            "a connection up: active, as with no server"
+        );
+        // Just disabled: shown as stopping until it has.
+        assert_eq!(state(ServerPhase::Stopping, &[Phase::Connected]), TrayState::Changing);
     }
 
     #[test]
@@ -358,26 +400,21 @@ mod tests {
     #[test]
     fn status_lines() {
         assert_eq!(server_line(None), "No server set up");
-        let server = ServerConfig {
-            endpoint_id: "e".into(),
-            secret: "s".into(),
-            authorized_clients: Vec::new(),
-            routed_domains: Vec::new(),
-            routed_cidrs: Vec::new(),
-            relay_urls: Vec::new(),
-            relay_auth_token: None,
-        };
+        let on = server(true);
         let stopped = snapshot(ServerPhase::Stopped, 0);
         assert_eq!(
-            server_line(Some((&server, &stopped))),
+            server_line(Some((&on, &stopped))),
             "Server stopped · no clients authorized"
         );
-        assert_eq!(server_toggle(&server, ServerPhase::Stopped), ("Start Server", false));
         assert_eq!(
-            server_line(Some((&server, &snapshot(ServerPhase::Running, 1)))),
+            server_line(Some((&on, &snapshot(ServerPhase::Running, 1)))),
             "Server running · 1 client connected"
         );
-        assert_eq!(server_toggle(&server, ServerPhase::Running), ("Stop Server", true));
+        assert_eq!(server_toggle(&on, ServerPhase::Running), ("Disable Server", true));
+        assert_eq!(server_toggle(&on, ServerPhase::Stopping), ("Disable Server", false));
+        let off = server(false);
+        assert_eq!(server_line(Some((&off, &stopped))), "Server disabled");
+        assert_eq!(server_toggle(&off, ServerPhase::Stopped), ("Enable Server", true));
 
         assert_eq!(connections_line(&[]), None);
         assert_eq!(

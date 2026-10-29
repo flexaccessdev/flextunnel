@@ -508,6 +508,7 @@ fn sidebar_profile_row<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Me
 fn server_row_status(app: &App, server: &ServerConfig) -> String {
     let snapshot = &app.server_snapshot;
     match snapshot.phase {
+        ServerPhase::Stopped if !server.enabled => "disabled".into(),
         ServerPhase::Running => match snapshot.connected_clients.len() {
             0 => "running · no clients".into(),
             n => format!("running · {n} connected"),
@@ -524,7 +525,10 @@ fn sidebar_server_row<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a,
     let selected = app.selection == Selection::Server && !form_open(app);
     let content = column![
         row![
-            dot(server_phase_color(snapshot.phase), 8.0),
+            dot(
+                if server.enabled { server_phase_color(snapshot.phase) } else { GRAY },
+                8.0,
+            ),
             text("This computer").size(13).font(semibold()),
         ]
         .spacing(7)
@@ -1250,13 +1254,17 @@ fn server_detail<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
     let snapshot = &app.server_snapshot;
     let running = snapshot.phase == ServerPhase::Running;
 
+    // A disabled server that has stopped reads as "disabled", not "stopped".
+    let disabled = !server.enabled && snapshot.phase == ServerPhase::Stopped;
+    let (label, color) = if disabled {
+        ("disabled", GRAY)
+    } else {
+        (server_phase_label(snapshot.phase), server_phase_color(snapshot.phase))
+    };
     let mut hero = row![
-        dot(server_phase_color(snapshot.phase), 12.0),
+        dot(color, 12.0),
         text("Server").size(20).font(semibold()),
-        pill(
-            server_phase_label(snapshot.phase).to_string(),
-            server_phase_color(snapshot.phase)
-        ),
+        pill(label.to_string(), color),
     ]
     .spacing(10)
     .align_y(Center);
@@ -1272,24 +1280,28 @@ fn server_detail<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
         );
     }
     hero = hero.push(space().width(Fill));
-    hero = hero.push(match snapshot.phase {
-        // Clickable even when the server can't start yet: Start then opens
-        // what is missing (see `App::start_server`).
-        ServerPhase::Stopped | ServerPhase::Failed => {
-            button(text("Start").size(13).font(semibold()))
-                .padding([7, 16])
+    // An enabled server that is down — it failed, or was missing something —
+    // can be tried again; Start opens what is missing (see `App::start_server`).
+    if server.enabled && matches!(snapshot.phase, ServerPhase::Stopped | ServerPhase::Failed) {
+        let label = if snapshot.phase == ServerPhase::Failed { "Retry" } else { "Start" };
+        hero = hero.push(
+            button(text(label).size(13).font(semibold()))
+                .padding([6, 14])
                 .style(style::primary)
-                .on_press(Message::StartServer)
-        }
-        // Stopping: the endpoint is closing; Start comes back when it's done.
-        ServerPhase::Stopping => button(text("Stopping…").size(13))
-            .padding([7, 16])
-            .style(style::outlined),
-        ServerPhase::Starting | ServerPhase::Running => button(text("Stop").size(13))
-            .padding([7, 16])
-            .style(style::outlined)
-            .on_press(Message::StopServer),
-    });
+                .on_press(Message::RetryServer),
+        );
+    }
+    // Enabled is the persisted intent: a disabled server stays stopped across
+    // launches. Not switchable while the endpoint is still closing.
+    let mut switch = toggler(server.enabled)
+        .label("Enabled")
+        .text_size(13)
+        .size(20)
+        .style(style::switch);
+    if snapshot.phase != ServerPhase::Stopping {
+        switch = switch.on_toggle(Message::SetServerEnabled);
+    }
+    hero = hero.push(switch);
 
     let mut col = column![hero].spacing(12);
     if let Some(notice) = &app.notice {
@@ -1300,6 +1312,7 @@ fn server_detail<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
     }
     if let Some(blocker) = server.start_blocker()
         && !running
+        && server.enabled
     {
         col = col.push(
             container(row![dot(AMBER, 8.0), text(blocker).size(12)].spacing(8).align_y(Center))
@@ -1330,37 +1343,14 @@ fn server_detail<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
     }
 
     // The endpoint id is what clients need, so it leads: in full (it is
-    // public), with a prominent Copy.
+    // public), selectable, with a prominent Copy — and with it the identity
+    // behind it, exported or replaced right here.
     col = col.push(section_label("ENDPOINT ID"));
     col = col.push(
-        container(
-            column![
-                row![
-                    text(server.endpoint_id.as_str())
-                        .size(14)
-                        .font(Font::MONOSPACE)
-                        .wrapping(text::Wrapping::Glyph)
-                        .width(Fill),
-                    button(text("Copy").size(12).font(semibold()))
-                        .padding([5, 14])
-                        .style(style::tinted)
-                        .on_press(Message::CopyText(server.endpoint_id.clone())),
-                ]
-                .spacing(12)
-                .align_y(Center),
-                text(
-                    "Share this with your clients: they enter it as the server node id \
-                     when adding a connection. It is public — the identity key behind it \
-                     never leaves this computer."
-                )
-                .size(11)
-                .style(style::faint_text),
-            ]
-            .spacing(8),
-        )
-        .padding([12, 14])
-        .width(Fill)
-        .style(style::card),
+        container(endpoint_card(app, server))
+            .padding([12, 14])
+            .width(Fill)
+            .style(style::card),
     );
 
     col = col.push(
@@ -1448,9 +1438,6 @@ fn server_detail<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
     tunnel = tunnel.push(space().height(4));
     tunnel = tunnel.push(info_row("Relays", relays, None));
     col = col.push(container(tunnel).padding([12, 14]).width(Fill).style(style::card));
-
-    col = col.push(section_label("IDENTITY"));
-    col = col.push(identity_card(app, server));
 
     col = col.push(
         text(
@@ -1601,53 +1588,82 @@ fn client_form_view<'a>(
     container(col).padding([12, 14]).width(Fill).style(style::card).into()
 }
 
-/// The identity: the secret behind the endpoint id, never shown. It can be
-/// copied out (two clicks) to move the server, or replaced — a new endpoint
-/// id, so clients must be told — through [`identity_form_view`].
-fn identity_card<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Message> {
-    let mut col = column![].spacing(10);
+/// The endpoint id in full, then the identity behind it: the secret, never
+/// shown, which can be copied out (two clicks) to move the server, or
+/// replaced — a new endpoint id, so clients must be told — through
+/// [`identity_form_view`], opened in place.
+fn endpoint_card<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Message> {
+    let mut col = column![
+        endpoint_field(&server.endpoint_id),
+        text(
+            "Share this with your clients: they enter it as the server node id when \
+             adding a connection. It is public — the identity key behind it is sealed in \
+             the system keychain and never shown.",
+        )
+        .size(11)
+        .style(style::faint_text),
+    ]
+    .spacing(10);
     if let Some(identity) = &app.identity_form {
+        col = col.push(space().height(2));
         col = col.push(identity_form_view(server, identity));
-    } else {
-        let lost = server.secret.is_empty();
-        col = col.push(if lost {
+        return col.into();
+    }
+    let lost = server.secret.is_empty();
+    if lost {
+        col = col.push(
             text(
                 "The identity key is missing from the keychain. Import it to start the \
-                 server again with the same endpoint id.",
+                 server again with this endpoint id.",
             )
             .size(12)
-            .color(AMBER)
-        } else {
-            text(
-                "The identity key is the secret behind the endpoint id. It is sealed in \
-                 the system keychain and never shown.",
-            )
-            .size(12)
-            .style(style::dim_text)
-        });
-        let exporting = app.confirm_export_server_secret;
-        col = col.push(
-            row![
-                button(
-                    text(if exporting {
-                        "Click again to copy the key"
-                    } else {
-                        "Export key…"
-                    })
-                    .size(12)
-                )
-                .padding([4, 12])
-                .style(style::outlined)
-                .on_press_maybe((!lost).then_some(Message::ExportServerSecret)),
-                button(text(if lost { "Import key…" } else { "Replace identity…" }).size(12))
-                    .padding([4, 12])
-                    .style(style::outlined)
-                    .on_press(Message::ReplaceIdentity),
-            ]
-            .spacing(8),
+            .color(AMBER),
         );
     }
-    container(col).padding([12, 14]).width(Fill).style(style::card).into()
+    let exporting = app.confirm_export_server_secret;
+    col = col.push(
+        row![
+            button(text(if lost { "Import key…" } else { "Replace identity…" }).size(12))
+                .padding([4, 12])
+                .style(style::outlined)
+                .on_press(Message::ReplaceIdentity),
+            button(
+                text(if exporting {
+                    "Click again to copy the key"
+                } else {
+                    "Export key…"
+                })
+                .size(12)
+            )
+            .padding([4, 12])
+            .style(style::outlined)
+            .on_press_maybe((!lost).then_some(Message::ExportServerSecret)),
+        ]
+        .spacing(8),
+    );
+    col.into()
+}
+
+/// An endpoint id in full, in a read-only field — iced text can't be
+/// selected, so this is what lets it be selected and copied by hand — with a
+/// Copy button.
+fn endpoint_field<'a>(endpoint_id: &str) -> Element<'a, Message> {
+    row![
+        text_input("", endpoint_id)
+            .on_input(|_| Message::ReadOnlyEdited)
+            .font(Font::MONOSPACE)
+            .size(12)
+            .padding([6, 10])
+            .style(style::input)
+            .width(Fill),
+        button(text("Copy").size(12).font(semibold()))
+            .padding([5, 14])
+            .style(style::tinted)
+            .on_press(Message::CopyText(endpoint_id.to_owned())),
+    ]
+    .spacing(10)
+    .align_y(Center)
+    .into()
 }
 
 /// Two side-by-side choices, the picked one tinted.
@@ -1693,15 +1709,14 @@ fn identity_picker<'a>(
     }
     match identity.resolve() {
         Ok((_, endpoint_id)) => {
-            col = col.push(form_row(
-                "Endpoint id",
-                row![
-                    text(truncate_middle(&endpoint_id, 34)).size(12).font(Font::MONOSPACE),
-                    copy_button(endpoint_id),
+            // Its own full-width line, so all 64 characters fit.
+            col = col.push(
+                column![
+                    text("Endpoint id").size(12).style(style::dim_text),
+                    endpoint_field(&endpoint_id),
                 ]
-                .spacing(8)
-                .align_y(Center),
-            ));
+                .spacing(6),
+            );
         }
         Err(message) => {
             if identity.import.as_deref().is_some_and(|s| !s.trim().is_empty()) {
@@ -1766,29 +1781,82 @@ fn identity_form_view<'a>(
 }
 
 fn server_form_view<'a>(app: &'a App, form: &'a ServerForm) -> Element<'a, Message> {
-    let validated = form.validate(app.server.as_ref());
+    // Setup or settings, by whether the server has an identity yet.
+    let (label, card, note) = match &form.identity {
+        Some(identity) => (
+            "SET UP SERVER",
+            server_setup_card(app, identity),
+            "The identity is the server's permanent address: clients connect to its \
+             endpoint id. Next you authorize the clients; the tunnel set and relays \
+             can be changed any time.",
+        ),
+        None => (
+            "TUNNEL SET & RELAYS",
+            server_settings_card(app, form),
+            "The tunnel set decides what else clients may reach through this server; \
+             both lists are optional, since flextunnel.internal (the status page) and \
+             localhost.flextunnel.internal (this machine's localhost) are always \
+             routed. Clients are authorized on the server pane.",
+        ),
+    };
+    scrollable(
+        column![
+            section_label(label),
+            container(card).padding([12, 14]).width(Fill).style(style::card),
+            text(note).size(11).style(style::faint_text),
+        ]
+        .spacing(10)
+        .padding([0, 4]),
+    )
+    .height(Fill)
+    .spacing(4)
+    .into()
+}
 
-    let mut card = column![].spacing(10);
-    if let Some(identity) = &form.identity {
-        card = card.push(identity_picker(
+/// Setup: the identity alone — a new one, or one imported to move a server
+/// here — then Create server.
+fn server_setup_card<'a>(app: &'a App, identity: &'a IdentityChoice) -> Element<'a, Message> {
+    let mut card = column![
+        identity_picker(
             identity,
             Message::ServerImportToggled,
             Message::ServerImportSecretChanged,
-        ));
-        card = card.push(
-            text(if identity.import.is_some() {
-                "Moving a server here: paste the identity key exported from the other \
-                 computer (or the secret line of a `flextunnel generate-iroh-key` file), \
-                 so its clients keep their endpoint id. Then stop the old server."
-            } else {
-                "A new identity for this computer. Clients will connect to this endpoint \
-                 id; its key stays sealed in the system keychain."
-            })
-            .size(11)
-            .style(style::faint_text),
-        );
-        card = card.push(space().height(4));
+        ),
+        text(if identity.import.is_some() {
+            "Moving a server here: paste the identity key exported from the other \
+             computer (or the secret line of a `flextunnel generate-iroh-key` file), so \
+             its clients keep their endpoint id. Then stop the old server."
+        } else {
+            "A new identity for this computer. Its key stays sealed in the system \
+             keychain."
+        })
+        .size(11)
+        .style(style::faint_text),
+    ]
+    .spacing(10);
+    let mut buttons = row![
+        button(text("Create server").size(13).font(semibold()))
+            .padding([6, 16])
+            .style(style::primary)
+            .on_press_maybe(identity.resolve().is_ok().then_some(Message::ServerFormSave)),
+        button(text("Cancel").size(13))
+            .padding([6, 16])
+            .style(style::outlined)
+            .on_press(Message::ServerFormCancel),
+    ]
+    .spacing(8)
+    .align_y(Center);
+    if let Some(notice) = &app.notice {
+        buttons = buttons.push(text(notice.as_str()).size(12).style(style::dim_text));
     }
+    card = card.push(buttons);
+    card.into()
+}
+
+/// The existing server's tunnel set and relays.
+fn server_settings_card<'a>(app: &'a App, form: &'a ServerForm) -> Element<'a, Message> {
+    let validated = form.validate(app.server.as_ref());
+    let mut card = column![].spacing(10);
     card = card.extend([
         form_row(
             "Routed domains",
@@ -1825,16 +1893,11 @@ fn server_form_view<'a>(app: &'a App, form: &'a ServerForm) -> Element<'a, Messa
             .width(240),
         ),
     ]);
-
-    // An identity that doesn't resolve is the picker's to explain.
-    let identity_unresolved = form.identity.as_ref().is_some_and(|i| i.resolve().is_err());
-    if let Err(message) = &validated
-        && !identity_unresolved
-    {
+    if let Err(message) = &validated {
         card = card.push(text(message.clone()).size(12).color(AMBER));
     }
     let mut buttons = row![
-        button(text(if form.is_edit() { "Save" } else { "Create server" }).size(13).font(semibold()))
+        button(text("Save").size(13).font(semibold()))
             .padding([6, 16])
             .style(style::primary)
             .on_press_maybe(validated.is_ok().then_some(Message::ServerFormSave)),
@@ -1849,30 +1912,7 @@ fn server_form_view<'a>(app: &'a App, form: &'a ServerForm) -> Element<'a, Messa
         buttons = buttons.push(text(notice.as_str()).size(12).style(style::dim_text));
     }
     card = card.push(buttons);
-
-    scrollable(
-        column![
-            section_label(if form.is_edit() {
-                "TUNNEL SET & RELAYS"
-            } else {
-                "SET UP SERVER"
-            }),
-            container(card).padding([12, 14]).width(Fill).style(style::card),
-            text(
-                "The tunnel set decides what else clients may reach through this server; \
-                 both lists are optional, since flextunnel.internal (the status page) and \
-                 localhost.flextunnel.internal (this machine's localhost) are always \
-                 routed. Clients are authorized on the server pane.",
-            )
-            .size(11)
-            .style(style::faint_text),
-        ]
-        .spacing(10)
-        .padding([0, 4]),
-    )
-    .height(Fill)
-    .spacing(4)
-    .into()
+    card.into()
 }
 
 // ---------------------------------------------------------------------------
