@@ -1779,11 +1779,12 @@ impl App {
 
     /// Start the server if it is enabled, down, and can start: at launch, and
     /// after a change that may have made it startable — the first client
-    /// authorized, a lost identity re-imported.
+    /// authorized, a lost identity re-imported. A server still stopping (its
+    /// last client just removed) gets the start queued behind the stop.
     fn resume_server(&mut self) {
         let down = matches!(
             self.controller.server_snapshot().phase,
-            ServerPhase::Stopped | ServerPhase::Failed
+            ServerPhase::Stopped | ServerPhase::Failed | ServerPhase::Stopping
         );
         if down
             && let Some(server) = self
@@ -1933,13 +1934,11 @@ impl App {
         self.notice = None;
         self.persist_store();
         // A revocation can't wait for a restart: the running server still
-        // lets the removed client in. Restart it without the client, or stop
-        // it when no client is left (it starts again once one is added).
-        if matches!(
-            self.controller.server_snapshot().phase,
-            ServerPhase::Starting | ServerPhase::Running
-        ) && let Some(server) = self.server.clone()
-        {
+        // lets the removed client in. Restart it without the client — which
+        // also replaces a restart already in flight — or stop it when no
+        // client is left (it starts again once one is added). The supervisor
+        // leaves a server that is not running alone.
+        if let Some(server) = self.server.clone().filter(|s| s.enabled) {
             if server.is_ready() {
                 self.controller.restart_server(server.clone());
                 self.server_applied = Some(server);

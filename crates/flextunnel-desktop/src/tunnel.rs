@@ -93,8 +93,10 @@ enum Command {
     QueryConnPath(ProfileId, std::sync::mpsc::Sender<ConnectionSnapshot>),
     /// Start the server session (its identity secret travels inside).
     StartServer(Box<ServerConfig>),
-    /// Stop the running server (if any) and start this config once it has
-    /// stopped — how changed settings are applied.
+    /// Stop the running server and start this config once it has stopped —
+    /// how changed settings are applied. A restart already waiting for its
+    /// stop takes this newer config instead; a server that is not running, or
+    /// is stopping for good, is left alone.
     RestartServer(Box<ServerConfig>),
     StopServer,
     /// Stop the server and reset its snapshot once it has stopped (the
@@ -377,12 +379,20 @@ async fn run_loop(
                 }
             }
             Some(Command::RestartServer(config)) => match &server {
+                // Decided here rather than from the UI's snapshot, which reads
+                // Stopped between a restart's two sessions: a change made
+                // meanwhile (a client revoked) must still reach the new one.
+                Some(_) if stopping => {
+                    if pending_start.is_some() {
+                        pending_start = Some(*config);
+                    }
+                }
                 Some(handle) => {
                     let _ = handle.tx.send(ServerCmd::Stop).await;
                     stopping = true;
                     pending_start = Some(*config);
                 }
-                None => server = server_session::spawn_server(*config, &server_shared),
+                None => {}
             },
             Some(Command::StopServer) => {
                 // Also calls off a restart that is waiting for the old stop.
