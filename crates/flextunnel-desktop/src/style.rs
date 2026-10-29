@@ -239,6 +239,17 @@ pub fn banner(color: Color) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
+/// A numbered step's round badge: the number in accent on an accent tint.
+pub fn step(theme: &Theme) -> container::Style {
+    let accent = tokens(theme).accent;
+    container::Style {
+        background: Some(accent.scale_alpha(0.15).into()),
+        text_color: Some(accent),
+        border: border::rounded(999),
+        ..container::Style::default()
+    }
+}
+
 /// Solid round status dot.
 pub fn dot(color: Color) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {

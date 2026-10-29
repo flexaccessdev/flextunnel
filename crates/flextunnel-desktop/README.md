@@ -24,9 +24,10 @@ window loses nothing — the tray owns the lifecycle and re-opens it on demand.
 
 ## First launch
 
-With nothing set up, the window opens on a short intro of both roles with a
-single *Continue*: there is no role to pick. Either is then set up from the
-sidebar whenever wanted — "+" next to Connections, or "Set up server…".
+With nothing set up, the window opens with nothing selected, pointing at the
+sidebar: there is no role to pick. Either is set up from there whenever wanted
+— "+" next to Connections, or "Set up server…", which opens the server's
+welcome first.
 
 ## Client connections
 
@@ -55,10 +56,13 @@ its own **server-direct port forwards**. Connecting is always manual.
 ## The server
 
 The app hosts one server per user — the per-user server lock is shared with the
-CLI, so a `flextunnel server` running on the same account counts too. Setup
-is one step, the identity — a fresh one generated, or an existing one imported
-to move a server here, either way showing the endpoint id it gives — then
-*Create server* goes straight on to authorizing the first client.
+CLI, so a `flextunnel server` running on the same account counts too. Until
+one is set up, "Set up server…" (in the sidebar or the tray) opens a welcome:
+what a server is for and the three steps ahead — an identity, authorized
+clients, what they reach — with *Set up server* and *Move a server here…*.
+Setup is then one step, the identity — a fresh one generated, or an existing
+one imported to move a server here, either way showing the endpoint id it
+gives — and *Create server* goes straight on to authorizing the first client.
 
 - **Enabled** — the server's only on/off control: a switch in the server
   pane (and *Enable/Disable Server* in the tray); there is no separate
@@ -81,7 +85,9 @@ to move a server here, either way showing the endpoint id it gives — then
   imports another, warning first that clients must then switch to the new
   endpoint id, and *Export key…* copies it to the clipboard (two clicks) to move
   the server to another computer. If the keychain loses it, the same place
-  imports it back.
+  offers both ways on: *Import key…* to restore it and keep the endpoint id,
+  or *Generate new identity…* when it is gone for good (clients then switch to
+  the new endpoint id).
 - **Tunnel set & relays** — the routed domains/CIDRs pushed to clients and
   enforced here, plus custom relays; optional, and edited any time.
 - **Restart to apply** — the server runs with the settings it started with;
@@ -100,7 +106,7 @@ dimmed while it is down, a **dot** while it is starting or stopping, and a
 and the server pane); client connections don't change it then. Without a
 server, or with a disabled one, the app is client-only: the icon is at full
 strength (dark on macOS) while a connection is up and dimmed otherwise, with no
-badge — except a **minus** for a disabled server while no connection is up.
+badge — except an **empty circle** for a disabled server while no connection is up.
 
 - **Live logs** — an in-app Logs pane; every session's log lines (core
   internals included) are attributed to the server or their profile.
@@ -127,7 +133,12 @@ the one entry kept in the system keychain (**macOS Keychain** or the **Windows
 Credential Manager**), named "Flextunnel Safe Storage". The sealed secrets
 carry a format version: an update that changes what is sealed bumps it, and
 then starts every secret fresh — re-enter the auth-key secrets, the server
-identity and the relay tokens — rather than loading some and not others.
+identity and the relay tokens — rather than loading some and not others. Either
+way — and when the keychain entry was deleted or replaced so the master key no
+longer opens them, or when the settings can't be loaded at all (the keychain
+can't be read, or `profiles.json` is unreadable) — the app first asks: *Quit*
+leaves what is on disk untouched (for the older build, or for once the cause is
+fixed), *Start fresh* drops it for good. Nothing is saved until then.
 
 > **Development escape hatch:** setting `FLEXTUNNEL_DEV_CONFIG` (to `1` or to an
 > explicit file path) stores everything, tokens included, in a single plaintext

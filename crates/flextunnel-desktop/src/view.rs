@@ -1,12 +1,12 @@
 //! Widget tree for the sidebar (the client connections, then the server) +
-//! detail-pane window (or the first-run intro), rendered from
+//! detail-pane window, rendered from
 //! [`App`] state — all pure functions of `&App`, every mutation flows back
 //! through a [`Message`]. The look (cards, pills, ghost buttons, sidebar rows)
 //! comes from the design system in [`crate::style`].
 
 use crate::app::{
     format_duration, App, ClientForm, ForwardForm, IdentityChoice, KeyChoice, KeyForm, LogFilter,
-    Message, ProfileForm, Selection, ServerForm,
+    Message, ProfileForm, Selection, ServerForm, StoreReset,
 };
 use crate::config::{self, AuthKey, AuthorizedClient, Profile, ServerConfig};
 use crate::server_session::ServerPhase;
@@ -143,15 +143,11 @@ fn phase_label(phase: Phase) -> &'static str {
 }
 
 pub fn root(app: &App) -> Element<'_, Message> {
-    let base: Element<'_, Message> = if app.intro {
-        intro()
-    } else {
-        row![sidebar(app), detail_pane(app)].into()
-    };
+    let base: Element<'_, Message> = row![sidebar(app), detail_pane(app)].into();
     // The reset warning must be answered, so it sits above everything and
     // its backdrop does nothing.
-    if let Some(version) = app.secrets_reset_from {
-        return modal(base, secrets_reset_modal(version), None);
+    if let Some(reset) = &app.store_reset {
+        return modal(base, store_reset_modal(reset), None);
     }
     match &app.conn_path_modal {
         Some(snapshot) => {
@@ -159,44 +155,6 @@ pub fn root(app: &App) -> Element<'_, Message> {
         }
         None => base,
     }
-}
-
-/// The first-run intro: what the app does — its two roles, side by side and
-/// neither required — and one way on, into the window, where both are set up
-/// from the sidebar. Not a choice that has to be made here.
-fn intro() -> Element<'static, Message> {
-    let role = |name: &'static str, body: &'static str| {
-        column![
-            text(name).size(14).font(semibold()),
-            text(body).size(13).style(style::dim_text),
-        ]
-        .spacing(3)
-    };
-    let col = column![
-        text("Welcome to flextunnel").size(22).font(semibold()),
-        text("flextunnel does two things. Use either one, or both:").size(13),
-        role(
-            "Connections",
-            "Reach flextunnel servers elsewhere from this computer, through local \
-             proxies and port forwards — as many servers as you like.",
-        ),
-        role(
-            "Server",
-            "Let your other devices reach this computer, and the network it is on, \
-             from anywhere.",
-        ),
-        text("Both are set up from the sidebar, any time.")
-            .size(12)
-            .style(style::faint_text),
-        space().height(6),
-        button(text("Continue").size(13).font(semibold()))
-            .padding([7, 20])
-            .style(style::primary)
-            .on_press(Message::IntroContinue),
-    ]
-    .spacing(10)
-    .max_width(520);
-    center(col).padding(24).into()
 }
 
 /// Overlay `content`, centered on a dimmed backdrop, as a stack layer above
@@ -218,27 +176,58 @@ fn modal<'a>(
     stack![base.into(), opaque(backdrop)].into()
 }
 
-/// The startup warning when this build cannot read the stored secrets'
-/// sealed format (`version` is the one they were sealed under): quit with
-/// them left on disk, or start fresh and re-enter them.
-fn secrets_reset_modal<'a>(version: u32) -> Element<'a, Message> {
-    let sealed_by = match version {
-        0 => "an earlier version of flextunnel".to_string(),
-        v => format!("format version {v}"),
+/// The store reset warning (see [`App::store_reset`]): what could not be
+/// read and why, then quit with it left on disk, or start fresh without it.
+fn store_reset_modal(reset: &StoreReset) -> Element<'_, Message> {
+    const SECRETS: &str = "The auth-key secrets, the server identity key and the relay auth \
+                           tokens will all be empty and must be re-entered.";
+    let (title, why, keep, lost) = match reset {
+        StoreReset::Version(version) => {
+            let sealed_by = match version {
+                0 => "an earlier version of flextunnel".to_string(),
+                v => format!("format version {v}"),
+            };
+            (
+                "Saved secrets can't be read",
+                format!(
+                    "Your secrets were saved by {sealed_by}, which this version stores \
+                     differently. {SECRETS}"
+                ),
+                "the previous version of flextunnel can still read them, for example to \
+                 export the keys first.",
+                "deletes them",
+            )
+        }
+        StoreReset::Unsealable => (
+            "Saved secrets can't be read",
+            format!(
+                "Your secrets are sealed in profiles.json under a master key kept in the \
+                 system keychain (\"Flextunnel Safe Storage\"), and the key there no \
+                 longer opens them: the entry was deleted or replaced. {SECRETS}"
+            ),
+            "they open again once the original keychain entry is restored, for example \
+             from a backup.",
+            "deletes them",
+        ),
+        StoreReset::Unreadable(error) => (
+            "Saved settings can't be read",
+            format!(
+                "flextunnel couldn't load its settings: {error}. It is running with none: \
+                 no connections, keys or server."
+            ),
+            "fix the cause (for example, allow flextunnel to read its \"Flextunnel Safe \
+             Storage\" keychain entry) and open flextunnel again.",
+            "replaces them with empty settings, deleting every connection, key and the \
+             server",
+        ),
     };
     let card = column![
-        text("Saved secrets can't be read").size(15).font(semibold()),
+        text(title).size(15).font(semibold()),
+        text(why).size(12),
         text(format!(
-            "Your secrets were saved by {sealed_by}, which this version stores \
-             differently. The auth-key secrets, the server identity key and the \
-             relay auth tokens will all be empty and must be re-entered."
+            "Quit now to leave them on disk untouched — {keep} Starting fresh {lost} for \
+             good."
         ))
-        .size(12),
-        text(
-            "Quit now to leave them on disk untouched — the previous version of \
-             flextunnel can still read them, for example to export the keys first. \
-             Starting fresh deletes them for good."
-        )
         .size(12)
         .color(AMBER),
         row![
@@ -246,11 +235,11 @@ fn secrets_reset_modal<'a>(version: u32) -> Element<'a, Message> {
             button(text("Quit").size(12))
                 .padding([5, 14])
                 .style(style::ghost)
-                .on_press(Message::SecretsResetQuit),
+                .on_press(Message::StoreResetQuit),
             button(text("Start fresh").size(12))
                 .padding([5, 14])
                 .style(style::primary)
-                .on_press(Message::SecretsResetContinue),
+                .on_press(Message::StoreResetContinue),
         ]
         .spacing(8)
         .align_y(Center),
@@ -384,12 +373,16 @@ fn sidebar(app: &App) -> Element<'_, Message> {
     }
     list = list.push(space().height(10));
     list = list.push(section_label("SERVER"));
+    // Unset, the slot leads to the server's welcome, and stays selected
+    // through the setup form it opens.
+    let welcome_selected = app.server_form.is_some()
+        || (app.selection == Selection::Server && app.profile_form.is_none());
     list = list.push(match &app.server {
         Some(server) => sidebar_server_row(app, server),
         None => button(text("Set up server…").size(13).style(style::dim_text))
             .padding([6, 10])
             .width(Fill)
-            .style(style::sidebar_row(app.server_form.is_some()))
+            .style(style::sidebar_row(welcome_selected))
             .on_press(Message::SetUpServer)
             .into(),
     });
@@ -563,6 +556,7 @@ fn detail_pane(app: &App) -> Element<'_, Message> {
         server_form_view(app, form)
     } else {
         match &app.selection {
+            Selection::Empty => empty_state(),
             Selection::Keys => keys_pane(app),
             Selection::Logs => logs_pane(app),
             Selection::Profile(id) => match app.profile(id) {
@@ -571,7 +565,7 @@ fn detail_pane(app: &App) -> Element<'_, Message> {
             },
             Selection::Server => match &app.server {
                 Some(server) => server_detail(app, server),
-                None => empty_state(),
+                None => server_welcome(),
             },
         }
     };
@@ -1250,6 +1244,85 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
 // ---------------------------------------------------------------------------
 // Server
 
+/// No server yet: what one is for and how setup goes, then the two ways in —
+/// a new server, or one moved here from another computer (its identity
+/// imported, so its clients need no change).
+fn server_welcome() -> Element<'static, Message> {
+    let step = |n: &'static str, title: &'static str, body: &'static str| {
+        row![
+            container(text(n).size(12).font(semibold()))
+                .width(24)
+                .height(24)
+                .align_x(Center)
+                .align_y(Center)
+                .style(style::step),
+            column![
+                text(title).size(13).font(semibold()),
+                text(body).size(12).style(style::dim_text),
+            ]
+            .spacing(2),
+        ]
+        .spacing(12)
+    };
+    let steps = column![
+        step(
+            "1",
+            "An identity",
+            "This computer gets a permanent endpoint id — the address clients enter when \
+             adding a connection. Its key is sealed in profiles.json under a master \
+             key kept in the system keychain.",
+        ),
+        step(
+            "2",
+            "Authorized clients",
+            "Only the devices you authorize can connect: each has an auth key (in the \
+             flextunnel app: Keys), whose public half you add here. The server starts \
+             with the first one.",
+        ),
+        step(
+            "3",
+            "What clients reach",
+            "This computer's localhost always. Optionally more — domains or networks \
+             reachable from here (the tunnel set), changeable any time.",
+        ),
+    ]
+    .spacing(14);
+    let col = column![
+        text("Run a server on this computer").size(20).font(semibold()),
+        text(
+            "Let your other devices — a laptop, a phone — reach this computer, and the \
+             network it is on, from anywhere. Nothing to open on your router: devices \
+             connect directly when they can, through a relay when they can't.",
+        )
+        .size(13),
+        space().height(4),
+        section_label("HOW IT WORKS"),
+        container(steps).padding([14, 16]).width(Fill).style(style::card),
+        space().height(4),
+        row![
+            button(text("Set up server").size(13).font(semibold()))
+                .padding([7, 20])
+                .style(style::primary)
+                .on_press(Message::BeginServerSetup(false)),
+            button(text("Move a server here…").size(13))
+                .padding([7, 16])
+                .style(style::outlined)
+                .on_press(Message::BeginServerSetup(true)),
+        ]
+        .spacing(8),
+        text(
+            "Moving a server from another computer? Import its identity key to keep its \
+             endpoint id, so its clients need no change. One server runs per user — a CLI \
+             `flextunnel server` on this account counts too.",
+        )
+        .size(11)
+        .style(style::faint_text),
+    ]
+    .spacing(10)
+    .max_width(560);
+    scrollable(container(col).center_x(Fill).padding([8, 4])).height(Fill).spacing(4).into()
+}
+
 fn server_detail<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Message> {
     let snapshot = &app.server_snapshot;
     let running = snapshot.phase == ServerPhase::Running;
@@ -1593,7 +1666,8 @@ fn endpoint_card<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
         text(
             "Share this with your clients: they enter it as the server node id when \
              adding a connection. It is public — the identity key behind it is sealed in \
-             the system keychain and never shown.",
+             profiles.json under a master key kept in the system keychain, and never \
+             shown.",
         )
         .size(11)
         .style(style::faint_text),
@@ -1604,24 +1678,47 @@ fn endpoint_card<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
         col = col.push(identity_form_view(server, identity));
         return col.into();
     }
-    let lost = server.secret.is_empty();
-    if lost {
+    // A lost key leaves two ways on, side by side: import it (from an export,
+    // or the other computer it was moved from) to keep this endpoint id, or
+    // start over with a new identity when it is gone for good.
+    if server.secret.is_empty() {
         col = col.push(
-            text(
-                "The identity key is missing from the keychain. Import it to start the \
-                 server again with this endpoint id.",
+            container(
+                column![
+                    text("The identity key is missing from the keychain").size(12).font(semibold()),
+                    text(
+                        "Import it, if you exported it, to keep this endpoint id. Otherwise \
+                         generate a new identity: every client must then switch to the new \
+                         endpoint id.",
+                    )
+                    .size(12),
+                    row![
+                        button(text("Import key…").size(12).font(semibold()))
+                            .padding([4, 12])
+                            .style(style::tinted)
+                            .on_press(Message::ReplaceIdentity(true)),
+                        button(text("Generate new identity…").size(12))
+                            .padding([4, 12])
+                            .style(style::outlined)
+                            .on_press(Message::ReplaceIdentity(false)),
+                    ]
+                    .spacing(8),
+                ]
+                .spacing(8),
             )
-            .size(12)
-            .color(AMBER),
+            .padding([10, 12])
+            .width(Fill)
+            .style(style::banner(AMBER)),
         );
+        return col.into();
     }
     let exporting = app.confirm_export_server_secret;
     col = col.push(
         row![
-            button(text(if lost { "Import key…" } else { "Replace identity…" }).size(12))
+            button(text("Replace identity…").size(12))
                 .padding([4, 12])
                 .style(style::outlined)
-                .on_press(Message::ReplaceIdentity),
+                .on_press(Message::ReplaceIdentity(false)),
             button(
                 text(if exporting {
                     "Click again to copy the key"
@@ -1632,7 +1729,7 @@ fn endpoint_card<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
             )
             .padding([4, 12])
             .style(style::outlined)
-            .on_press_maybe((!lost).then_some(Message::ExportServerSecret)),
+            .on_press(Message::ExportServerSecret),
         ]
         .spacing(8),
     );
@@ -1728,7 +1825,11 @@ fn identity_form_view<'a>(
 ) -> Element<'a, Message> {
     let resolved = identity.resolve();
     let mut col = column![
-        text(if server.secret.is_empty() { "Import the identity key" } else { "Replace identity" })
+        text(match (server.secret.is_empty(), identity.import.is_some()) {
+            (true, true) => "Restore the identity key",
+            (true, false) => "Start over with a new identity",
+            (false, _) => "Replace identity",
+        })
             .size(13)
             .font(semibold()),
         identity_picker(identity, Message::IdentityImportToggled, Message::IdentitySecretChanged),
@@ -1822,8 +1923,8 @@ fn server_setup_card<'a>(app: &'a App, identity: &'a IdentityChoice) -> Element<
              computer (or the secret line of a `flextunnel generate-iroh-key` file), so \
              its clients keep their endpoint id. Then stop the old server."
         } else {
-            "A new identity for this computer. Its key stays sealed in the system \
-             keychain."
+            "A new identity for this computer. Its key is sealed in profiles.json under \
+             a master key kept in the system keychain."
         })
         .size(11)
         .style(style::faint_text),
