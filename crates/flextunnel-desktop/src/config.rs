@@ -6,12 +6,14 @@
 //! server ids, ports, forwards, the server's tunnel set and authorized keys)
 //! lives in a plaintext `profiles.json` under the local data dir — same
 //! treatment as the iOS app's `forwards.json`. The secrets (auth-key secret
-//! halves and the server's identity key) ride in the same file, sealed the way
+//! halves, the server's identity key, and the profiles' and server's custom
+//! relay auth tokens) ride in the same file, sealed the way
 //! Chrome/Slack/Notion store their secrets: a single keychain entry
 //! ("Flextunnel Safe Storage", macOS Keychain / Windows Credential Manager)
-//! holds a random 256-bit master key, and the id → secret map (key ids plus
-//! the reserved [`SERVER_SECRET_ID`]) is AES-256-GCM-encrypted with it into
-//! the file's `sealed_keys` blob. The
+//! holds a random 256-bit master key, and the id → secret map (key ids, the
+//! reserved [`SERVER_SECRET_ID`] and [`SERVER_RELAY_SECRET_ID`], and a
+//! [`PROFILE_RELAY_PREFIX`]ed id per profile relay token) is
+//! AES-256-GCM-encrypted with it into the file's `sealed_keys` blob. The
 //! keychain holds one small fixed-size entry regardless of how many keys
 //! exist, so a fresh install (or a rebuilt, differently-signed binary)
 //! triggers at most one macOS keychain prompt per run — and none at all
@@ -52,6 +54,15 @@ pub const DEFAULT_HTTP_PORT: u16 = 18080;
 /// recognizable in Keychain Access.
 const SAFE_STORAGE_SERVICE: &str = "Flextunnel Safe Storage";
 const SAFE_STORAGE_USER: &str = "Flextunnel";
+
+/// The format of what is sealed into `sealed_keys`: which secrets it holds,
+/// their ids in the map, and their encoding. Bump it on any change a store
+/// sealed before would only half match, and a store sealed under another
+/// version (or none) then loads with every sealed secret empty, to be
+/// re-entered — one fresh start instead of some secrets loading and others
+/// silently missing. The master key is not versioned: it is random bytes
+/// whatever the format.
+const SEALED_VERSION: u32 = 1;
 
 /// Set this (to `1`/`true` for the default dev path, or to an explicit file
 /// path) to store profiles as plaintext JSON instead of the system keychain.
@@ -147,9 +158,10 @@ pub struct Profile {
     #[serde(default)]
     pub relay_urls: Vec<String>,
     /// Shared bearer token sent to every custom relay (custom relays only).
-    /// TODO(keychain): stored in the profile for now; move to the keychain when
-    /// all secrets migrate there (see the iOS roadmap note).
-    #[serde(default)]
+    /// A secret, so never serialized here: in keychain mode it rides in the
+    /// store's encrypted `sealed_keys` blob; the dev file backend re-adds it
+    /// via [`StoredProfile`]. Never exported or imported either.
+    #[serde(skip)]
     pub relay_auth_token: Option<String>,
     #[serde(default)]
     pub forwards: Vec<PortForward>,
@@ -170,9 +182,23 @@ impl Profile {
 }
 
 /// The server's entry in the sealed id → secret map. Key ids are 16 hex
-/// digits (see `random_id`), so this can only clash with a hand-edited key id,
-/// which `drop_invalid_keys` rejects.
+/// digits (see `random_id`), so this and the other reserved ids below can only
+/// clash with a hand-edited key id, which `drop_invalid_keys` rejects.
 const SERVER_SECRET_ID: &str = "server";
+/// The server's custom relay auth token in the sealed map.
+const SERVER_RELAY_SECRET_ID: &str = "server-relay";
+/// A profile's custom relay auth token is sealed under this prefix plus the
+/// profile id.
+const PROFILE_RELAY_PREFIX: &str = "relay:";
+
+fn profile_relay_secret_id(profile_id: &str) -> String {
+    format!("{PROFILE_RELAY_PREFIX}{profile_id}")
+}
+
+/// Whether a key id would collide with a non-key entry of the sealed map.
+fn is_reserved_secret_id(id: &str) -> bool {
+    id == SERVER_SECRET_ID || id == SERVER_RELAY_SECRET_ID || id.starts_with(PROFILE_RELAY_PREFIX)
+}
 
 /// The app's one server — the desktop equivalent of a `server.toml`, core
 /// settings only: an iroh identity, the authorized client keys, the tunnel set
@@ -203,7 +229,9 @@ pub struct ServerConfig {
     #[serde(default)]
     pub relay_urls: Vec<String>,
     /// Shared bearer token sent to every custom relay (custom relays only).
-    #[serde(default)]
+    /// Sealed like [`Profile::relay_auth_token`]; the dev file re-adds it via
+    /// [`StoredServer`].
+    #[serde(skip)]
     pub relay_auth_token: Option<String>,
 }
 
@@ -238,12 +266,15 @@ pub struct Store {
     /// keychain entry is restored. Never persisted.
     #[serde(skip)]
     pub unseal_failed: bool,
-    /// The id → secret map (auth keys and the server identity), sealed under the
-    /// Safe Storage master key: base64 of 12-byte nonce ‖ AES-256-GCM
+    /// The id → secret map (auth keys, the server identity and the relay auth
+    /// tokens), sealed under the Safe Storage master key: base64 of 12-byte nonce ‖ AES-256-GCM
     /// ciphertext. Empty when nothing has a secret (and always in dev file
     /// mode, where secrets are inline).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     sealed_keys: String,
+    /// The [`SEALED_VERSION`] `sealed_keys` was sealed under; 0 when absent.
+    #[serde(default)]
+    sealed_version: u32,
 }
 
 /// Borrowing twin of [`Store`] so saves don't clone the app state.
@@ -255,6 +286,7 @@ struct StoreRef<'a> {
     login_item_set_up: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     sealed_keys: String,
+    sealed_version: u32,
 }
 
 /// Serialization wrapper for the dev file backend only: the secret rides along
@@ -267,11 +299,23 @@ struct StoredKey {
     key: AuthKey,
 }
 
-/// Dev file twin of [`StoredKey`] for a server identity secret.
+/// Dev file twin of [`StoredKey`] for a profile's relay auth token.
+#[derive(Serialize, Deserialize)]
+struct StoredProfile {
+    #[serde(default)]
+    relay_auth_token: Option<String>,
+    #[serde(flatten)]
+    profile: Profile,
+}
+
+/// Dev file twin of [`StoredKey`] for the server's identity secret and relay
+/// auth token.
 #[derive(Serialize, Deserialize)]
 struct StoredServer {
     #[serde(default)]
     secret: String,
+    #[serde(default)]
+    relay_auth_token: Option<String>,
     #[serde(flatten)]
     server: ServerConfig,
 }
@@ -282,7 +326,7 @@ struct DevFile {
     #[serde(default)]
     keys: Vec<StoredKey>,
     #[serde(default)]
-    profiles: Vec<Profile>,
+    profiles: Vec<StoredProfile>,
     #[serde(default)]
     server: Option<StoredServer>,
     #[serde(default)]
@@ -419,26 +463,41 @@ fn safe_storage_key() -> Result<[u8; 32]> {
     Ok(key)
 }
 
-/// The `(id, secret)` pairs sealed into `sealed_keys`: every auth key, plus
-/// the server identity under [`SERVER_SECRET_ID`].
+/// The `(id, secret)` pairs sealed into `sealed_keys`: every auth key, every
+/// profile's relay auth token, plus the server identity under
+/// [`SERVER_SECRET_ID`] and its relay auth token under
+/// [`SERVER_RELAY_SECRET_ID`].
 fn secret_entries<'a>(
     keys: &'a [AuthKey],
+    profiles: &'a [Profile],
     server: Option<&'a ServerConfig>,
-) -> impl Iterator<Item = (&'a str, &'a str)> {
+) -> impl Iterator<Item = (String, &'a str)> {
+    let relay = |token: &'a Option<String>| token.as_deref().unwrap_or_default();
     keys.iter()
-        .map(|k| (k.id.as_str(), k.secret.as_str()))
-        .chain(server.map(|s| (SERVER_SECRET_ID, s.secret.as_str())))
+        .map(|k| (k.id.clone(), k.secret.as_str()))
+        .chain(
+            profiles
+                .iter()
+                .map(move |p| (profile_relay_secret_id(&p.id), relay(&p.relay_auth_token))),
+        )
+        .chain(server.into_iter().flat_map(move |s| {
+            [
+                (SERVER_SECRET_ID.to_owned(), s.secret.as_str()),
+                (SERVER_RELAY_SECRET_ID.to_owned(), relay(&s.relay_auth_token)),
+            ]
+        }))
 }
 
 /// Seal the id → secret map of `entries` into the `sealed_keys` blob.
-/// Secretless entries (lost secrets) are left out so a later load warns about
-/// them again instead of loading an empty secret; an all-secretless list
-/// seals to the empty string, which `open_secrets` never sees.
+/// Secretless entries (lost secrets, profiles without a relay token) are left
+/// out so a later load warns about them again instead of loading an empty
+/// secret; an all-secretless list seals to the empty string, which
+/// `open_secrets` never sees.
 fn seal_secrets<'a>(
     master: &[u8; 32],
-    entries: impl Iterator<Item = (&'a str, &'a str)>,
+    entries: impl Iterator<Item = (String, &'a str)>,
 ) -> Result<String> {
-    let map: std::collections::BTreeMap<&str, &str> =
+    let map: std::collections::BTreeMap<String, &str> =
         entries.filter(|(_, secret)| !secret.is_empty()).collect();
     if map.is_empty() {
         return Ok(String::new());
@@ -493,7 +552,7 @@ fn drop_invalid_keys(keys: Vec<AuthKey>) -> Vec<AuthKey> {
                 log::error!("Ignoring key \"{}\": duplicate key id {}", k.name, k.id);
                 return false;
             }
-            if k.id == SERVER_SECRET_ID {
+            if is_reserved_secret_id(&k.id) {
                 log::error!("Ignoring key \"{}\": reserved key id {}", k.name, k.id);
                 return false;
             }
@@ -564,8 +623,39 @@ fn drop_invalid(profiles: Vec<Profile>) -> Vec<Profile> {
         .collect()
 }
 
+/// The id → secret map of a loaded sealed store. Empty with no keychain access
+/// when there is no blob (a store without secrets never prompts) or it was
+/// sealed under another [`SEALED_VERSION`]: those secrets are discarded
+/// whole, and the next save drops the blob. Empty with `unseal_failed` set
+/// when the blob will not open under the current master key.
+fn unseal_store(store: &mut Store) -> Result<std::collections::HashMap<String, String>> {
+    if store.sealed_keys.is_empty() {
+        return Ok(Default::default());
+    }
+    if store.sealed_version != SEALED_VERSION {
+        log::warn!(
+            "The stored secrets were sealed by format version {}, this build reads version \
+             {SEALED_VERSION}: starting fresh, every secret must be re-entered",
+            store.sealed_version
+        );
+        return Ok(Default::default());
+    }
+    match open_secrets(&safe_storage_key()?, &store.sealed_keys) {
+        Ok(map) => Ok(map),
+        Err(e) => {
+            log::error!(
+                "Failed to unseal the stored secrets (was the \
+                 \"{SAFE_STORAGE_SERVICE}\" keychain entry replaced?): {e:#}"
+            );
+            store.unseal_failed = true;
+            Ok(Default::default())
+        }
+    }
+}
+
 /// Load the whole store; empty when nothing has been saved yet. In keychain
-/// mode each key's and the server's secret is filled from the unsealed
+/// mode each key's and the server's secret, and every relay auth token, is
+/// filled from the unsealed
 /// `sealed_keys` blob — a missing secret (or a blob the current Safe Storage
 /// key can't decrypt) loads as an empty secret with a warning instead of
 /// failing. Structurally invalid keys and profiles are ignored (see the
@@ -582,23 +672,7 @@ pub fn load_store() -> Result<Store> {
             let mock = matches!(backend, Backend::MockKeychain);
             let mut store: Store = read_json(&sealed_path(mock)?)?.unwrap_or_default();
             store.keys = drop_invalid_keys(store.keys);
-            // No sealed blob → nothing to unseal, and crucially no keychain
-            // access: a store without secrets never prompts.
-            let secrets = if store.sealed_keys.is_empty() {
-                Default::default()
-            } else {
-                match open_secrets(&safe_storage_key()?, &store.sealed_keys) {
-                    Ok(map) => map,
-                    Err(e) => {
-                        log::error!(
-                            "Failed to unseal the stored secrets (was the \
-                             \"{SAFE_STORAGE_SERVICE}\" keychain entry replaced?): {e:#}"
-                        );
-                        store.unseal_failed = true;
-                        Default::default()
-                    }
-                }
-            };
+            let secrets = unseal_store(&mut store)?;
             for key in &mut store.keys {
                 match secrets.get(&key.id) {
                     Some(secret) => key.secret = secret.clone(),
@@ -608,6 +682,11 @@ pub fn load_store() -> Result<Store> {
                     ),
                 }
             }
+            // A relay token is optional, so a missing one is not lost.
+            for profile in &mut store.profiles {
+                profile.relay_auth_token =
+                    secrets.get(&profile_relay_secret_id(&profile.id)).cloned();
+            }
             if let Some(server) = &mut store.server {
                 match secrets.get(SERVER_SECRET_ID) {
                     Some(secret) => server.secret = secret.clone(),
@@ -615,6 +694,7 @@ pub fn load_store() -> Result<Store> {
                         "No keychain secret for the server; its identity key must be re-entered"
                     ),
                 }
+                server.relay_auth_token = secrets.get(SERVER_RELAY_SECRET_ID).cloned();
             }
             store
         }
@@ -646,11 +726,12 @@ pub fn save_store(
     match backend()? {
         Backend::DevFile(path) => save_dev_file(path, keys, profiles, server, login_item_set_up),
         backend => {
-            let sealed_keys = if secret_entries(keys, server).all(|(_, s)| s.is_empty()) {
-                String::new()
-            } else {
-                seal_secrets(&safe_storage_key()?, secret_entries(keys, server))?
-            };
+            let sealed_keys =
+                if secret_entries(keys, profiles, server).all(|(_, s)| s.is_empty()) {
+                    String::new()
+                } else {
+                    seal_secrets(&safe_storage_key()?, secret_entries(keys, profiles, server))?
+                };
             write_json(
                 &sealed_path(matches!(backend, Backend::MockKeychain))?,
                 &StoreRef {
@@ -659,19 +740,16 @@ pub fn save_store(
                     server,
                     login_item_set_up,
                     sealed_keys,
+                    sealed_version: SEALED_VERSION,
                 },
             )
         }
     }
 }
 
-/// Field holding the second secret. Unlike `auth_key` it has to serialize
-/// (it lives in `profiles.json`), so export/import strip it by hand instead.
-const RELAY_TOKEN_FIELD: &str = "relay_auth_token";
-
 /// Export all profiles to a user-chosen file. Non-secrets only, whatever the
-/// backend: no secret ever lives in a `Profile`, and the relay auth token is
-/// removed here. Profile ids, forward ids, and the auth-key reference are
+/// backend: a profile's one secret, its relay auth token, never serializes.
+/// Profile ids, forward ids, and the auth-key reference are
 /// stripped too — they are app-local keys that mean nothing in another
 /// install, not part of the portable data.
 pub fn export_profiles(path: &Path, profiles: &[Profile]) -> Result<()> {
@@ -680,7 +758,6 @@ pub fn export_profiles(path: &Path, profiles: &[Profile]) -> Result<()> {
         if let Some(profile) = entry.as_object_mut() {
             profile.remove("id");
             profile.remove("auth_key_id");
-            profile.remove(RELAY_TOKEN_FIELD);
             for forward in forwards_of(profile) {
                 forward.remove("id");
             }
@@ -694,9 +771,9 @@ pub fn export_profiles(path: &Path, profiles: &[Profile]) -> Result<()> {
 /// caller merges the result into the current profiles and assigns final ids;
 /// missing ids (the normal export shape) get placeholders here so the entries
 /// deserialize. No secret or key reference is imported: neither is ever in an
-/// export, and a hand-written relay auth token or auth-key reference is
-/// dropped rather than trusted, so imported entries come back with all three
-/// empty.
+/// export, and a hand-written auth-key reference is dropped rather than
+/// trusted (a hand-written relay auth token never deserializes), so imported
+/// entries come back with both empty.
 pub fn import_profiles(path: &Path) -> Result<Vec<Profile>> {
     let mut values: serde_json::Value = read_json(path)?
         .ok_or_else(|| anyhow::anyhow!("{} does not exist", path.display()))?;
@@ -706,7 +783,6 @@ pub fn import_profiles(path: &Path) -> Result<Vec<Profile>> {
                 .entry("id")
                 .or_insert_with(|| Profile::new_id().into());
             profile.remove("auth_key_id");
-            profile.remove(RELAY_TOKEN_FIELD);
             for forward in forwards_of(profile) {
                 forward
                     .entry("id")
@@ -742,14 +818,23 @@ fn load_dev_file(path: &Path) -> Result<Store> {
                 ..s.key
             })
             .collect(),
-        profiles: stored.profiles,
+        profiles: stored
+            .profiles
+            .into_iter()
+            .map(|s| Profile {
+                relay_auth_token: s.relay_auth_token,
+                ..s.profile
+            })
+            .collect(),
         server: stored.server.map(|s| ServerConfig {
             secret: s.secret,
+            relay_auth_token: s.relay_auth_token,
             ..s.server
         }),
         login_item_set_up: stored.login_item_set_up,
         unseal_failed: false,
         sealed_keys: String::new(),
+        sealed_version: 0,
     })
 }
 
@@ -768,9 +853,16 @@ fn save_dev_file(
                 key: k.clone(),
             })
             .collect(),
-        profiles: profiles.to_vec(),
+        profiles: profiles
+            .iter()
+            .map(|p| StoredProfile {
+                relay_auth_token: p.relay_auth_token.clone(),
+                profile: p.clone(),
+            })
+            .collect(),
         server: server.map(|s| StoredServer {
             secret: s.secret.clone(),
+            relay_auth_token: s.relay_auth_token.clone(),
             server: s.clone(),
         }),
         login_item_set_up,
@@ -826,13 +918,13 @@ mod tests {
             authorized_keys: "ed25519-pub:abc work laptop\n".into(),
             routed_domains: vec!["*.internal".into()],
             routed_cidrs: vec!["10.0.0.0/8".into()],
-            relay_urls: Vec::new(),
-            relay_auth_token: None,
+            relay_urls: vec!["https://relay.example".into()],
+            relay_auth_token: Some("ftc-secret-serverpsk".into()),
         }
     }
 
     fn seal(master: &[u8; 32], keys: &[AuthKey]) -> String {
-        seal_secrets(master, secret_entries(keys, None)).unwrap()
+        seal_secrets(master, secret_entries(keys, &[], None)).unwrap()
     }
 
     fn profile() -> Profile {
@@ -877,6 +969,7 @@ mod tests {
             server: Some(&server()),
             login_item_set_up: false,
             sealed_keys: String::new(),
+            sealed_version: SEALED_VERSION,
         })
         .unwrap();
         assert!(!json.contains("ftc-secret-authtok"), "secret leaked: {json}");
@@ -890,25 +983,37 @@ mod tests {
         assert!(json.contains("\"auth_key_id\":\"key1\""), "reference dropped: {json}");
         // `enabled` is runtime-only on forwards and must not leak either.
         assert!(!json.contains("enabled"), "enabled leaked: {json}");
-        // The relay token is a secret too, but it has no keychain home yet, so
-        // it must stay in this serialization (`profiles.json`). Export/import
-        // strip it explicitly — see `export_profiles`.
-        assert!(
-            json.contains("ftc-secret-relaypsk"),
-            "relay token must persist in profiles.json: {json}"
-        );
+        // The relay tokens are secrets: sealed, never plaintext.
+        assert!(!json.contains("relay_auth_token"), "relay token field leaked: {json}");
+        assert!(!json.contains("ftc-secret-relaypsk"), "profile relay token leaked: {json}");
+        assert!(!json.contains("ftc-secret-serverpsk"), "server relay token leaked: {json}");
     }
 
     #[test]
     fn sealed_secrets_roundtrip_without_leaking_plaintext() {
         let master = [7u8; 32];
-        let sealed = seal_secrets(&master, secret_entries(&[key()], Some(&server()))).unwrap();
+        let mut no_relay = profile();
+        no_relay.id = "00000000feedface".into();
+        no_relay.relay_auth_token = None;
+        let (keys, profiles, server) = ([key()], [profile(), no_relay], server());
+        let sealed =
+            seal_secrets(&master, secret_entries(&keys, &profiles, Some(&server))).unwrap();
         assert!(!sealed.contains("ftc-secret-authtok"), "secret leaked: {sealed}");
         assert!(!sealed.contains("ftc-secret-identity"), "server secret leaked: {sealed}");
+        assert!(!sealed.contains("ftc-secret-relaypsk"), "relay token leaked: {sealed}");
         let map = open_secrets(&master, &sealed).unwrap();
-        assert_eq!(map.len(), 2);
+        // The profile without a relay token seals nothing.
+        assert_eq!(map.len(), 4);
         assert_eq!(map.get("key1").map(String::as_str), Some("ftc-secret-authtok"));
         assert_eq!(map.get(SERVER_SECRET_ID).map(String::as_str), Some("ftc-secret-identity"));
+        assert_eq!(
+            map.get(SERVER_RELAY_SECRET_ID).map(String::as_str),
+            Some("ftc-secret-serverpsk")
+        );
+        assert_eq!(
+            map.get(&profile_relay_secret_id(&profile().id)).map(String::as_str),
+            Some("ftc-secret-relaypsk")
+        );
     }
 
     /// Secretless keys stay out of the seal (so a load warns about them),
@@ -926,6 +1031,25 @@ mod tests {
         let sealed = seal(&master, &[lost, other]);
         let map = open_secrets(&master, &sealed).unwrap();
         assert_eq!(map.keys().collect::<Vec<_>>(), ["key2"]);
+    }
+
+    /// A blob sealed under another format version — or before there was one —
+    /// is discarded whole, before the keychain is asked for the master key:
+    /// no secret loads, and it is not an unseal failure.
+    #[test]
+    fn a_blob_of_another_sealed_version_starts_fresh() {
+        for version in [0, SEALED_VERSION + 1] {
+            let mut store = Store {
+                sealed_keys: seal(&[7u8; 32], &[key()]),
+                sealed_version: version,
+                ..Default::default()
+            };
+            let secrets = unseal_store(&mut store).unwrap();
+            assert!(secrets.is_empty(), "version {version}: {secrets:?}");
+            assert!(!store.unseal_failed, "version {version}");
+        }
+        let unversioned: Store = serde_json::from_str(r#"{"sealed_keys":"AAAA"}"#).unwrap();
+        assert_eq!(unversioned.sealed_version, 0);
     }
 
     /// A blob sealed under a different master key (a replaced Safe Storage
@@ -979,6 +1103,15 @@ mod tests {
         reserved_id.id = SERVER_SECRET_ID.into();
         reserved_id.name = "reserved".into();
         reserved_id.public_key = "ed25519-pub:pqr".into();
+        // The relay tokens' slots: the server's and a profile's.
+        let mut server_relay_id = key();
+        server_relay_id.id = SERVER_RELAY_SECRET_ID.into();
+        server_relay_id.name = "server relay".into();
+        server_relay_id.public_key = "ed25519-pub:stu".into();
+        let mut profile_relay_id = key();
+        profile_relay_id.id = profile_relay_secret_id("00000000deadbeef");
+        profile_relay_id.name = "profile relay".into();
+        profile_relay_id.public_key = "ed25519-pub:vwx".into();
         let mut unique = key();
         unique.id = "key5".into();
         unique.name = "home".into();
@@ -992,6 +1125,8 @@ mod tests {
             bad_name,
             empty_id,
             reserved_id,
+            server_relay_id,
+            profile_relay_id,
             unique.clone(),
         ]);
         assert_eq!(kept, vec![a, unique]);
@@ -1118,6 +1253,14 @@ mod tests {
         assert!(
             raw.contains("\"secret\": \"ftc-secret-identity\""),
             "server secret missing: {raw}"
+        );
+        assert!(
+            raw.contains("\"relay_auth_token\": \"ftc-secret-relaypsk\""),
+            "profile relay token missing: {raw}"
+        );
+        assert!(
+            raw.contains("\"relay_auth_token\": \"ftc-secret-serverpsk\""),
+            "server relay token missing: {raw}"
         );
 
         // Forward `enabled` is runtime-only: comes back off.

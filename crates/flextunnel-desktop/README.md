@@ -62,10 +62,16 @@ its own **server-direct port forwards**. Connecting is always manual.
 
 ## Where settings live
 
-Non-secret profile data (name, server id, ports, forwards) is stored as a
-plaintext `profiles.json` in the platform's local data directory. The **auth
-token is the only secret** and is kept in the system keychain — **macOS
-Keychain** or the **Windows Credential Manager** — one entry per profile.
+Everything is stored in one `profiles.json` in the platform's local data
+directory. Non-secret data (names, server ids, ports, forwards, relay URLs,
+public keys) is plaintext. The **secrets** — auth-key secrets, the server's
+identity key, and the custom-relay auth tokens of profiles and the server —
+are sealed in the same file with AES-256-GCM under a random master key that is
+the one entry kept in the system keychain (**macOS Keychain** or the **Windows
+Credential Manager**), named "Flextunnel Safe Storage". The sealed secrets
+carry a format version: an update that changes what is sealed bumps it, and
+then starts every secret fresh — re-enter the auth-key secrets, the server
+identity and the relay tokens — rather than loading some and not others.
 
 > **Development escape hatch:** setting `FLEXTUNNEL_DEV_CONFIG` (to `1` or to an
 > explicit file path) stores everything, tokens included, in a single plaintext
