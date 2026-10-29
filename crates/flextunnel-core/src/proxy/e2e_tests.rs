@@ -493,24 +493,32 @@ async fn prepared_server_serves_an_authorized_client() {
 
     let server_ep = loopback_endpoint(secret, true).await;
     let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
-    let running = prepared.bind_on(server_ep);
+    let running = Arc::new(prepared.bind_on(server_ep));
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(async move {
-        tokio::select! {
-            res = running.serve() => res.map(|()| false),
-            _ = stop_rx => Ok(true),
+    let served = tokio::spawn({
+        let running = running.clone();
+        async move {
+            tokio::select! {
+                res = running.serve() => res.map(|()| false),
+                _ = stop_rx => Ok(true),
+            }
         }
-        .map(|stopped| (stopped, running))
     });
+    assert!(running.connected_client_keys().is_empty(), "no client yet");
 
     let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
-    let (conn, _ctrl_send, _ctrl_recv, response) =
+    let (conn, ctrl_send, ctrl_recv, response) =
         client_handshake(&client_ep, server_addr, 77, false).await;
     assert!(response.accepted, "authorized client accepted");
     assert_echo_roundtrip(&conn, spawn_echo().await).await;
+    // The live client shows by the key it authenticated with, until it leaves.
+    assert_eq!(running.connected_client_keys(), [test_client_key().public_str()]);
+    drop((ctrl_send, ctrl_recv));
+    conn.close(0u32.into(), b"done");
+    wait_until("the client to leave", || running.connected_client_keys().is_empty()).await;
 
     stop_tx.send(()).unwrap();
-    let (stopped, running) = with_timeout(served).await.unwrap().unwrap();
+    let stopped = with_timeout(served).await.unwrap().unwrap();
     assert!(stopped, "serve ran until stopped");
     running.endpoint().close().await;
     let _ = std::fs::remove_file(bl_path);

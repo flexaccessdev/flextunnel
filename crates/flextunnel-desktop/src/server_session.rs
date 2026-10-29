@@ -6,7 +6,9 @@
 //! one `flextunnel server start` runs, so the app's server validates and
 //! behaves exactly like a CLI server with the same settings — and takes the
 //! same per-user lock. Status is published as a snapshot the UI polls each
-//! frame.
+//! frame, including which authorized clients are connected (refreshed every
+//! [`CLIENTS_POLL`] while running) — the tray badge and the client list's
+//! dots come from it.
 
 use crate::config::ServerConfig;
 use flextunnel_core::server::{self, ServerOptions};
@@ -17,6 +19,10 @@ use tokio::sync::mpsc;
 
 /// The server session's thread name, and so its log tag (`[server]`).
 pub const THREAD_NAME: &str = "server";
+
+/// How often a running server's connected clients are re-read into the
+/// snapshot.
+const CLIENTS_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ServerPhase {
@@ -35,6 +41,9 @@ pub enum ServerPhase {
 pub struct ServerSnapshot {
     pub phase: ServerPhase,
     pub running_since: Option<Instant>,
+    /// The public keys of the authorized clients connected right now (empty
+    /// unless running).
+    pub connected_clients: Vec<String>,
     pub last_error: Option<String>,
 }
 
@@ -43,6 +52,7 @@ impl Default for ServerSnapshot {
         Self {
             phase: ServerPhase::Stopped,
             running_since: None,
+            connected_clients: Vec::new(),
             last_error: None,
         }
     }
@@ -96,9 +106,16 @@ pub(crate) struct ServerHandle {
 /// of what the CLI loads from `server.toml` and its key files.
 fn options(server: &ServerConfig) -> anyhow::Result<ServerOptions> {
     let secret_key = flextunnel_core::secret::load_secret_from_string(server.secret.trim())?;
-    let authorized_keys = flextunnel_core::flexaccess_keys::parse_authorized_keys(
-        &server.authorized_keys,
-        "authorized keys",
+    // The client's name rides along as the authorized-keys comment, so the
+    // server's own logs and status page name it too.
+    let entries: Vec<String> = server
+        .authorized_clients
+        .iter()
+        .map(|c| format!("{} {}", c.public_key, c.name))
+        .collect();
+    let authorized_keys = flextunnel_core::flexaccess_keys::parse_authorized_key_entries(
+        &entries,
+        "authorized clients",
     )?;
     let blocklist_file = flextunnel_core::blocklist::default_blocklist_path().ok_or_else(|| {
         anyhow::anyhow!(
@@ -208,18 +225,29 @@ async fn run_server(server: ServerConfig, mut rx: mpsc::Receiver<ServerCmd>, slo
         s.running_since = Some(Instant::now());
     });
 
-    let (cmd, result) = tokio::select! {
-        res = running.serve() => (None, res),
-        cmd = rx.recv() => {
-            if matches!(cmd, Some(ServerCmd::Stop | ServerCmd::Remove)) {
-                log::info!("Stopping the server");
+    let serve = running.serve();
+    tokio::pin!(serve);
+    let mut poll = tokio::time::interval(CLIENTS_POLL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let (cmd, result) = loop {
+        tokio::select! {
+            res = &mut serve => break (None, res),
+            cmd = rx.recv() => {
+                if matches!(cmd, Some(ServerCmd::Stop | ServerCmd::Remove)) {
+                    log::info!("Stopping the server");
+                }
+                break (cmd, Ok(()));
             }
-            (cmd, Ok(()))
+            _ = poll.tick() => {
+                let clients = running.connected_client_keys();
+                slot.update(|s| s.connected_clients = clients);
+            }
         }
     };
     slot.update(|s| {
         s.phase = ServerPhase::Stopping;
         s.running_since = None;
+        s.connected_clients.clear();
     });
     close(&running).await;
     finish(&slot, cmd, result);
@@ -245,6 +273,7 @@ fn finish(slot: &ServerSlot, cmd: Option<ServerCmd>, result: anyhow::Result<()>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AuthorizedClient;
 
     fn config() -> ServerConfig {
         let secret = flextunnel_core::iroh::SecretKey::generate();
@@ -252,11 +281,15 @@ mod tests {
         ServerConfig {
             endpoint_id: secret.public().to_string(),
             secret: base64_secret(&secret),
-            authorized_keys: format!("# laptop\n{} laptop\n", client.public_str()),
+            authorized_clients: vec![AuthorizedClient {
+                name: "laptop".into(),
+                public_key: client.public_str(),
+            }],
             routed_domains: vec!["*".into()],
             routed_cidrs: Vec::new(),
             relay_urls: Vec::new(),
             relay_auth_token: None,
+            enabled: true,
         }
     }
 
@@ -271,6 +304,8 @@ mod tests {
         let opts = options(&server).unwrap();
         assert_eq!(opts.secret_key.public().to_string(), server.endpoint_id);
         assert_eq!(opts.authorized_keys.len(), 1);
+        let public = server.authorized_clients[0].public_key.parse().unwrap();
+        assert_eq!(opts.authorized_keys.comment(&public), Some("laptop"));
         assert_eq!(opts.routed_domains, server.routed_domains);
         assert!(opts.quick_client.is_none());
     }
@@ -282,7 +317,7 @@ mod tests {
         assert!(options(&bad_secret).is_err());
 
         let mut bad_keys = config();
-        bad_keys.authorized_keys = "ed25519-pub:nope".into();
+        bad_keys.authorized_clients[0].public_key = "ed25519-pub:nope".into();
         assert!(options(&bad_keys).is_err());
     }
 }

@@ -61,6 +61,10 @@ struct ConnEntry {
     last_seen: Instant,
     /// Handle to the connection, so a confirmed duplicate can be torn down.
     connection: Connection,
+    /// The authorized key (`ed25519-pub:...`) the client authenticated with;
+    /// `None` for a quick-mode client (no keypair). Lets an embedding app show
+    /// which of its authorized clients are connected.
+    client_key: Option<String>,
 }
 
 /// `EndpointId → (conn_seq → entry)`. Two live entries under one node id with
@@ -287,6 +291,19 @@ impl ProxyServer {
         inbound
     }
 
+    /// The distinct authorized keys (`ed25519-pub:...`) of the clients
+    /// connected right now, sorted. A passive read of the duplicate-detection
+    /// registry, which holds exactly the authenticated live connections.
+    pub fn connected_client_keys(&self) -> Vec<String> {
+        let reg = self.registry.lock().expect("registry lock");
+        let keys: std::collections::BTreeSet<&str> = reg
+            .values()
+            .flat_map(HashMap::values)
+            .filter_map(|e| e.client_key.as_deref())
+            .collect();
+        keys.into_iter().map(str::to_owned).collect()
+    }
+
     /// Snapshot the live routing config into the status-page template. Secrets
     /// are never included; the blocklist is exposed as counts only.
     fn build_status_template(&self) -> ServerStatusTemplate {
@@ -425,6 +442,7 @@ impl ProxyServer {
         conn_seq: u64,
         nonce: u128,
         connection: Connection,
+        client_key: Option<String>,
     ) -> Result<(), Vec<Connection>> {
         let mut reg = self.registry.lock().expect("registry lock");
         let now = Instant::now();
@@ -443,6 +461,7 @@ impl ProxyServer {
                 nonce,
                 last_seen: now,
                 connection,
+                client_key,
             },
         );
         Ok(())
@@ -594,7 +613,21 @@ impl ProxyServer {
         // concurrently-live connection for the same node id with a *different*
         // instance nonce — a confirmed duplicate (a benign same-process reconnect
         // reuses the same nonce and is not flagged).
-        let _guard = match self.try_register(remote_id, conn_seq, hello.client_instance_nonce, connection.clone()) {
+        // Only a keypair client's key was verified above; a quick-mode client
+        // got in on its ALPN, so whatever key it sent is unchecked.
+        let client_key = hello
+            .auth
+            .as_ref()
+            .filter(|_| connection.alpn() != crate::transport::QUICK_ALPN)
+            .and_then(|auth| auth.public_key.parse::<flexaccess_keys::PublicKey>().ok())
+            .map(|public| public.to_token());
+        let _guard = match self.try_register(
+            remote_id,
+            conn_seq,
+            hello.client_instance_nonce,
+            connection.clone(),
+            client_key,
+        ) {
             Ok(()) => ConnGuard {
                 registry: self.registry.clone(),
                 remote_id,

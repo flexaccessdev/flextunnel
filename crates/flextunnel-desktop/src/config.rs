@@ -2,8 +2,9 @@
 //! named list so several profiles can authenticate with the same keypair; each
 //! profile references one by [`AuthKey::id`]. The optional [`ServerConfig`]
 //! runs the one flextunnel server the app hosts in-process (one server per
-//! user). The non-secret data (key names and public halves, profile names,
-//! server ids, ports, forwards, the server's tunnel set and authorized keys)
+//! user). The non-secret data (key names and public halves,
+//! profile names, server ids, ports, forwards, the server's tunnel set and
+//! authorized clients)
 //! lives in a plaintext `profiles.json` under the local data dir — same
 //! treatment as the iOS app's `forwards.json`. The secrets (auth-key secret
 //! halves, the server's identity key, and the profiles' and server's custom
@@ -200,8 +201,17 @@ fn is_reserved_secret_id(id: &str) -> bool {
     id == SERVER_SECRET_ID || id == SERVER_RELAY_SECRET_ID || id.starts_with(PROFILE_RELAY_PREFIX)
 }
 
+/// One client the server lets in: the public half of the client's auth key,
+/// under a name for it (the authorized-keys comment).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizedClient {
+    pub name: String,
+    /// `ed25519-pub:...`, in its canonical token form.
+    pub public_key: String,
+}
+
 /// The app's one server — the desktop equivalent of a `server.toml`, core
-/// settings only: an iroh identity, the authorized client keys, the tunnel set
+/// settings only: an iroh identity, the authorized clients, the tunnel set
 /// and relays (no host aliases, DNS forwards or bridges). Runs in-process.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -215,11 +225,10 @@ pub struct ServerConfig {
     /// dev file backend re-adds it via [`StoredServer`].
     #[serde(skip)]
     pub secret: String,
-    /// The authorized client keys, as an authorized-keys document: one
-    /// `ed25519-pub:...` per line, optional trailing comment, `#` lines and
-    /// blank lines ignored.
+    /// The clients allowed to connect. May be empty: the server is then set up
+    /// but cannot start until one is added.
     #[serde(default)]
-    pub authorized_keys: String,
+    pub authorized_clients: Vec<AuthorizedClient>,
     /// The tunnel set; may be empty (the reserved `flextunnel.internal`
     /// namespace is always routed).
     #[serde(default)]
@@ -233,14 +242,82 @@ pub struct ServerConfig {
     /// [`StoredServer`].
     #[serde(skip)]
     pub relay_auth_token: Option<String>,
+    /// Whether the server is meant to run: an enabled server starts with the
+    /// app, and once it becomes startable; a disabled one stays stopped, at
+    /// every launch, until enabled again.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 impl ServerConfig {
-    /// Whether the server can start: its identity secret must be present (it
-    /// goes missing when the keychain entry was lost — re-enter it).
-    pub fn is_ready(&self) -> bool {
-        !self.secret.is_empty()
+    /// Why the server cannot start, if it can't: its identity secret is
+    /// missing (the keychain entry was lost — import it again), or no client
+    /// is authorized yet (the core refuses a server nobody may use).
+    pub fn start_blocker(&self) -> Option<&'static str> {
+        if self.secret.is_empty() {
+            Some("The identity key is missing from the keychain — import it under Identity.")
+        } else if self.authorized_clients.is_empty() {
+            Some("Authorize at least one client to start the server.")
+        } else {
+            None
+        }
     }
+
+    pub fn is_ready(&self) -> bool {
+        self.start_blocker().is_none()
+    }
+}
+
+/// The canonical `ed25519-pub:...` token of a client public key, or why it
+/// isn't one.
+pub fn parse_client_public_key(value: &str) -> Result<String, String> {
+    value
+        .trim()
+        .parse::<flextunnel_core::flexaccess_keys::PublicKey>()
+        .map(|key| key.to_token())
+        .map_err(|e| format!("Invalid public key: {e}"))
+}
+
+/// Drop structurally invalid authorized clients from a (possibly hand-edited)
+/// store, keeping the first occurrence of duplicates: a malformed name or key
+/// can't be loaded into the server, a duplicate name makes the list ambiguous,
+/// and a duplicate key is the same client added twice. The form rejects all
+/// of these; this is the backstop.
+fn drop_invalid_clients(clients: Vec<AuthorizedClient>) -> Vec<AuthorizedClient> {
+    let mut names = std::collections::HashSet::new();
+    let mut publics = std::collections::HashSet::new();
+    clients
+        .into_iter()
+        .filter(|c| {
+            if !is_valid_name(&c.name) {
+                log::error!("Ignoring an authorized client: invalid name {:?}", c.name);
+                return false;
+            }
+            if parse_client_public_key(&c.public_key).as_deref() != Ok(c.public_key.as_str()) {
+                log::error!(
+                    "Ignoring authorized client \"{}\": not a canonical public key",
+                    c.name
+                );
+                return false;
+            }
+            // Both checked before either is reserved: a dropped entry must
+            // not shadow a later valid one sharing its name or key.
+            if names.contains(&c.name) {
+                log::error!("Ignoring an authorized client: duplicate name \"{}\"", c.name);
+                return false;
+            }
+            if publics.contains(&c.public_key) {
+                log::error!(
+                    "Ignoring authorized client \"{}\": another client already holds its key",
+                    c.name
+                );
+                return false;
+            }
+            names.insert(c.name.clone());
+            publics.insert(c.public_key.clone());
+            true
+        })
+        .collect()
 }
 
 /// Everything the app persists: the shared key list plus the profiles that
@@ -707,6 +784,10 @@ pub fn load_store() -> Result<Store> {
         }
     };
     store.profiles = drop_invalid(store.profiles);
+    if let Some(server) = &mut store.server {
+        let clients = std::mem::take(&mut server.authorized_clients);
+        server.authorized_clients = drop_invalid_clients(clients);
+    }
     for profile in &store.profiles {
         if !profile.auth_key_id.is_empty() && find_key(&store.keys, &profile.auth_key_id).is_none()
         {
@@ -919,15 +1000,23 @@ mod tests {
         }
     }
 
+    fn client_public_key() -> String {
+        flextunnel_core::auth::ClientKey::generate().unwrap().public_str()
+    }
+
     fn server() -> ServerConfig {
         ServerConfig {
             endpoint_id: "endpoint".into(),
             secret: "ftc-secret-identity".into(),
-            authorized_keys: "ed25519-pub:abc work laptop\n".into(),
+            authorized_clients: vec![AuthorizedClient {
+                name: "work laptop".into(),
+                public_key: "ed25519-pub:abc".into(),
+            }],
             routed_domains: vec!["*.internal".into()],
             routed_cidrs: vec!["10.0.0.0/8".into()],
             relay_urls: vec!["https://relay.example".into()],
             relay_auth_token: Some("ftc-secret-serverpsk".into()),
+            enabled: true,
         }
     }
 
@@ -989,8 +1078,12 @@ mod tests {
         // reference to it.
         assert!(json.contains("ed25519-pub:abc"), "public key dropped: {json}");
         assert!(json.contains("\"auth_key_id\":\"key1\""), "reference dropped: {json}");
-        // `enabled` is runtime-only on forwards and must not leak either.
-        assert!(!json.contains("enabled"), "enabled leaked: {json}");
+        // `enabled` is runtime-only on forwards and must not leak either; the
+        // server's is its persisted intent.
+        let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let forward = &doc["profiles"][0]["forwards"][0];
+        assert!(forward.get("enabled").is_none(), "forward enabled leaked: {json}");
+        assert_eq!(doc["server"]["enabled"], true, "server enabled dropped: {json}");
         // The relay tokens are secrets: sealed, never plaintext.
         assert!(!json.contains("relay_auth_token"), "relay token field leaked: {json}");
         assert!(!json.contains("ftc-secret-relaypsk"), "profile relay token leaked: {json}");
@@ -1085,6 +1178,37 @@ mod tests {
         let mut unpicked = profile();
         unpicked.auth_key_id = String::new();
         assert!(!unpicked.is_ready(&keys), "no key picked");
+    }
+
+    #[test]
+    fn server_start_blockers() {
+        let mut ready = server();
+        assert_eq!(ready.start_blocker(), None);
+        ready.authorized_clients.clear();
+        assert!(ready.start_blocker().unwrap().contains("Authorize"), "no client");
+        let mut lost = server();
+        lost.secret = String::new();
+        assert!(lost.start_blocker().unwrap().contains("identity"), "lost identity");
+    }
+
+    #[test]
+    fn invalid_and_duplicate_clients_are_dropped() {
+        let (a_key, b_key) = (client_public_key(), client_public_key());
+        let client = |name: &str, public_key: &str| AuthorizedClient {
+            name: name.into(),
+            public_key: public_key.into(),
+        };
+        let kept = drop_invalid_clients(vec![
+            client("laptop", &a_key),
+            client("laptop", &b_key),
+            // Dropped for its key, so it doesn't reserve "phone".
+            client("phone", &a_key),
+            client(" padded", &b_key),
+            client("garbage", "ed25519-pub:nope"),
+            client("spaced", &format!(" {b_key}")),
+            client("phone", &b_key),
+        ]);
+        assert_eq!(kept, vec![client("laptop", &a_key), client("phone", &b_key)]);
     }
 
     #[test]

@@ -93,6 +93,11 @@ enum Command {
     QueryConnPath(ProfileId, std::sync::mpsc::Sender<ConnectionSnapshot>),
     /// Start the server session (its identity secret travels inside).
     StartServer(Box<ServerConfig>),
+    /// Stop the running server and start this config once it has stopped —
+    /// how changed settings are applied. A restart already waiting for its
+    /// stop takes this newer config instead; a server that is not running, or
+    /// is stopping for good, is left alone.
+    RestartServer(Box<ServerConfig>),
     StopServer,
     /// Stop the server and reset its snapshot once it has stopped (the
     /// server was deleted).
@@ -176,6 +181,10 @@ impl Controller {
 
     pub fn start_server(&self, server: ServerConfig) {
         let _ = self.tx.blocking_send(Command::StartServer(Box::new(server)));
+    }
+
+    pub fn restart_server(&self, server: ServerConfig) {
+        let _ = self.tx.blocking_send(Command::RestartServer(Box::new(server)));
     }
 
     pub fn stop_server(&self) {
@@ -324,41 +333,92 @@ async fn run_loop(
 ) {
     let mut sessions: HashMap<ProfileId, SessionHandle> = HashMap::new();
     let mut server: Option<ServerHandle> = None;
+    // A restart's config, started once the old session has ended: until its
+    // endpoint is closed it holds the identity and the per-user server lock.
+    let mut pending_start: Option<ServerConfig> = None;
+    // Whether the current server session was told to stop (or remove): a
+    // start meanwhile waits for it in `pending_start` instead of being dropped.
+    let mut stopping = false;
     loop {
-        let cmd = rx.recv().await;
         // An ended session drops its receiver, closing the sender.
-        sessions.retain(|_, handle| !handle.tx.is_closed());
         if server.as_ref().is_some_and(|handle| handle.tx.is_closed()) {
             server = None;
         }
+        if server.is_none() {
+            stopping = false;
+        }
+        if server.is_none()
+            && let Some(config) = pending_start.take()
+        {
+            server = server_session::spawn_server(config, &server_shared);
+        }
+        let cmd = match server.as_mut() {
+            // Waiting out a restart's stop: wake when the old session ends,
+            // so the new one starts without waiting for the next command.
+            Some(handle) if pending_start.is_some() => tokio::select! {
+                cmd = rx.recv() => cmd,
+                _ = &mut handle.done => continue,
+            },
+            _ => rx.recv().await,
+        };
+        sessions.retain(|_, handle| !handle.tx.is_closed());
+        if server.as_ref().is_some_and(|handle| handle.tx.is_closed()) {
+            server = None;
+            stopping = false;
+        }
         match cmd {
             Some(Command::StartServer(config)) => {
-                // Includes a server still stopping: it holds the identity and
-                // the per-user lock until its endpoint is closed.
-                if server.is_some() {
-                    log::warn!("The server is still running");
-                    continue;
-                }
-                server = server_session::spawn_server(*config, &server_shared);
-            }
-            Some(Command::StopServer) => {
-                if let Some(handle) = &server {
-                    let _ = handle.tx.send(ServerCmd::Stop).await;
+                match &server {
+                    // A server still stopping holds the identity and the
+                    // per-user lock until its endpoint is closed: start once
+                    // it has (e.g. disabled and enabled again in quick
+                    // succession).
+                    Some(_) if stopping => pending_start = Some(*config),
+                    Some(_) => log::warn!("The server is still running"),
+                    None => server = server_session::spawn_server(*config, &server_shared),
                 }
             }
-            Some(Command::RemoveServer) => match &server {
-                // The handle stays until the session ends, so a server set up
-                // again meanwhile can't start while this one still holds the
-                // lock; the session resets the snapshot as its final write.
-                Some(handle) => {
-                    // A closed channel means the session already made its
-                    // final write (it holds the receiver until then).
-                    if handle.tx.send(ServerCmd::Remove).await.is_err() {
-                        reset_server_snapshot(&server_shared);
+            Some(Command::RestartServer(config)) => match &server {
+                // Decided here rather than from the UI's snapshot, which reads
+                // Stopped between a restart's two sessions: a change made
+                // meanwhile (a client revoked) must still reach the new one.
+                Some(_) if stopping => {
+                    if pending_start.is_some() {
+                        pending_start = Some(*config);
                     }
                 }
-                None => reset_server_snapshot(&server_shared),
+                Some(handle) => {
+                    let _ = handle.tx.send(ServerCmd::Stop).await;
+                    stopping = true;
+                    pending_start = Some(*config);
+                }
+                None => {}
             },
+            Some(Command::StopServer) => {
+                // Also calls off a restart that is waiting for the old stop.
+                pending_start = None;
+                if let Some(handle) = &server {
+                    let _ = handle.tx.send(ServerCmd::Stop).await;
+                    stopping = true;
+                }
+            }
+            Some(Command::RemoveServer) => {
+                pending_start = None;
+                stopping = server.is_some();
+                match &server {
+                    // The handle stays until the session ends, so a server set up
+                    // again meanwhile can't start while this one still holds the
+                    // lock; the session resets the snapshot as its final write.
+                    Some(handle) => {
+                        // A closed channel means the session already made its
+                        // final write (it holds the receiver until then).
+                        if handle.tx.send(ServerCmd::Remove).await.is_err() {
+                            reset_server_snapshot(&server_shared);
+                        }
+                    }
+                    None => reset_server_snapshot(&server_shared),
+                }
+            }
             Some(Command::Connect(profile, auth_key)) => {
                 if sessions.contains_key(&profile.id) {
                     log::warn!("Profile \"{}\" is already running a session", profile.name);

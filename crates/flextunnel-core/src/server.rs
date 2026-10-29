@@ -330,6 +330,12 @@ impl RunningServer {
         &self.endpoint
     }
 
+    /// The authorized keys of the clients connected right now (see
+    /// [`ProxyServer::connected_client_keys`]).
+    pub fn connected_client_keys(&self) -> Vec<String> {
+        self.server.connected_client_keys()
+    }
+
     /// Serve until the server ends. Alongside, with custom relays, the shared
     /// home-relay failover keeps the server dialable: a custom-relay server is
     /// reachable from off the LAN only through its home relay (n0 discovery is
