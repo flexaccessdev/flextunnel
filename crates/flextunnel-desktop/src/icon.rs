@@ -2,10 +2,11 @@
 //! (`../flextunnel-ios/icon.svg`, 1024 viewBox): crosshair lines, two inner
 //! ellipses, and an outer circle, white on a blue gradient. macOS renders the
 //! bare glyph as a template image — the OS adapts it to light/dark menu bars,
-//! matching the iOS "tinted" appearance — with the connection state shown by
-//! opacity plus a corner status badge when connected: a plain dot while some
-//! profiles are still connecting, upgrading to a checkmark once every connecting
-//! profile has connected successfully. The badge stays monochrome on macOS so
+//! matching the iOS "tinted" appearance — with the server's state shown by
+//! opacity plus a corner status badge: a plain dot while it is starting or
+//! stopping, upgrading to a checkmark once it is running. The badge is the
+//! server's alone; an app with client connections only shows them by opacity.
+//! The badge stays monochrome on macOS so
 //! the icon remains a crisp template (a colored icon renders as a blurry
 //! non-template image in the menu bar); on Windows it is green on the full-color
 //! badge (grayscale while disconnected).
@@ -17,16 +18,17 @@ use tiny_skia::{
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrayState {
-    Idle,
-    Connecting,
-    /// At least one profile is connected, but others are still connecting or
-    /// reconnecting — rendered with a plain status dot.
-    Connected,
-    /// Every profile that was connecting has connected successfully (none still
-    /// in progress) — rendered with a status checkmark instead of the dot.
-    AllConnected,
-    Reconnecting,
-    Failed,
+    /// Nothing up: the server is stopped or failed (or, with no server, no
+    /// client connection is up). Dimmed.
+    Off,
+    /// No server, and a client connection is in progress. Half-dimmed.
+    Busy,
+    /// No server, and a client connection is up: full opacity, no badge.
+    Active,
+    /// The server is starting or stopping — a plain status dot.
+    Changing,
+    /// The server is running — a status checkmark instead of the dot.
+    Running,
 }
 
 // Geometry from icon.svg, in its 1024x1024 viewBox.
@@ -108,8 +110,8 @@ fn draw_glyph(pixmap: &mut Pixmap, paint: &Paint, fill: f32) {
 /// color, or `None` to punch a transparent gap (used by the macOS template,
 /// where only alpha matters). When `checkmark` is set, a check is stroked over
 /// the dot in the ring's treatment (the ring color, or a transparent punch on
-/// the template) to signal that every connecting profile has connected. Drawn
-/// last, so it sits on top.
+/// the template) to signal that the server is running. Drawn last, so it sits
+/// on top.
 fn draw_status_dot(pixmap: &mut Pixmap, dot: Color, ring: Option<Color>, checkmark: bool) {
     let s = pixmap.width() as f32;
     let (cx, cy) = (s * 0.70, s * 0.70);
@@ -272,19 +274,19 @@ pub fn tray_rgba(state: TrayState) -> (Vec<u8>, u32, u32) {
     {
         // tray-icon scales the NSImage to 18pt itself; 44px stays crisp on retina.
         let alpha = match state {
-            TrayState::Connected | TrayState::AllConnected => 1.0,
-            TrayState::Connecting | TrayState::Reconnecting => 0.6,
-            TrayState::Idle | TrayState::Failed => 0.35,
+            TrayState::Active | TrayState::Changing | TrayState::Running => 1.0,
+            TrayState::Busy => 0.6,
+            TrayState::Off => 0.35,
         };
         let mut pixmap = glyph_only(44, alpha);
-        if matches!(state, TrayState::Connected | TrayState::AllConnected) {
+        if matches!(state, TrayState::Changing | TrayState::Running) {
             // Monochrome so the icon stays a crisp template; the transparent
             // ring/check reads as a gap once the OS tints the mask.
             draw_status_dot(
                 &mut pixmap,
                 Color::from_rgba8(0, 0, 0, 255),
                 None,
-                state == TrayState::AllConnected,
+                state == TrayState::Running,
             );
         }
         (to_rgba(pixmap), 44, 44)
@@ -292,19 +294,19 @@ pub fn tray_rgba(state: TrayState) -> (Vec<u8>, u32, u32) {
     #[cfg(windows)]
     {
         let (blue, alpha) = match state {
-            TrayState::Connected | TrayState::AllConnected => (true, 1.0),
-            TrayState::Connecting | TrayState::Reconnecting => (true, 0.6),
-            TrayState::Idle | TrayState::Failed => (false, 1.0),
+            TrayState::Active | TrayState::Changing | TrayState::Running => (true, 1.0),
+            TrayState::Busy => (true, 0.6),
+            TrayState::Off => (false, 1.0),
         };
         let mut pixmap = badge(32, blue, alpha);
-        if matches!(state, TrayState::Connected | TrayState::AllConnected) {
+        if matches!(state, TrayState::Changing | TrayState::Running) {
             // Green dot with a white ring to stand out against the blue badge;
-            // a white check on top once every connecting profile is connected.
+            // a white check on top once the server is running.
             draw_status_dot(
                 &mut pixmap,
                 Color::from_rgba8(52, 199, 89, 255),
                 Some(Color::from_rgba8(255, 255, 255, 255)),
-                state == TrayState::AllConnected,
+                state == TrayState::Running,
             );
         }
         (to_rgba(pixmap), 32, 32)
@@ -322,25 +324,26 @@ mod tests {
 
     #[test]
     fn tray_icon_has_expected_dimensions_and_content() {
-        let (rgba, w, h) = tray_rgba(TrayState::Connected);
+        let (rgba, w, h) = tray_rgba(TrayState::Running);
         assert_eq!(rgba.len(), (w * h * 4) as usize);
         assert!(rgba.chunks(4).any(|px| px[3] > 0), "icon is fully transparent");
     }
 
     #[test]
     fn state_variants_differ() {
-        let (connected, ..) = tray_rgba(TrayState::Connected);
-        let (idle, ..) = tray_rgba(TrayState::Idle);
-        assert_ne!(connected, idle);
-    }
-
-    #[test]
-    fn all_connected_checkmark_differs_from_plain_dot() {
-        // The checkmark badge must be visually distinct from the plain dot so
-        // "all connected" reads differently from "partially connected".
-        let (all_connected, ..) = tray_rgba(TrayState::AllConnected);
-        let (connected, ..) = tray_rgba(TrayState::Connected);
-        assert_ne!(all_connected, connected);
+        let states = [
+            TrayState::Off,
+            TrayState::Busy,
+            TrayState::Active,
+            TrayState::Changing,
+            TrayState::Running,
+        ];
+        let icons: Vec<_> = states.iter().map(|s| tray_rgba(*s).0).collect();
+        for (i, a) in icons.iter().enumerate() {
+            for (j, b) in icons.iter().enumerate().skip(i + 1) {
+                assert_ne!(a, b, "{:?} and {:?} render the same", states[i], states[j]);
+            }
+        }
     }
 
     #[test]

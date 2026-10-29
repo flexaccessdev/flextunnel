@@ -113,12 +113,16 @@ without installing. `-PreRelease` is also accepted by the Windows installer when
 the selected prerelease includes a Windows asset. A container image is also
 published to `ghcr.io/flexaccessdev/flextunnel`.
 
-### Desktop app (tray GUI, client mode)
+### Desktop app (tray GUI, server and client)
 
-Stable releases also include the desktop client
+Stable releases also include the desktop app
 (`flextunnel-desktop-macos-arm64.dmg` and
-`flextunnel-desktop-windows-amd64.msi`). The installers are **unsigned** — if
-you'd rather not apply the workarounds below, build it yourself instead:
+`flextunnel-desktop-windows-amd64.msi`), a tray app with two roles of equal
+weight, either one optional: client connections to any number of servers
+elsewhere, and this computer's own server (a generated identity, then the
+clients you authorize). See [its README](crates/flextunnel-desktop/README.md).
+The installers are **unsigned** — if you'd rather not apply the workarounds
+below, build it yourself instead:
 
 ```sh
 cargo build --release -p flextunnel-desktop

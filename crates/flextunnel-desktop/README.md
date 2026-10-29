@@ -1,8 +1,9 @@
 # flextunnel-desktop
 
-The native desktop GUI for the [flextunnel](../..) client — a system-tray app
-for **macOS and Windows** that manages connection profiles and runs one tunnel
-session per profile without ever opening a terminal.
+The native desktop app for [flextunnel](../..) — a system-tray app for **macOS
+and Windows** with two roles of equal weight, either one optional:
+**connections** to any number of flextunnel servers elsewhere, and this
+computer's own **server**, run in-process. Nothing ever needs a terminal.
 
 It embeds [`flextunnel-core`](../flextunnel-core) directly (no FFI layer) and is
 built on [iced](https://iced.rs/)'s daemon runtime: the process lives in the
@@ -10,43 +11,92 @@ menu bar / system tray and keeps running with no window open, so closing the
 window loses nothing — the tray owns the lifecycle and re-opens it on demand.
 
 ```
-┌── tray / menu bar ──┐        ┌──────────── window ────────────┐
-│ Open flextunnel…     │        │  Profiles          Detail pane │
-│ 1 of 2 connected     │        │  ● home-lab        SOCKS 1080   │
-│ Server        ▸      │  ⇄     │  ○ staging         HTTP  18080  │
-│ ☑ Open at Login      │        │  Logs              forwards…   │
-│ Quit flextunnel      │        │  Export / Import   Conn. path  │
-└──────────────────────┘        └────────────────────────────────┘
+┌── tray / menu bar ─────────────────┐   ┌──────────── window ─────────────────┐
+│ Open flextunnel…                    │   │ CONNECTIONS   +   home-lab ● conn.  │
+│ Connections: 1 of 2 connected       │   │ ● home-lab        SOCKS 1080        │
+│ Server running · 2 clients connected│ ⇄ │ ○ staging         PORT FORWARDS     │
+│ Stop Server                         │   │ SERVER            ● db  5432        │
+│ Copy Endpoint ID                    │   │ ● This computer                     │
+│ ☑ Open at Login                     │   │ Keys · Logs                         │
+│ Quit flextunnel                     │   │                                     │
+└─────────────────────────────────────┘   └─────────────────────────────────────┘
 ```
 
-## What it does
+## First launch
 
-Each **profile** is the desktop equivalent of a `client.toml` — a server
-`EndpointId`, an auth token, and the local front-ends you want. Profiles are
+With nothing set up, the window opens on a short intro of both roles with a
+single *Continue*: there is no role to pick. Either is then set up from the
+sidebar whenever wanted — "+" next to Connections, or "Set up server…".
+
+```
+```
+
+## Client connections
+
+Each **connection profile** is the desktop equivalent of a `client.toml` — a
+server `EndpointId`, an auth key, and the local front-ends you want. Profiles are
 independent: any number can be connected at once, and each runs its own tunnel
 session with its own optional local **SOCKS5** and **HTTP** proxy listeners plus
 its own **server-direct port forwards**. Connecting is always manual.
 
-- **Multiple concurrent profiles** — a sidebar of connections, each with its own
-  session, ports, and forwards. Add, edit, and delete them from the window.
+- **Shared auth keys** — the Keys pane holds this computer's client keypairs;
+  any number of profiles can use the same one. Each server a key connects to
+  must authorize its public half.
 - **Local SOCKS5 / HTTP proxies** — enable either or both per profile; point any
   proxy-aware app at `127.0.0.1:<port>` and its traffic to routed targets rides
   the tunnel.
 - **Port forwards** — bind a local port to any `host:port` on the server's
   network so tools that can't use a proxy reach private services as if local.
-- **System tray status** — the tray icon and its status line reflect the
-  worst/most-notable state across all profiles (profiles themselves are
-  connected from the window); the server gets a submenu with status, Start,
-  Stop, and Copy Endpoint ID.
 - **Connection path** — a modal that reports whether a connected profile is
   reaching the server directly (hole-punched) or via relay.
-- **Live logs** — an in-app Logs pane; every session's log lines (core internals
-  included) are attributed to their profile.
 - **Export / import** — move profiles between machines via native save/open
   dialogs. (Secrets are re-entered on import: neither the auth token nor the
   custom-relay auth token is written to the export file. Importing over an
   existing profile — matched by server id — keeps that profile's secrets.)
 - **Auto-reconnect** — sessions re-establish the tunnel when the path drops.
+
+## The server
+
+The app hosts one server per user — the per-user server lock is shared with the
+CLI, so a `flextunnel server` running on the same account counts too. Setting
+it up generates a fresh identity (or imports an existing one, to move a server
+here), then the pane asks for the first client to authorize. A configured
+server starts with the app (at login or by hand) and stays meant to
+be running until stopped from the window or the tray; while it is, authorizing
+its first client or re-importing a lost identity starts it.
+
+- **Endpoint ID** — the server's public identity, shown in full at the top of
+  its pane with a Copy button (and "Copy Endpoint ID" in the tray): it is what
+  clients enter as the server node id.
+- **Authorized clients** — a named list of client public keys
+  (`ed25519-pub:…`, never a secret). Paste a key — or a whole authorized-key
+  entry as `flexaccess-keys show-auth-key` prints it, whose comment then names
+  the client — or pick one of this app's own keys. While the server runs, each
+  client shows whether it is connected.
+- **Identity** — the secret behind the endpoint id is generated at setup and
+  never shown. *Export key…* copies it to the clipboard (two clicks) to move the
+  server to another computer; *Replace identity…* generates or imports another,
+  warning first that clients must then switch to the new endpoint id. If the
+  keychain loses it, the same section imports it back.
+- **Tunnel set & relays** — the routed domains/CIDRs pushed to clients and
+  enforced here, plus custom relays.
+- **Restart to apply** — the server runs with the settings it started with;
+  after a change (a client authorized or removed, the tunnel set edited, a new
+  identity) its pane offers *Restart now*.
+
+## Tray
+
+The menu shows the connections' aggregate line, then the server's status line
+with Start/Stop and Copy Endpoint ID (or "Set Up Server…" while there is
+none). The icon's badge shows the server's state — dimmed while stopped, a
+**dot** while it is starting or stopping, and a **checkmark** while it runs
+(how many clients are connected shows in the menu and the server pane);
+client connections don't change it while there is a server. Without one, the
+icon shows by its opacity alone whether a connection is up (no badge — the
+badge means the server).
+
+- **Live logs** — an in-app Logs pane; every session's log lines (core
+  internals included) are attributed to the server or their profile.
 - **Start at login** — on by default: the first launch registers the app as a
   per-user login item (a LaunchAgent plist in `~/Library/LaunchAgents` on
   macOS, a `HKCU\…\CurrentVersion\Run` value on Windows — the same
@@ -57,14 +107,13 @@ its own **server-direct port forwards**. Connecting is always manual.
   (`FLEXTUNNEL_DEV_CONFIG` or `FLEXTUNNEL_KEYCHAIN=mock`) never touches the
   login item, so a debug or test binary neither becomes one nor re-points a
   real install's at itself.
-- **Server auto-start** — when a server is configured, it starts with the app
-  (at login or by hand); its tray submenu still stops and restarts it.
 
 ## Where settings live
 
 Everything is stored in one `profiles.json` in the platform's local data
 directory. Non-secret data (names, server ids, ports, forwards, relay URLs,
-public keys) is plaintext. The **secrets** — auth-key secrets, the server's
+public keys — the server's endpoint id and authorized clients included) is
+plaintext. The **secrets** — auth-key secrets, the server's
 identity key, and the custom-relay auth tokens of profiles and the server —
 are sealed in the same file with AES-256-GCM under a random master key that is
 the one entry kept in the system keychain (**macOS Keychain** or the **Windows
@@ -93,7 +142,7 @@ Prebuilt, **unsigned** installers ship with each stable flextunnel release —
 `flextunnel-desktop-macos-arm64.dmg` and `flextunnel-desktop-windows-amd64.msi`
 on the [Releases page](https://github.com/flexaccessdev/flextunnel/releases).
 Because they're unsigned you'll need to work around Gatekeeper (macOS) or
-SmartScreen (Windows); the [main README](../../README.md#desktop-app-tray-gui-client-mode)
+SmartScreen (Windows); the [main README](../../README.md#desktop-app-tray-gui-server-and-client)
 covers the exact steps (the short version: download with `curl` rather than a
 browser to avoid the quarantine / mark-of-the-web flag).
 
@@ -129,10 +178,11 @@ Requires a recent Rust toolchain (edition 2024).
 ```
 src/main.rs     entry point; boots the iced daemon and the tray
    app.rs       the daemon state machine (sidebar + detail pane + tray glue)
-   view.rs      the window UI (profile list, detail pane, modals)
-   tray.rs      system-tray icon + status/server menu
+   view.rs      the window UI (sidebar, server + profile panes, modals)
+   tray.rs      system-tray icon + connections/server status menu
+   server_session.rs  the in-process server: one session, connected clients
    autostart.rs login-item registration (LaunchAgent / Run key)
-   tunnel.rs    background controller: one session per connected profile
+   tunnel.rs    background controller: the server + one session per profile
    config.rs    profile persistence (profiles.json + keychain tokens)
    icon.rs      tray glyph rendered at runtime
    style.rs     iced theme

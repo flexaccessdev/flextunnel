@@ -1,9 +1,11 @@
-//! The iced daemon state machine: a sidebar of connection profiles and the
-//! optional server plus a detail pane, driven alongside the system tray. Each
-//! profile can run its own tunnel session concurrently (its optional proxy
-//! ports and direct forwards); the server runs a flextunnel server in-process
-//! (there is only one: the per-user server lock is shared with the CLI). The
-//! daemon
+//! The iced daemon state machine: a sidebar of client connection profiles and
+//! the app's server plus a detail pane, driven alongside the system tray. The
+//! two roles weigh the same and either can go unused: each profile can run its
+//! own tunnel session concurrently (its optional proxy ports and direct
+//! forwards); the server is a flextunnel server run in-process (there is only
+//! one: the per-user server lock is shared with the CLI), started with the app
+//! and kept running unless stopped. A first launch shows a short intro of both
+//! (see [`App::intro`]). The daemon
 //! owns all state, so closing the window (which destroys it) loses nothing —
 //! the tray re-opens it on demand. Tray/menu events are forwarded from
 //! tray-icon's handlers into a channel drained by a [`Subscription`], so a
@@ -11,7 +13,9 @@
 //! keeps the snapshots and the tray state fresh the rest of the time.
 
 use crate::autostart;
-use crate::config::{self, AuthKey, Profile, ServerConfig, DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT};
+use crate::config::{
+    self, AuthKey, AuthorizedClient, Profile, ServerConfig, DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT,
+};
 use flextunnel_core::forwards::{
     PortForward, disable_failed_forwards, parse_port, validate_label, validate_remote_host,
 };
@@ -23,7 +27,6 @@ use crate::tunnel::{Controller, Phase, ProfileId, Snapshot};
 use crate::view;
 use flextunnel_core::transport::paths::ConnectionSnapshot;
 use iced::futures::Stream;
-use iced::widget::text_editor;
 use iced::{window, Element, Size, Subscription, Task};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -132,23 +135,45 @@ pub enum Message {
     FormCancel,
     // Server
     SetUpServer,
+    /// Leave the first-run intro for the server setup form.
+    IntroContinue,
+    /// Open the server's settings form (tunnel set and relays).
     EditServer,
     DeleteServer,
     StartServer,
     StopServer,
-    ServerSecretChanged(String),
-    /// Fill the server form's identity field with a freshly generated key.
-    ServerGenerateSecret,
-    ServerAuthorizedKeysEdited(text_editor::Action),
-    /// Append one of the app's own auth keys to the authorized keys (for a
-    /// client profile in this same app, or to copy a key over by hand).
-    ServerAddOwnKey(KeyChoice),
+    /// Restart the running server so changed settings take effect.
+    RestartServer,
+    /// The setup form's identity: import an existing key (`true`) or use the
+    /// generated one.
+    ServerImportToggled(bool),
+    ServerImportSecretChanged(String),
     ServerRoutedDomainsChanged(String),
     ServerRoutedCidrsChanged(String),
     ServerRelayUrlsChanged(String),
     ServerRelayAuthTokenChanged(String),
     ServerFormSave,
     ServerFormCancel,
+    // Authorized clients (the server pane)
+    AuthorizeClient,
+    ClientNameChanged(String),
+    ClientPublicKeyChanged(String),
+    /// Fill the client form with one of the app's own auth keys (for a client
+    /// profile on another of the user's machines that shares it).
+    ClientUseOwnKey(KeyChoice),
+    ClientFormSave,
+    ClientFormCancel,
+    /// Two-click removal, by public key.
+    RemoveClient(String),
+    // Server identity
+    /// Copy the identity secret to the clipboard (two-click), to move the
+    /// server to another computer.
+    ExportServerSecret,
+    ReplaceIdentity,
+    IdentityImportToggled(bool),
+    IdentitySecretChanged(String),
+    IdentityFormSave,
+    IdentityFormCancel,
     // Logs
     LogFilterChanged(LogFilter),
     OpenLogFolder,
@@ -533,19 +558,10 @@ pub fn validate_key_name(
     Ok(name)
 }
 
-/// Editable buffers for the server (the server add/edit form).
-#[derive(Default)]
-pub struct ServerForm {
-    /// Editing the existing server rather than adding it.
-    editing: bool,
-    /// The iroh identity secret (base64), masked in the form.
-    pub secret: String,
-    /// The authorized-keys document, one `ed25519-pub:...` per line.
-    pub authorized_keys: text_editor::Content,
-    pub routed_domains: String,
-    pub routed_cidrs: String,
-    pub relay_urls: String,
-    pub relay_auth_token: String,
+/// Words separated by single spaces, nothing leading or trailing — the
+/// stored shape of every name (see `config::is_valid_name`).
+fn normalize_name(name: &str) -> String {
+    name.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// A fresh iroh identity secret, base64 — the secret line of a
@@ -556,23 +572,78 @@ pub fn generate_server_secret() -> String {
         .encode(flextunnel_core::iroh::SecretKey::generate().to_bytes())
 }
 
+/// A server identity being chosen — at setup, or to replace the current one:
+/// a freshly generated key unless the user imports an existing one. The secret
+/// is never shown; the endpoint id it gives is.
+pub struct IdentityChoice {
+    generated: String,
+    /// `Some` while importing instead: the pasted secret.
+    pub import: Option<String>,
+}
+
+impl IdentityChoice {
+    fn new() -> Self {
+        Self {
+            generated: generate_server_secret(),
+            import: None,
+        }
+    }
+
+    fn importing() -> Self {
+        Self {
+            import: Some(String::new()),
+            ..Self::new()
+        }
+    }
+
+    fn secret(&self) -> &str {
+        self.import.as_deref().unwrap_or(&self.generated).trim()
+    }
+
+    /// The `(secret, endpoint id)` this choice gives the server — the endpoint
+    /// id is what clients enter as the server node id.
+    pub fn resolve(&self) -> Result<(String, String), String> {
+        let secret = self.secret();
+        if secret.is_empty() {
+            return Err("Paste the identity key to import".into());
+        }
+        let endpoint_id = flextunnel_core::secret::load_secret_from_string(secret)
+            .map_err(|e| format!("Invalid identity key: {e:#}"))?
+            .public()
+            .to_string();
+        Ok((secret.into(), endpoint_id))
+    }
+}
+
+/// Editable buffers for the server's setup form and its settings form. The
+/// identity is chosen at setup only (afterwards it is replaced through its own
+/// form, see [`IdentityChoice`]), and the authorized clients are managed on
+/// the server pane, not here.
+#[derive(Default)]
+pub struct ServerForm {
+    /// `Some` when setting up the server; `None` when editing its settings.
+    pub identity: Option<IdentityChoice>,
+    pub routed_domains: String,
+    pub routed_cidrs: String,
+    pub relay_urls: String,
+    pub relay_auth_token: String,
+}
+
 impl ServerForm {
     pub fn is_edit(&self) -> bool {
-        self.editing
+        self.identity.is_none()
     }
 
     fn add() -> Self {
         Self {
-            secret: generate_server_secret(),
+            identity: Some(IdentityChoice::new()),
             ..Self::default()
         }
     }
 
     fn edit(server: &ServerConfig) -> Self {
         Self {
-            editing: true,
-            secret: server.secret.clone(),
-            authorized_keys: text_editor::Content::with_text(&server.authorized_keys),
+            identity: None,
             routed_domains: server.routed_domains.join(", "),
             routed_cidrs: server.routed_cidrs.join(", "),
             relay_urls: server.relay_urls.join(", "),
@@ -580,49 +651,21 @@ impl ServerForm {
         }
     }
 
-    /// The endpoint id the form's secret gives the server, when it parses —
-    /// what clients enter as the server node id.
-    pub fn endpoint_id(&self) -> Option<String> {
-        flextunnel_core::secret::load_secret_from_string(self.secret.trim())
-            .ok()
-            .map(|secret| secret.public().to_string())
-    }
-
-    /// Append `line` to the authorized keys unless its key is already listed.
-    fn add_authorized_key(&mut self, public_key: &str, comment: &str) {
-        let text = self.authorized_keys.text();
-        if text
-            .lines()
-            .any(|line| line.split_whitespace().next() == Some(public_key))
-        {
-            return;
-        }
-        let mut text = text.trim_end().to_string();
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&format!("{public_key} {comment}\n"));
-        self.authorized_keys = text_editor::Content::with_text(&text);
-    }
-
-    pub fn validate(&self) -> Result<ServerConfig, String> {
-        let secret = self.secret.trim();
-        if secret.is_empty() {
-            return Err("Identity key is required (generate one, or paste a server key)".into());
-        }
-        let endpoint_id = flextunnel_core::secret::load_secret_from_string(secret)
-            .map_err(|e| format!("Invalid identity key: {e:#}"))?
-            .public()
-            .to_string();
-        let authorized_keys = self.authorized_keys.text();
-        let parsed = flextunnel_core::flexaccess_keys::parse_authorized_keys(
-            &authorized_keys,
-            "authorized keys",
-        )
-        .map_err(|e| format!("{e:#}"))?;
-        if parsed.is_empty() {
-            return Err("Add at least one authorized client key".into());
-        }
+    /// The server this form describes: a new one (no clients yet) when
+    /// setting up, else `current` with the form's settings.
+    pub fn validate(&self, current: Option<&ServerConfig>) -> Result<ServerConfig, String> {
+        let (secret, endpoint_id, authorized_clients) = match (&self.identity, current) {
+            (Some(identity), _) => {
+                let (secret, endpoint_id) = identity.resolve()?;
+                (secret, endpoint_id, Vec::new())
+            }
+            (None, Some(current)) => (
+                current.secret.clone(),
+                current.endpoint_id.clone(),
+                current.authorized_clients.clone(),
+            ),
+            (None, None) => return Err("The server was deleted".into()),
+        };
         let routed_domains = split_list(&self.routed_domains);
         let routed_cidrs = split_list(&self.routed_cidrs);
         flextunnel_core::proxy::RoutedSet::new(&routed_domains, &routed_cidrs)
@@ -637,13 +680,60 @@ impl ServerForm {
         }
         Ok(ServerConfig {
             endpoint_id,
-            secret: secret.into(),
-            authorized_keys,
+            secret,
+            authorized_clients,
             routed_domains,
             routed_cidrs,
             relay_urls,
             relay_auth_token,
         })
+    }
+}
+
+/// Editable buffers for authorizing one client on the server pane: a name for
+/// it and the public half of its auth key.
+#[derive(Default)]
+pub struct ClientForm {
+    pub name: String,
+    pub public_key: String,
+}
+
+impl ClientForm {
+    /// Take the public key field's new value. A whole authorized-key entry
+    /// (`ed25519-pub:... alice laptop`, as `flexaccess-keys show-auth-key`
+    /// prints it) is split: the key stays in the field, and its comment names
+    /// the client unless a name was typed already.
+    fn set_public_key(&mut self, value: String) {
+        match value.trim().split_once(char::is_whitespace) {
+            Some((key, comment)) => {
+                if self.name.trim().is_empty() {
+                    self.name = normalize_name(comment);
+                }
+                self.public_key = key.into();
+            }
+            None => self.public_key = value,
+        }
+    }
+
+    pub fn validate(&self, clients: &[AuthorizedClient]) -> Result<AuthorizedClient, String> {
+        let name = normalize_name(&self.name);
+        if name.is_empty() {
+            return Err("Name the client (e.g. the device it runs on)".into());
+        }
+        if name.chars().count() > 64 {
+            return Err("Client name must be 64 characters or fewer".into());
+        }
+        if clients.iter().any(|c| c.name == name) {
+            return Err(format!("Another client is already named \"{name}\""));
+        }
+        if self.public_key.trim().is_empty() {
+            return Err("Paste the client's public key (ed25519-pub:…)".into());
+        }
+        let public_key = config::parse_client_public_key(&self.public_key)?;
+        if let Some(other) = clients.iter().find(|c| c.public_key == public_key) {
+            return Err(format!("Client \"{}\" already has this key", other.name));
+        }
+        Ok(AuthorizedClient { name, public_key })
     }
 }
 
@@ -792,9 +882,25 @@ pub struct App {
     pub profile_form: Option<ProfileForm>,
     /// The Keys pane's open add/edit form.
     pub key_form: Option<KeyForm>,
-    /// The open server add/edit form (replaces the detail pane, like the
-    /// profile form).
+    /// The open server setup/settings form (replaces the detail pane, like
+    /// the profile form).
     pub server_form: Option<ServerForm>,
+    /// The server pane's open "authorize a client" form.
+    pub client_form: Option<ClientForm>,
+    /// The server pane's open "replace identity" form.
+    pub identity_form: Option<IdentityChoice>,
+    /// Two-click removal guard for an authorized client, by public key.
+    pub confirm_remove_client: Option<String>,
+    /// Two-click guard for copying the server's identity secret.
+    pub confirm_export_server_secret: bool,
+    /// The config the server session was last started with, so the pane can
+    /// tell when the saved settings differ from the running ones.
+    server_applied: Option<ServerConfig>,
+    /// Whether the server is meant to be running: set at launch (a configured
+    /// server starts with the app) and by Start, cleared by Stop. While set, a
+    /// change that makes a stopped server startable — the first client
+    /// authorized, a lost identity re-imported — starts it.
+    server_wanted: bool,
     /// The open forward form and the profile it belongs to.
     pub forward_form: Option<(ProfileId, ForwardForm)>,
     /// Two-click delete guard: the profile whose Delete was clicked once.
@@ -808,6 +914,10 @@ pub struct App {
     pub confirm_export_key: Option<String>,
     /// Transient status line in the detail pane (save results/failures).
     pub notice: Option<String>,
+    /// First run (nothing set up yet): the window shows the intro of both
+    /// roles, whose one Continue opens the window — no role to pick there;
+    /// either is set up from the sidebar any time.
+    pub intro: bool,
     /// Open connection-path modal: a point-in-time path snapshot (`ezvpn
     /// status`-style), overlaid until dismissed. `None` when closed.
     pub conn_path_modal: Option<ConnectionSnapshot>,
@@ -865,15 +975,14 @@ impl App {
                 (config::Store::default(), false)
             }
         };
+        let first_run = store.server.is_none() && store.profiles.is_empty();
+        // The first connection, else the server — or, with neither, the
+        // empty pane pointing at the sidebar (the unset server's slot).
         let selection = store
             .profiles
             .first()
             .map(|p| Selection::Profile(p.id.clone()))
-            .or_else(|| store.server.as_ref().map(|_| Selection::Server))
-            .unwrap_or(Selection::Logs);
-        // First run: go straight to creating a profile.
-        let profile_form = (store.profiles.is_empty() && store.server.is_none())
-            .then(|| ProfileForm::add(&[]));
+            .unwrap_or(Selection::Server);
 
         let mut app = Self {
             controller,
@@ -883,9 +992,16 @@ impl App {
             keys: store.keys,
             server: store.server,
             selection,
-            profile_form,
+            profile_form: None,
             key_form: None,
             server_form: None,
+            intro: first_run,
+            client_form: None,
+            identity_form: None,
+            confirm_remove_client: None,
+            confirm_export_server_secret: false,
+            server_applied: None,
+            server_wanted: true,
             forward_form: None,
             confirm_delete: None,
             confirm_delete_key: None,
@@ -936,16 +1052,12 @@ impl App {
         }
         app.launch_at_login = autostart::is_enabled();
         // A configured server is meant to be running: it starts with the app.
-        match &app.server {
-            Some(server) if server.is_ready() => {
-                log::info!("Starting the configured server");
-                app.controller.start_server(server.clone());
+        if let Some(server) = &app.server {
+            match server.start_blocker() {
+                None => log::info!("Starting the configured server"),
+                Some(blocker) => log::warn!("Not starting the server yet: {blocker}"),
             }
-            Some(_) => log::warn!(
-                "Not starting the server: its identity key is missing (re-enter it in the \
-                 Server pane)"
-            ),
-            None => {}
+            app.resume_server();
         }
         // Launched as a login item, the app stays in the tray; the window is
         // a click away — unless the secrets reset warning needs answering.
@@ -1030,15 +1142,7 @@ impl App {
             }
             Message::Select(selection) => {
                 self.selection = selection;
-                self.profile_form = None;
-                self.key_form = None;
-                self.server_form = None;
-                self.forward_form = None;
-                self.confirm_delete = None;
-                self.confirm_delete_key = None;
-                self.confirm_delete_server = false;
-                self.confirm_export_key = None;
-                self.notice = None;
+                self.close_forms();
                 self.conn_path_modal = None;
                 Task::none()
             }
@@ -1071,21 +1175,15 @@ impl App {
                 Task::none()
             }
             Message::AddProfile => {
+                self.close_forms();
                 self.profile_form = Some(ProfileForm::add(&self.profiles));
-                self.key_form = None;
-                self.server_form = None;
-                self.forward_form = None;
-                self.confirm_delete = None;
-                self.notice = None;
                 Task::none()
             }
             Message::EditProfile(id) => {
                 if let Some(profile) = self.profiles.iter().find(|p| p.id == id) {
-                    self.profile_form = Some(ProfileForm::edit(profile));
-                    self.key_form = None;
-                    self.server_form = None;
-                    self.forward_form = None;
-                    self.notice = None;
+                    let form = ProfileForm::edit(profile);
+                    self.close_forms();
+                    self.profile_form = Some(form);
                 }
                 Task::none()
             }
@@ -1358,26 +1456,16 @@ impl App {
                 self.forward_form = None;
                 Task::none()
             }
-            Message::SetUpServer => {
-                // There is only one server: the sidebar offers setup only
-                // while none is configured.
-                if self.server.is_none() {
-                    self.server_form = Some(ServerForm::add());
-                    self.profile_form = None;
-                    self.key_form = None;
-                    self.forward_form = None;
-                    self.confirm_delete_server = false;
-                    self.notice = None;
-                }
+            Message::SetUpServer => self.set_up_server(),
+            Message::IntroContinue => {
+                self.intro = false;
                 Task::none()
             }
             Message::EditServer => {
                 if let Some(server) = &self.server {
-                    self.server_form = Some(ServerForm::edit(server));
-                    self.profile_form = None;
-                    self.key_form = None;
-                    self.forward_form = None;
-                    self.notice = None;
+                    let form = ServerForm::edit(server);
+                    self.close_forms();
+                    self.server_form = Some(form);
                 }
                 Task::none()
             }
@@ -1387,32 +1475,38 @@ impl App {
             }
             Message::StartServer => self.start_server(),
             Message::StopServer => {
-                self.controller.stop_server();
+                self.stop_server();
                 Task::none()
             }
-            Message::ServerSecretChanged(value) => {
-                if let Some(form) = &mut self.server_form {
-                    form.secret = value;
+            Message::RestartServer => {
+                let Some(server) = self.server.clone() else {
+                    return Task::none();
+                };
+                self.server_wanted = true;
+                match server.start_blocker() {
+                    None => {
+                        self.controller.restart_server(server.clone());
+                        self.server_applied = Some(server);
+                    }
+                    // E.g. the last client was removed: it would not start again.
+                    Some(blocker) => self.notice = Some(blocker.into()),
                 }
                 Task::none()
             }
-            Message::ServerGenerateSecret => {
-                if let Some(form) = &mut self.server_form {
-                    form.secret = generate_server_secret();
+            Message::ServerImportToggled(import) => {
+                if let Some(identity) = self.server_form.as_mut().and_then(|f| f.identity.as_mut()) {
+                    identity.import = import.then(String::new);
                 }
                 Task::none()
             }
-            Message::ServerAuthorizedKeysEdited(action) => {
-                if let Some(form) = &mut self.server_form {
-                    form.authorized_keys.perform(action);
-                }
-                Task::none()
-            }
-            Message::ServerAddOwnKey(choice) => {
-                if let Some(form) = &mut self.server_form
-                    && let Some(key) = config::find_key(&self.keys, &choice.id)
+            Message::ServerImportSecretChanged(value) => {
+                if let Some(secret) = self
+                    .server_form
+                    .as_mut()
+                    .and_then(|f| f.identity.as_mut())
+                    .and_then(|i| i.import.as_mut())
                 {
-                    form.add_authorized_key(&key.public_key, &key.name);
+                    *secret = value;
                 }
                 Task::none()
             }
@@ -1446,6 +1540,83 @@ impl App {
             }
             Message::ServerFormCancel => {
                 self.server_form = None;
+                Task::none()
+            }
+            Message::AuthorizeClient => {
+                self.client_form = Some(ClientForm::default());
+                self.identity_form = None;
+                self.confirm_remove_client = None;
+                self.notice = None;
+                Task::none()
+            }
+            Message::ClientNameChanged(value) => {
+                if let Some(form) = &mut self.client_form {
+                    form.name = value;
+                }
+                Task::none()
+            }
+            Message::ClientPublicKeyChanged(value) => {
+                if let Some(form) = &mut self.client_form {
+                    form.set_public_key(value);
+                }
+                Task::none()
+            }
+            Message::ClientUseOwnKey(choice) => {
+                if let Some(form) = &mut self.client_form
+                    && let Some(key) = config::find_key(&self.keys, &choice.id)
+                {
+                    form.name = key.name.clone();
+                    form.public_key = key.public_key.clone();
+                }
+                Task::none()
+            }
+            Message::ClientFormSave => {
+                self.save_client_form();
+                Task::none()
+            }
+            Message::ClientFormCancel => {
+                self.client_form = None;
+                Task::none()
+            }
+            Message::RemoveClient(public_key) => {
+                self.remove_client(public_key);
+                Task::none()
+            }
+            Message::ExportServerSecret => {
+                self.export_server_secret();
+                Task::none()
+            }
+            Message::ReplaceIdentity => {
+                // A lost identity is restored by importing it, not replaced.
+                let lost = self.server.as_ref().is_some_and(|s| s.secret.is_empty());
+                self.identity_form = Some(if lost {
+                    IdentityChoice::importing()
+                } else {
+                    IdentityChoice::new()
+                });
+                self.client_form = None;
+                self.confirm_export_server_secret = false;
+                self.notice = None;
+                Task::none()
+            }
+            Message::IdentityImportToggled(import) => {
+                if let Some(identity) = &mut self.identity_form {
+                    identity.import = import.then(String::new);
+                }
+                Task::none()
+            }
+            Message::IdentitySecretChanged(value) => {
+                if let Some(secret) = self.identity_form.as_mut().and_then(|i| i.import.as_mut()) {
+                    *secret = value;
+                }
+                Task::none()
+            }
+            Message::IdentityFormSave => {
+                self.save_identity_form();
+                Task::none()
+            }
+            Message::IdentityFormCancel => {
+                self.identity_form = None;
                 Task::none()
             }
             Message::LogFilterChanged(filter) => {
@@ -1559,10 +1730,62 @@ impl App {
                 .profiles
                 .get(pos.min(self.profiles.len().saturating_sub(1)))
                 .map(|p| Selection::Profile(p.id.clone()))
+                .or_else(|| self.server.as_ref().map(|_| Selection::Server))
                 .unwrap_or(Selection::Logs);
         }
-        if self.profiles.is_empty() {
-            self.profile_form = Some(ProfileForm::add(&[]));
+    }
+
+    /// Close every form and two-click guard of the detail pane.
+    fn close_forms(&mut self) {
+        self.profile_form = None;
+        self.key_form = None;
+        self.server_form = None;
+        self.client_form = None;
+        self.identity_form = None;
+        self.forward_form = None;
+        self.confirm_delete = None;
+        self.confirm_delete_key = None;
+        self.confirm_delete_server = false;
+        self.confirm_export_key = None;
+        self.confirm_remove_client = None;
+        self.confirm_export_server_secret = false;
+        self.notice = None;
+    }
+
+    fn set_up_server(&mut self) -> Task<Message> {
+        // There is only one server: setup is offered only while none is
+        // configured.
+        if self.server.is_some() {
+            self.selection = Selection::Server;
+            return self.show_window();
+        }
+        self.close_forms();
+        self.server_form = Some(ServerForm::add());
+        self.show_window()
+    }
+
+    /// Whether the running server was started with other settings than the
+    /// saved ones, so a restart is needed to apply them.
+    pub fn server_needs_restart(&self) -> bool {
+        matches!(
+            self.server_snapshot.phase,
+            ServerPhase::Starting | ServerPhase::Running
+        ) && self.server_applied.as_ref() != self.server.as_ref()
+    }
+
+    /// Start the server if it is meant to run, is down, and can start: at
+    /// launch, and after a change that may have made it startable.
+    fn resume_server(&mut self) {
+        let down = matches!(
+            self.controller.server_snapshot().phase,
+            ServerPhase::Stopped | ServerPhase::Failed
+        );
+        if self.server_wanted
+            && down
+            && let Some(server) = self.server.clone().filter(ServerConfig::is_ready)
+        {
+            self.controller.start_server(server.clone());
+            self.server_applied = Some(server);
         }
     }
 
@@ -1570,17 +1793,29 @@ impl App {
         let Some(server) = self.server.clone() else {
             return Task::none();
         };
+        self.server_wanted = true;
         if server.is_ready() {
-            self.controller.start_server(server);
+            self.controller.start_server(server.clone());
+            self.server_applied = Some(server);
             return Task::none();
         }
-        // The identity secret was lost from the keychain — re-enter it (or
-        // generate a new identity, which changes the endpoint id).
+        // Show what is missing, with its form open: the identity secret was
+        // lost from the keychain (import it again), or no client is
+        // authorized yet.
         self.selection = Selection::Server;
-        self.server_form = Some(ServerForm::edit(&server));
-        self.profile_form = None;
-        self.notice = Some("Re-enter the server's identity key to start it.".into());
+        self.close_forms();
+        if server.secret.is_empty() {
+            self.identity_form = Some(IdentityChoice::importing());
+        } else {
+            self.client_form = Some(ClientForm::default());
+        }
+        self.notice = server.start_blocker().map(String::from);
         self.show_window()
+    }
+
+    fn stop_server(&mut self) {
+        self.server_wanted = false;
+        self.controller.stop_server();
     }
 
     fn delete_server(&mut self) {
@@ -1594,6 +1829,8 @@ impl App {
         }
         self.controller.remove_server();
         self.server_snapshot = ServerSnapshot::default();
+        self.server_applied = None;
+        self.close_forms();
         if self.log_filter == LogFilter::Server {
             self.log_filter = LogFilter::All;
             self.rebuild_log_text();
@@ -1614,24 +1851,115 @@ impl App {
         let Some(form) = &self.server_form else {
             return;
         };
-        let Ok(server) = form.validate() else {
+        let Ok(server) = form.validate(self.server.as_ref()) else {
             return;
         };
-        let running = matches!(
-            self.server_snapshot.phase,
-            ServerPhase::Starting | ServerPhase::Running
-        );
+        let setting_up = self.server.is_none();
         self.server = Some(server);
+        // A save failure's notice wins over the outcome below.
+        self.notice = None;
         self.persist_store();
-        if self.notice.is_none() {
-            self.notice = Some(if running {
-                "Saved — restart the server to apply.".into()
-            } else {
-                "Saved.".into()
-            });
-        }
         self.selection = Selection::Server;
         self.server_form = None;
+        if setting_up {
+            // A new server has no clients yet and cannot start without one:
+            // go straight on to authorizing the first. It starts once there is.
+            self.server_wanted = true;
+            self.client_form = Some(ClientForm::default());
+            if self.notice.is_none() {
+                self.notice = Some(
+                    "Server created. Authorize the first client to start it.".into(),
+                );
+            }
+        } else if self.notice.is_none() {
+            self.notice = Some("Saved.".into());
+        }
+    }
+
+    fn save_client_form(&mut self) {
+        let (Some(form), Some(server)) = (&self.client_form, &mut self.server) else {
+            return;
+        };
+        let Ok(client) = form.validate(&server.authorized_clients) else {
+            return;
+        };
+        let name = client.name.clone();
+        server.authorized_clients.push(client);
+        self.client_form = None;
+        self.notice = None;
+        self.persist_store();
+        if self.notice.is_none() {
+            self.notice = Some(format!("Authorized \"{name}\"."));
+        }
+        self.resume_server();
+    }
+
+    fn remove_client(&mut self, public_key: String) {
+        self.confirm_export_server_secret = false;
+        if self.confirm_remove_client.as_deref() != Some(public_key.as_str()) {
+            self.confirm_remove_client = Some(public_key);
+            return;
+        }
+        self.confirm_remove_client = None;
+        let Some(server) = &mut self.server else {
+            return;
+        };
+        let before = server.authorized_clients.len();
+        server.authorized_clients.retain(|c| c.public_key != public_key);
+        if server.authorized_clients.len() != before {
+            self.notice = None;
+            self.persist_store();
+        }
+    }
+
+    /// Two-click export: the second click puts the identity secret on the
+    /// clipboard, to import on another computer (or into a CLI server's key
+    /// file). The clipboard is the export channel on purpose — the secret
+    /// never lands in a file or on screen.
+    fn export_server_secret(&mut self) {
+        self.confirm_remove_client = None;
+        if !self.confirm_export_server_secret {
+            self.confirm_export_server_secret = true;
+            return;
+        }
+        self.confirm_export_server_secret = false;
+        let Some(secret) = self.server.as_ref().map(|s| s.secret.clone()) else {
+            return;
+        };
+        if secret.is_empty() {
+            return;
+        }
+        self.notice = Some(if self.copy_text(secret) {
+            "Identity key copied — import it on the other computer, then delete the \
+             server here: one identity must run on one server only."
+                .into()
+        } else {
+            "Clipboard unavailable — the identity key was not copied.".into()
+        });
+    }
+
+    fn save_identity_form(&mut self) {
+        let (Some(identity), Some(server)) = (&self.identity_form, &mut self.server) else {
+            return;
+        };
+        let Ok((secret, endpoint_id)) = identity.resolve() else {
+            return;
+        };
+        let changed = endpoint_id != server.endpoint_id;
+        server.secret = secret;
+        server.endpoint_id = endpoint_id;
+        self.identity_form = None;
+        self.notice = None;
+        self.persist_store();
+        if self.notice.is_none() {
+            self.notice = Some(if changed {
+                "New identity saved — every client must switch to the new endpoint id.".into()
+            } else {
+                "Identity key restored.".into()
+            });
+        }
+        // A re-imported identity makes a stopped server startable again.
+        self.resume_server();
     }
 
     fn handle_menu_event(&mut self, id: &str) -> Task<Message> {
@@ -1641,11 +1969,15 @@ impl App {
                 self.controller.shutdown();
                 iced::exit()
             }
-            tray::MENU_START_SERVER => self.start_server(),
-            tray::MENU_STOP_SERVER => {
-                self.controller.stop_server();
-                Task::none()
-            }
+            tray::MENU_TOGGLE_SERVER => match self.server_snapshot.phase {
+                ServerPhase::Starting | ServerPhase::Running => {
+                    self.stop_server();
+                    Task::none()
+                }
+                ServerPhase::Stopped | ServerPhase::Failed => self.start_server(),
+                ServerPhase::Stopping => Task::none(),
+            },
+            tray::MENU_SET_UP_SERVER => self.set_up_server(),
             tray::MENU_COPY_SERVER_ID => {
                 if let Some(endpoint_id) = self.server.as_ref().map(|s| s.endpoint_id.clone()) {
                     self.copy_text(endpoint_id);
@@ -2351,73 +2683,113 @@ mod tests {
     }
 
     fn valid_server_form() -> ServerForm {
-        let client = flextunnel_core::auth::ClientKey::generate().unwrap();
         ServerForm {
-            editing: false,
-            secret: format!(" {} ", generate_server_secret()),
-            authorized_keys: text_editor::Content::with_text(&format!(
-                "# laptop\n{} laptop\n",
-                client.public_str()
-            )),
             routed_domains: " *.internal ,, example.com ".into(),
             routed_cidrs: "10.0.0.0/8".into(),
-            relay_urls: String::new(),
-            relay_auth_token: String::new(),
+            ..ServerForm::add()
         }
     }
 
-    #[test]
-    fn server_form_trims_and_builds() {
-        let form = valid_server_form();
-        let server = form.validate().expect("valid");
-        assert_eq!(server.secret, form.secret.trim());
-        assert_eq!(Some(server.endpoint_id.clone()), form.endpoint_id());
-        assert_eq!(server.routed_domains, ["*.internal", "example.com"]);
-        assert_eq!(server.routed_cidrs, ["10.0.0.0/8"]);
-        assert!(server.authorized_keys.contains("laptop"));
+    fn client_key() -> String {
+        flextunnel_core::auth::ClientKey::generate().unwrap().public_str()
     }
 
     #[test]
-    fn server_form_accepts_an_empty_tunnel_set() {
+    fn server_setup_generates_an_identity_and_starts_without_clients() {
+        let form = valid_server_form();
+        let server = form.validate(None).expect("valid");
+        let (secret, endpoint_id) = form.identity.as_ref().unwrap().resolve().unwrap();
+        assert_eq!((server.secret, server.endpoint_id), (secret, endpoint_id));
+        assert_eq!(server.routed_domains, ["*.internal", "example.com"]);
+        assert_eq!(server.routed_cidrs, ["10.0.0.0/8"]);
+        assert!(server.authorized_clients.is_empty(), "clients come after setup");
+        assert_ne!(
+            ServerForm::add().validate(None).unwrap().endpoint_id,
+            ServerForm::add().validate(None).unwrap().endpoint_id,
+            "every setup generates its own identity"
+        );
+    }
+
+    #[test]
+    fn server_setup_imports_an_existing_identity() {
+        let existing = valid_server_form().validate(None).unwrap();
         let mut form = valid_server_form();
+        let identity = form.identity.as_mut().unwrap();
+        identity.import = Some(String::new());
+        assert!(form.validate(None).is_err(), "nothing pasted yet");
+        form.identity.as_mut().unwrap().import = Some(format!(" {} ", existing.secret));
+        let imported = form.validate(None).expect("valid");
+        assert_eq!(imported.endpoint_id, existing.endpoint_id);
+        assert_eq!(imported.secret, existing.secret);
+        form.identity.as_mut().unwrap().import = Some("not base64!".into());
+        assert!(form.validate(None).is_err());
+    }
+
+    #[test]
+    fn server_settings_keep_the_identity_and_clients() {
+        let mut current = valid_server_form().validate(None).unwrap();
+        current.authorized_clients.push(AuthorizedClient {
+            name: "laptop".into(),
+            public_key: client_key(),
+        });
+        let mut form = ServerForm::edit(&current);
+        assert!(form.is_edit());
         form.routed_domains = String::new();
         form.routed_cidrs = " , ".into();
-        let server = form.validate().expect("the reserved namespace is always routed");
-        assert!(server.routed_domains.is_empty());
-        assert!(server.routed_cidrs.is_empty());
+        let edited = form.validate(Some(&current)).expect("an empty tunnel set is fine");
+        assert!(edited.routed_domains.is_empty() && edited.routed_cidrs.is_empty());
+        assert_eq!(edited.secret, current.secret);
+        assert_eq!(edited.authorized_clients, current.authorized_clients);
+        assert!(form.validate(None).is_err(), "server deleted meanwhile");
     }
 
     #[test]
     fn server_form_rejects_bad_input() {
         let mut form = valid_server_form();
-        form.secret = "not base64!".into();
-        assert!(form.validate().is_err());
-
-        let mut form = valid_server_form();
-        form.authorized_keys = text_editor::Content::with_text("# nothing but comments\n");
-        assert!(form.validate().is_err(), "no client keys");
-        form.authorized_keys = text_editor::Content::with_text("ed25519-pub:nope\n");
-        assert!(form.validate().is_err(), "malformed key");
-
-        let mut form = valid_server_form();
         form.routed_cidrs = "10.0.0.0/33".into();
-        assert!(form.validate().is_err(), "bad CIDR");
+        assert!(form.validate(None).is_err(), "bad CIDR");
 
         let mut form = valid_server_form();
         form.relay_auth_token = "psk".into();
-        assert!(form.validate().is_err(), "token without relays");
+        assert!(form.validate(None).is_err(), "token without relays");
     }
 
     #[test]
-    fn adding_an_own_key_appends_once() {
-        let mut form = ServerForm::default();
-        form.add_authorized_key("ed25519-pub:abc", "work laptop");
-        form.add_authorized_key("ed25519-pub:abc", "work laptop");
-        form.add_authorized_key("ed25519-pub:def", "home");
-        assert_eq!(
-            form.authorized_keys.text(),
-            "ed25519-pub:abc work laptop\ned25519-pub:def home\n"
-        );
+    fn client_form_validates() {
+        let key = client_key();
+        let form = ClientForm {
+            name: "  work   laptop ".into(),
+            public_key: format!(" {key} "),
+        };
+        let client = form.validate(&[]).expect("valid");
+        assert_eq!(client.name, "work laptop");
+        assert_eq!(client.public_key, key);
+
+        assert!(ClientForm { name: " ".into(), ..ClientForm::default() }.validate(&[]).is_err());
+        let no_key = ClientForm { name: "phone".into(), public_key: String::new() };
+        assert!(no_key.validate(&[]).is_err());
+        let bad_key = ClientForm { name: "phone".into(), public_key: "ed25519-pub:nope".into() };
+        assert!(bad_key.validate(&[]).is_err());
+
+        let existing = [client];
+        let same_name = ClientForm { name: "work laptop".into(), public_key: client_key() };
+        assert!(same_name.validate(&existing).is_err(), "duplicate name");
+        let same_key = ClientForm { name: "phone".into(), public_key: key.clone() };
+        assert!(same_key.validate(&existing).is_err(), "duplicate key");
+    }
+
+    #[test]
+    fn pasting_an_authorized_key_entry_names_the_client() {
+        let key = client_key();
+        let mut form = ClientForm::default();
+        form.set_public_key(format!(" {key}  alice   laptop "));
+        assert_eq!((form.name.as_str(), form.public_key.as_str()), ("alice laptop", key.as_str()));
+
+        // A name already typed wins over the comment.
+        let mut named = ClientForm { name: "phone".into(), ..ClientForm::default() };
+        named.set_public_key(format!("{key} alice laptop"));
+        assert_eq!((named.name.as_str(), named.public_key.as_str()), ("phone", key.as_str()));
+        assert!(named.validate(&[]).is_ok());
     }
 
     #[test]

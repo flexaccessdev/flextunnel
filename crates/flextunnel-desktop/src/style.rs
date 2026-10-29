@@ -4,7 +4,7 @@
 //! palette colors never show through.
 
 use iced::overlay::menu;
-use iced::widget::{button, checkbox, container, pick_list, text_editor, text_input, toggler};
+use iced::widget::{button, checkbox, container, pick_list, text_input, toggler};
 use iced::{border, Border, Color, Shadow, Theme, Vector};
 
 /// Status colors, readable on both modes.
@@ -259,23 +259,6 @@ pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
             radius: 8.0.into(),
         },
         icon: t.dim,
-        placeholder: t.faint,
-        value: t.text,
-        selection: t.accent.scale_alpha(0.35),
-    }
-}
-
-/// Multi-line field (the server form's authorized keys), matching `input`.
-pub fn editor(theme: &Theme, status: text_editor::Status) -> text_editor::Style {
-    let t = tokens(theme);
-    let focused = matches!(status, text_editor::Status::Focused { .. });
-    text_editor::Style {
-        background: t.surface_hi.into(),
-        border: Border {
-            color: if focused { t.accent } else { t.border },
-            width: 1.0,
-            radius: 8.0.into(),
-        },
         placeholder: t.faint,
         value: t.text,
         selection: t.accent.scale_alpha(0.35),
