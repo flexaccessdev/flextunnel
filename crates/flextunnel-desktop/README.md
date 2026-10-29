@@ -63,12 +63,13 @@ is one step, the identity — a fresh one generated, or an existing one imported
 to move a server here, either way showing the endpoint id it gives — then
 *Create server* goes straight on to authorizing the first client.
 
-- **Enabled** — a switch in the server pane (and *Enable/Disable Server* in
-  the tray). An enabled server starts with the app (at login or by hand), and
-  as soon as it becomes startable — its first client authorized, a lost
-  identity re-imported; after a failure, *Retry* starts it again. Disabling
-  stops it and keeps it stopped across launches until it is enabled again;
-  *Delete server…* removes it and its identity for good.
+- **Enabled** — the server's only on/off control: a switch in the server
+  pane (and *Enable/Disable Server* in the tray); there is no separate
+  Start/Stop. An enabled server runs: it starts with the app (at login or by
+  hand), and as soon as it becomes startable — its first client authorized, a
+  lost identity re-imported. Disabling stops it and keeps it stopped across
+  launches until it is enabled again; after a failure, switching it off and
+  on retries. *Delete server…* removes it and its identity for good.
 
 - **Endpoint ID** — the server's public identity, shown in full at the top of
   its pane in a selectable field with a Copy button (and "Copy Endpoint ID" in

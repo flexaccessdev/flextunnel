@@ -143,12 +143,10 @@ pub enum Message {
     /// Open the server's settings form (tunnel set and relays).
     EditServer,
     DeleteServer,
-    /// The server pane's Enabled switch and the tray's Enable/Disable item:
-    /// whether the server is meant to run — persisted, so a disabled server
-    /// stays stopped across launches.
+    /// The server pane's Enabled switch and the tray's Enable/Disable item —
+    /// the server's only on/off control: enabled, it runs (starting with the
+    /// app); disabled, it stops and stays stopped across launches.
     SetServerEnabled(bool),
-    /// Start an enabled server that is down (it failed, or could not start).
-    RetryServer,
     /// Restart the running server so changed settings take effect.
     RestartServer,
     /// The setup form's identity: import an existing key (`true`) or use the
@@ -1479,7 +1477,6 @@ impl App {
                 Task::none()
             }
             Message::SetServerEnabled(enabled) => self.set_server_enabled(enabled),
-            Message::RetryServer => self.start_server(),
             Message::RestartServer => {
                 let Some(server) = self.server.clone() else {
                     return Task::none();
@@ -1795,8 +1792,9 @@ impl App {
         }
     }
 
-    /// Enable or disable the server, persisted: enabling starts it (or shows
-    /// what it is missing), disabling stops it and keeps it stopped.
+    /// Enable or disable the server, persisted: enabling starts it — or shows
+    /// what it is missing — and disabling stops it and keeps it stopped.
+    /// Switching it off and on again is also how a failed server is retried.
     fn set_server_enabled(&mut self, enabled: bool) -> Task<Message> {
         let Some(server) = &mut self.server else {
             return Task::none();
@@ -1806,17 +1804,11 @@ impl App {
             self.notice = None;
             self.persist_store();
         }
-        if enabled {
-            self.start_server()
-        } else {
+        if !enabled {
             self.controller.stop_server();
-            Task::none()
+            return Task::none();
         }
-    }
-
-    /// Start the (enabled) server now, or show what keeps it from starting.
-    fn start_server(&mut self) -> Task<Message> {
-        let Some(server) = self.server.clone().filter(|s| s.enabled) else {
+        let Some(server) = self.server.clone() else {
             return Task::none();
         };
         if server.is_ready() {

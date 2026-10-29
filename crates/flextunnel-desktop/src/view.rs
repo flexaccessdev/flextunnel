@@ -1280,19 +1280,9 @@ fn server_detail<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
         );
     }
     hero = hero.push(space().width(Fill));
-    // An enabled server that is down — it failed, or was missing something —
-    // can be tried again; Start opens what is missing (see `App::start_server`).
-    if server.enabled && matches!(snapshot.phase, ServerPhase::Stopped | ServerPhase::Failed) {
-        let label = if snapshot.phase == ServerPhase::Failed { "Retry" } else { "Start" };
-        hero = hero.push(
-            button(text(label).size(13).font(semibold()))
-                .padding([6, 14])
-                .style(style::primary)
-                .on_press(Message::RetryServer),
-        );
-    }
-    // Enabled is the persisted intent: a disabled server stays stopped across
-    // launches. Not switchable while the endpoint is still closing.
+    // The server's only on/off control, persisted: enabled, it runs (and
+    // starts with the app); disabled, it stays stopped across launches. Not
+    // switchable while the endpoint is still closing.
     let mut switch = toggler(server.enabled)
         .label("Enabled")
         .text_size(13)
@@ -1309,6 +1299,11 @@ fn server_detail<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
     }
     if let Some(error) = &snapshot.last_error {
         col = col.push(text(error.as_str()).size(12).color(RED));
+    }
+    if server.enabled && snapshot.phase == ServerPhase::Failed {
+        col = col.push(
+            text("Switch it off and on again to retry.").size(12).style(style::dim_text),
+        );
     }
     if let Some(blocker) = server.start_blocker()
         && !running
