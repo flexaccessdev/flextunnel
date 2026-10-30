@@ -128,15 +128,18 @@ cargo build --release -p flextunnel-desktop
 That produces the bare executable, **not** a `.app` bundle — so on macOS it has
 no `Info.plist` and will show a Dock icon instead of running as a pure menu-bar
 app. For the proper bundle, build it the way CI does with `cargo-packager`
-(macOS only; `app` gives `flextunnel.app`, `dmg` gives the drag-to-Applications
-disk image):
+(macOS only):
 
 ```sh
 cargo install cargo-packager   # or: cargo binstall cargo-packager
 cargo packager --release -p flextunnel-desktop --formats app
 # bundle: target/release/flextunnel.app  (locally built → not quarantined,
-# so no Gatekeeper workaround needed; use --formats dmg for a .dmg instead)
+# so no Gatekeeper workaround needed)
 ```
+
+For the drag-to-Applications disk image instead, run `./build-macos-dmg.sh`
+(also needs `brew install create-dmg`); it writes
+`dist/macos/flextunnel-desktop-macos-arm64.dmg`.
 
 Otherwise:
 
@@ -212,10 +215,20 @@ flextunnel show-iroh-id --secret-file server.key   # re-print the EndpointId
 ```
 
 Client authentication keys are managed by the standalone
-[`flexaccess-keys`](https://github.com/flexaccessdev/flexaccess-keys) CLI;
-install it with its one-line installer
-(`curl -sSL https://flexaccessdev.github.io/flexaccess-keys/install.sh | bash`,
-Windows: `irm https://flexaccessdev.github.io/flexaccess-keys/install.ps1 | iex`):
+[`flexaccess-keys`](https://github.com/flexaccessdev/flexaccess-keys) CLI.
+Install it with its one-line installer:
+
+```sh
+# macOS / Linux
+curl -sSL https://flexaccessdev.github.io/flexaccess-keys/install.sh | bash
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://flexaccessdev.github.io/flexaccess-keys/install.ps1 | iex
+```
+
+Then:
 
 ```sh
 # On each client machine: generate that client's keypair, then derive its

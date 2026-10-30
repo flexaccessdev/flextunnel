@@ -55,6 +55,7 @@ windows-registry = "0.6"
 tempfile = { workspace = true }
 
 # Installer packaging (`cargo packager`): .app on macOS, .msi (WiX) on Windows.
+# The macOS .dmg is made from the .app by build-macos-dmg.sh, not by this config.
 # Icons are pre-generated from the iOS icon.svg glyph (see src/icon.rs, which
 # renders the same geometry at runtime for the tray).
 [package.metadata.packager]

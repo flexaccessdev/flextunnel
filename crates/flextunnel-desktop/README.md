@@ -182,9 +182,15 @@ a Dock icon instead of running as a pure menu-bar app because it has no
 
 ```sh
 cargo install cargo-packager        # or: cargo binstall cargo-packager
-cargo packager --release -p flextunnel-desktop --formats app   # or dmg / wix
+cargo packager --release -p flextunnel-desktop --formats app   # or wix
 # bundle: target/release/flextunnel.app
 ```
+
+The macOS `.dmg` comes from [`build-macos-dmg.sh`](../../build-macos-dmg.sh)
+at the repo root (needs `brew install create-dmg`), which wraps that `.app` and
+gives the mounted volume [`icons/dmg-volume.icns`](icons/dmg-volume.icns) — a
+drive with the app icon on it. Regenerate that icon with
+`uv run icons/make-dmg-volume-icon.py` after changing the app icon.
 
 Requires a recent Rust toolchain (edition 2024).
 
