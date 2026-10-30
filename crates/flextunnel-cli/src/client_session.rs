@@ -74,9 +74,11 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
     }
 
     // Serve the control socket others attach to; a detaching panel never stops
-    // the tunnel, and the loop keeps running when the channel closes.
+    // the tunnel, and the loop keeps running when the channel closes. `client
+    // nc` tunnels share the session's connection, like the port forwards.
+    let forwarder = runtime.client.server_forwarder();
     drive_session(runtime, move |tx, _initial| {
-        ipc::spawn_ipc_server(&key, tx).map(IpcSink::Socket)
+        ipc::spawn_ipc_server(&key, tx, forwarder).map(IpcSink::Socket)
     })
     .await
 }

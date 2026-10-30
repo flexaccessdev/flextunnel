@@ -60,7 +60,12 @@ flextunnel client control -c ~/.config/flextunnel/aws.toml
 
 Specify the instance config: a bare `client control` looks for
 `~/.config/flextunnel/client.toml`, not `<instance>.toml`. Alternatively, use
-`-n <server EndpointId>` to attach by server id.
+`-n <server EndpointId>` to attach by server id. The same goes for
+`client nc`, for example as an SSH `ProxyCommand`:
+
+```
+ProxyCommand flextunnel client nc -c ~/.config/flextunnel/aws.toml %h %p
+```
 
 The panel is read-only; `q` detaches without stopping the tunnel. To change
 ports, forwards or other settings, edit the config and restart the instance:

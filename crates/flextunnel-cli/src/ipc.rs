@@ -1,5 +1,6 @@
-//! Local control channel between a running `flextunnel client start` and
-//! `flextunnel client control`.
+//! Local control channel between a running `flextunnel client start` and the
+//! commands that attach to it: `flextunnel client control` and
+//! `flextunnel client nc`.
 //!
 //! Transport: a Unix domain socket (`~/.config/flextunnel/client-<key>.sock`)
 //! or a Windows named pipe (`\\.\pipe\flextunnel-client-<key>`), where `<key>`
@@ -8,10 +9,13 @@
 //! ends are this one binary and the repo has a no-compatibility policy, so
 //! there is no protocol version field.
 //!
-//! The channel is read-only (status and connection-path snapshots), but the
-//! snapshots describe the user's network (routes, hosts, forwards), so the Unix
-//! socket is still chmod'd 0600 (owner only). On Windows the default pipe
-//! security descriptor already restricts other users.
+//! A connection either carries status requests (status and connection-path
+//! snapshots), or opens with one [`Request::Connect`] and, once answered with
+//! [`Response::Connected`], turns into the raw byte stream of one tunnel to a
+//! server-side target — `client nc`'s stdio relay. The snapshots describe the
+//! user's network and a tunnel reaches into it, so the Unix socket is chmod'd
+//! 0600 (owner only). On Windows the default pipe security descriptor already
+//! restricts other users.
 //!
 //! The socket is not the single-instance lock — see `lock.rs` for why. But
 //! *because* the caller holds that lock, unconditionally removing a stale
@@ -23,7 +27,11 @@
 //! overflows — that surfaces as a clear bind error.
 
 use anyhow::{Context, Result};
+use flextunnel_core::forwards::validate_remote_host;
+use flextunnel_core::proxy::ServerForwarder;
+use flextunnel_core::proxy::signaling::Target;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{
@@ -41,6 +49,9 @@ use crate::instance;
 const MAX_LINE: usize = 1024 * 1024;
 /// Client-side timeout for connect and for each request round trip.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// Client-side timeout for a [`Request::Connect`] answer: past the core's own
+/// 30 s bound on opening a tunnel, so the client's error arrives first.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(35);
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -54,6 +65,11 @@ pub enum Request {
     /// desktop modal / iOS sheet). Kept off the polled `Status` because the
     /// custom-relay `/healthz` probe does on-demand HTTP.
     ConnPath,
+    /// Open a tunnel to `host:port` on the server side, like a port forward:
+    /// the server enforces its routed set and resolves the host. Answered with
+    /// [`Response::Connected`], after which the connection is that tunnel's
+    /// byte stream, or with [`Response::Error`].
+    Connect { host: String, port: u16 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -61,6 +77,7 @@ pub enum Request {
 pub enum Response {
     Status(Box<StatusSnapshot>),
     ConnPath(WireConnSnapshot),
+    Connected,
     Error { message: String },
 }
 
@@ -212,6 +229,24 @@ pub enum IpcCmd {
     ConnPath(oneshot::Sender<WireConnSnapshot>),
 }
 
+/// Opens the tunnels [`Request::Connect`] asks for: the session's
+/// [`ServerForwarder`], or an in-memory stand-in in tests.
+pub trait TunnelOpener: Clone + Send + Sync + 'static {
+    type Stream: AsyncRead + AsyncWrite + Unpin + Send;
+    fn open(&self, target: Target) -> impl Future<Output = Result<Self::Stream>> + Send;
+}
+
+impl TunnelOpener for ServerForwarder {
+    type Stream = tokio::io::Join<
+        flextunnel_core::iroh::endpoint::RecvStream,
+        flextunnel_core::iroh::endpoint::SendStream,
+    >;
+
+    async fn open(&self, target: Target) -> Result<Self::Stream> {
+        self.connect(&target).await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Naming
 // ---------------------------------------------------------------------------
@@ -246,21 +281,30 @@ impl Drop for IpcServerGuard {
     }
 }
 
-/// Start serving the control channel for `instance`. The caller must already
-/// hold the instance lock (that is what makes the stale-socket removal safe).
-pub fn spawn_ipc_server(key: &str, tx: mpsc::Sender<IpcCmd>) -> Result<IpcServerGuard> {
+/// Start serving the control channel for `instance`, opening `client nc`
+/// tunnels through `opener`. The caller must already hold the instance lock
+/// (that is what makes the stale-socket removal safe).
+pub fn spawn_ipc_server(
+    key: &str,
+    tx: mpsc::Sender<IpcCmd>,
+    opener: impl TunnelOpener,
+) -> Result<IpcServerGuard> {
     #[cfg(unix)]
     {
-        spawn_unix(socket_path(key)?, tx)
+        spawn_unix(socket_path(key)?, tx, opener)
     }
     #[cfg(windows)]
     {
-        spawn_pipe(pipe_name(key), tx)
+        spawn_pipe(pipe_name(key), tx, opener)
     }
 }
 
 #[cfg(unix)]
-fn spawn_unix(socket: std::path::PathBuf, tx: mpsc::Sender<IpcCmd>) -> Result<IpcServerGuard> {
+fn spawn_unix(
+    socket: std::path::PathBuf,
+    tx: mpsc::Sender<IpcCmd>,
+    opener: impl TunnelOpener,
+) -> Result<IpcServerGuard> {
     use std::os::unix::fs::PermissionsExt;
 
     if let Some(dir) = socket.parent() {
@@ -280,8 +324,7 @@ fn spawn_unix(socket: std::path::PathBuf, tx: mpsc::Sender<IpcCmd>) -> Result<Ip
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
-                    let tx = tx.clone();
-                    tokio::spawn(serve_connection(stream, tx));
+                    tokio::spawn(serve_connection(stream, tx.clone(), opener.clone()));
                 }
                 Err(e) => {
                     log::warn!("Control socket accept failed: {e}");
@@ -294,7 +337,11 @@ fn spawn_unix(socket: std::path::PathBuf, tx: mpsc::Sender<IpcCmd>) -> Result<Ip
 }
 
 #[cfg(windows)]
-fn spawn_pipe(name: String, tx: mpsc::Sender<IpcCmd>) -> Result<IpcServerGuard> {
+fn spawn_pipe(
+    name: String,
+    tx: mpsc::Sender<IpcCmd>,
+    opener: impl TunnelOpener,
+) -> Result<IpcServerGuard> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
     // `first_pipe_instance` makes creation fail if another process already
@@ -327,17 +374,18 @@ fn spawn_pipe(name: String, tx: mpsc::Sender<IpcCmd>) -> Result<IpcServerGuard> 
                 }
             };
             let conn = std::mem::replace(&mut server, next);
-            tokio::spawn(serve_connection(conn, tx.clone()));
+            tokio::spawn(serve_connection(conn, tx.clone(), opener.clone()));
         }
     });
     Ok(IpcServerGuard { task })
 }
 
-/// Serve one attached `client control`: read a JSON-line request, forward it to
-/// the session loop, write the JSON-line response; repeat until EOF. A
-/// malformed line gets `Response::Error` and the connection stays open; a
-/// closed session channel ends the connection.
-async fn serve_connection<S>(stream: S, tx: mpsc::Sender<IpcCmd>)
+/// Serve one attached command: read a JSON-line request, forward it to the
+/// session loop, write the JSON-line response; repeat until EOF. A malformed
+/// line gets `Response::Error` and the connection stays open; a closed session
+/// channel ends the connection. A [`Request::Connect`] hands the connection
+/// over to [`serve_tunnel`] for good.
+async fn serve_connection<S>(stream: S, tx: mpsc::Sender<IpcCmd>, opener: impl TunnelOpener)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -355,6 +403,9 @@ where
         }
 
         let response = match serde_json::from_slice::<Request>(&line) {
+            Ok(Request::Connect { host, port }) => {
+                return serve_tunnel(stream, &opener, host, port).await;
+            }
             Ok(request) => match dispatch(request, &tx).await {
                 Some(response) => response,
                 None => return, // Session loop gone: client is shutting down.
@@ -363,24 +414,62 @@ where
                 message: format!("Bad request: {e}"),
             },
         };
-
-        let mut buf = match serde_json::to_vec(&response) {
-            Ok(buf) => buf,
-            Err(e) => {
-                log::warn!("Failed to encode control response: {e}");
-                return;
-            }
-        };
-        buf.push(b'\n');
-        if let Err(e) = stream.get_mut().write_all(&buf).await {
+        if let Err(e) = write_response(&mut stream, &response).await {
             log::debug!("Control connection write failed: {e}");
             return;
         }
     }
 }
 
+/// Open the tunnel a [`Request::Connect`] asked for, answer it, and on success
+/// splice the rest of the connection with the tunnel until either side ends.
+/// `stream` is spliced as the buffered reader it was read through, so bytes the
+/// caller sent right behind the request are not lost.
+async fn serve_tunnel<S>(
+    mut stream: BufReader<S>,
+    opener: &impl TunnelOpener,
+    host: String,
+    port: u16,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let target = format!("{host}:{port}");
+    let opened = match validate_remote_host(&host) {
+        Ok(_) if port == 0 => Err(anyhow::anyhow!("port must be 1-65535")),
+        Ok(host) => opener.open(Target::Domain(host, port)).await,
+        Err(e) => Err(anyhow::anyhow!(e)),
+    };
+    let mut tunnel = match opened {
+        Ok(tunnel) => tunnel,
+        Err(e) => {
+            log::debug!("nc tunnel to {target} failed: {e:#}");
+            let message = format!("{target}: {e:#}");
+            let _ = write_response(&mut stream, &Response::Error { message }).await;
+            return;
+        }
+    };
+    if let Err(e) = write_response(&mut stream, &Response::Connected).await {
+        log::debug!("Control connection write failed: {e}");
+        return;
+    }
+    log::debug!("nc tunnel to {target} opened");
+    if let Err(e) = tokio::io::copy_bidirectional(&mut stream, &mut tunnel).await {
+        log::debug!("nc tunnel to {target} ended: {e}");
+    }
+}
+
+/// Write one JSON-line response.
+async fn write_response<W>(writer: &mut W, response: &Response) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = serde_json::to_vec(response).map_err(std::io::Error::other)?;
+    buf.push(b'\n');
+    writer.write_all(&buf).await
+}
+
 async fn dispatch(request: Request, tx: &mpsc::Sender<IpcCmd>) -> Option<Response> {
-    let (cmd, pending) = build_cmd(request);
+    let (cmd, pending) = build_cmd(request)?;
     tx.send(cmd).await.ok()?;
     pending.into_response().await
 }
@@ -389,9 +478,10 @@ async fn dispatch(request: Request, tx: &mpsc::Sender<IpcCmd>) -> Option<Respons
 /// blocking the current thread for the reply. Used by the self-contained quick
 /// panel (`client start --quick`), which drives its own session directly instead
 /// of over a socket. Returns `None` once the session loop is gone (its receiver
-/// dropped, or the reply sender dropped), which signals the panel to exit.
+/// dropped, or the reply sender dropped), which signals the panel to exit — and
+/// for a [`Request::Connect`], which the panel never sends.
 pub fn blocking_request(tx: &mpsc::Sender<IpcCmd>, request: Request) -> Option<Response> {
-    let (cmd, pending) = build_cmd(request);
+    let (cmd, pending) = build_cmd(request)?;
     tx.blocking_send(cmd).ok()?;
     pending.blocking_into_response()
 }
@@ -421,8 +511,10 @@ impl PendingReply {
     }
 }
 
-fn build_cmd(request: Request) -> (IpcCmd, PendingReply) {
-    match request {
+/// The session-loop command for a status request; `None` for a
+/// [`Request::Connect`], which is no session query (see [`serve_tunnel`]).
+fn build_cmd(request: Request) -> Option<(IpcCmd, PendingReply)> {
+    Some(match request {
         Request::Status => {
             let (reply, rx) = oneshot::channel();
             (IpcCmd::Status(reply), PendingReply::Status(rx))
@@ -431,7 +523,8 @@ fn build_cmd(request: Request) -> (IpcCmd, PendingReply) {
             let (reply, rx) = oneshot::channel();
             (IpcCmd::ConnPath(reply), PendingReply::ConnPath(rx))
         }
-    }
+        Request::Connect { .. } => return None,
+    })
 }
 
 /// Read one `\n`-terminated line into `buf`, rejecting lines over [`MAX_LINE`]
@@ -464,7 +557,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Client side (used by `flextunnel client control`)
+// Client side (used by `flextunnel client control` and `flextunnel client nc`)
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
@@ -560,17 +653,51 @@ impl IpcClient {
             .stream
             .as_mut()
             .expect("stream reconnected before round_trip");
-        let mut buf = serde_json::to_vec(request)?;
-        buf.push(b'\n');
-        stream.get_mut().write_all(&buf).await?;
-
-        let mut line = Vec::new();
-        let read = read_line_capped(stream, &mut line).await?;
-        if read == 0 {
-            anyhow::bail!("The client closed the control connection");
-        }
-        serde_json::from_slice(&line).context("Malformed control response")
+        round_trip(stream, request).await
     }
+
+    /// Turn this connection into a tunnel to `host:port` on the server side
+    /// (see [`Request::Connect`]): the returned stream carries the tunnel's
+    /// bytes, starting with any the target sent before this call returned.
+    pub async fn open_tunnel(
+        mut self,
+        host: &str,
+        port: u16,
+    ) -> Result<impl AsyncRead + AsyncWrite + Unpin + use<>> {
+        let mut stream = match self.stream.take() {
+            Some(stream) => stream,
+            None => BufReader::new(Self::open(&self.key).await?),
+        };
+        let request = Request::Connect {
+            host: host.to_string(),
+            port,
+        };
+        let response = tokio::time::timeout(CONNECT_TIMEOUT, round_trip(&mut stream, &request))
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out waiting for the client to open the tunnel"))??;
+        match response {
+            Response::Connected => Ok(stream),
+            Response::Error { message } => Err(anyhow::anyhow!(message)),
+            other => anyhow::bail!("Unexpected response to a connect request: {other:?}"),
+        }
+    }
+}
+
+/// Send one JSON-line request on `stream` and read its JSON-line response.
+async fn round_trip<S>(stream: &mut BufReader<S>, request: &Request) -> Result<Response>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut buf = serde_json::to_vec(request)?;
+    buf.push(b'\n');
+    stream.get_mut().write_all(&buf).await?;
+
+    let mut line = Vec::new();
+    let read = read_line_capped(stream, &mut line).await?;
+    if read == 0 {
+        anyhow::bail!("The client closed the control connection");
+    }
+    serde_json::from_slice(&line).context("Malformed control response")
 }
 
 fn is_not_running(e: &std::io::Error) -> bool {
@@ -636,7 +763,11 @@ mod tests {
 
     #[test]
     fn wire_types_roundtrip() {
-        for request in [Request::Status, Request::ConnPath] {
+        let connect = Request::Connect {
+            host: "workstation.internal".into(),
+            port: 22,
+        };
+        for request in [Request::Status, Request::ConnPath, connect] {
             let json = serde_json::to_string(&request).unwrap();
             let _: Request = serde_json::from_str(&json).unwrap();
         }
@@ -696,12 +827,16 @@ mod tests {
             // Keep the socket out of the real ~/.config: bind at a temp path
             // through the same internal entry point the public API uses.
             let dir = tempfile::tempdir().unwrap();
-            let guard = spawn_unix(dir.path().join(format!("client-{instance}.sock")), stub_session())
-                .unwrap();
+            let guard = spawn_unix(
+                dir.path().join(format!("client-{instance}.sock")),
+                stub_session(),
+                EchoOpener,
+            )
+            .unwrap();
             (dir, guard)
         };
         #[cfg(windows)]
-        let guard = spawn_pipe(pipe_name(&instance), stub_session()).unwrap();
+        let guard = spawn_pipe(pipe_name(&instance), stub_session(), EchoOpener).unwrap();
 
         #[cfg(unix)]
         let mut client = {
@@ -746,6 +881,121 @@ mod tests {
         }
 
         drop(guard);
+    }
+
+    /// Stand-in for the session's forwarder: each tunnel is an in-memory pipe
+    /// whose far end greets first (as an SSH server does), then echoes until
+    /// EOF. `refused.internal` is turned away, as an off-list target would be.
+    #[derive(Clone)]
+    struct EchoOpener;
+
+    impl TunnelOpener for EchoOpener {
+        type Stream = tokio::io::DuplexStream;
+
+        async fn open(&self, target: Target) -> Result<Self::Stream> {
+            if matches!(&target, Target::Domain(host, _) if host == "refused.internal") {
+                anyhow::bail!("server rejected target: connection not allowed by ruleset");
+            }
+            let (near, far) = tokio::io::duplex(1024);
+            tokio::spawn(async move {
+                let (mut from_near, mut to_near) = tokio::io::split(far);
+                to_near.write_all(b"SSH-2.0-echo\r\n").await?;
+                tokio::io::copy(&mut from_near, &mut to_near).await?;
+                to_near.shutdown().await
+            });
+            Ok(near)
+        }
+    }
+
+    /// Serve the real platform transport against the stub session and return
+    /// a way to attach fresh connections to it.
+    struct Served {
+        guard: IpcServerGuard,
+        #[cfg(unix)]
+        _dir: tempfile::TempDir,
+        #[cfg(unix)]
+        path: std::path::PathBuf,
+        #[cfg(windows)]
+        instance: String,
+    }
+
+    impl Served {
+        fn start(name: &str) -> Self {
+            let instance = format!("test-{name}-{}", std::process::id());
+            #[cfg(unix)]
+            {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join(format!("client-{instance}.sock"));
+                let guard = spawn_unix(path.clone(), stub_session(), EchoOpener).unwrap();
+                Self {
+                    guard,
+                    _dir: dir,
+                    path,
+                }
+            }
+            #[cfg(windows)]
+            {
+                let guard = spawn_pipe(pipe_name(&instance), stub_session(), EchoOpener).unwrap();
+                Self { guard, instance }
+            }
+        }
+
+        async fn attach(&self) -> IpcClient {
+            #[cfg(unix)]
+            {
+                IpcClient {
+                    key: String::new(),
+                    stream: Some(BufReader::new(
+                        tokio::net::UnixStream::connect(&self.path).await.unwrap(),
+                    )),
+                }
+            }
+            #[cfg(windows)]
+            {
+                IpcClient::connect(&self.instance).await.unwrap().expect("running")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_turns_the_connection_into_the_tunnel() {
+        let served = Served::start("nc");
+        let mut tunnel = served
+            .attach()
+            .await
+            .open_tunnel("echo.internal", 22)
+            .await
+            .unwrap();
+
+        // The greeting the far end sent before the reply was read is not lost.
+        let mut banner = [0u8; 14];
+        tunnel.read_exact(&mut banner).await.unwrap();
+        assert_eq!(&banner, b"SSH-2.0-echo\r\n");
+
+        tunnel.write_all(b"hello\n").await.unwrap();
+        let mut echo = [0u8; 6];
+        tunnel.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"hello\n");
+
+        drop(tunnel);
+        drop(served.guard);
+    }
+
+    #[tokio::test]
+    async fn connect_failures_come_back_as_errors() {
+        let served = Served::start("nc-err");
+        for (host, port, expected) in [
+            ("refused.internal", 22, "refused.internal:22: server rejected target"),
+            ("echo.internal", 0, "port must be 1-65535"),
+            ("bad..host", 22, "bad..host:22"),
+        ] {
+            let err = match served.attach().await.open_tunnel(host, port).await {
+                Ok(_) => panic!("{host}:{port} should fail"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains(expected), "{host}:{port}: {err}");
+        }
+        drop(served.guard);
     }
 
     #[tokio::test]

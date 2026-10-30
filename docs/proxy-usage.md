@@ -26,8 +26,8 @@ guide covers, in order:
    all, or whose SOCKS5 support resolves DNS client-side (which breaks routed
    internal names): `wget`, Docker, JVM/JDBC, and the generic
    `https_proxy=` path.
-5. **`ssh` through the proxy** — reach an internal SSH host, then use SSH's own
-   `-L` / `-D` forwards for a second hop.
+5. **`ssh` through the tunnel** — reach an internal SSH host with `client nc`,
+   then use SSH's own `-L` / `-D` forwards for a second hop.
 6. **Adapters for programs that don't speak either proxy** — put a plain local
    TCP port in front of the proxy with `socat` (databases, RDP, JDBC natives).
 
@@ -172,16 +172,16 @@ which does its own DNS and would fail with `Could not resolve hostname`. Route
 through SSH's `ProxyCommand` instead:
 
 ```sh
-GIT_SSH_COMMAND='ssh -o "ProxyCommand=nc -X 5 -x 127.0.0.1:1080 %h %p"' \
+GIT_SSH_COMMAND='ssh -o "ProxyCommand=flextunnel client nc %h %p"' \
   git clone ssh://networking.internal/repo.git
 ```
 
-Or make it permanent in `~/.ssh/config` (see "`ssh` through the proxy") so plain
-`git clone ssh://networking.internal/repo.git` just works:
+Or make it permanent in `~/.ssh/config` (see "`ssh` through the tunnel") so
+plain `git clone ssh://networking.internal/repo.git` just works:
 
 ```
 Host networking.internal
-    ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p
+    ProxyCommand flextunnel client nc %h %p
 ```
 
 ### `kubectl` (inline `proxy-url` in kubeconfig)
@@ -308,7 +308,8 @@ receives the hostname.
 ### Other tools worth knowing
 
 - **`nc` (OpenBSD netcat)** — `nc -X 5 -x 127.0.0.1:1080 host port` dials
-  through SOCKS5 (used as the SSH `ProxyCommand` below).
+  through SOCKS5. For SSH, the built-in `flextunnel client nc` needs neither
+  netcat nor a SOCKS port (see "`ssh` through the tunnel").
 - **`proxychains-ng`** — wraps programs that have no proxy option of their own
   by hooking libc. Point it at `127.0.0.1:1080`. It can miss statically linked
   or Go binaries, where a `socat` port forward is more reliable. (Not tested
@@ -398,17 +399,22 @@ connection churn under high plain-HTTP request rates. HTTPS (`CONNECT`) tunnels
 are unaffected — they carry a single long-lived stream. `https://` URLs always
 go over `CONNECT` automatically; you never send them as absolute-URI forwards.
 
-## `ssh` through the proxy
+## `ssh` through the tunnel
 
-OpenSSH can use a proxy through `ProxyCommand`. This example uses OpenBSD
-`nc` (`netcat`) to perform a SOCKS5 handshake and reach an internal SSH server:
+Use `flextunnel client nc` as SSH's `ProxyCommand`. It opens one tunnel
+through the running client for the profile and relays it to ssh's
+stdin/stdout, so it needs no SOCKS or HTTP port and no external netcat (which
+Windows' OpenSSH lacks):
 
 ```sh
-ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@workstation.internal
+ssh -o ProxyCommand='flextunnel client nc %h %p' user@workstation.internal
 ```
 
-`%h`/`%p` expand to the target host/port; `nc` sends `%h` as a hostname to the
-proxy, so flextunnel resolves `workstation.internal` server-side.
+`%h`/`%p` expand to the target host/port. Like a port forward, the target goes
+to the server: it must be in the routed set, and the server resolves
+`workstation.internal`. Without `-c`/`-n` the profile is
+`~/.config/flextunnel/client.toml`; with one config per server (for example
+under [systemd](systemd.md)), name it with `-c`.
 
 Make it permanent in `~/.ssh/config` so plain `ssh workstation` just works (and
 so `git@workstation:…` remotes route through the tunnel too):
@@ -417,8 +423,13 @@ so `git@workstation:…` remotes route through the tunnel too):
 Host workstation
     HostName workstation.internal
     User user
-    ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p
+    ProxyCommand flextunnel client nc -c ~/.config/flextunnel/aws.toml %h %p
 ```
+
+A client with a SOCKS port can also be reached with OpenBSD netcat
+(`ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p`). That path follows normal
+proxy routing, so an off-list target connects directly from the client instead
+of being refused.
 
 ### Combine with SSH's own forwards
 
@@ -427,11 +438,11 @@ second hop *from the SSH host's* network:
 
 ```sh
 # Local forward: localhost:5432 -> db.internal:5432, as seen from workstation.internal
-ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' \
+ssh -o ProxyCommand='flextunnel client nc %h %p' \
     -L 127.0.0.1:5432:db.internal:5432 user@workstation.internal
 
 # Dynamic (SOCKS) forward: a second SOCKS5 proxy scoped to the SSH host's network
-ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' \
+ssh -o ProxyCommand='flextunnel client nc %h %p' \
     -D 127.0.0.1:1081 user@workstation.internal
 ```
 
