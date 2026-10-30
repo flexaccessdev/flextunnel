@@ -6,17 +6,18 @@ This file tracks only the remaining HTTP proxy work.
 
 ### Shared Local-Connection Concurrency Cap
 
-The client currently spawns one task per accepted SOCKS5 or HTTP proxy
-connection. Add a shared cap across both local listeners so a local connection
-flood cannot grow tasks and sockets without bound.
+Each SOCKS5/HTTP listener already caps active handlers at 256 and held
+recovery requests at 64, pausing accepts at capacity. A shared process-level
+budget could additionally bound their combined resource use.
 
 Expected shape:
 
-- Introduce one shared limiter in `crates/flextunnel-core/src/proxy/client.rs`.
+- Decide whether a combined budget is needed beyond the per-listener limits in
+  `crates/flextunnel-core/src/proxy/client.rs`.
 - Apply it before spawning per-connection handlers for both SOCKS5 and HTTP.
 - Preserve current behavior under normal load: both listeners stay bound across
   reconnects, off-list targets can still direct-connect, and on-list targets
-  still return a clean proxy error while the tunnel is down.
+  still wait for recovery or return a clean proxy error while the tunnel is down.
 - Decide what local clients see when the cap is full: backpressure in `accept`,
   immediate proxy failure, or a bounded wait.
 

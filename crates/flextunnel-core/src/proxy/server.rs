@@ -25,8 +25,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, Semaphore};
 
 /// Deadline for receiving the client's auth handshake once a connection opens.
-/// The QUIC keep-alive keeps the connection from idling out, so without this a
-/// peer that never opens the handshake stream would hang the task forever.
+/// Heartbeats only start after the handshake, so without this a peer that never
+/// opens the handshake stream would hold the task until the QUIC idle timeout,
+/// or indefinitely if it keeps the connection alive itself.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on concurrent connection handlers. A flood of inbound connections would
 /// otherwise spawn unbounded handler tasks; once this many are live the accept

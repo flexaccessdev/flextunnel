@@ -1,15 +1,10 @@
 # flextunnel
 
-A SOCKS5/HTTP-proxy, and port-forward-over-QUIC split tunnel. The **client**
-runs optional local SOCKS5 and HTTP proxy listeners, plus optional port
-forwards that send a local port straight to one server-side address. Each
-proxy request is matched
-against the server-pushed tunnel set: routed targets are tunneled as reliable
-QUIC bi-streams to the **server**, which performs **DNS resolution and the
-outbound TCP connection from its own network**, then pipes bytes back; off-list
-targets are connected directly from the client device. A forwarded port does no
-matching on the client: everything it accepts goes to the server, which
-enforces its routed set there.
+A TCP tunnel over QUIC with optional local SOCKS5/HTTP proxies and port
+forwards. Proxy requests matching the server's tunnel set go through the
+**server**, which resolves DNS and connects from its own network; off-list
+requests connect directly from the client. Port forwards always send their
+fixed target to the server, which enforces its routed set.
 
 This lets you reach hosts that are only reachable from the server side — a
 private network, the server's own `localhost`, or names that only resolve via
@@ -59,7 +54,7 @@ misconfiguration (e.g. duplicate-id detection catching two clients or servers
 started with the same identity — an operator guard rail, not an adversary
 defense).
 
-A per-client ed25519 keypair gates every connection:
+Normal client connections authenticate with an ed25519 keypair:
 
 - **Client keypair** — each client generates a keypair in the shared
   [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys) format
@@ -342,10 +337,10 @@ regardless of the routed set. The browser view is HTML; `/status.txt` is plain
 text and `/status.json` is structured JSON for scripts:
 
 ```sh
-# plain-text status through the default SOCKS5 listener
+# plain-text status through a SOCKS5 listener configured on port 1080
 curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.txt
 
-# JSON status through the default SOCKS5 listener
+# JSON status through the same listener
 curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.json
 
 # same endpoint through the optional HTTP proxy listener
@@ -399,8 +394,8 @@ https_proxy=http://127.0.0.1:8081 curl https://example.com
 http_proxy=http://127.0.0.1:8081  curl http://example.com
 ```
 
-See [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) for the gap
-analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
+See [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) for remaining
+HTTP proxy work. Apps without proxy support can use built-in port forwards.
 
 ## Commands
 
@@ -425,7 +420,7 @@ Client auth keypairs are generated with the standalone
 | `--default-config` | Load `~/.config/flextunnel/server.toml`. |
 | `--secret-file <FILE>` | Server identity key. |
 | `--authorized-keys-file <FILE>` | File of authorized client public keys, one `ed25519-pub:…` per line (optional trailing comment, ssh `authorized_keys` style). |
-| `--relay-url <URL>` | Custom relay URLs (repeatable; at least two distinct relays, since the server rides out a relay outage by moving onto another one). Configuring custom relays disables n0 internet discovery: clients reach this server via relay hints, and outbound bridges attach the same hints when dialing peer servers. mDNS local discovery stays on. |
+| `--relay-url <URL>` | Custom relay URLs (repeatable; at least two distinct URLs). See the [shared relay guide](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/relays-and-address-lookup.md) for discovery and dialing requirements. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
 | `--quick` | Ephemeral one-off server: prompt for the client's EndpointId (shown by `client start --quick`) and natively allowlist it as the only allowed client — no auth keypair — then mint an in-memory identity, full-tunnel all traffic, print this server's EndpointId, and exit if the client doesn't connect within 5 minutes. Needs an interactive terminal. Takes no single-instance lock; nothing is persisted. Conflicts with `-c`/`--secret-file`/`--authorized-keys-file`. |
 
@@ -438,7 +433,7 @@ Client auth keypairs are generated with the standalone
 | `--socks-port <PORT>` | Optional SOCKS5 listener port, e.g. `1080`. Binds `127.0.0.1` only. Disabled unless set. |
 | `--http-port <PORT>` | Optional HTTP proxy listener port (CONNECT + plain-HTTP forwarding). Binds `127.0.0.1` only. |
 | `--auth-key <SECRET>` / `--auth-key-file <FILE>` | Client auth keypair (one required): the inline `ed25519-sec:…` secret, or the key file from `flexaccess-keys generate-auth-key`. |
-| `--relay-url <URL>` | Custom relay URLs (repeatable; at least two distinct relays, the same set as the server). Configuring custom relays disables n0 internet discovery (the server is reached via relay hints); mDNS local discovery stays on. |
+| `--relay-url <URL>` | Custom relay URLs (repeatable; at least two distinct URLs, matching the server's set). See the shared relay guide above. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
 | `--auto-reconnect` | Force auto-reconnect on (overrides `auto_reconnect = false` in the config). |
 | `--no-auto-reconnect` | Exit on the first failed connection attempt or drop instead of retrying. |
@@ -590,12 +585,12 @@ by the server, not locally.
 ## Routed-set split-tunneling
 
 The routed set (the **tunnel set**) is a VPN-style split-tunnel "included routes"
-list that decides which destinations traverse the tunnel. Targets not on it are
-**not** rejected — the client falls back to a direct connection for them. It is
-useful when a client must send *all* its traffic to the local SOCKS5 proxy (e.g.
-an iOS WebView, whose proxy config is global) but only some hosts should actually
-be tunneled. It is **optional** and configured on the **server only** (config-file
-only — there is no CLI flag); the client configures nothing:
+list that decides which proxy destinations traverse the tunnel. Off-list proxy
+requests connect directly from the client; server-direct forwards are rejected
+if their target is off-list. This suits a client that must send *all* its
+traffic to the local proxy (for example a WebView with a global proxy config)
+when only some hosts should be tunneled. The set is optional and configured on
+the server only, through its config file or the desktop server pane:
 
 ```toml
 # server.toml
@@ -630,9 +625,8 @@ in the handshake response, so there is no client list to keep in sync:
   (SOCKS5 reply `0x03`; the HTTP front-end maps it to `502 Bad Gateway`).
 - **Server** — it also enforces the same list independently as a **whitelist**,
   **rejecting** any tunnel request for a target not on it (SOCKS5 reply `0x02`).
-  This is a defense-in-depth boundary against a misconfigured or untrusted
-  client. (Note the asymmetry: the client falls back to a direct connection for
-  off-list targets, whereas the server rejects them outright.)
+  This enforces routing policy for trusted clients and catches accidental
+  misconfiguration; it is not an isolation boundary for untrusted clients.
 
 Matching: domain entries are exact (`example.com`), wildcard (`*.example.com`,
 which matches subdomains only — not the bare apex), or `*` (matches every
@@ -673,27 +667,20 @@ Auto-reconnect is **enabled by default** (`auto_reconnect = true`); pass
   auto-reconnect is disabled. A server that is down, or not up yet, is the
   ordinary case, not a reason to exit: the client waits it out and connects
   when the server appears.
-- A long outage is cheap to sit through: once the backoff reaches its cap the
-  client makes one bounded connect attempt a minute. Repeated
-  failures escalate to rebuilding the iroh endpoint from scratch after the
-  third one, and then at most every 30 minutes for as long as the outage
-  lasts (see [`docs/architecture.md`](docs/architecture.md#reconnect-policy-client)).
-- A permanent error (a rejected key, a malformed config) never retries; that
-  is the only kind of error the client exits on.
+- The delay between attempts is capped at 60s plus jitter; connection and
+  handshake time add to it. After three consecutive failures, the next attempt
+  rebuilds the endpoint; further rebuilds are at least 30 minutes apart during
+  that outage. See the [reconnect policy](docs/architecture.md#reconnect-policy-client).
+- A permanent error, such as a rejected key or malformed config, ends the
+  session. Transient errors also end it when retries are disabled or exhausted.
 - The control panel shows the outage's progress: failed attempts so far, the
   last error, and when the next attempt is due.
 - The local proxy listeners stay bound across reconnects. Off-list targets keep
   connecting directly; on-list requests are held for the reconnect (up to 45s)
   and only then fail with a network-unreachable reply.
 
-A **server** with custom relays watches its own home-relay registration: if it
-has no connected home relay for 60s and iroh has not re-homed it on its own,
-it takes the wedged relay out of its relay map and homes on another configured
-relay in place (same server id, same sockets, nothing dropped), so clients off
-the LAN (the iOS app) are not stranded until someone restarts the service. The
-relay is put back once it is connectable again. A custom relay set is
-therefore at least two distinct relays. See
-[`docs/architecture.md`](docs/architecture.md#relay-failover-server-custom-relays).
+Server home-relay failover is provided by `flexaccess-iroh`; see the
+[shared failover design](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/relay-failover.md).
 
 ## Logging
 
@@ -721,15 +708,14 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
   lifecycle (fixed ALPN, auth handshake, per-stream protocol), module map,
   concurrency model, reconnect policy, security boundaries, and reference
   constants.
-- [`docs/local-ci.md`](docs/local-ci.md) — running the CI workflow's clippy and
-  test steps locally on all three host platforms (macOS natively, Linux and
-  Windows over ssh) against the working tree, via `ci/all.sh`.
+- [`docs/local-ci.md`](docs/local-ci.md) — clippy and tests on all three host
+  platforms via `ci/all.sh`; Linux/macOS run natively on the current host and
+  the other platforms use SSH.
 - [`docs/systemd.md`](docs/systemd.md) — running the CLI client under systemd:
-  one template-unit instance per server, why `Restart=on-failure` is the whole
-  restart policy, attaching the control panel, journald logging.
-- [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) — the HTTP proxy
-  front-end (CONNECT tunneling + absolute-URI forwarding): motivation, design,
-  and remaining hardening work.
+  one template-unit instance per server, reconnects, the control panel and
+  journald logging.
+- [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) — remaining HTTP
+  proxy work.
 - [`docs/proxy-usage.md`](docs/proxy-usage.md) — using the SOCKS5 and HTTP
   proxies: which listener a tool needs, native SOCKS5 clients (`curl`, `git`,
   browsers), HTTP-proxy-only tools (`wget`, Docker, JVM/JDBC), `ssh`

@@ -1,167 +1,102 @@
 # Running CI locally
 
-`.github/workflows/ci.yml` runs the same two steps — clippy with `-D warnings`,
-then the tests — on a Linux, a macOS and a Windows runner, plus an iOS
-xcframework build on macOS. The three platforms are not interchangeable: the
-host clippy is the only thing that type-checks `flextunnel-desktop`'s
-macOS/Windows tray + keychain backends, and `flextunnel-desktop` is excluded
-entirely on Linux. So a change that compiles here can still fail there.
-
-`ci/` runs all of it locally, against the working tree as it is — uncommitted
-changes included — so a platform-specific failure can be found without pushing a
-branch and waiting.
-
-Any of the machines can be the driver. The platform you are on runs natively
-(`ci/unix/ci.sh` picks its own platform's steps); the other two are reached
-over ssh by alias, each with an override for pointing at a different machine:
-
-| Platform | Default ssh alias | Override | Entry point |
-| --- | --- | --- | --- |
-| macOS | `macwork` | `FLEXTUNNEL_MACCI_HOST`, or `ci/unix/remote.sh -H <host>` | `ci/unix/ci.sh` natively on a Mac, `ci/unix/remote.sh` otherwise |
-| Linux | `workstation-wsl` | `FLEXTUNNEL_UNIXCI_HOST`, or `-H` | `ci/unix/ci.sh` natively on Linux, `ci/unix/remote.sh` otherwise |
-| Windows | `windows-ci-build` | `FLEXTUNNEL_WINCI_HOST` | `ci/windows/remote.ps1` (PowerShell 7) |
+`ci/all.sh` runs the clippy and test steps from
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) against the working
+tree, including uncommitted changes. macOS and Windows checks compile the
+desktop backends that Linux excludes.
 
 ```sh
-ci/all.sh                  # all three, concurrently
-ci/all.sh linux windows    # only these
+ci/all.sh                  # macOS, Linux and Windows concurrently
+ci/all.sh linux windows    # selected platforms
+ci/unix/ci.sh              # this host's Unix checks, with live output
+pwsh -File ci/windows/ci.ps1   # on a Windows dev box, with live output
 ```
 
-`ci/all.sh` decides native-vs-remote itself from `uname`, so the same command
-works from a Mac or a Linux box.
-
-`ci/all.sh` captures each platform's output and replays it in full once
-everything has finished — three machines writing to one terminal at once would
-interleave into nonsense — then prints a summary of exit codes. To watch one
-platform live, run its script directly.
-
-## The two halves
-
-Each remote platform is two scripts, and the split is the point:
-
-- `ci/unix/ci.sh` and `ci/windows/ci.ps1` run **natively on the far end**. They
-  are the workflow's steps, in the same order, with the same flags. They install
-  nothing and change no machine state, so either can also be run directly on a
-  dev box — running `ci/unix/ci.sh` on the machine you are sitting at *is* that
-  machine's row of the table above.
-- `ci/unix/remote.sh` and `ci/windows/remote.ps1` run **here**. Both are thin
-  wrappers over the shared drivers in the sibling `../devtools` repo
-  (`ci/unix/remote.sh`, `ci/windows/remote.ps1`), parameterized by this repo's
-  `.devtools.conf`. They pack the working tree, ship it over ssh, and invoke the
-  script above.
+On Linux, the Linux job runs on the current host; on macOS, the macOS job does.
+The other jobs use SSH. `ci/all.sh` captures each job's output and prints the
+logs and exit codes after all jobs finish.
 
 When a `ci.*` script and the workflow disagree, the workflow is right and the
-script is stale. Keep them in step by hand; nothing enforces it.
+script is stale. Nothing enforces this; keep them in step by hand.
 
-Both remote drivers take the same four commands:
+## Hosts and prerequisites
+
+| Platform | Default SSH alias | Host override |
+| --- | --- | --- |
+| macOS | `macwork` | `FLEXTUNNEL_MACCI_HOST` |
+| Linux | `workstation-wsl` | `FLEXTUNNEL_UNIXCI_HOST` |
+| Windows | `windows-ci-build` | `FLEXTUNNEL_WINCI_HOST` |
+
+Hosts need Rust, clippy and a native C toolchain. The macOS xcframework check
+also needs Xcode; `build-ios.sh` installs the required Rust targets if missing.
+Windows remoting needs PowerShell 7 on both ends and an SSH PowerShell
+subsystem on the remote host.
+
+The remote wrappers use the sibling `../devtools` checkout, or `DEVTOOLS_DIR`,
+with this repo's [`.devtools.conf`](../.devtools.conf). They copy the working
+tree over SSH and invoke `ci/unix/ci.sh` or `ci/windows/ci.ps1` remotely.
+The shared drivers document transport details.
+
+The Windows VM is provisioned as described in
+[`../wrustic/docs/windows-vm-ci.md`](https://github.com/andrewtheguy/wrustic/blob/main/docs/windows-vm-ci.md),
+with rustup installed machine-wide so it is visible over SSH. Two failures there
+look like a broken toolchain: sshd captures its environment when the service
+starts, so a machine-scoped `PATH` or `CARGO_*` change needs
+`Restart-Service sshd`; and without a page file, parallel `rustc` processes
+exhaust the commit limit.
 
 ```sh
-ci/unix/remote.sh            # or: ci ...  clippy + test over there
-ci/unix/remote.sh shell      # interactive shell in the remote workspace
-ci/unix/remote.sh doctor     # report on the machine, change nothing
-ci/unix/remote.sh clean      # drop the machine's cargo target cache
+ci/unix/remote.sh doctor
+ci/unix/remote.sh -H another-host ci
+ci/unix/remote.sh shell
+ci/unix/remote.sh clean
 
-pwsh -File ci/windows/remote.ps1 [ci|shell|doctor|clean]   # the same, on Windows
+pwsh -File ci/windows/remote.ps1 doctor
+pwsh -File ci/windows/remote.ps1 ci
 ```
 
-`ci/unix/remote.sh -H some-other-host` points the Unix driver at a different ssh
-alias; any Unix machine with rustup and a C toolchain works — including a Mac,
-which is how the macOS leg runs when the driver is not itself a Mac (the iOS
-step additionally needs Xcode on that machine).
+Both remote drivers accept `ci` (the default), `shell`, `doctor` and `clean`.
+`clean` deletes the remote Cargo build cache.
 
-## What runs where
+## Checks
 
-Mirroring the jobs in `ci.yml`:
+| Platform | Clippy | Tests | Additional check |
+| --- | --- | --- | --- |
+| Linux | `cargo clippy --workspace --exclude flextunnel-desktop --all-targets -- -D warnings` | `cargo test -p flextunnel-core -p flextunnel-cli` | — |
+| macOS | `cargo clippy --workspace --all-targets -- -D warnings` | `cargo test -p flextunnel-core -p flextunnel-cli -p flextunnel-desktop` | `./build-ios.sh debug` |
+| Windows | Same as macOS | Same as macOS | — |
 
-- **Linux** — `cargo clippy --workspace --exclude flextunnel-desktop
-  --all-targets -- -D warnings`, then `cargo test -p flextunnel-core -p
-  flextunnel-cli`. `flextunnel-desktop` is macOS/Windows only;
-  `flextunnel-ffi` (the iOS staticlib) still type-checks on a Linux host.
-- **macOS** — clippy over the whole workspace, tests for core + cli + desktop,
-  then `./build-ios.sh debug` (the `verify-ios-xcframework` job). The iOS step
-  skips itself, loudly, on a machine with no `xcodebuild`; set
-  `FLEXTUNNEL_CI_SKIP_IOS=1` to skip it on a machine that has one. That step only
-  proves the xcframework *builds*; whether an iOS-affecting change still compiles
-  and links into the app, and whether it runs on a real phone, is the sibling
-  repo's `../flextunnel-ios/ci/` (`ci/ci.sh ffi` builds this working tree and
-  links the app against it — see that repo's `docs/local-ci.md`).
-- **Windows** — clippy over the whole workspace, tests for core + cli + desktop.
+The macOS script reports the xcframework check as skipped if `xcodebuild` is
+missing or `FLEXTUNNEL_CI_SKIP_IOS` is set. A green run with that skip does not
+verify the iOS build.
 
-Deliberately **not** here: release-profile builds, `.dmg`/`.msi` packaging, the
-iOS release zip and the Docker images. Those belong to `release.yml`, they are
-slow, and none of them catch anything the steps above miss.
+The xcframework check builds the Rust library for iOS; it does not build or run
+the Swift app. For app integration, run `ci/ci.sh ffi` in `../flextunnel-ios`;
+see [the app's CI guide](https://github.com/flexaccessdev/flextunnel-ios/blob/main/docs/local-ci.md). That job builds
+and links against the sibling Rust working tree. Simulator tests and device
+runs are separate app-side checks.
 
-## Where the trees land
+## Remote workspaces
 
-The tree is copied, not fetched from git — the reason to run this instead of
-pushing a branch is to test what is in front of you. On both remotes the
-workspace is replaced outright on every run (`tar` has no `--delete`, so
-unpacking over the old tree would leave a file you deleted here still sitting
-there and still being compiled), while `CARGO_TARGET_DIR` points *outside* the
-workspace so the build cache survives the swap. That is what makes a warm run
-fast and a cold one slow.
+Each run replaces the remote source workspace. Build caches live outside it
+and survive subsequent runs.
 
-| | Unix remotes (`workstation-wsl`, `macwork`, …) | Windows (`windows-ci-build`) |
+| | Unix remotes | Windows |
 | --- | --- | --- |
-| workspace | `~/codes/staging-area/flextunnel` | `C:\ci-workspaces\flextunnel` |
-| build cache | `~/codes/staging-area/flextunnel-cargo-target` | `C:\ci-workspaces\cargo-target` |
-| lock | `~/codes/staging-area/flextunnel.lock` | `C:\ci-workspaces\flextunnel.lock` |
-| overrides | `FLEXTUNNEL_UNIXCI_HOST`, `FLEXTUNNEL_UNIXCI_STAGING` | `FLEXTUNNEL_WINCI_HOST`, `FLEXTUNNEL_WINCI_STAGING`, `FLEXTUNNEL_WINCI_CACHE_DIR` |
+| Workspace | `~/codes/staging-area/flextunnel` | `C:\ci-workspaces\flextunnel` |
+| Build cache | `~/codes/staging-area/flextunnel-cargo-target` | `C:\ci-workspaces\cargo-target` |
+| Lock | `~/codes/staging-area/flextunnel.lock` | `C:\ci-workspaces\flextunnel.lock` |
+| Overrides | `FLEXTUNNEL_UNIXCI_STAGING` | `FLEXTUNNEL_WINCI_STAGING`, `FLEXTUNNEL_WINCI_CACHE_DIR` |
 
-Both staging areas are shared with other repos driven onto the same boxes, which
-is why every workspace under them is named for this one. The Windows build
-cache is the exception: it is the VM's machine-wide `CARGO_TARGET_DIR`, shared
-by every Rust repo driven onto it, so everything stays under `C:\ci-workspaces`.
+The Windows cache is shared across Rust repos on that VM. Drivers lock the
+workspace during CI and cache cleanup; if a terminated run leaves a lock,
+confirm it has stopped before using the removal command printed by the driver.
 
-**One run per machine at a time.** The workspace and the build cache are single
-and shared, so a second run starting mid-build would delete the tree the first
-is compiling. Each driver claims a lock directory with `mkdir` (which fails,
-atomically, if it exists) and drops it on the way out. `clean` takes the same
-lock — the cache it drops is the one a concurrent run would be compiling into.
-If a run is killed hard enough to skip the release, the next one says so and
-prints the command to clear the lock.
+## Coverage limits
 
-## The machines
+Local hosts use their installed Rust/Xcode versions and OS environments, which
+can differ from GitHub runners. Use `doctor` to inspect a remote host.
 
-These are the machines the default aliases point at; any equivalently equipped
-machine works through the overrides above. The macOS leg has no dedicated CI
-box — it is a Mac dev machine, run natively when it is the driver and over
-`ci/unix/remote.sh` (default alias `macwork`) when it is not.
-
-**`workstation-wsl`** is a Debian install under WSL2, reached by the ssh alias of
-that name. It needs rustup (with clippy) and a C toolchain and nothing else —
-the desktop crate, which is what would drag in dbus and a tray, is excluded on
-Linux. `ci/unix/remote.sh doctor` reports what is there.
-
-**`windows-ci-build`** is a Hyper-V guest running Windows Server 2025 with the VS Build
-Tools and rustup installed **machine-wide** — a per-profile rustup install would
-be invisible over ssh. How that VM was built, provisioned and hardened is
-written up once, in the sibling repo that first used it:
-[`../wrustic/docs/windows-vm-ci.md`](https://github.com/andrewtheguy/wrustic/blob/main/docs/windows-vm-ci.md).
-Two things from it are worth repeating because they cost an afternoon each:
-sshd captures its environment when the service starts, so a machine-scoped
-`PATH` or `CARGO_*` change is invisible over ssh until `Restart-Service sshd`;
-and the guest needs a page file, or parallel `rustc` processes exhaust the commit
-limit and fail with what looks like a corrupted toolchain.
-
-The Windows driver is PowerShell 7 on both ends, over PowerShell remoting's SSH
-transport (`Invoke-Command -HostName windows-ci-build -SSHTransport`) — never
-WinRM. Script blocks cross intact, so nothing is quoted through `cmd.exe`. It
-needs `pwsh` on the driving machine and PowerShell 7 plus a `Subsystem
-powershell` line in the VM's `sshd_config`; the shared driver's header in
-`../devtools` covers the setup.
-
-## Where this is not the real runner
-
-Worth knowing before trusting a green run:
-
-- **The toolchains float and are not pinned.** Rust on each box is whatever
-  `rustup update` last fetched; on GitHub it is whatever the image ships. Run
-  `doctor` on both remotes rather than trusting a version written down here.
-- **The Windows VM is a bare Server install** — MSVC, the Windows SDK, rustup,
-  nothing else. `windows-latest` carries an enormous preinstalled toolbox, so a
-  test that quietly depends on some other tool passes there and fails here. It
-  also runs as Administrator, which CI does not.
-- **Linux is WSL2, not a GitHub Ubuntu runner** — a different kernel, and a
-  Debian userland rather than Ubuntu.
-- **macOS is a dev box**, with its Xcode, its keychain and its logged-in
-  GUI session — the closest of the three to its runner and still not it.
+Release builds, installer packaging, release uploads and Docker images are not
+checked here. They have additional build and packaging failure modes and are
+covered by the release workflows.

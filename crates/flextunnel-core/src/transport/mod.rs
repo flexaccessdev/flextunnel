@@ -2,8 +2,8 @@
 //!
 //! Unlike the ezvpn VPN this is derived from, the data path here is reliable
 //! QUIC bi-streams (not unreliable datagrams), so there is no datagram-buffer,
-//! congestion-controller, or flow-control-window tuning — just keep-alive,
-//! idle timeout, and a larger initial MTU.
+//! congestion-controller, or flow-control-window tuning — just the idle
+//! timeout, the app-level heartbeat cadence, and a larger initial MTU.
 
 pub mod endpoint;
 pub mod paths;

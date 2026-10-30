@@ -1,13 +1,11 @@
 # Architecture
 
-flextunnel is a **SOCKS5/HTTP-proxy-over-QUIC split tunnel**: local proxy
-listeners on the **client** parse each request, match it against the
-server-pushed tunnel set, and either direct-connect off-list targets from the
-client device or tunnel on-list targets over reliable QUIC bi-streams to the
-**server**. Tunneled targets are resolved and connected *from the server's own
-network*. Transport, NAT traversal, relay fallback, and TLS 1.3 encryption come
-from [iroh](https://www.iroh.computer/). Neither side needs a TUN device or
-admin/root — it is ordinary userspace sockets end to end.
+flextunnel carries TCP connections over iroh QUIC streams. Optional client-side
+SOCKS5/HTTP listeners split traffic using the server-pushed tunnel set: matching
+targets go through the server, and off-list targets connect from the client.
+Port forwards send every connection to a fixed server-side target, subject to
+the server's routed set. Tunneled hostnames are resolved from the server's
+network. Neither role needs a TUN device or admin/root.
 
 ## High-level flow
 
@@ -30,43 +28,41 @@ local app ──SOCKS5/HTTP──► flextunnel client                    flextu
 
 All streams from one client multiplex over a **single** QUIC `Connection`. The
 control stream authenticates once; each subsequent data bi-stream carries one
-tunneled proxied TCP connection. Direct off-list connections never touch the
-server.
+proxied TCP connection or accepted port-forward connection. Direct off-list
+connections never touch the server.
 
-## Module map (`src/`)
+## Module map
+
+Core paths below are relative to `crates/flextunnel-core/src/`.
 
 | Module | Responsibility |
-|---|---|
-| `main.rs` | clap CLI, command dispatch, logger/runtime, graceful `endpoint.close()`, shutdown signal |
-| `config.rs` | TOML config files (`-c`/`--default-config`), `deny_unknown_fields`, CLI>file>default merge, `~` expansion |
-| `auth.rs` | client keypair auth (ed25519): flextunnel's domain-separation context over the shared endpoint-id-bound sign/verify transcript in [flexaccess-iroh](https://github.com/flexaccessdev/flexaccess-iroh); key format, key files, and authorized-keys parsing (`ed25519-pub:`/`ed25519-sec:`) come from [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys) |
-| `blocklist.rs` | persisted duplicate-id blocklist (JSON): confirmed duplicate client ids + the server's own conflicted id |
-| `secret.rs` | iroh identity key commands (`generate-iroh-key`/`show-iroh-id`); client auth keypairs are generated with the standalone `flexaccess-keys` CLI |
-| `error.rs` | `ProxyError` (`Network`/`Config`/`Signaling`/`AuthenticationFailed`/`ConnectionLost`) + `is_recoverable()` |
-| `transport/mod.rs` | QUIC transport config, ALPN, heartbeat/liveness timing |
-| `transport/endpoint.rs` | flextunnel's layer over the shared [flexaccess-iroh](https://github.com/flexaccessdev/flexaccess-iroh) endpoint builder: the three ALPNs, client/server identity rules, native per-ALPN allowlist hook (`AllowlistHook` over `EndpointAllowlists`: bridges + quick clients). `RelayConfig`, relay-mode-dependent n0 discovery, the per-relay startup probe (the endpoint is bound without the relays that fail it), and the server's in-place home-relay failover are the shared crate's; the rebuildable client endpoint (`ClientEndpoint`, the reconnect loop's escalation) is flextunnel's own |
-| `transport/paths.rs` | connection-path snapshot (direct/relay) + on-demand custom-relay `/healthz` health |
-| `proxy/signaling.rs` | length-prefixed `Hello`/`HelloResponse`, control frames, per-stream `Target` codec, `REP_*` codes |
-| `proxy/socks5.rs` | client-side RFC 1928: method negotiation + `CONNECT` parsing + replies |
-| `proxy/client.rs` | connect + auth + SOCKS5/HTTP listeners + split-tunnel routing + reconnect loop |
-| `proxy/http.rs` | client-side HTTP proxy front-end: `CONNECT` tunneling + absolute-URI plain-HTTP forwarding |
-| `proxy/routed_set.rs` | parsed tunnel set: client split-tunnel decision + server whitelist enforcement |
-| `proxy/server.rs` | accept + auth + routed-set whitelist + per-stream DNS/connect/pipe; status page |
-| `proxy/bridge.rs` | outbound server-to-server bridge: persistent upstream connection (`BRIDGE_ALPN`, id-allowlist-authenticated) with retry-forever reconnect; matching streams splice over it |
-| `proxy/dial.rs` | `Target` → TCP dial + `connect_and_pipe` (the server's exit-point body) |
+| --- | --- |
+| `app.rs`, `config.rs` | Runtime options, TOML parsing, CLI/file/default merging and validation |
+| `server.rs` | Shared CLI/desktop server preparation, per-user lock, endpoint binding and serving |
+| `auth.rs`, `secret.rs` | Flextunnel auth context and identity-key commands; shared key parsing and auth primitives come from `flexaccess-keys` and `flexaccess-iroh` |
+| `blocklist.rs`, `error.rs` | Persisted duplicate-id records and recoverable/permanent errors |
+| `transport/mod.rs` | Flextunnel ALPNs, QUIC tuning and heartbeat timing |
+| `transport/endpoint.rs` | Endpoint allowlist hook and rebuildable `ClientEndpoint`, using the shared endpoint builder |
+| `transport/paths.rs` | Direct/relay path snapshots and on-demand relay health checks |
+| `proxy/signaling.rs` | Handshakes, control frames, target codec and reply codes |
+| `proxy/client.rs` | Local proxy listeners, split routing, heartbeats and reconnect loop |
+| `proxy/socks5.rs`, `proxy/http.rs` | Local proxy protocol parsing and replies |
+| `proxy/routed_set.rs` | Domain/CIDR matching on client and server |
+| `proxy/server.rs`, `proxy/dial.rs` | Connection handling, routed-set checks and outbound TCP connections |
+| `proxy/reserved.rs`, `proxy/status_page.rs` | Built-in status and server-loopback names |
+| `proxy/bridge.rs`, `proxy/dns_forward.rs` | Server-to-server bridges and conditional DNS resolution |
+| `forwards.rs`, `proxy/forward.rs` | Forward definitions and server-direct loopback listeners |
 
-**Bridges** split-tunnel *across servers*: a `[bridges.<name>]` entry on server A
-forwards targets matching its domain/CIDR rules verbatim over a persistent
-connection to server B, which re-enforces its own routed set, applies its own
-aliases/DNS forwards, and dials from its network. A dials out on its
-own server endpoint with the bridge ALPN, so the TLS-authenticated id it
-presents is its persistent server id — which B must list in
-`allowed_bridge_servers`, the sole bridge credential, enforced natively at the
-TLS handshake by B's endpoint hook (empty allowlist = inbound bridging
-disabled). Bridged-in streams are served like client streams but are
-never re-bridged (single hop, so mutual bridges cannot loop). Bridge rules must
-be reachable through A's routed set (validated at startup, like `dns_forwards`
-coverage).
+`crates/flextunnel-cli/src/` holds command dispatch, client supervision, IPC and
+the read-only terminal panel. `flextunnel-desktop` embeds core directly;
+`flextunnel-ffi` exposes it to the iOS app.
+
+Bridges forward matching targets from server A to server B over a persistent
+`BRIDGE_ALPN` connection. B must allow A's persistent endpoint id in
+`allowed_bridge_servers`; B then checks its own routed set, applies its
+aliases/DNS forwards and connects from its network. Incoming bridge streams are
+never bridged again, so forwarding is single-hop. Startup validation requires
+A's routed set to cover its bridge rules.
 
 ## Connection lifecycle
 
@@ -110,20 +106,19 @@ identical for both. On rejection the server closes the connection gracefully
 
 The `*_instance_nonce` fields are random per-process ids (distinct from the iroh
 node id) that drive duplicate-id detection (see below); `duplicate_server_observed`
-is a client advisory. Unlike earlier versions the handshake bi-stream is **not
-closed** after the exchange — it stays open as the control stream carrying
-heartbeats (§6).
+is a client advisory. The handshake bi-stream stays open after the exchange to
+carry heartbeats (§6).
 
 The server bounds accepting/reading the client `Hello` with a 10s timeout, and
 the client bounds waiting for the server `HelloResponse` with the same timeout
-(`HANDSHAKE_TIMEOUT` in `client.rs` / `server.rs`), because QUIC keep-alive
-otherwise prevents the idle timeout from firing on a peer that connects but
-never speaks.
+(`HANDSHAKE_TIMEOUT` in `client.rs` / `server.rs`), so a peer that connects but
+never speaks is dropped promptly instead of holding a task until the 180s QUIC
+idle timeout (heartbeats only start after the handshake).
 
 ### 3. Per-request data streams
 For each on-list local request that needs the tunnel, the client opens a new
-bi-stream and writes a compact request header, then reads a one-byte reply, then
-pipes raw bytes:
+bi-stream and writes a compact request header, reads a two-byte reply header,
+then pipes raw bytes:
 
 ```
 Request (client→server):  [ver=1][atyp][addr][port:u16 BE]
@@ -142,14 +137,15 @@ The server reads the requested `Target`. The reserved `flextunnel.internal`
 namespace is handled first, bypassing the routed-set whitelist, bridges and
 host aliases: `flextunnel.internal` is the status page and
 `localhost.flextunnel.internal` is dialed as the server's own `localhost`.
-Every other target is enforced against the routed-set whitelist (on the
-requested name, before aliasing), then (bounded by `CONNECT_TIMEOUT` = 10s in
-`proxy/dial.rs`) either
-`TcpStream::connect`s a literal address or, for a domain, calls
-`tokio::net::lookup_host` and connects to the first address that accepts.
-**DNS happens on the server** for tunneled domain targets, which is what lets
-clients reach names/IPs that only resolve or route from the server's network.
-Connect failures map to SOCKS5 reply codes via `signaling::map_io_err`.
+For other targets, the server checks the requested name/IP against its routed
+set before selecting a bridge or applying a host alias. A matching bridge
+receives the original target; otherwise the server applies any alias and dials
+locally. Hostnames use a matching conditional DNS forward or the server's
+system resolver, and the server tries the resolved addresses in turn until one
+accepts. Loopback targets try both IPv4 and IPv6; other literal IPs are dialed
+as given. DNS and TCP connection share a 10s timeout in
+`proxy/dial.rs`. Connect failures map to SOCKS5 reply codes through
+`signaling::map_io_err`.
 
 ### 5. Byte piping
 Both ends join the iroh `(SendStream, RecvStream)` halves with
@@ -159,19 +155,20 @@ maps to a stream FIN). Per-stream errors stay per-stream — the shared QUIC
 `Connection` is never closed for a single failed proxied connection.
 
 ### 6. Heartbeat & liveness (control stream)
-After the handshake the control bi-stream stays open. The client sends a
-`ControlMsg::Heartbeat { seq }` every `HEARTBEAT_INTERVAL` (10s) and the server
-replies `HeartbeatAck { seq }`, framed with the same length-prefixed helpers
-(capped at `MAX_CONTROL_MSG_SIZE` = 16 KiB). This is an app-level liveness signal *on top
-of* QUIC keep-alive: it catches an *application-level* stall — a peer still
-answering QUIC keep-alive at the transport level but no longer sending
-heartbeats — within `LIVENESS_WINDOW` (33s: three heartbeat intervals plus 3s
-grace). A fully silent peer is caught sooner by the 30s QUIC idle timeout, which
-fires first. On the server,
-heartbeats also refresh the per-client connection registry used for duplicate
-detection (below). A missing heartbeat surfaces as a recoverable
-`ConnectionLost`, so the client's normal reconnect path applies. The heartbeat
-runs concurrently with the SOCKS5 stream loop via `tokio::select!` on both sides.
+
+The client sends `ControlMsg::Heartbeat { seq }`; the server replies with
+`HeartbeatAck { seq }`. Frames use the length-prefixed control codec with a
+16 KiB cap. There is no QUIC transport keep-alive configured.
+
+Client heartbeats run every 10s in the foreground and every 60s when an
+embedding app reports background mode. The client's acknowledgement timeout is
+three intervals plus 3s: 33s or 183s respectively. The server always allows
+183s between heartbeats because it does not know the client's current cadence.
+The QUIC idle timeout is 180s and can close a silent connection sooner.
+
+Heartbeats refresh the server's duplicate-detection registry. A missing
+heartbeat or acknowledgement ends the connection; recoverable client failures
+enter the reconnect loop.
 
 ## Duplicate-id detection
 
@@ -179,9 +176,8 @@ A guard rail against *accidental misconfiguration* (not an adversary defense —
 see the security model). Both roles carry a random per-process **instance nonce**
 that is distinct from the iroh node id, exchanged in the handshake.
 
-**Duplicate client (server-side).** Client identity is ephemeral (a fresh key per
-process), so two *different* client processes never share a node id; a node id
-seen on two concurrently-live connections is a rare bug. The server keeps a
+**Duplicate client (server-side).** Client identity is ephemeral, so independent
+processes normally have different node ids. The server keeps a
 registry keyed by client node id, and within it by connection, refreshed by the
 heartbeat. Two live connections for one node id with **different** instance nonces
 are a confirmed duplicate (a benign same-process reconnect reuses the *same*
@@ -191,10 +187,9 @@ a blocklisted node id is rejected up-front. Because ephemeral ids never recur,
 the persisted client entry is largely an audit record.
 
 **Duplicate server (self-block).** Server identity is persistent, so two servers
-sharing one secret key is a plausible misconfiguration — but only observable when
-both are reachable by the *same client over a shared discovery/relay path*
-(same-id servers on isolated networks that no client can reach both of are not a
-conflict). Each server emits a stable `server_instance_nonce`; a restart yields a
+sharing one secret key is a plausible misconfiguration. This detector needs
+both to be reachable by the same client; it cannot observe two instances on
+isolated networks. Each server emits a stable `server_instance_nonce`; a restart yields a
 fresh nonce that never reappears, whereas a client bouncing between two concurrent
 same-id servers sees a previously-seen nonce **reappear** after a different one.
 On that reappearance the client latches an advisory (`duplicate_server_observed`)
@@ -206,166 +201,103 @@ both instances); prompt, robust detection would require a signaling server. See
 [`duplicate-detection-roadmap.md`](./duplicate-detection-roadmap.md).
 
 The blocklist is a JSON file at the fixed path
-`~/.config/flextunnel/blocklist.json` — deliberately **not** configurable, since
-relocating this security guard rail would let it be bypassed. It is written
-atomically (temp + rename) and loaded at startup.
+`~/.config/flextunnel/blocklist.json`. It is deliberately not configurable:
+relocating this guard rail would let it be bypassed. It is written atomically
+(temp + rename) and loaded at startup.
 
 ## Concurrency model
 
-- **Server:** one tokio task per accepted iroh connection (`handle_connection`,
-  capped at `MAX_CONCURRENT_CONNECTIONS`), and within it one task per accepted
-  data bi-stream (`handle_socks_stream`). No shared mutable state on the data
-  path; the authorized-keys set is read-only (loaded at startup).
-- **Client:** one task per accepted local TCP connection (`handle_local_conn`),
-  from the SOCKS5 listener and optional HTTP listener. All tunneled requests
-  share the single `Connection` clone; off-list requests direct-connect locally.
-  The local listeners and the QUIC connection liveness are raced with
-  `tokio::select!` so a dropped connection breaks into the reconnect path.
+The server accepts up to 1024 concurrent QUIC connections and spawns a task
+per data stream. Authorized keys are loaded at startup.
+
+The client runs its local listeners independently of the connection manager,
+so they stay bound across reconnects. Each proxy listener allows 256 active
+handlers, with at most 64 requests held for tunnel recovery. At capacity,
+accepting pauses; excess recovery holds are refused. Each server-direct
+forward has its own 128-connection cap.
 
 ## Reconnect policy (client)
 
-Implemented in `ProxyClient::run` / `handle_failure`:
+`ProxyClient::handle_failure` retries `ConnectionLost`, `Network` and
+`Signaling` errors, including a failed first connection. Delays double from 1s
+to 60s plus up to 500ms jitter. The connect attempt can take another 30s and
+the auth handshake another 10s; the 60s cap is a delay between attempts, not a
+guarantee of one attempt per minute.
 
-- Every recoverable failure (`ConnectionLost` / `Network` / `Signaling` — see
-  `ProxyError::is_recoverable`) is retried with **exponential backoff +
-  jitter** (1s doubling to `RECONNECT_BACKOFF_MAX`, 60s), indefinitely,
-  unless `--max-reconnect-attempts` caps it or `--no-auto-reconnect` disables
-  it. The first attempt is no different from any later one: a server that is
-  down or not up yet is the ordinary case (boot order, maintenance), not an
-  error to exit on. A bad node id or relay URL is a `Config` error and still
-  fails on the first attempt.
-- Permanent errors (`AuthenticationFailed` / `Config`) never retry — the same
-  credential and config would fail the same way every time.
-- A long outage costs one bounded connect (`CONNECT_TIMEOUT`) per attempt on
-  the endpoint the client already holds, once a minute at the cap.
-  Two events cut a backoff step short with a fresh series: the device
-  reporting its network path back (`set_network_available`) and the embedding
-  app coming to the foreground (`set_background(false)`), so a user who is
-  looking never waits out a step sized for a long outage.
-- An outage's **third** consecutive failure escalates to a **full endpoint
-  rebuild** (`ClientEndpoint::rebuild`), repeated at most every
-  `REBUILD_ENDPOINT_MIN_INTERVAL` (30 min) for as long as the outage lasts; the
-  other retries nudge `Endpoint::network_change()` (rebinds dead UDP sockets)
-  instead. The rebuild swaps in a freshly bound endpoint — new sockets, new
-  relay connections, fresh discovery — and closes the wedged one in the
-  background. This is the in-process equivalent of restarting the client, for
-  wedges a rebind can't fix (a relay link lost to a ping timeout and never
-  re-established, stale cached paths for the server). It is the expensive step
-  and it repairs the *endpoint*; a rebuilt endpoint that still cannot connect
-  has ruled that out, which is why it is rate-limited rather than repeated on
-  every third failure. The rebuild skips the startup per-relay probe and
-  tolerates the online-wait failing, so a partial outage never blocks
-  recovery. A successful connection resets the budget.
-- The loop publishes its progress (`ProxyClient::reconnect_status`: failed
-  attempts, last error, next attempt due) for status displays; the CLI panel
-  shows it on the phase line.
-- The local proxy listeners stay bound across reconnects. Off-list targets keep
-  connecting directly; on-list requests are held for the reconnect — up to 45s
-  (`TUNNEL_RECOVERY_HOLD`), deploy-style connection holding — and only then fail
-  with a network-unreachable reply.
+Retries continue indefinitely unless auto-reconnect is disabled or the retry
+limit is reached. `Config`, `AuthenticationFailed` and `DuplicateServerId`
+errors end the session. Status displays can read failed attempts, the last
+error and the next attempt time through `reconnect_status`.
+
+After three consecutive failures, the next attempt rebuilds `ClientEndpoint`.
+Further rebuilds during that outage are at least 30 minutes apart. Other
+retries call `Endpoint::network_change()`. Rebuilding replaces the endpoint
+and generates a new ephemeral id for normal clients; quick mode keeps its
+session id so it remains allowlisted. The old endpoint is closed gracefully,
+with a bounded wait before leaving shutdown in the background. The rebuild
+skips the startup relay probe, so it returns to the full configured relay set
+(a client endpoint otherwise keeps probe-failed relays out for its lifetime),
+and it tolerates the online-wait failing, so a partial outage never blocks
+recovery. It is rate-limited because it repairs only the endpoint: a rebuilt
+endpoint that still cannot connect has ruled that out. A successful connection
+resets the rebuild schedule.
+
+Embedders can report network availability and background state. No-path
+reports park backoff retries until a path returns. A returning path or a
+foreground transition resets the delay for an immediate attempt.
+
+Once the routed set is known, off-list requests continue connecting directly
+during an outage. On-list requests wait up to 45s for a tunnel, then receive a
+network-unreachable reply. Before the first handshake, requests wait for the
+initial route policy under the same hold limit; unclassified requests never
+connect directly.
 
 ## Relay failover (server, custom relays)
 
-Implemented once for every FlexAccess program in the shared
-[flexaccess-iroh](https://github.com/flexaccessdev/flexaccess-iroh) crate
-(`relay_failover::fail_over_home_relay`), run here by the CLI's `run_server`
-alongside `ProxyServer::run`; the design is documented once in
-[iroh-common-architecture/relay-failover.md](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/relay-failover.md).
-A custom-relay server is dialable from off the LAN only while it is
-**registered on its home relay** (n0 discovery is off; clients dial by relay
-hint, and a relay forwards Initials only to endpoints connected to it). iroh
-re-homes on its own when a relay is really down, but not when the relay keeps
-answering net-report probes while relay connections to it fail (the shape seen
-on v1.0.3 behind Cloudflare tunnels, unchanged in v1.1.0): net_report keeps
-preferring it, the relay connection never re-establishes, and the server is
-registered nowhere until the process restarts, while LAN clients that find it
-over mDNS keep working and hide the outage (the mac desktop reconnects, the iOS
-app times out).
+`RunningServer::serve` in `crates/flextunnel-core/src/server.rs` runs
+`ProxyServer::run` alongside `flexaccess-iroh`'s `fail_over_home_relay`. The CLI
+and desktop use this same server lifecycle.
 
-The failover watches `Endpoint::home_relay_status()`. After 60 s
-(`RELAY_OUTAGE_FAILOVER`) without a connected home relay it takes the wedged
-relay **out of the endpoint's relay map**; the forced net report can only
-prefer a relay still in the map, so the endpoint homes on another configured
-relay **in place**: same server id, same allowlists, same sockets, same direct
-paths, same established connections and bridge tasks. Nothing is rebuilt. The
-removed relay is probed every 90 s (`RELAY_RESTORE_INTERVAL`) and put back once
-it is connectable again. Relays that failed the **startup** probe are handled
-the same way: the endpoint is bound without them
-(`CreatedEndpoint::relays_left_out`) and the failover restores them, so a
-server or client that starts during such an outage still comes online on the
-relay that works.
+Relay configuration, startup probes, discovery, authentication tokens and
+in-place home-relay failover belong to the shared crate. See
+[iroh-common-architecture](https://github.com/flexaccessdev/iroh-common-architecture),
+including its [relay-failover design](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/relay-failover.md).
+The client's endpoint rebuild described above is implemented in flextunnel.
 
-A reconnect at any point resets the outage clock. Non-home relays are
-connected on demand and dropped after a minute idle, which is normal and never
-counts as an outage. With the default relays the failover is pending forever:
-reachability there rests on n0 publishing/resolution, not on one relay
-registration. A custom relay set must therefore hold at least two distinct
-relays, which `RelayConfig` enforces at startup.
-
-Until flexaccess-iroh v0.0.7 this was a watchdog that nudged
-`Endpoint::network_change()` (a no-op on a stable host) and then rebuilt the
-endpoint, dropping every connection; both are gone. The client's own endpoint
-rebuild (above) is unrelated and stays: it answers a wedged *client* endpoint
-after a network change, and it is flextunnel's code, not the crate's.
-
-On every exit path both `run_server` and `run_client` call
-`endpoint.close().await` before the `Endpoint` drops; skipping it makes iroh tear
-down its relay tasks ungracefully (a `JoinSet` panic that is fatal under the
-release profile's `panic = "abort"`).
+Callers close endpoints with `endpoint.close().await` after serving stops,
+including error and cancellation paths. Dropping an endpoint without closing it
+tears down iroh's relay tasks ungracefully, a `JoinSet` panic that aborts the
+process under the release profile's `panic = "abort"`.
 
 ## Security model & trust boundaries
 
-**Purpose & threat model.** flextunnel exists to let a set of **trusted clients**
-reach resources on the **server's** side of the network — names and addresses that
-only resolve or route from where the server sits. Both ends of the deployment are
-operated by the same trusted party: whoever runs the server also decides which
-clients' keys get authorized. flextunnel is *not* a multi-tenant service and does not defend
-the server against the clients it admits — a client with an authorized key is, by
-design, allowed to reach whatever the server's network can reach. The threats it
-does address are **on-path attackers** (defeated by QUIC/TLS 1.3 encryption and
-per-client keypairs) and **accidental misconfiguration** — the duplicate-id
-detection (see "Duplicate-id detection" above) catches, e.g., two clients or two
-servers started with the same identity, blocking the conflicted id and refusing a
-self-blocked server's restart. These are guard rails for operators, not adversary
-defenses.
+Servers and admitted clients are trusted. Flextunnel provides encrypted access
+to the server's network; it is not a multi-tenant isolation layer. Routed-set
+checks enforce the configured routing policy, while duplicate-id detection
+catches accidental identity reuse.
 
-- **Credentials:** client keypairs are ed25519 in the shared
-  [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys) format —
-  the public key travels as `ed25519-pub:` + base64url, the secret as
-  `ed25519-sec:` + base64url — verified in the handshake via a signature bound
-  to the connection's endpoint id under a flextunnel-specific
-  domain-separation context. That context is what rejects a signature produced
-  for another FlexAccess app — cross-app isolation holds because each app signs
-  under its own distinct context, not because the shared library enforces
-  anything about how applications use the keys. Bridges and quick-mode clients
-  carry no keypair: their credential is their TLS-authenticated endpoint id,
-  checked natively against the matching allowlist — `allowed_bridge_servers`,
-  or the single client id entered on a quick server (the `authorized_keys`
-  model). The QUIC ALPNs (`flextunnel/1`, `flextunnel-bridge/1`,
-  `flextunnel-quick/1`) are fixed protocol/role identifiers, not credentials.
-  All payload is encrypted by QUIC/TLS 1.3.
-- **The server is the exit point.** Anyone with an authorized key can reach whatever
-  the server's network can reach (including its `localhost`). Authorize keys
-  accordingly; scope server network access if needed.
-- **The local SOCKS5/HTTP proxy listeners are unauthenticated** and bind to
-  loopback by default — access control lives at the QUIC layer, not in the local
-  proxy front-ends. Binding them off-loopback exposes an open proxy on the LAN;
-  don't, unless you add auth.
-- iroh's relay/discovery operators can see connection *metadata* (which endpoints
-  talk), never the encrypted payload.
+- Normal clients authenticate with an Ed25519 signature bound to their
+  TLS-authenticated endpoint id under flextunnel's auth context. Key encoding
+  and files use [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys).
+- Bridges and quick-mode clients authenticate through endpoint-id allowlists.
+  ALPN labels select the protocol role and carry no credential.
+- Every admitted client can reach the server's own loopback services through
+  `localhost.flextunnel.internal`, whatever the routed set says. Authorize keys
+  accordingly.
+- Proxy listeners are unauthenticated and bind only to `127.0.0.1`;
+  server-direct forwards bind `127.0.0.1` and `::1`. Local callers share the
+  authenticated client's access.
+- QUIC/TLS encrypts payloads end to end. Relay/discovery services can observe
+  connection metadata.
 
 ## Reference constants
 
 | Constant | Value | Where |
 |---|---|---|
-| `QUIC_KEEP_ALIVE_INTERVAL` | 15s | `transport/mod.rs` |
-| `QUIC_IDLE_TIMEOUT` | 30s | `transport/mod.rs` |
+| `QUIC_IDLE_TIMEOUT` | 180s | `transport/mod.rs` |
 | `QUIC_INITIAL_MTU` | 1452 | `transport/mod.rs` |
-| `HEARTBEAT_INTERVAL` | 10s | `transport/mod.rs` |
-| `LIVENESS_WINDOW` | 33s | `transport/mod.rs` |
-| `RELAY_CONNECT_TIMEOUT` (`endpoint.online()`) | 10s | flexaccess-iroh `relay` |
-| `RELAY_OUTAGE_FAILOVER` (server home-relay failover) | 60s | flexaccess-iroh `relay_failover` |
-| `RELAY_RESTORE_INTERVAL` (restore probe for a relay taken out of the map) | 90s | flexaccess-iroh `relay_failover` |
+| `HEARTBEAT_INTERVAL` / `HEARTBEAT_INTERVAL_IDLE` | 10s / 60s | `transport/mod.rs` |
+| `liveness_window(interval)` / server `LIVENESS_WINDOW` | 3 × interval + 3s / 183s | `transport/mod.rs` |
 | `REBUILD_CLOSE_TIMEOUT` (client endpoint rebuild, old endpoint close) | 5s | `transport/endpoint.rs` |
 | `CONNECT_TIMEOUT` (client server connect) | 30s | `proxy/client.rs` |
 | `HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs`, `proxy/server.rs`, `proxy/bridge.rs` |
@@ -374,7 +306,9 @@ defenses.
 | `CONNECT_TIMEOUT` (server dial) | 10s | `proxy/dial.rs` |
 | `MAX_CONCURRENT_CONNECTIONS` | 1024 | `proxy/server.rs` |
 | reconnect backoff | 1s → 60s + ≤500ms jitter | `proxy/client.rs` |
-| `REBUILD_ENDPOINT_ATTEMPTS` / `REBUILD_ENDPOINT_MIN_INTERVAL` (client endpoint rebuild) | 3rd failure, then ≥30 min apart | `proxy/client.rs` |
+| `REBUILD_ENDPOINT_ATTEMPTS` / `REBUILD_ENDPOINT_MIN_INTERVAL` (client endpoint rebuild) | After 3 failures, then ≥30 min apart | `proxy/client.rs` |
+| `MAX_ACTIVE_LOCAL_CONNS` / `MAX_HELD_CONNS` (per proxy listener) | 256 / 64 | `proxy/client.rs` |
+| `TUNNEL_RECOVERY_HOLD` | 45s | `proxy/client.rs` |
 | `MAX_HANDSHAKE_SIZE` | 64 KiB | `proxy/signaling.rs` |
 | `MAX_CONTROL_MSG_SIZE` | 16 KiB | `proxy/signaling.rs` |
 | `MAX_HTTP_HEADER` | 64 KiB | `proxy/http.rs` |
