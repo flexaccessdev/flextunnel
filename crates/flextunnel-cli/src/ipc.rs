@@ -305,11 +305,21 @@ fn spawn_unix(
     tx: mpsc::Sender<IpcCmd>,
     opener: impl TunnelOpener,
 ) -> Result<IpcServerGuard> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
+    // Owner-only directory before the bind: the socket is created with umask
+    // permissions and only chmod'd below, so the directory is what keeps other
+    // users out in between. It usually exists already (the instance lock
+    // creates it with umask permissions), so tighten it rather than only
+    // creating it that way.
     if let Some(dir) = socket.parent() {
-        std::fs::create_dir_all(dir)
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
             .with_context(|| format!("Failed to create {}", dir.display()))?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("Failed to set permissions on {}", dir.display()))?;
     }
     // Safe unconditionally: the instance lock guarantees no live owner.
     let _ = std::fs::remove_file(&socket);
@@ -979,6 +989,22 @@ mod tests {
 
         drop(tunnel);
         drop(served.guard);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn socket_dir_is_tightened_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join("flextunnel");
+        std::fs::create_dir(&socket_dir).unwrap();
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let guard = spawn_unix(socket_dir.join("client-test.sock"), stub_session(), EchoOpener)
+            .unwrap();
+        let mode = std::fs::metadata(&socket_dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        drop(guard);
     }
 
     #[tokio::test]
