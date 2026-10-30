@@ -172,7 +172,7 @@ which does its own DNS and would fail with `Could not resolve hostname`. Route
 through SSH's `ProxyCommand` instead:
 
 ```sh
-GIT_SSH_COMMAND='ssh -o "ProxyCommand=flextunnel client nc %h %p"' \
+GIT_SSH_COMMAND='ssh -o "ProxyCommand=flextunnel client nc -n <ENDPOINT_ID> %h %p"' \
   git clone ssh://networking.internal/repo.git
 ```
 
@@ -181,7 +181,7 @@ plain `git clone ssh://networking.internal/repo.git` just works:
 
 ```
 Host networking.internal
-    ProxyCommand flextunnel client nc %h %p
+    ProxyCommand flextunnel client nc -n <ENDPOINT_ID> %h %p
 ```
 
 ### `kubectl` (inline `proxy-url` in kubeconfig)
@@ -407,14 +407,15 @@ stdin/stdout, so it needs no SOCKS or HTTP port and no external netcat (which
 Windows' OpenSSH lacks):
 
 ```sh
-ssh -o ProxyCommand='flextunnel client nc %h %p' user@workstation.internal
+ssh -o ProxyCommand='flextunnel client nc -n <ENDPOINT_ID> %h %p' user@workstation.internal
 ```
 
 `%h`/`%p` expand to the target host/port. Like a port forward, the target goes
 to the server: it must be in the routed set, and the server resolves
-`workstation.internal`. Without `-c`/`-n` the profile is
-`~/.config/flextunnel/client.toml`; with one config per server (for example
-under [systemd](systemd.md)), name it with `-c`.
+`workstation.internal`. `-n` picks the running client by its server's
+EndpointId, which works however the client was started; a client started from
+a config can be named by that config with `-c` instead, and with neither,
+`client nc` uses `~/.config/flextunnel/client.toml`.
 
 Make it permanent in `~/.ssh/config` so plain `ssh workstation` just works (and
 so `git@workstation:…` remotes route through the tunnel too):
@@ -438,11 +439,11 @@ second hop *from the SSH host's* network:
 
 ```sh
 # Local forward: localhost:5432 -> db.internal:5432, as seen from workstation.internal
-ssh -o ProxyCommand='flextunnel client nc %h %p' \
+ssh -o ProxyCommand='flextunnel client nc -n <ENDPOINT_ID> %h %p' \
     -L 127.0.0.1:5432:db.internal:5432 user@workstation.internal
 
 # Dynamic (SOCKS) forward: a second SOCKS5 proxy scoped to the SSH host's network
-ssh -o ProxyCommand='flextunnel client nc %h %p' \
+ssh -o ProxyCommand='flextunnel client nc -n <ENDPOINT_ID> %h %p' \
     -D 127.0.0.1:1081 user@workstation.internal
 ```
 

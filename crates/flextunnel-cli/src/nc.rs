@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::instance;
-use crate::ipc::IpcClient;
+use crate::ipc::{self, IpcClient};
 
 pub fn run(
     config_path: Option<PathBuf>,
@@ -38,10 +38,11 @@ pub fn run(
     res
 }
 
-/// Copy stdin into the tunnel and the tunnel into stdout. Ends when the far
-/// side closes; stdin reaching EOF only half-closes the tunnel, so the reply
-/// still drains. (A Windows named pipe has no half-close, so there the far side
-/// does not see that EOF — nothing an SSH session relies on.)
+/// Copy stdin into the tunnel (as frames, ending in the EOF frame) and the
+/// tunnel into stdout. Ends when the far side closes; stdin reaching EOF only
+/// half-closes the tunnel, so the reply still drains. The EOFs travel in the
+/// protocol rather than as a transport half-close, which a Windows named pipe
+/// lacks (see `ipc.rs`).
 async fn relay<S>(tunnel: S) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -50,12 +51,13 @@ where
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
 
-    let upload = async {
-        tokio::io::copy(&mut stdin, &mut to_tunnel).await?;
-        to_tunnel.shutdown().await
-    };
+    let upload = ipc::copy_to_frames(&mut stdin, &mut to_tunnel);
     let download = async {
-        tokio::io::copy(&mut from_tunnel, &mut stdout).await?;
+        match tokio::io::copy(&mut from_tunnel, &mut stdout).await {
+            // A closed Windows pipe can read as broken rather than as EOF.
+            Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => return Err(e),
+            _ => {}
+        }
         stdout.flush().await
     };
     tokio::pin!(download);

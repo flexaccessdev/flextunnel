@@ -24,6 +24,8 @@ mod instance;
 mod ipc;
 mod lock;
 mod nc;
+#[cfg(windows)]
+mod pipe_security;
 mod prompt;
 mod tui;
 

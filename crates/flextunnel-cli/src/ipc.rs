@@ -11,11 +11,17 @@
 //!
 //! A connection either carries status requests (status and connection-path
 //! snapshots), or opens with one [`Request::Connect`] and, once answered with
-//! [`Response::Connected`], turns into the raw byte stream of one tunnel to a
-//! server-side target — `client nc`'s stdio relay. The snapshots describe the
+//! [`Response::Connected`], turns into one tunnel to a server-side target —
+//! `client nc`'s stdio relay. From there the client sends length-prefixed
+//! frames ending in an empty one (see [`copy_to_frames`]) and the session sends
+//! the target's raw bytes, closing the connection when the target closes. A
+//! Windows named pipe has no half-close, so neither end of the tunnel may rely
+//! on one to carry an EOF. The snapshots describe the
 //! user's network and a tunnel reaches into it, so the Unix socket is chmod'd
-//! 0600 (owner only). On Windows the default pipe security descriptor already
-//! restricts other users.
+//! 0600 (owner only), in a 0700 directory. Windows pipe names are global and
+//! the default pipe descriptor lets Everyone read, so each pipe instance gets
+//! an owner-only descriptor and attaching commands refuse a pipe another user
+//! owns (see `pipe_security.rs`).
 //!
 //! The socket is not the single-instance lock — see `lock.rs` for why. But
 //! *because* the caller holds that lock, unconditionally removing a stale
@@ -44,6 +50,8 @@ use tokio::task::JoinHandle;
 // lives under the instance dir.
 #[cfg(unix)]
 use crate::instance;
+#[cfg(windows)]
+use crate::pipe_security;
 
 /// Cap on one JSON line in either direction.
 const MAX_LINE: usize = 1024 * 1024;
@@ -52,6 +60,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// Client-side timeout for a [`Request::Connect`] answer: past the core's own
 /// 30 s bound on opening a tunnel, so the client's error arrives first.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(35);
+/// Largest payload of one client-to-session tunnel frame.
+const MAX_FRAME: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -354,11 +364,13 @@ fn spawn_pipe(
 ) -> Result<IpcServerGuard> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
+    let sid = pipe_security::current_user_sid().context("Failed to read the current user's SID")?;
     // `first_pipe_instance` makes creation fail if another process already
-    // owns the name — defense in depth on top of the instance lock.
-    let mut server = ServerOptions::new()
-        .first_pipe_instance(true)
-        .create(&name)
+    // owns the name — defense in depth on top of the instance lock, and what
+    // keeps another user's squatted pipe from being joined.
+    let mut first = ServerOptions::new();
+    first.first_pipe_instance(true);
+    let mut server = pipe_security::create_owner_only(&first, &name, &sid)
         .with_context(|| format!("Failed to create control pipe {name}"))?;
     log::info!("Control pipe listening on {name}");
 
@@ -375,7 +387,7 @@ fn spawn_pipe(
             // of the session — retry until it succeeds (the guard aborts this
             // task on shutdown, which bounds the loop).
             let next = loop {
-                match ServerOptions::new().create(&name) {
+                match pipe_security::create_owner_only(&ServerOptions::new(), &name, &sid) {
                     Ok(next) => break next,
                     Err(e) => {
                         log::warn!("Failed to re-create control pipe {name}: {e}; retrying");
@@ -432,9 +444,11 @@ where
 }
 
 /// Open the tunnel a [`Request::Connect`] asked for, answer it, and on success
-/// splice the rest of the connection with the tunnel until either side ends.
-/// `stream` is spliced as the buffered reader it was read through, so bytes the
-/// caller sent right behind the request are not lost.
+/// relay it: the caller's frames into the tunnel, ending in a half-close of the
+/// tunnel at the empty frame, and the tunnel's bytes back raw. The connection
+/// closes when the target closes, which is how the caller sees that EOF.
+/// `stream` is read through the buffered reader the request came in on, so
+/// frames the caller sent right behind the request are not lost.
 async fn serve_tunnel<S>(
     mut stream: BufReader<S>,
     opener: &impl TunnelOpener,
@@ -463,8 +477,69 @@ async fn serve_tunnel<S>(
         return;
     }
     log::debug!("nc tunnel to {target} opened");
-    if let Err(e) = tokio::io::copy_bidirectional(&mut stream, &mut tunnel).await {
+    let (mut from_caller, mut to_caller) = tokio::io::split(stream);
+    let (mut from_tunnel, mut to_tunnel) = tokio::io::split(&mut tunnel);
+    let upload = async {
+        copy_from_frames(&mut from_caller, &mut to_tunnel).await?;
+        to_tunnel.shutdown().await
+    };
+    let download = async {
+        tokio::io::copy(&mut from_tunnel, &mut to_caller).await?;
+        to_caller.flush().await
+    };
+    tokio::pin!(download);
+    // The target closing ends the relay even while the caller still has input;
+    // the caller's EOF only half-closes the tunnel, so the reply still drains.
+    let res = tokio::select! {
+        res = &mut download => res,
+        res = upload => match res {
+            Ok(()) => (&mut download).await,
+            Err(e) => Err(e),
+        },
+    };
+    if let Err(e) = res {
         log::debug!("nc tunnel to {target} ended: {e}");
+    }
+}
+
+/// Copy `reader` into `writer` as tunnel frames — a 4-byte big-endian length,
+/// then that many bytes — ending with an empty frame at `reader`'s EOF.
+pub async fn copy_to_frames<R, W>(reader: &mut R, writer: &mut W) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 4 + MAX_FRAME];
+    loop {
+        let n = reader.read(&mut buf[4..]).await?;
+        buf[..4].copy_from_slice(&(n as u32).to_be_bytes());
+        writer.write_all(&buf[..4 + n]).await?;
+        if n == 0 {
+            return writer.flush().await;
+        }
+    }
+}
+
+/// Copy tunnel frames from `reader` into `writer` until the empty frame.
+async fn copy_from_frames<R, W>(reader: &mut R, writer: &mut W) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; MAX_FRAME];
+    loop {
+        let len = reader.read_u32().await? as usize;
+        if len == 0 {
+            return Ok(());
+        }
+        if len > MAX_FRAME {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("tunnel frame of {len} bytes exceeds {MAX_FRAME}"),
+            ));
+        }
+        reader.read_exact(&mut buf[..len]).await?;
+        writer.write_all(&buf[..len]).await?;
     }
 }
 
@@ -614,12 +689,17 @@ impl IpcClient {
 
         const ERROR_PIPE_BUSY: i32 = 231;
         let name = pipe_name(key);
+        let sid = pipe_security::current_user_sid()?;
         // All pipe instances can be momentarily busy between one attacher
         // connecting and the server pre-creating the next instance; retry
         // briefly (the outer connect() timeout still bounds the wait).
         loop {
             match ClientOptions::new().open(&name) {
-                Ok(stream) => return Ok(stream),
+                // Only a pipe this user's client created is the client.
+                Ok(stream) => {
+                    pipe_security::check_owner(&stream, &sid)?;
+                    return Ok(stream);
+                }
                 Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
@@ -667,8 +747,9 @@ impl IpcClient {
     }
 
     /// Turn this connection into a tunnel to `host:port` on the server side
-    /// (see [`Request::Connect`]): the returned stream carries the tunnel's
-    /// bytes, starting with any the target sent before this call returned.
+    /// (see [`Request::Connect`]): write to it in frames ([`copy_to_frames`]);
+    /// it reads back the target's bytes, starting with any the target sent
+    /// before this call returned, and ends when the target closes.
     pub async fn open_tunnel(
         mut self,
         host: &str,
@@ -982,13 +1063,31 @@ mod tests {
         tunnel.read_exact(&mut banner).await.unwrap();
         assert_eq!(&banner, b"SSH-2.0-echo\r\n");
 
-        tunnel.write_all(b"hello\n").await.unwrap();
-        let mut echo = [0u8; 6];
-        tunnel.read_exact(&mut echo).await.unwrap();
-        assert_eq!(&echo, b"hello\n");
+        // Our input, then its EOF as the empty frame: the far end echoes it
+        // and closes, and that close ends the connection — EOF both ways with
+        // no transport half-close, as on a Windows named pipe.
+        let (mut from_tunnel, mut to_tunnel) = tokio::io::split(tunnel);
+        copy_to_frames(&mut &b"hello\n"[..], &mut to_tunnel).await.unwrap();
+        let mut echo = Vec::new();
+        from_tunnel.read_to_end(&mut echo).await.unwrap();
+        assert_eq!(echo, b"hello\n");
 
-        drop(tunnel);
         drop(served.guard);
+    }
+
+    #[tokio::test]
+    async fn frames_round_trip_and_cap_their_size() {
+        let input: Vec<u8> = (0..3 * MAX_FRAME + 17).map(|i| i as u8).collect();
+        let mut framed = Vec::new();
+        copy_to_frames(&mut &input[..], &mut framed).await.unwrap();
+        assert!(framed.ends_with(&[0, 0, 0, 0]), "ends with the empty frame");
+        let mut output = Vec::new();
+        copy_from_frames(&mut &framed[..], &mut output).await.unwrap();
+        assert_eq!(output, input);
+
+        let oversized = ((MAX_FRAME + 1) as u32).to_be_bytes();
+        let err = copy_from_frames(&mut &oversized[..], &mut Vec::new()).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[cfg(unix)]

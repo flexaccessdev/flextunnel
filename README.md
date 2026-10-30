@@ -301,8 +301,9 @@ curl -x socks5h://127.0.0.1:1080 https://example.com
 # a server-side host alias, for example server.internal -> 127.0.0.1
 curl -x socks5h://127.0.0.1:1080 http://server.internal:8000/
 
-# SSH through the tunnel (see `client nc`; needs no proxy port)
-ssh -o ProxyCommand='flextunnel client nc %h %p' user@internal-host
+# SSH through the tunnel (see `client nc`; needs no proxy port). -n names the
+# running client by its server, since this one was started without a config.
+ssh -o ProxyCommand='flextunnel client nc -n <ENDPOINT_ID> %h %p' user@internal-host
 ```
 
 #### Quick ephemeral tunnel (no setup)
