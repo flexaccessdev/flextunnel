@@ -128,15 +128,18 @@ cargo build --release -p flextunnel-desktop
 That produces the bare executable, **not** a `.app` bundle — so on macOS it has
 no `Info.plist` and will show a Dock icon instead of running as a pure menu-bar
 app. For the proper bundle, build it the way CI does with `cargo-packager`
-(macOS only; `app` gives `flextunnel.app`, `dmg` gives the drag-to-Applications
-disk image):
+(macOS only):
 
 ```sh
 cargo install cargo-packager   # or: cargo binstall cargo-packager
 cargo packager --release -p flextunnel-desktop --formats app
 # bundle: target/release/flextunnel.app  (locally built → not quarantined,
-# so no Gatekeeper workaround needed; use --formats dmg for a .dmg instead)
+# so no Gatekeeper workaround needed)
 ```
+
+For the drag-to-Applications disk image instead, run `./build-macos-dmg.sh`
+(also needs `brew install create-dmg`); it writes
+`dist/macos/flextunnel-desktop-macos-arm64.dmg`.
 
 Otherwise:
 
@@ -212,10 +215,20 @@ flextunnel show-iroh-id --secret-file server.key   # re-print the EndpointId
 ```
 
 Client authentication keys are managed by the standalone
-[`flexaccess-keys`](https://github.com/flexaccessdev/flexaccess-keys) CLI;
-install it with its one-line installer
-(`curl -sSL https://flexaccessdev.github.io/flexaccess-keys/install.sh | bash`,
-Windows: `irm https://flexaccessdev.github.io/flexaccess-keys/install.ps1 | iex`):
+[`flexaccess-keys`](https://github.com/flexaccessdev/flexaccess-keys) CLI.
+Install it with its one-line installer:
+
+```sh
+# macOS / Linux
+curl -sSL https://flexaccessdev.github.io/flexaccess-keys/install.sh | bash
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://flexaccessdev.github.io/flexaccess-keys/install.ps1 | iex
+```
+
+Then:
 
 ```sh
 # On each client machine: generate that client's keypair, then derive its
@@ -423,6 +436,12 @@ Client auth keypairs are generated with the standalone
 | `--relay-url <URL>` | Custom relay URLs (repeatable; at least two distinct URLs). See the [shared relay guide](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/relays-and-address-lookup.md) for discovery and dialing requirements. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
 | `--quick` | Ephemeral one-off server: prompt for the client's EndpointId (shown by `client start --quick`) and natively allowlist it as the only allowed client — no auth keypair — then mint an in-memory identity, full-tunnel all traffic, print this server's EndpointId, and exit if the client doesn't connect within 5 minutes. Needs an interactive terminal. Takes no single-instance lock; nothing is persisted. Conflicts with `-c`/`--secret-file`/`--authorized-keys-file`. |
+
+The server takes a single-instance lock keyed by the prefix of its own
+EndpointId (`~/.config/flextunnel/server-<key>.lock`). So one server runs per
+identity per user: servers with different identity keys — including the
+desktop app's — run side by side without any extra configuration, while a
+second start of the same identity is refused.
 
 ### `client start`
 

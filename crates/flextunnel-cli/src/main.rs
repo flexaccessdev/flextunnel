@@ -463,11 +463,20 @@ async fn run_server(
     r: config::ResolvedServer,
     quick: Option<QuickServer>,
 ) -> Result<()> {
-    // Enforce one server per user before doing any work (held for the process
-    // lifetime; released automatically on exit or crash) — except a quick
-    // ephemeral server, which is an intentional throwaway and takes no lock, so
-    // it can run alongside a real server (or another quick one).
-    let _lock = quick.is_none().then(server::acquire_server_lock).transpose()?;
+    // A quick server's identity is the ephemeral in-memory key it carries;
+    // a regular server's comes from its key file.
+    let (secret_key, quick_client) = match &quick {
+        Some(q) => (q.secret.clone(), Some(q.client_id)),
+        None => (secret::resolve_secret_key(r.secret_file.as_deref())?, None),
+    };
+    // Enforce one server per identity before doing any other work (held for
+    // the process lifetime; released automatically on exit or crash) — except
+    // a quick server, whose identity is fresh and in-memory, so it can never
+    // be running twice.
+    let _lock = match &quick {
+        Some(_) => None,
+        None => Some(server::acquire_server_lock(&secret_key.public())?),
+    };
 
     // A quick server runs without client keys: its single allowlisted client
     // id is the whole credential set (enforced natively by the endpoint's hook).
@@ -475,12 +484,6 @@ async fn run_server(
         Some(path) => auth::load_authorized_keys(path)
             .context("Failed to load the authorized client keys")?,
         None => Default::default(),
-    };
-    // A quick server's identity is the ephemeral in-memory key it carries;
-    // a regular server's comes from its key file.
-    let (secret_key, quick_client) = match &quick {
-        Some(q) => (q.secret.clone(), Some(q.client_id)),
-        None => (secret::resolve_secret_key(r.secret_file.as_deref())?, None),
     };
     // Quick mode arms an idle-exit timer; the server fires this on the first
     // client to cancel it. `None` for a normal server (the timer never runs).

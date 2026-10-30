@@ -38,7 +38,7 @@ Core paths below are relative to `crates/flextunnel-core/src/`.
 | Module | Responsibility |
 | --- | --- |
 | `app.rs`, `config.rs` | Runtime options, TOML parsing, CLI/file/default merging and validation |
-| `server.rs` | Shared CLI/desktop server preparation, per-user lock, endpoint binding and serving |
+| `server.rs` | Shared CLI/desktop server preparation, per-identity lock, endpoint binding and serving |
 | `auth.rs`, `secret.rs` | Flextunnel auth context and identity-key commands; shared key parsing and auth primitives come from `flexaccess-keys` and `flexaccess-iroh` |
 | `blocklist.rs`, `error.rs` | Persisted duplicate-id records and recoverable/permanent errors |
 | `transport/mod.rs` | Flextunnel ALPNs, QUIC tuning and heartbeat timing |

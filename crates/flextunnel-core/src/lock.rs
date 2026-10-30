@@ -7,7 +7,8 @@
 //! never wedges a restart.
 //!
 //! This module owns only the mechanics; the caller chooses the *scope* by
-//! passing the lock path. The server uses a per-user path (one server per user).
+//! passing the lock path. The server keys it by its own identity (one server per
+//! identity per user).
 //!
 //! # Alternative mechanisms (if the file lock ever becomes inconvenient)
 //!
