@@ -437,6 +437,12 @@ Client auth keypairs are generated with the standalone
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
 | `--quick` | Ephemeral one-off server: prompt for the client's EndpointId (shown by `client start --quick`) and natively allowlist it as the only allowed client — no auth keypair — then mint an in-memory identity, full-tunnel all traffic, print this server's EndpointId, and exit if the client doesn't connect within 5 minutes. Needs an interactive terminal. Takes no single-instance lock; nothing is persisted. Conflicts with `-c`/`--secret-file`/`--authorized-keys-file`. |
 
+The server takes a single-instance lock keyed by the prefix of its own
+EndpointId (`~/.config/flextunnel/server-<key>.lock`). So one server runs per
+identity per user: servers with different identity keys — including the
+desktop app's — run side by side without any extra configuration, while a
+second start of the same identity is refused.
+
 ### `client start`
 
 | Flag | Description |

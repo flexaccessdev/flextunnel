@@ -31,7 +31,7 @@ pub enum ServerPhase {
     /// online-wait).
     Starting,
     Running,
-    /// Closing the endpoint; the identity (and the per-user server lock) is
+    /// Closing the endpoint; the identity (and its server lock) is
     /// still held until this finishes.
     Stopping,
     Failed,
@@ -182,14 +182,18 @@ async fn run_server(server: ServerConfig, mut rx: mpsc::Receiver<ServerCmd>, slo
             ..ServerSnapshot::default()
         };
     });
-    // One server per user, shared with the CLI: held until the endpoint is
+    let opts = match options(&server) {
+        Ok(opts) => opts,
+        Err(e) => return slot.fail(format!("{e:#}")),
+    };
+    // One server per identity, shared with the CLI: held until the endpoint is
     // closed, so a stop-then-start can never run two endpoints with one
     // identity.
-    let _lock = match server::acquire_server_lock() {
+    let _lock = match server::acquire_server_lock(&opts.secret_key.public()) {
         Ok(lock) => lock,
         Err(e) => return slot.fail(format!("{e:#}")),
     };
-    let prepared = match options(&server).and_then(server::prepare) {
+    let prepared = match server::prepare(opts) {
         Ok(prepared) => prepared,
         Err(e) => return slot.fail(format!("{e:#}")),
     };

@@ -2,8 +2,8 @@
 //! the app's server plus a detail pane, driven alongside the system tray. The
 //! two roles weigh the same and either can go unused: each profile can run its
 //! own tunnel session concurrently (its optional proxy ports and direct
-//! forwards); the server is a flextunnel server run in-process (there is only
-//! one: the per-user server lock is shared with the CLI), started with the app
+//! forwards); the server is a flextunnel server run in-process (the app hosts
+//! one; its lock, per identity, is shared with the CLI), started with the app
 //! and kept running unless stopped. The daemon owns all state, so closing the window (which destroys it) loses nothing —
 //! the tray re-opens it on demand. Tray/menu events are forwarded from
 //! tray-icon's handlers into a channel drained by a [`Subscription`], so a

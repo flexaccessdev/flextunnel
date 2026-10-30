@@ -1312,8 +1312,8 @@ fn server_welcome() -> Element<'static, Message> {
         .spacing(8),
         text(
             "Moving a server from another computer? Import its identity key to keep its \
-             endpoint id, so its clients need no change. One server runs per user — a CLI \
-             `flextunnel server` on this account counts too.",
+             endpoint id, so its clients need no change. One identity runs once per user — a \
+             CLI `flextunnel server` with the same key counts too.",
         )
         .size(11)
         .style(style::faint_text),
@@ -1509,8 +1509,7 @@ fn server_detail<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
 
     col = col.push(
         text(
-            "The tunnel set is pushed to clients and enforced here. One server runs per \
-             user — a CLI `flextunnel server` counts too.",
+            "The tunnel set is pushed to clients and enforced here.",
         )
         .size(11)
         .style(style::faint_text),

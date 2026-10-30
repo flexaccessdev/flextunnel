@@ -61,27 +61,41 @@ pub struct ServerOptions {
     pub blocklist_file: PathBuf,
 }
 
-/// The per-user server lock path (`~/.config/flextunnel/server.lock`).
+/// How much of the server's own EndpointId keys its lock file. 16 hex chars
+/// (64 bits) cannot collide by accident between distinct identities.
+const LOCK_KEY_LEN: usize = 16;
+
+/// The per-identity server lock path
+/// (`~/.config/flextunnel/server-<id prefix>.lock`).
 ///
 /// There is deliberately no temp-dir fallback: if the home dir is unavailable
 /// the server fails fast rather than silently narrowing the guarantee to a
 /// fallback lock that a second process could sidestep.
-fn server_lock_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".config").join("flextunnel").join("server.lock"))
+fn server_lock_path(own_id: &EndpointId) -> Option<PathBuf> {
+    let key = &own_id.to_string()[..LOCK_KEY_LEN];
+    dirs::home_dir().map(|home| {
+        home.join(".config")
+            .join("flextunnel")
+            .join(format!("server-{key}.lock"))
+    })
 }
 
-/// Acquire the per-user single-instance server lock: one flextunnel server
-/// per user, whichever front-end runs it (a CLI server and a desktop server
-/// profile contend for the same lock). Hold it for as long as the server runs.
-pub fn acquire_server_lock() -> Result<InstanceLock> {
-    let path = server_lock_path().context(
+/// Acquire the single-instance lock for the server identity `own_id`: one
+/// flextunnel server per identity per user, whichever front-end runs it (a CLI
+/// server and the desktop app's server contend for it when they share an
+/// identity, and run side by side when they don't). Hold it for as long as the
+/// server runs.
+pub fn acquire_server_lock(own_id: &EndpointId) -> Result<InstanceLock> {
+    let path = server_lock_path(own_id).context(
         "Could not determine the home directory, so the single-instance lock \
-         (~/.config/flextunnel/server.lock) cannot be enforced",
+         (~/.config/flextunnel/server-<id>.lock) cannot be enforced",
     )?;
     InstanceLock::acquire(
         &path,
-        "Another flextunnel server is already running for this user. \
-         Only one server per user is allowed.",
+        &format!(
+            "Another flextunnel server with this identity ({own_id}) is already \
+             running for this user. Only one server per identity is allowed."
+        ),
     )
 }
 
@@ -466,5 +480,16 @@ mod tests {
             .unwrap();
         let err = prepare(opts).err().expect("self-blocked id");
         assert!(err.to_string().contains("Refusing to start"), "{err}");
+    }
+
+    #[test]
+    fn server_lock_is_keyed_by_identity() {
+        let a = SecretKey::generate().public();
+        let b = SecretKey::generate().public();
+        let path_a = server_lock_path(&a).unwrap();
+        assert_eq!(path_a, server_lock_path(&a).unwrap());
+        assert_ne!(path_a, server_lock_path(&b).unwrap());
+        let name = path_a.file_name().unwrap().to_str().unwrap();
+        assert_eq!(name, format!("server-{}.lock", &a.to_string()[..LOCK_KEY_LEN]));
     }
 }

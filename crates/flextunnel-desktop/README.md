@@ -55,8 +55,9 @@ its own **server-direct port forwards**. Connecting is always manual.
 
 ## The server
 
-The app hosts one server per user — the per-user server lock is shared with the
-CLI, so a `flextunnel server` running on the same account counts too. Until
+The app hosts one server. Its single-instance lock is keyed by the server's
+identity and shared with the CLI, so a `flextunnel server` with the same
+identity key cannot run at the same time; one with a different key can. Until
 one is set up, "Set up server…" (in the sidebar or the tray) opens a welcome:
 what a server is for and the three steps ahead — an identity, authorized
 clients, what they reach — with *Set up server* and *Move a server here…*.

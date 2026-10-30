@@ -1,8 +1,8 @@
 //! Per-user client single-instance locks: one client per (user, target
 //! server) — keyed by the server-id prefix (see `instance.rs`), so two clients
 //! for the same server cannot run at once, while clients for different servers
-//! coexist. (The one-server-per-user lock is shared with the desktop app and
-//! lives in [`flextunnel_core::server::acquire_server_lock`].)
+//! coexist. (The server lock, likewise one per identity, is shared with the
+//! desktop app and lives in [`flextunnel_core::server::acquire_server_lock`].)
 //!
 //! The lock files live under the user's own config dir
 //! (`~/.config/flextunnel/`), so each user gets independent locks. This guards

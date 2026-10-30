@@ -334,7 +334,7 @@ async fn run_loop(
     let mut sessions: HashMap<ProfileId, SessionHandle> = HashMap::new();
     let mut server: Option<ServerHandle> = None;
     // A restart's config, started once the old session has ended: until its
-    // endpoint is closed it holds the identity and the per-user server lock.
+    // endpoint is closed it holds the identity and its server lock.
     let mut pending_start: Option<ServerConfig> = None;
     // Whether the current server session was told to stop (or remove): a
     // start meanwhile waits for it in `pending_start` instead of being dropped.

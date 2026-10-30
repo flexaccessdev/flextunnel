@@ -1,11 +1,9 @@
 //! Profile, server and auth-key persistence. Client auth keys live in a shared,
 //! named list so several profiles can authenticate with the same keypair; each
 //! profile references one by [`AuthKey::id`]. The optional [`ServerConfig`]
-//! runs the one flextunnel server the app hosts in-process (one server per
-//! user). The non-secret data (key names and public halves,
-//! profile names, server ids, ports, forwards, the server's tunnel set and
-//! authorized clients)
-//! lives in a plaintext `profiles.json` under the local data dir — same
+//! runs the one flextunnel server the app hosts in-process. The non-secret
+//! data (key names and public halves, profile names, server ids, ports,
+//! forwards, the server's tunnel set and authorized clients) lives in a plaintext `profiles.json` under the local data dir — same
 //! treatment as the iOS app's `forwards.json`. The secrets (auth-key secret
 //! halves, the server's identity key, and the profiles' and server's custom
 //! relay auth tokens) ride in the same file, sealed the way
