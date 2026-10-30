@@ -23,6 +23,9 @@ mod client_session;
 mod instance;
 mod ipc;
 mod lock;
+mod nc;
+#[cfg(windows)]
+mod pipe_security;
 mod prompt;
 mod tui;
 
@@ -196,30 +199,49 @@ enum ClientAction {
         #[arg(short = 'n', long)]
         server_node_id: Option<String>,
     },
+    /// Relay stdin/stdout through the running client to HOST:PORT on the
+    /// server side, for SSH's `ProxyCommand`:
+    /// `ProxyCommand flextunnel client nc -c <profile.toml> %h %p`. Like a port
+    /// forward, the server enforces its routed set and resolves HOST. The
+    /// client is picked the same way as for `client control`.
+    #[command(arg_required_else_help = true)]
+    Nc {
+        /// Config file path (TOML) of the profile whose client to use. With
+        /// no flags, ~/.config/flextunnel/client.toml selects the profile.
+        #[arg(short = 'c', long)]
+        config: Option<PathBuf>,
+        /// Use the client for this server EndpointId directly (overrides the
+        /// config file).
+        #[arg(short = 'n', long)]
+        server_node_id: Option<String>,
+        /// Target host, resolved by the server.
+        host: String,
+        /// Target port.
+        port: u16,
+    },
 }
 
 fn log_version() {
     app::log_version(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 }
 
-/// Whether the command is `client start --quick`, whose in-process TUI must own
-/// the terminal without a logger writing over it.
-fn is_quick_client_start(command: &Command) -> bool {
-    matches!(
+/// Whether the command runs with the stderr logger. Not for `client start
+/// --quick`, whose in-process TUI must own the terminal without a logger
+/// writing over it, nor `client nc`, which runs under ssh and only reports
+/// its own errors.
+fn wants_logger(command: &Command) -> bool {
+    !matches!(
         command,
         Command::Client {
-            action: ClientAction::Start { quick: true, .. }
+            action: ClientAction::Start { quick: true, .. } | ClientAction::Nc { .. }
         }
     )
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    // `client start --quick` runs a full-screen control panel in this process;
-    // an stderr logger would splatter log lines across it. Every other command
-    // (including the detached `client control`, which is a separate process)
-    // wants the logger. `log::*` calls are silent no-ops when it is not set.
-    if !is_quick_client_start(&args.command) {
+    // `log::*` calls are silent no-ops when the logger is not set.
+    if wants_logger(&args.command) {
         app::init_logger(app::DEFAULT_LOG_FILTER);
     }
 
@@ -234,6 +256,16 @@ fn main() -> Result<()> {
                     server_node_id,
                 },
         } => tui::run(config, server_node_id),
+        // Runs its own small runtime, like `client control`.
+        Command::Client {
+            action:
+                ClientAction::Nc {
+                    config,
+                    server_node_id,
+                    host,
+                    port,
+                },
+        } => nc::run(config, server_node_id, host, port),
         Command::GenerateIrohKey { output, force, json } => {
             secret::generate_iroh_key(output, force, json)
         }

@@ -18,11 +18,10 @@
 
 mod view;
 
-use anyhow::{Context, Result, anyhow};
-use std::path::{Path, PathBuf};
+use anyhow::{Context, Result};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use flextunnel_core::config;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
 
@@ -85,25 +84,8 @@ struct App {
 }
 
 pub fn run(config_path: Option<PathBuf>, server_node_id: Option<String>) -> Result<()> {
-    // The running client is identified by the profile's server node id
-    // (-n wins over the config file; bare `client control` reads the default
-    // config), from which the same instance key as the client's is derived.
-    // With -n and no -c, identify purely by server id (skip the config load).
-    let file = if server_node_id.is_some() && config_path.is_none() {
-        None
-    } else {
-        config::load_client_config(config_path.as_deref())?
-    };
-    let cli = config::ClientConfig {
-        server_node_id,
-        ..Default::default()
-    };
-    let r = config::resolve_client(cli, file);
-    let Some(server_id) = r.server_node_id else {
-        return Err(no_profile_error(config_path.as_deref()));
-    };
-    let key = instance::instance_key(&server_id)?;
-    let profile = r.name.unwrap_or_else(|| format!("server {key}…"));
+    let instance::Located { key, profile } =
+        instance::locate(config_path, server_node_id, "client control")?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -120,63 +102,6 @@ pub fn run(config_path: Option<PathBuf>, server_node_id: Option<String>) -> Resu
 
     let app = App::new(snapshot);
     run_panel(app, &mut backend).context("Lost the connection to the client (did it stop?)")
-}
-
-/// The error for a `client control` that has nothing to identify a client by.
-/// The two cases read very differently and want different fixes: a config file
-/// that exists but carries no `server_node_id`, versus no config file at all —
-/// the usual shape under the systemd template (see `docs/systemd.md`), where
-/// every profile lives in its own `<instance>.toml` and there is no
-/// `client.toml` for a bare `client control` to find. In that case name the
-/// profiles that *are* there, so the fix is a copy-paste away.
-fn no_profile_error(config_path: Option<&Path>) -> anyhow::Error {
-    if let Some(path) = config_path {
-        return anyhow!(
-            "The client config {} has no server_node_id, so it does not say which client to \
-             attach to. Set server_node_id in it, or pass -n <server EndpointId>.",
-            path.display()
-        );
-    }
-    let Some(default_path) = config::default_client_config_path() else {
-        return anyhow!(
-            "Could not determine the default config directory. Pass -c <file> or \
-             -n <server EndpointId>."
-        );
-    };
-    if default_path.exists() {
-        return anyhow!(
-            "The default client config {} has no server_node_id, so it does not say which \
-             client to attach to. Set server_node_id in it, pass -c <file> for another \
-             profile, or pass -n <server EndpointId>.",
-            default_path.display()
-        );
-    }
-    let mut msg = format!(
-        "There is no client config at {}, so `client control` has no profile to attach to. \
-         Pass the profile's config with -c <file>, or attach by server id with \
-         -n <server EndpointId>.",
-        default_path.display()
-    );
-    if let Some(dir) = default_path.parent()
-        && let Some(found) = profile_configs(dir)
-    {
-        msg.push_str(&format!("\nProfiles in {}: {}", dir.display(), found.join(", ")));
-    }
-    anyhow!(msg)
-}
-
-/// Config files in the flextunnel config dir that could be a client profile,
-/// as bare file names, sorted. `None` when there are none (or the directory is
-/// unreadable) — the caller then says nothing rather than an empty list.
-fn profile_configs(dir: &Path) -> Option<Vec<String>> {
-    let mut names: Vec<String> = std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".toml") && n != "server.toml")
-        .collect();
-    names.sort();
-    (!names.is_empty()).then_some(names)
 }
 
 /// Run the self-contained control panel for `client start --quick`: the same UI
@@ -203,7 +128,7 @@ fn request_snapshot(backend: &mut dyn ControlBackend, request: Request) -> Resul
     match backend.request(request)? {
         Response::Status(snapshot) => Ok(*snapshot),
         Response::Error { message } => anyhow::bail!("{message}"),
-        Response::ConnPath(_) => anyhow::bail!("unexpected conn-path response to a status request"),
+        other => anyhow::bail!("unexpected response to a status request: {other:?}"),
     }
 }
 
@@ -301,7 +226,7 @@ impl App {
         Ok(match backend.request(Request::ConnPath)? {
             Response::ConnPath(snapshot) => Ok(snapshot),
             Response::Error { message } => Err(message),
-            Response::Status(_) => Err("unexpected status response".to_string()),
+            other => Err(format!("unexpected response to a conn-path request: {other:?}")),
         })
     }
 
@@ -323,42 +248,5 @@ impl App {
             _ => {}
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn profile_configs_lists_candidate_client_configs() {
-        let dir = tempfile::tempdir().unwrap();
-        for name in [
-            "macintel.toml",
-            "aws.toml",
-            "server.toml",
-            "client-abc.lock",
-            "client.key",
-        ] {
-            std::fs::write(dir.path().join(name), "").unwrap();
-        }
-        assert_eq!(
-            profile_configs(dir.path()).unwrap(),
-            ["aws.toml", "macintel.toml"]
-        );
-    }
-
-    #[test]
-    fn no_profiles_reports_nothing_to_list() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(profile_configs(dir.path()).is_none());
-        assert!(profile_configs(&dir.path().join("missing")).is_none());
-    }
-
-    #[test]
-    fn a_named_config_without_a_server_id_names_that_file() {
-        let msg = no_profile_error(Some(Path::new("/tmp/aws.toml"))).to_string();
-        assert!(msg.contains("/tmp/aws.toml"), "{msg}");
-        assert!(msg.contains("server_node_id"), "{msg}");
     }
 }

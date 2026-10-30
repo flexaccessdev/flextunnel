@@ -301,8 +301,9 @@ curl -x socks5h://127.0.0.1:1080 https://example.com
 # a server-side host alias, for example server.internal -> 127.0.0.1
 curl -x socks5h://127.0.0.1:1080 http://server.internal:8000/
 
-# SSH through the proxy
-ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
+# SSH through the tunnel (see `client nc`; needs no proxy port). -n names the
+# running client by its server, since this one was started without a config.
+ssh -o ProxyCommand='flextunnel client nc -n <ENDPOINT_ID> %h %p' user@internal-host
 ```
 
 #### Quick ephemeral tunnel (no setup)
@@ -417,6 +418,7 @@ HTTP proxy work. Apps without proxy support can use built-in port forwards.
 | `server start` | Run the proxy server. |
 | `client start` | Run the proxy client (optional SOCKS5 and HTTP proxy listeners, plus the port forwards declared in its config). |
 | `client control` | Attach the read-only terminal control panel to a running client. |
+| `client nc` | Relay stdin/stdout through a running client to a server-side `host:port` (SSH `ProxyCommand`). |
 | `client help` | Show the client subcommands and their help. |
 | `generate-iroh-key [-o <FILE>] [--force] [--json]` | Generate the server's iroh identity key (stdout without `-o`). |
 | `show-iroh-id --secret-file <FILE> [--json]` | Print the iroh id (EndpointId) for a key. |
@@ -536,6 +538,34 @@ change it), and the channel carries no mutations. It runs as the same user as
 the client — no elevated privilege on either end.
 
 Detaching (`q`) never affects the tunnel; several panels can attach at once.
+
+### `client nc`
+
+```sh
+flextunnel client nc <HOST> <PORT>               # profile from ~/.config/flextunnel/client.toml
+flextunnel client nc -c aws.toml <HOST> <PORT>   # profile from a specific config
+flextunnel client nc -n <ENDPOINT_ID> <HOST> <PORT>
+```
+
+Opens one tunnel to `<HOST>:<PORT>` through the **running** client for a
+profile (picked the same way as for `client control`, over the same control
+socket) and relays it to stdin/stdout — a built-in netcat for SSH's
+`ProxyCommand`:
+
+```
+Host workstation
+    HostName workstation.internal
+    ProxyCommand flextunnel client nc -c ~/.config/flextunnel/aws.toml %h %p
+```
+
+The tunnel rides the client's live connection, so it opens instantly, and it
+works with no SOCKS or HTTP port configured. Like a port forward, the target
+goes to the server, which enforces its routed set and resolves the host; an
+off-list target is refused rather than connected directly. It fails fast with
+the reason (client not running, tunnel down, target refused), which ssh prints.
+It reaches clients started with `client start`; the desktop app's connections
+have no control socket, so reach those through their SOCKS port instead
+(`ProxyCommand nc -X 5 -x 127.0.0.1:<port> %h %p`).
 
 ## Configuration files
 
