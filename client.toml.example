@@ -65,15 +65,15 @@ auth_key_file = "~/.config/flextunnel/client.key"
 # reason shown next to its row. Local ports must be unique and nonzero. label
 # is optional (display only).
 #
-# Unlike `ssh -L`, the server's loopback is NOT reachable by default: a
-# loopback remote must be on the server's routed set too. `127.0.0.1`/`::1`
-# need a loopback CIDR in routed_cidrs (e.g. "127.0.0.0/8", "::1"), while
-# `localhost` is a hostname and needs "localhost" (or "*") in routed_domains.
-# Otherwise the server rejects the stream ("connection not allowed").
+# Use remote_host = "localhost.flextunnel.internal" to reach the server's
+# loopback without adding a route. Literal `127.0.0.1`/`::1` targets need a
+# loopback CIDR in routed_cidrs (e.g. "127.0.0.0/8", "::1"), while `localhost`
+# needs "localhost" (or "*") in routed_domains. Unrouted non-reserved targets
+# are rejected ("connection not allowed").
 # [[forwards]]
 # label = "local-web"
 # local_port = 8080
-# remote_host = "127.0.0.1"   # needs "127.0.0.0/8" in the server's routed_cidrs
+# remote_host = "localhost.flextunnel.internal"   # always reaches server loopback
 # remote_port = 80
 #
 # [[forwards]]

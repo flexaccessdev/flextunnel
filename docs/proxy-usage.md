@@ -18,7 +18,7 @@ directly from the client device. For on-list targets, the server sees the same
 wire `Target` either way and does not care which local front-end you used. This
 guide covers, in order:
 
-1. **The one rule** — always let the *server* resolve names.
+1. **DNS** — pass hostnames through so routed names resolve on the server.
 2. **Which listener to use** — SOCKS5 vs HTTP proxy, and when only one works.
 3. **Programs that speak SOCKS5 natively** — `curl`, `git`, `kubectl`, `ssh`,
    browsers, and other common tools.
@@ -71,25 +71,22 @@ flextunnel resolve it. The two front-ends reach this differently:
   `h` means "resolve host at the proxy"). Never pre-resolve the name to an IP on
   the client, and don't attach a client-side resolver.
 
-The single most common mistake is using `socks5://` (client-side DNS) where you
-want `socks5h://` (proxy-side DNS). With flextunnel, **you almost always want
-the `h`.** This mistake is impossible with the HTTP proxy, which is one reason
-to prefer it for tools whose SOCKS5 support is client-DNS-only (see below).
+For curl and libcurl-based tools, use `socks5h://` for proxy-side DNS;
+`socks5://` resolves locally. Scheme behavior is tool-specific: Go's HTTP
+transport treats both SOCKS5 schemes alike, as discussed under `kubectl` below.
 
 ## Which listener to use
 
 | Your tool… | Use |
 |---|---|
 | speaks SOCKS5 with remote DNS (`socks5h`) — curl, ssh, browsers, apt | **SOCKS5** `127.0.0.1:1080` |
-| needs raw TCP — databases, RDP, native JDBC | **SOCKS5** (or a `socat` forward; see "Adapters for programs that don't speak either proxy") |
+| needs raw TCP without proxy support — databases, RDP, native JDBC | A built-in **port forward**, or an external adapter |
 | only speaks an HTTP proxy — `wget`, Docker pulls | **HTTP proxy** `127.0.0.1:8081` |
 | speaks SOCKS5 but only with **client-side** DNS — JVM `socksProxyHost` | **HTTP proxy** (client DNS can't resolve routed names) |
 
-The HTTP proxy handles **HTTPS and any TCP** via `CONNECT` tunneling and
-**plain HTTP** via absolute-URI forwarding. What it *cannot* do is carry a
-protocol that isn't HTTP: a database wire protocol, RDP, or SSH does not speak
-HTTP `CONNECT`, so those still go through SOCKS5 or a `socat` forward. The HTTP
-proxy *complements* SOCKS5; it doesn't replace it.
+The HTTP proxy carries any TCP protocol through `CONNECT`, provided the client
+or an adapter performs that handshake. Apps that speak neither proxy protocol
+can use built-in port forwards. Plain HTTP also supports absolute-URI forwarding.
 
 Enable the HTTP proxy by adding `--http-port` when you start the client.
 SOCKS5 is not on by default — keep `--socks-port` too if you also want it:
@@ -189,14 +186,10 @@ Host networking.internal
 
 ### `kubectl` (inline `proxy-url` in kubeconfig)
 
-`kubectl` (and any client-go–based tool) can route a **single cluster's** API
-traffic through a proxy declared inline in the kubeconfig, via the
-`proxy-url` field under `clusters[].cluster`. SOCKS5 support for this field is
-**stable since Kubernetes 1.24** — that release also fixed `kubectl exec`,
-which was the one subcommand that didn't work through a SOCKS proxy before. This
-is the preferred pattern: it scopes the proxy to just the one cluster context,
-and a kubeconfig `proxy-url` takes precedence over the global `HTTPS_PROXY`
-environment variable (which would otherwise proxy *every* context).
+Set `proxy-url` under `clusters[].cluster` to route that cluster's API traffic
+through flextunnel. This scopes the proxy to the cluster rather than every
+context affected by `HTTPS_PROXY`; see the
+[Kubernetes SOCKS5 guide](https://kubernetes.io/docs/tasks/extend-kubernetes/socks5-proxy-access-api/).
 
 Use the `socks5h://` scheme so flextunnel resolves the API server's hostname
 server-side — the same "let the server resolve names" rule as everywhere else.
@@ -227,14 +220,23 @@ users:
 ```
 
 `proxy-url` also accepts `http://` — point it at the HTTP proxy front-end
-(`proxy-url: http://127.0.0.1:8081`) if that fits your tooling better; kubectl
-sends the API server hostname to an HTTP proxy, so DNS still happens
-server-side for on-list targets there too. Plain `socks5://` (no `h`) would
-resolve `k8s.internal` on the client and fail — use `socks5h://`.
+(`proxy-url: http://127.0.0.1:8081`). Both send routed hostnames to flextunnel
+for server-side resolution. Unlike curl, Go's HTTP transport treats `socks5`
+and `socks5h` identically; the missing `h` does not imply local DNS here. See
+[Go's transport implementation](https://go.dev/src/net/http/transport.go).
+
+SOCKS5 `proxy-url` support is
+[stable since Kubernetes 1.24](https://kubernetes.io/docs/tasks/extend-kubernetes/socks5-proxy-access-api/),
+which also made `kubectl exec` work through it. The
+[kubeconfig reference](https://kubernetes.io/docs/reference/config-api/kubeconfig.v1/)
+still notes a SOCKS5 limitation for SPDY `exec`, `attach` and port forwarding;
+if an older or non-kubectl client hits it, use the HTTP proxy.
 
 > Note the DNS semantics: with `socks5h://`, a `server:` of
-> `https://localhost:6443` means *the flextunnel server's* localhost, not your
-> laptop's — the whole point when the API server sits on the server's network.
+> `https://localhost:6443` reaches the server's localhost only if `localhost`
+> is routed. Use `https://localhost.flextunnel.internal:6443` for the reserved
+> server-loopback name, with a TLS certificate or `tls-server-name` matching
+> the API server.
 
 ### Web browsers
 
@@ -398,10 +400,8 @@ go over `CONNECT` automatically; you never send them as absolute-URI forwards.
 
 ## `ssh` through the proxy
 
-SSH is a raw-TCP protocol — it does not speak HTTP `CONNECT`, so route it
-through **SOCKS5**, not the HTTP proxy. To reach an SSH server that only listens
-on the flextunnel server's network, run SSH's connection *through* the proxy
-with a `ProxyCommand`. OpenBSD `nc` (`netcat`) speaks SOCKS5 with `-X 5 -x`:
+OpenSSH can use a proxy through `ProxyCommand`. This example uses OpenBSD
+`nc` (`netcat`) to perform a SOCKS5 handshake and reach an internal SSH server:
 
 ```sh
 ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@workstation.internal
@@ -441,11 +441,25 @@ SSH box can.
 
 ## Adapters for programs that don't speak either proxy
 
-Database clients, RDP, JDBC native drivers, `psql`, and many GUI apps have no
-SOCKS5 option and don't speak HTTP `CONNECT` either. Put `socat` in front of the
-proxy to present a **plain local TCP port** that forwards through it.
+For database clients, RDP and other apps without proxy support, first consider
+a built-in server-direct forward in `client.toml`:
 
-`socat`'s `SOCKS5-CONNECT` address dials a target *through* the SOCKS5 proxy and
+```toml
+[[forwards]]
+local_port = 15432
+remote_host = "db.internal"
+remote_port = 5432
+```
+
+Connect the app to `localhost:15432`. The target must be in the server's routed
+set; forwards never connect off-list targets directly from the client. See
+[`client.toml.example`](../client.toml.example).
+
+An external adapter such as `socat` is useful for a temporary forward or a
+custom bind address. Its SOCKS5 path uses normal proxy routing, including
+direct connections for off-list targets.
+
+`socat` 1.8+'s `SOCKS5-CONNECT` address dials a target *through* the SOCKS5 proxy and
 sends the target as a **domain name** (it emits SOCKS5 `ATYP=DOMAIN`, so
 flextunnel resolves it server-side).
 

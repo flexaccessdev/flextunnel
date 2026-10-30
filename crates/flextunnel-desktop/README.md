@@ -123,22 +123,19 @@ badge — except an **empty circle** for a disabled server while no connection i
 
 ## Where settings live
 
-Everything is stored in one `profiles.json` in the platform's local data
-directory. Non-secret data (names, server ids, ports, forwards, relay URLs,
-public keys — the server's endpoint id and authorized clients included) is
-plaintext. The **secrets** — auth-key secrets, the server's
-identity key, and the custom-relay auth tokens of profiles and the server —
-are sealed in the same file with AES-256-GCM under a random master key that is
-the one entry kept in the system keychain (**macOS Keychain** or the **Windows
-Credential Manager**), named "Flextunnel Safe Storage". The sealed secrets
-carry a format version: an update that changes what is sealed bumps it, and
-then starts every secret fresh — re-enter the auth-key secrets, the server
-identity and the relay tokens — rather than loading some and not others. Either
-way — and when the keychain entry was deleted or replaced so the master key no
-longer opens them, or when the settings can't be loaded at all (the keychain
-can't be read, or `profiles.json` is unreadable) — the app first asks: *Quit*
-leaves what is on disk untouched (for the older build, or for once the cause is
-fixed), *Start fresh* drops it for good. Nothing is saved until then.
+Settings live in `profiles.json` in the platform's local data directory.
+Names, endpoint ids, ports, forwards, relay URLs and public keys are plaintext.
+Auth-key secrets, the server identity key and relay auth tokens are sealed in
+that file with AES-256-GCM. Only the random master key is kept in the system
+keychain (macOS Keychain or Windows Credential Manager), under "Flextunnel Safe
+Storage".
+
+If the store cannot be loaded or unsealed, or its sealed format version differs,
+the app blocks saves and offers **Quit** or **Start fresh**. Quit preserves the
+file for recovery; Start fresh saves the reset state. A sealed-format mismatch
+clears secrets and requires re-entering them; to keep them, quit and run the
+build that wrote the file. If the store does not unseal because the Safe
+Storage entry was deleted or replaced, quit and restore that entry.
 
 > **Development escape hatch:** setting `FLEXTUNNEL_DEV_CONFIG` (to `1` or to an
 > explicit file path) stores everything, tokens included, in a single plaintext
