@@ -10,7 +10,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.0.93"
+version = "0.0.94"
 edition = "2024"
 description = "SOCKS5/HTTP proxy and port forwards over QUIC — split tunnel via iroh P2P"
 license = "MIT"
