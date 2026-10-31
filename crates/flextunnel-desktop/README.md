@@ -60,10 +60,10 @@ identity and shared with the CLI, so a `flextunnel server` with the same
 identity key cannot run at the same time; one with a different key can. Until
 one is set up, "Set up server…" (in the sidebar or the tray) opens a welcome:
 what a server is for and the three steps ahead — an identity, authorized
-clients, what they reach — with *Set up server* and *Move a server here…*.
-Setup is then one step, the identity — a fresh one generated, or an existing
-one imported to move a server here, either way showing the endpoint id it
-gives — and *Create server* goes straight on to authorizing the first client.
+clients, what they reach — with a single *Set up server*.
+Setup is then one step, the identity — a fresh one generated (*Regenerate*
+rolls another), or an existing one imported to move a server here, either way
+showing the endpoint id it gives — and *Create server* goes straight on to authorizing the first client.
 
 - **Enabled** — the server's only on/off control: a switch in the server
   pane (and *Enable/Disable Server* in the tray); there is no separate

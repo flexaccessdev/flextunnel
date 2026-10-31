@@ -160,9 +160,8 @@ pub enum Message {
     /// Show the server's welcome (or the server, once set up): the sidebar's
     /// "Set up server…" and the tray's.
     SetUpServer,
-    /// Open the setup form from the welcome: a new identity, or (`true`) one
-    /// imported to move a server here.
-    BeginServerSetup(bool),
+    /// Open the setup form from the welcome.
+    BeginServerSetup,
     /// Open the server's settings form (tunnel set and relays).
     EditServer,
     DeleteServer,
@@ -176,6 +175,8 @@ pub enum Message {
     /// generated one.
     ServerImportToggled(bool),
     ServerImportSecretChanged(String),
+    /// The setup form's generated identity: roll a different one.
+    ServerRegenerateIdentity,
     ServerRoutedDomainsChanged(String),
     ServerRoutedCidrsChanged(String),
     ServerRelayUrlsChanged(String),
@@ -203,6 +204,7 @@ pub enum Message {
     ReplaceIdentity(bool),
     IdentityImportToggled(bool),
     IdentitySecretChanged(String),
+    IdentityRegenerate,
     IdentityFormSave,
     IdentityFormCancel,
     // Logs
@@ -627,6 +629,11 @@ impl IdentityChoice {
         }
     }
 
+    /// Roll a different generated key (and so endpoint id).
+    fn regenerate(&mut self) {
+        self.generated = generate_server_secret();
+    }
+
     fn secret(&self) -> &str {
         self.import.as_deref().unwrap_or(&self.generated).trim()
     }
@@ -664,13 +671,9 @@ pub struct ServerForm {
 }
 
 impl ServerForm {
-    fn add(import: bool) -> Self {
+    fn add() -> Self {
         Self {
-            identity: Some(if import {
-                IdentityChoice::importing()
-            } else {
-                IdentityChoice::new()
-            }),
+            identity: Some(IdentityChoice::new()),
             ..Self::default()
         }
     }
@@ -1489,11 +1492,11 @@ impl App {
                 Task::none()
             }
             Message::SetUpServer => self.set_up_server(),
-            Message::BeginServerSetup(import) => {
+            Message::BeginServerSetup => {
                 if self.server.is_none() {
                     self.close_forms();
                     self.selection = Selection::Server;
-                    self.server_form = Some(ServerForm::add(import));
+                    self.server_form = Some(ServerForm::add());
                 }
                 Task::none()
             }
@@ -1531,6 +1534,12 @@ impl App {
             Message::ServerImportToggled(import) => {
                 if let Some(identity) = self.server_form.as_mut().and_then(|f| f.identity.as_mut()) {
                     identity.import = import.then(String::new);
+                }
+                Task::none()
+            }
+            Message::ServerRegenerateIdentity => {
+                if let Some(identity) = self.server_form.as_mut().and_then(|f| f.identity.as_mut()) {
+                    identity.regenerate();
                 }
                 Task::none()
             }
@@ -1635,6 +1644,12 @@ impl App {
             Message::IdentityImportToggled(import) => {
                 if let Some(identity) = &mut self.identity_form {
                     identity.import = import.then(String::new);
+                }
+                Task::none()
+            }
+            Message::IdentityRegenerate => {
+                if let Some(identity) = &mut self.identity_form {
+                    identity.regenerate();
                 }
                 Task::none()
             }
@@ -2747,7 +2762,7 @@ mod tests {
         ServerForm {
             routed_domains: " *.internal ,, example.com ".into(),
             routed_cidrs: "10.0.0.0/8".into(),
-            ..ServerForm::add(false)
+            ..ServerForm::add()
         }
     }
 
@@ -2765,10 +2780,19 @@ mod tests {
         assert_eq!(server.routed_cidrs, ["10.0.0.0/8"]);
         assert!(server.authorized_clients.is_empty(), "clients come after setup");
         assert_ne!(
-            ServerForm::add(false).validate(None).unwrap().endpoint_id,
-            ServerForm::add(false).validate(None).unwrap().endpoint_id,
+            ServerForm::add().validate(None).unwrap().endpoint_id,
+            ServerForm::add().validate(None).unwrap().endpoint_id,
             "every setup generates its own identity"
         );
+    }
+
+    #[test]
+    fn server_setup_regenerates_its_identity() {
+        let mut identity = IdentityChoice::new();
+        let (_, before) = identity.resolve().unwrap();
+        identity.regenerate();
+        let (_, after) = identity.resolve().unwrap();
+        assert_ne!(before, after, "a regenerated identity gives a new endpoint id");
     }
 
     #[test]
