@@ -1244,9 +1244,7 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
 // ---------------------------------------------------------------------------
 // Server
 
-/// No server yet: what one is for and how setup goes, then the two ways in —
-/// a new server, or one moved here from another computer (its identity
-/// imported, so its clients need no change).
+/// No server yet: what one is for and how setup goes, then the way in.
 fn server_welcome() -> Element<'static, Message> {
     let step = |n: &'static str, title: &'static str, body: &'static str| {
         row![
@@ -1299,24 +1297,10 @@ fn server_welcome() -> Element<'static, Message> {
         section_label("HOW IT WORKS"),
         container(steps).padding([14, 16]).width(Fill).style(style::card),
         space().height(4),
-        row![
-            button(text("Set up server").size(13).font(semibold()))
-                .padding([7, 20])
-                .style(style::primary)
-                .on_press(Message::BeginServerSetup(false)),
-            button(text("Move a server here…").size(13))
-                .padding([7, 16])
-                .style(style::outlined)
-                .on_press(Message::BeginServerSetup(true)),
-        ]
-        .spacing(8),
-        text(
-            "Moving a server from another computer? Import its identity key to keep its \
-             endpoint id, so its clients need no change. One identity runs once per user — a \
-             CLI `flextunnel server` with the same key counts too.",
-        )
-        .size(11)
-        .style(style::faint_text),
+        button(text("Set up server").size(13).font(semibold()))
+            .padding([7, 20])
+            .style(style::primary)
+            .on_press(Message::BeginServerSetup),
     ]
     .spacing(10)
     .max_width(560);
@@ -1775,11 +1759,12 @@ fn segmented<'a>(
 }
 
 /// The identity picker shared by setup and replace: a generated key (only its
-/// endpoint id shown) or a pasted one.
+/// endpoint id shown, with Regenerate to roll another) or a pasted one.
 fn identity_picker<'a>(
     identity: &'a IdentityChoice,
     on_toggle: fn(bool) -> Message,
     on_secret: fn(String) -> Message,
+    on_regenerate: Message,
 ) -> Column<'a, Message> {
     let mut col = column![form_row(
         "Identity",
@@ -1801,12 +1786,17 @@ fn identity_picker<'a>(
     match identity.resolve() {
         Ok((_, endpoint_id)) => {
             // Its own full-width line, so all 64 characters fit.
+            let mut field = row![endpoint_field(&endpoint_id)].spacing(8).align_y(Center);
+            if identity.import.is_none() {
+                field = field.push(
+                    button(text("Regenerate").size(12))
+                        .padding([5, 14])
+                        .style(style::outlined)
+                        .on_press(on_regenerate),
+                );
+            }
             col = col.push(
-                column![
-                    text("Endpoint id").size(12).style(style::dim_text),
-                    endpoint_field(&endpoint_id),
-                ]
-                .spacing(6),
+                column![text("Endpoint id").size(12).style(style::dim_text), field].spacing(6),
             );
         }
         Err(message) => {
@@ -1831,7 +1821,12 @@ fn identity_form_view<'a>(
         })
             .size(13)
             .font(semibold()),
-        identity_picker(identity, Message::IdentityImportToggled, Message::IdentitySecretChanged),
+        identity_picker(
+            identity,
+            Message::IdentityImportToggled,
+            Message::IdentitySecretChanged,
+            Message::IdentityRegenerate,
+        ),
     ]
     .spacing(10);
     match &resolved {
@@ -1916,6 +1911,7 @@ fn server_setup_card<'a>(app: &'a App, identity: &'a IdentityChoice) -> Element<
             identity,
             Message::ServerImportToggled,
             Message::ServerImportSecretChanged,
+            Message::ServerRegenerateIdentity,
         ),
         text(if identity.import.is_some() {
             "Moving a server here: paste the identity key exported from the other \
