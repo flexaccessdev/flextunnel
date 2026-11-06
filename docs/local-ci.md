@@ -56,7 +56,8 @@ pwsh -File ci/windows/remote.ps1 ci
 ```
 
 Both remote drivers accept `ci` (the default), `shell`, `doctor` and `clean`.
-`clean` deletes the remote Cargo build cache.
+`clean` deletes the Cargo build cache: the remote target directory, and for
+Windows also this repo's cache archives on the driving machine.
 
 ## Checks
 
@@ -78,17 +79,20 @@ runs are separate app-side checks.
 
 ## Remote workspaces
 
-Each run replaces the remote source workspace. Build caches live outside it
-and survive subsequent runs.
+Each run replaces the remote source workspace. Build caches live outside it.
 
 | | Unix remotes | Windows |
 | --- | --- | --- |
 | Workspace | `~/codes/staging-area/flextunnel` | `C:\ci-workspaces\flextunnel` |
-| Build cache | `~/codes/staging-area/flextunnel-cargo-target` | `C:\ci-workspaces\cargo-target` |
+| Build cache | `~/codes/staging-area/flextunnel-cargo-target` | `C:\ci-workspaces\flextunnel-target`, for the run only; archives in `/mnt/dasdata/tmp/winci-cache/flextunnel` on the driving machine |
 | Lock | `~/codes/staging-area/flextunnel.lock` | `C:\ci-workspaces\flextunnel.lock` |
-| Overrides | `FLEXTUNNEL_UNIXCI_STAGING` | `FLEXTUNNEL_WINCI_STAGING`, `FLEXTUNNEL_WINCI_CACHE_DIR` |
+| Overrides | `FLEXTUNNEL_UNIXCI_STAGING` | `FLEXTUNNEL_WINCI_STAGING`, `FLEXTUNNEL_WINCI_CACHE_DIR`, `DEVTOOLS_WINCI_CACHE_STORE` |
 
-The Windows cache is shared across Rust repos on that VM. Drivers lock the
+A Unix remote keeps its target directory between runs. The Windows VM keeps
+none, like GitHub Actions' cache: the driver restores the run's target
+directory from this repo's newest matching archive, keyed on the lock and
+toolchain files and the VM's `rustc -vV`, and after a passing run whose key
+missed it saves one pruned to third-party dependencies. Drivers lock the
 workspace during CI and cache cleanup; if a terminated run leaves a lock,
 confirm it has stopped before using the removal command printed by the driver.
 
