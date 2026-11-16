@@ -57,7 +57,7 @@ pwsh -File ci/windows/remote.ps1 ci
 
 Both remote drivers accept `ci` (the default), `shell`, `doctor` and `clean`.
 `clean` deletes the Cargo build cache: the remote target directory, and for
-Windows also this repo's cache archives on the driving machine.
+Windows also this repo's snapshots in the build cache's restic repository.
 
 ## Checks
 
@@ -84,15 +84,17 @@ Each run replaces the remote source workspace. Build caches live outside it.
 | | Unix remotes | Windows |
 | --- | --- | --- |
 | Workspace | `~/codes/staging-area/flextunnel` | `C:\ci-workspaces\flextunnel` |
-| Build cache | `~/codes/staging-area/flextunnel-cargo-target` | `C:\ci-workspaces\flextunnel-target`, for the run only; archives in `/mnt/dasdata/tmp/winci-cache/flextunnel` on the driving machine |
+| Build cache | `~/codes/staging-area/flextunnel-cargo-target` | `C:\ci-workspaces\flextunnel-target`, for the run only; snapshots in the restic repository `rest:https://ci-cache.home.in.kuvi.fyi/main`, tagged `repo:flextunnel` |
 | Lock | `~/codes/staging-area/flextunnel.lock` | `C:\ci-workspaces\flextunnel.lock` |
-| Overrides | `FLEXTUNNEL_UNIXCI_STAGING` | `FLEXTUNNEL_WINCI_STAGING`, `FLEXTUNNEL_WINCI_CACHE_DIR`, `DEVTOOLS_WINCI_CACHE_STORE` |
+| Overrides | `FLEXTUNNEL_UNIXCI_STAGING` | `FLEXTUNNEL_WINCI_STAGING`, `FLEXTUNNEL_WINCI_CACHE_DIR` |
 
 A Unix remote keeps its target directory between runs. The Windows VM keeps
 none, like GitHub Actions' cache: the driver restores the run's target
-directory from this repo's newest matching archive, keyed on the lock and
-toolchain files and the VM's `rustc -vV`, and after a passing run whose key
-missed it saves one pruned to third-party dependencies. Drivers lock the
+directory from this repo's newest matching restic snapshot, keyed on the lock
+and toolchain files and the VM's `rustc -vV`, and after a passing run whose key
+missed it saves one pruned to third-party dependencies, keeping the repo's
+three newest. restic runs on the driving machine, which needs restic, zstd and
+bash; without them the Windows run builds cold. Drivers lock the
 workspace during CI and cache cleanup; if a terminated run leaves a lock,
 confirm it has stopped before using the removal command printed by the driver.
 
