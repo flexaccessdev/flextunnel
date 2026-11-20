@@ -30,7 +30,7 @@ tray-icon = "0.26"
 keyring-core = "1"
 arboard = "3"
 # Native save/open dialogs for profile export/import.
-rfd = "0.17"
+rfd = "0.18"
 env_filter = "2"
 tiny-skia = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -49,7 +49,7 @@ plist = "1.10"
 [target.'cfg(windows)'.dependencies]
 windows-native-keyring-store = "1"
 # The HKCU Run / StartupApproved login-item registration (see autostart.rs).
-windows-registry = "0.6"
+windows-registry = "0.100"
 
 [dev-dependencies]
 tempfile = { workspace = true }
