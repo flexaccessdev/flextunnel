@@ -88,9 +88,11 @@ they reach. It is one session for all of them.
   via native save/open dialogs; the proxy ports stay behind. (Secrets are
   re-entered on import: neither an auth key nor a custom-relay auth token is
   written to the export file. An imported destination whose server is already
-  here replaces that destination and keeps its key and relay token; an
-  imported forward replaces the one on the same local port. An import whose
-  hosts or routes clash with the ones here is refused whole.)
+  here replaces that destination and keeps its key — and its relay token,
+  unless the import changes its relays, in which case the token is cleared and
+  the import says so. An imported forward replaces the one on the same local
+  port. An import is all or nothing: a file that names a host or a server
+  twice, or whose hosts or routes clash with the ones here, is refused whole.)
 
 ## The server
 

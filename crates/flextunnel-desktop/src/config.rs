@@ -221,16 +221,7 @@ impl ClientSettings {
     /// The client's routing as the core will see it: every destination's host
     /// and routes, validated together. The error names what to fix.
     pub fn route_table(&self) -> Result<RouteTable, String> {
-        let specs: Vec<RouteSpec<'_>> = self
-            .destinations
-            .iter()
-            .map(|d| RouteSpec {
-                host: &d.host,
-                routed_domains: &d.routed_domains,
-                routed_cidrs: &d.routed_cidrs,
-            })
-            .collect();
-        RouteTable::new(&specs).map_err(|e| format!("{e:#}"))
+        route_table_of(&self.destinations)
     }
 
     /// Why the client cannot start, if it can't: it has no destination, one of
@@ -272,6 +263,21 @@ impl ClientSettings {
     pub fn is_ready(&self, keys: &[AuthKey]) -> bool {
         self.start_blocker(keys).is_none()
     }
+}
+
+/// The core's routing table over `destinations`, in their order.
+pub fn route_table_of<'a>(
+    destinations: impl IntoIterator<Item = &'a Destination>,
+) -> Result<RouteTable, String> {
+    let specs: Vec<RouteSpec<'_>> = destinations
+        .into_iter()
+        .map(|d| RouteSpec {
+            host: &d.host,
+            routed_domains: &d.routed_domains,
+            routed_cidrs: &d.routed_cidrs,
+        })
+        .collect();
+    RouteTable::new(&specs).map_err(|e| format!("{e:#}"))
 }
 
 /// The server's entry in the sealed id → secret map. Key ids are 16 hex
@@ -766,7 +772,9 @@ fn drop_invalid(destinations: Vec<Destination>) -> Vec<Destination> {
     destinations
         .into_iter()
         .filter(|d| {
-            if !ids.insert(d.id.clone()) {
+            // Every check before anything is reserved: a dropped entry must
+            // not shadow a later valid one sharing its id, host or server.
+            if ids.contains(&d.id) {
                 log::error!("Ignoring destination \"{}\": duplicate id {}", d.host, d.id);
                 return false;
             }
@@ -774,11 +782,11 @@ fn drop_invalid(destinations: Vec<Destination>) -> Vec<Destination> {
                 log::error!("Ignoring destination {}: invalid host {:?}", d.id, d.host);
                 return false;
             }
-            if !hosts.insert(d.host.clone()) {
+            if hosts.contains(&d.host) {
                 log::error!("Ignoring a destination: duplicate host \"{}\"", d.host);
                 return false;
             }
-            if !servers.insert(d.server_node_id.clone()) {
+            if servers.contains(&d.server_node_id) {
                 log::error!(
                     "Ignoring destination \"{}\": another destination already uses its server \
                      node id",
@@ -786,6 +794,9 @@ fn drop_invalid(destinations: Vec<Destination>) -> Vec<Destination> {
                 );
                 return false;
             }
+            ids.insert(d.id.clone());
+            hosts.insert(d.host.clone());
+            servers.insert(d.server_node_id.clone());
             true
         })
         .collect()
@@ -808,7 +819,9 @@ fn drop_invalid_forwards(forwards: Vec<PortForward>) -> Vec<PortForward> {
                 log::error!("Ignoring forward \"{}\": invalid entry", f.display_name());
                 return false;
             }
-            if !ids.insert(f.id.clone()) || !ports.insert(f.local_port) {
+            // Both checked before either is reserved: a forward dropped for
+            // its port must not take its id from a later valid one.
+            if ids.contains(&f.id) || ports.contains(&f.local_port) {
                 log::error!(
                     "Ignoring forward \"{}\": duplicate id or local port {}",
                     f.display_name(),
@@ -816,6 +829,8 @@ fn drop_invalid_forwards(forwards: Vec<PortForward>) -> Vec<PortForward> {
                 );
                 return false;
             }
+            ids.insert(f.id.clone());
+            ports.insert(f.local_port);
             true
         })
         .collect()
@@ -983,11 +998,14 @@ pub fn export_client(path: &Path, client: &ClientSettings) -> Result<()> {
     write_json(path, &doc)
 }
 
-/// Read an export file back, applying the same structural validation as a
-/// load (invalid entries and in-file duplicates are dropped with logs). The
-/// caller merges the result into the current client and assigns final ids;
-/// missing ids (the normal export shape) get placeholders here so the entries
-/// deserialize. No secret or key reference is imported: neither is ever in an
+/// Read an export file back. The destinations come back exactly as the file
+/// has them — the caller's merge checks them strictly and refuses the import
+/// over any that do not fit, rather than importing a file in part — while
+/// forwards a load would drop (a bad field, a second one on a local port) are
+/// dropped here too, with logs. The caller merges the result into the current
+/// client and assigns final ids; missing ids (the normal export shape) get
+/// placeholders here so the entries deserialize. No secret or key reference is
+/// imported: neither is ever in an
 /// export, and a hand-written auth-key reference is dropped rather than
 /// trusted (a hand-written relay auth token never deserializes), so imported
 /// destinations come back with both empty.
@@ -1013,7 +1031,7 @@ pub fn import_client(path: &Path) -> Result<Portable> {
     let portable: Portable = serde_json::from_value(doc)
         .with_context(|| format!("Failed to parse {}", path.display()))?;
     Ok(Portable {
-        destinations: drop_invalid(portable.destinations),
+        destinations: portable.destinations,
         forwards: drop_invalid_forwards(portable.forwards),
     })
 }
@@ -1465,11 +1483,16 @@ mod tests {
             ..destination()
         };
         let unique = variant("d", "staging.internal", "unique");
+        // Dropped for its server, "late.internal"; so neither its id nor its
+        // host is taken from the entry after it.
+        let late = variant("late", "late.internal", "late-server");
         let kept = drop_invalid(vec![
             a.clone(),
             variant("b", "b.internal", "node"),
             variant("00000000deadbeef", "c.internal", "other"),
             variant("n", "prod.internal", "elsewhere"),
+            variant("late", "late.internal", "node"),
+            late.clone(),
             // Not the form the core stores: uppercase, an address, reserved.
             variant("u", "Upper.Internal", "upper"),
             variant("i", "10.0.0.1", "address"),
@@ -1477,7 +1500,7 @@ mod tests {
             variant("e", "", "hostless"),
             unique.clone(),
         ]);
-        assert_eq!(kept, vec![a, unique]);
+        assert_eq!(kept, vec![a, late, unique]);
     }
 
     #[test]
@@ -1490,16 +1513,19 @@ mod tests {
             ..forward()
         };
         let unique = variant("bbbb", 5433, "db.internal");
+        // "cccc" is dropped for its port, which must not cost this one its id.
+        let reused_id = variant("cccc", 5434, "db.internal");
         let kept = drop_invalid_forwards(vec![
             a.clone(),
             variant("cccc", 5432, "other.internal"),
+            reused_id.clone(),
             variant("aaaa", 6000, "other.internal"),
             variant("dddd", 0, "db.internal"),
             variant("eeee", 7000, "bad..host"),
             variant("ffff", 7001, " padded "),
             unique.clone(),
         ]);
-        assert_eq!(kept, vec![a, unique]);
+        assert_eq!(kept, vec![a, reused_id, unique]);
     }
 
     #[test]

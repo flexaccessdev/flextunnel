@@ -12,8 +12,17 @@
 //! On `/` (and `/servers/<destination>/`) an `Accept: application/json` or
 //! `text/plain` header picks the format, as the path suffix does. Any other
 //! `*.flextunnel.internal` name is reserved and answers 404.
+//!
+//! A server's page is content from another machine shown under this
+//! endpoint's own name, so it is never passed through as the server sent it:
+//! the client reads the whole response, keeps its body, and answers with
+//! headers of its own — a content type from the three served here, and a
+//! `Content-Security-Policy: sandbox` that gives the page an origin of its
+//! own (and no scripts), apart from the client's pages and the other servers'.
 
-use super::client::{ClientStatus, LocalProto, LocalStream, Router, TUNNEL_OPEN_TIMEOUT, open_tunnel};
+use super::client::{
+    ClientStatus, HoldBudget, LocalProto, LocalStream, Router, TUNNEL_OPEN_TIMEOUT, open_tunnel,
+};
 use super::destination::{DestinationState, DestinationStatus};
 use super::signaling::{self, StreamRequest};
 use super::status_page::{
@@ -25,11 +34,19 @@ use askama::Template;
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::Semaphore;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Path prefix of a destination server's status page.
 pub const SERVERS_PATH_PREFIX: &str = "/servers/";
+
+/// Cap on a server status response read into memory to be relayed. The page
+/// is a few kilobytes; this only bounds a server that sends without end.
+const SERVER_STATUS_LIMIT: usize = 1024 * 1024;
+
+/// Headers on a relayed server status page: the page gets an origin of its
+/// own with scripts off, and its type is the one stated, not a guess.
+const ISOLATION_HEADERS: &str =
+    "Content-Security-Policy: sandbox\r\nX-Content-Type-Options: nosniff\r\n";
 
 /// The path of `host`'s server status page in `format`, relative to
 /// `http://flextunnel.internal`.
@@ -169,8 +186,16 @@ pub(crate) fn render(
     status: &ClientStatus,
     format: StatusFormat,
 ) -> (&'static str, &'static str, String) {
+    render_at(status, format, Instant::now())
+}
+
+/// [`render`] as of `now`: every uptime and retry delay is measured to it.
+fn render_at(
+    status: &ClientStatus,
+    format: StatusFormat,
+    now: Instant,
+) -> (&'static str, &'static str, String) {
     let version = env!("CARGO_PKG_VERSION");
-    let now = Instant::now();
     let addr = |a: Option<std::net::SocketAddr>| a.map_or_else(|| "off".to_string(), |a| a.to_string());
     let idle_timeout = match status.idle_timeout {
         Some(idle) => human_duration(idle.as_secs()),
@@ -261,7 +286,7 @@ pub(super) async fn serve<P: LocalProto, S: LocalStream>(
     preamble: Option<Vec<u8>>,
     router: &Arc<Router>,
     reserved_other: bool,
-    holds: &Semaphore,
+    holds: &HoldBudget,
 ) -> Result<()> {
     let head = match preamble {
         Some(head) => head,
@@ -274,7 +299,9 @@ pub(super) async fn serve<P: LocalProto, S: LocalStream>(
         let (status_line, content_type, body) = status_page::render_reserved_404();
         return respond(tcp, status_line, content_type, &body).await;
     }
-    let request = status_page::parse_status_request(&head);
+    let Some(request) = status_page::parse_status_request(&head) else {
+        return respond(tcp, "400 Bad Request", CONTENT_TYPE_TEXT, "not an HTTP request\n").await;
+    };
     if request.method != "GET" {
         return respond(
             tcp,
@@ -299,14 +326,19 @@ pub(super) async fn serve<P: LocalProto, S: LocalStream>(
 
 /// Serve `/servers/<host>[/status.txt|/status.json]`: fetch that destination
 /// server's own status page over a [`StreamRequest::Status`] stream — which
-/// connects to the server if it is not connected — and relay the server's
-/// HTTP response verbatim.
+/// connects to the server if it is not connected — and answer with its body
+/// under headers of our own (see the module docs).
+///
+/// The server's response is read whole before anything is written, so every
+/// failure — a refusal, a stalled server, a response that is not a status
+/// page — is a clean 502, and the destination's connection is released
+/// before the local app is written to.
 async fn serve_server_status<S: LocalStream>(
     tcp: &mut S,
     router: &Arc<Router>,
     rest: &str,
     accept: Option<StatusFormat>,
-    holds: &Semaphore,
+    holds: &HoldBudget,
 ) -> Result<()> {
     let (host, tail) = match rest.split_once('/') {
         Some((host, tail)) => (host, format!("/{tail}")),
@@ -319,48 +351,123 @@ async fn serve_server_status<S: LocalStream>(
         return not_found(tcp, &format!("no destination named {host:?}")).await;
     };
     let destination = &router.destinations[dest];
-    let bad_gateway = |detail: String| format!("{}: {detail}\n", destination.host());
 
-    let lease = match destination.acquire(Some(holds)).await {
-        Ok(lease) => lease,
-        Err(e) => {
-            return respond(tcp, "502 Bad Gateway", CONTENT_TYPE_TEXT, &bad_gateway(e.to_string()))
-                .await;
-        }
-    };
-    let opened =
-        tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, open_tunnel(&lease.conn, &StreamRequest::Status))
+    let fetched = async {
+        let lease = destination
+            .acquire(Some(holds.for_destination(dest)))
             .await
-            .map_err(|_| anyhow::anyhow!("timed out asking the server for its status page"))
-            .and_then(|r| r);
-    let (mut send, mut recv) = match opened {
-        Ok((send, recv, signaling::REP_SUCCESS)) => (send, recv),
-        Ok((_, _, rep)) => {
-            let detail = format!("server refused: {}", super::socks5::describe_reply(rep));
-            return respond(tcp, "502 Bad Gateway", CONTENT_TYPE_TEXT, &bad_gateway(detail)).await;
-        }
-        Err(e) => {
-            return respond(tcp, "502 Bad Gateway", CONTENT_TYPE_TEXT, &bad_gateway(e.to_string()))
-                .await;
-        }
-    };
+            .map_err(|e| e.to_string())?;
+        let (mut send, mut recv) = match tokio::time::timeout(
+            TUNNEL_OPEN_TIMEOUT,
+            open_tunnel(&lease.conn, &StreamRequest::Status),
+        )
+        .await
+        {
+            Ok(Ok((send, recv, signaling::REP_SUCCESS))) => (send, recv),
+            Ok(Ok((_, _, rep))) => {
+                return Err(format!("server refused: {}", super::socks5::describe_reply(rep)));
+            }
+            Ok(Err(e)) => return Err(e.to_string()),
+            Err(_) => return Err("timed out asking the server for its status page".to_string()),
+        };
 
-    // The server picks its format from this request's path and `Accept`.
-    let accept = match accept {
-        Some(StatusFormat::Json) => "application/json",
-        Some(StatusFormat::Text) => "text/plain",
-        Some(StatusFormat::Html) | None => "*/*",
+        // The server picks its format from this request's path and `Accept`.
+        let accept = match accept {
+            Some(StatusFormat::Json) => "application/json",
+            Some(StatusFormat::Text) => "text/plain",
+            Some(StatusFormat::Html) | None => "*/*",
+        };
+        let request = format!(
+            "GET {tail} HTTP/1.1\r\nHost: {}\r\nAccept: {accept}\r\nConnection: close\r\n\r\n",
+            super::reserved::STATUS_HOST
+        );
+        exchange(&mut send, &mut recv, request.as_bytes(), TUNNEL_OPEN_TIMEOUT).await
+        // `lease` ends here, on every path.
     };
-    let request = format!(
-        "GET {tail} HTTP/1.1\r\nHost: {}\r\nAccept: {accept}\r\nConnection: close\r\n\r\n",
-        super::reserved::STATUS_HOST
-    );
-    send.write_all(request.as_bytes()).await?;
-    // Nothing more to send: finishing lets the server stop draining at once.
-    let _ = send.finish();
-    tokio::io::copy(&mut recv, tcp).await?;
-    tcp.shutdown().await?;
-    Ok(())
+    let fetched = fetched.await;
+    let page = match &fetched {
+        Ok(response) => parse_server_status(response),
+        Err(detail) => Err(detail.clone()),
+    };
+    match page {
+        Ok((content_type, body)) => {
+            status_page::write_http_response(tcp, "200 OK", content_type, ISOLATION_HEADERS, body)
+                .await?;
+            tcp.shutdown().await?;
+            Ok(())
+        }
+        Err(detail) => {
+            let body = format!("{}: {detail}\n", destination.host());
+            respond(tcp, "502 Bad Gateway", CONTENT_TYPE_TEXT, &body).await
+        }
+    }
+}
+
+/// Send `request` on a status stream and read the server's whole response —
+/// at most one byte past [`SERVER_STATUS_LIMIT`] — within `deadline` for the
+/// exchange in all: a server that takes the stream and then says nothing, or
+/// sends without end, must not hold the request, or the lease on its
+/// connection, open.
+async fn exchange<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    request: &[u8],
+    deadline: std::time::Duration,
+) -> Result<Vec<u8>, String>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let exchange = async {
+        send.write_all(request).await?;
+        // Nothing more to send: ending our half lets the server stop
+        // draining at once.
+        let _ = send.shutdown().await;
+        let mut response = Vec::new();
+        recv.take(SERVER_STATUS_LIMIT as u64 + 1)
+            .read_to_end(&mut response)
+            .await?;
+        std::io::Result::Ok(response)
+    };
+    match tokio::time::timeout(deadline, exchange).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(e)) => Err(format!("reading the server's status page failed: {e}")),
+        Err(_) => Err("timed out reading the server's status page".to_string()),
+    }
+}
+
+/// Take a server's status response apart into what is relayed: one of the
+/// three content types served here, and the body. Anything else — another
+/// status, another type, a response cut short or too long — is refused with
+/// the reason.
+fn parse_server_status(response: &[u8]) -> Result<(&'static str, &str), String> {
+    if response.len() > SERVER_STATUS_LIMIT {
+        return Err("the server's status page is too large".to_string());
+    }
+    let malformed = || "the server did not answer with an HTTP response".to_string();
+    let response = std::str::from_utf8(response).map_err(|_| malformed())?;
+    let (head, body) = response.split_once("\r\n\r\n").ok_or_else(malformed)?;
+    let mut lines = head.split("\r\n");
+    let mut status_line = lines.next().unwrap_or_default().splitn(3, ' ');
+    let (version, code) = (status_line.next().unwrap_or_default(), status_line.next());
+    if !version.starts_with("HTTP/") {
+        return Err(malformed());
+    }
+    if code != Some("200") {
+        return Err(format!("the server answered {}", code.unwrap_or("without a status")));
+    }
+    let content_type = lines
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let content_type = match content_type.split(';').next().unwrap_or_default().trim() {
+        "text/html" => CONTENT_TYPE_HTML,
+        "text/plain" => CONTENT_TYPE_TEXT,
+        "application/json" => CONTENT_TYPE_JSON,
+        other => return Err(format!("the server answered with content type {other:?}")),
+    };
+    Ok((content_type, body))
 }
 
 async fn not_found<S: LocalStream>(tcp: &mut S, detail: &str) -> Result<()> {
@@ -402,10 +509,16 @@ mod tests {
         }
     }
 
-    fn status() -> ClientStatus {
-        let now = Instant::now();
+    /// A status as of [`now`]: `m1` connected 125s earlier, `m2` retrying in
+    /// 30s, `m3` idle.
+    fn status() -> (ClientStatus, Instant) {
+        // The connection is the fixed point and "now" is counted on from it,
+        // so nothing depends on the clock while the test runs (or on how long
+        // the machine has been up).
+        let connected_at = Instant::now();
+        let now = connected_at + Duration::from_secs(125);
         let mut connected = destination("m1.internal", DestinationState::Connected);
-        connected.connected_since = now.checked_sub(Duration::from_secs(125));
+        connected.connected_since = Some(connected_at);
         connected.open_streams = 2;
         connected.client_node_id = Some("clientid".to_string());
         let mut backoff = destination("m2.internal", DestinationState::Backoff);
@@ -413,17 +526,23 @@ mod tests {
         backoff.last_error = Some("Signaling error: timed out".to_string());
         backoff.next_attempt_at = Some(now + Duration::from_secs(30));
         backoff.waiting = 1;
-        ClientStatus {
+        let status = ClientStatus {
             socks_listen: Some("127.0.0.1:1080".parse().unwrap()),
             http_listen: None,
             idle_timeout: Some(Duration::from_secs(300)),
             destinations: vec![connected, backoff, destination("m3.internal", DestinationState::Idle)],
-        }
+        };
+        (status, now)
+    }
+
+    fn render_fixed(format: StatusFormat) -> (&'static str, &'static str, String) {
+        let (status, now) = status();
+        render_at(&status, format, now)
     }
 
     #[test]
     fn json_reports_every_destination() {
-        let (line, content_type, body) = render(&status(), StatusFormat::Json);
+        let (line, content_type, body) = render_fixed(StatusFormat::Json);
         assert_eq!(line, "200 OK");
         assert_eq!(content_type, CONTENT_TYPE_JSON);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -434,14 +553,14 @@ mod tests {
         assert_eq!(d.len(), 3);
         assert_eq!(d[0]["host"], "m1.internal");
         assert_eq!(d[0]["state"], "connected");
-        assert!(d[0]["connected_secs"].as_u64().unwrap() >= 125);
+        assert_eq!(d[0]["connected_secs"], 125);
         assert_eq!(d[0]["open_streams"], 2);
         assert_eq!(d[0]["client_node_id"], "clientid");
         assert_eq!(d[0]["server_status"], "/servers/m1.internal/status.json");
         assert_eq!(d[1]["state"], "backoff");
         assert_eq!(d[1]["failed_attempts"], 3);
         assert_eq!(d[1]["waiting"], 1);
-        assert!(d[1]["next_attempt_secs"].as_u64().unwrap() <= 30);
+        assert_eq!(d[1]["next_attempt_secs"], 30);
         assert_eq!(d[1]["last_error"], "Signaling error: timed out");
         assert_eq!(d[2]["state"], "idle");
         assert!(d[2]["connected_secs"].is_null());
@@ -452,15 +571,15 @@ mod tests {
 
     #[test]
     fn html_and_text_render_states_and_links() {
-        let (line, content_type, html) = render(&status(), StatusFormat::Html);
+        let (line, content_type, html) = render_fixed(StatusFormat::Html);
         assert_eq!((line, content_type), ("200 OK", CONTENT_TYPE_HTML));
         assert!(html.contains("m1.internal"));
         assert!(html.contains("for 2m 05s"));
         assert!(html.contains("href=\"/servers/m1.internal/\""));
-        assert!(html.contains("3 failed attempts, next in"));
+        assert!(html.contains("3 failed attempts, next in 30s"));
         assert!(html.contains("connects on first use"));
 
-        let (line, content_type, text) = render(&status(), StatusFormat::Text);
+        let (line, content_type, text) = render_fixed(StatusFormat::Text);
         assert_eq!((line, content_type), ("200 OK", CONTENT_TYPE_TEXT));
         assert!(text.contains("socks5: 127.0.0.1:1080"));
         assert!(text.contains("http: off"));
@@ -471,7 +590,7 @@ mod tests {
 
     #[test]
     fn never_idle_is_reported() {
-        let mut status = status();
+        let (mut status, _) = status();
         status.idle_timeout = None;
         let (_, _, body) = render(&status, StatusFormat::Json);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -485,6 +604,71 @@ mod tests {
         assert_eq!(human_duration(7), "7s");
         assert_eq!(human_duration(125), "2m 05s");
         assert_eq!(human_duration(3725), "1h 02m");
+    }
+
+    /// Only a server's `200` with one of the three served types is relayed,
+    /// and only its body: the content type sent on is ours, not the server's.
+    #[test]
+    fn a_server_status_response_is_taken_apart() {
+        let response = |head: &str, body: &str| format!("{head}\r\n\r\n{body}").into_bytes();
+        let ok = response("HTTP/1.1 200 OK\r\nContent-Type: Application/JSON; charset=utf-8\r\nSet-Cookie: x=1", "{}\n");
+        assert_eq!(parse_server_status(&ok), Ok((CONTENT_TYPE_JSON, "{}\n")));
+        let html = response("HTTP/1.1 200 OK\r\ncontent-type:text/html", "<p>hi</p>\r\n\r\nmore");
+        assert_eq!(parse_server_status(&html), Ok((CONTENT_TYPE_HTML, "<p>hi</p>\r\n\r\nmore")));
+
+        for (bad, why) in [
+            (response("HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain", "x"), "answered 500"),
+            (response("HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml", "<svg/>"), "content type"),
+            (response("HTTP/1.1 200 OK", "no type"), "content type"),
+            (response("SSH-2.0-nope", ""), "HTTP response"),
+            (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n".to_vec(), "HTTP response"),
+            (vec![0xff; 16], "HTTP response"),
+            (vec![b'a'; SERVER_STATUS_LIMIT + 1], "too large"),
+        ] {
+            let err = parse_server_status(&bad).unwrap_err();
+            assert!(err.contains(why), "{why}: {err}");
+        }
+    }
+
+    /// The exchange with the server has one deadline: a server that takes
+    /// the request and goes quiet, or never stops sending, is given up on —
+    /// before anything was written to the app, so the answer is a clean 502.
+    #[tokio::test(start_paused = true)]
+    async fn the_server_status_exchange_is_bounded() {
+        let deadline = Duration::from_secs(30);
+
+        // A server that answers and closes: the whole response, request sent.
+        let (mut ours, mut server) = tokio::io::duplex(1024);
+        let serving = tokio::spawn(async move {
+            let mut request = Vec::new();
+            server.read_to_end(&mut request).await.unwrap();
+            server.write_all(b"HTTP/1.1 200 OK\r\n\r\nbody").await.unwrap();
+            request
+        });
+        let (mut recv, mut send) = tokio::io::split(&mut ours);
+        let response = exchange(&mut send, &mut recv, b"GET / HTTP/1.1\r\n\r\n", deadline).await;
+        assert_eq!(response.as_deref(), Ok(&b"HTTP/1.1 200 OK\r\n\r\nbody"[..]));
+        assert_eq!(serving.await.unwrap(), b"GET / HTTP/1.1\r\n\r\n");
+
+        // A server that reads the request and then says nothing.
+        let (mut ours, _silent) = tokio::io::duplex(1024);
+        let (mut recv, mut send) = tokio::io::split(&mut ours);
+        let started = tokio::time::Instant::now();
+        let err = exchange(&mut send, &mut recv, b"GET / HTTP/1.1\r\n\r\n", deadline).await.unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert_eq!(started.elapsed(), deadline);
+
+        // A server that sends a byte a second, forever: the same deadline.
+        let (mut ours, mut server) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            while server.write_all(b"x").await.is_ok() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        let (mut recv, mut send) = tokio::io::split(&mut ours);
+        let started = tokio::time::Instant::now();
+        assert!(exchange(&mut send, &mut recv, b"GET /", deadline).await.is_err());
+        assert_eq!(started.elapsed(), deadline);
     }
 
     #[test]

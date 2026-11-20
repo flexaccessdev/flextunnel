@@ -3,10 +3,10 @@
 //! A client *instance* is one running `flextunnel client start` process,
 //! identified by its **name**: the `name` in its config, or `default`. The name
 //! keys every per-instance artifact — the single-instance lock
-//! (`client-<name>.lock`) and the control socket (`client-<name>.sock` /
-//! `\\.\pipe\flextunnel-client-<name>`) — so `flextunnel client control` and
-//! `flextunnel client nc` find the right running client from the same config,
-//! or from `-n <name>` alone.
+//! (`client-<name>.lock`) and the control socket (a `client-….sock` file or a
+//! per-user `\\.\pipe\flextunnel-client-…` pipe, both named from it — see
+//! `ipc.rs`) — so `flextunnel client control` and `flextunnel client nc` find
+//! the right running client from the same config, or from `-n <name>` alone.
 //!
 //! One client reaches any number of servers (its destinations), so a single
 //! unnamed client is the common case. Names exist for running several at once
@@ -19,9 +19,9 @@ use std::path::{Path, PathBuf};
 /// The instance name of a client whose config sets none.
 pub const DEFAULT_INSTANCE: &str = "default";
 
-/// Longest instance name. With `~/.config/flextunnel/client-<name>.sock` this
-/// keeps the socket path inside macOS's ~104-byte `sun_path` for any ordinary
-/// home directory.
+/// Longest instance name: short enough to read in a lock file's name and a
+/// panel title. The control socket's file name is bounded separately (see
+/// `ipc.rs`), so a long name never costs the socket path its length limit.
 const MAX_NAME_LEN: usize = 32;
 
 /// Resolve and validate an instance name: `name` when given, else
@@ -120,10 +120,15 @@ impl Located {
                     && let Some(dir) = path.parent()
                     && let Some(found) = client_configs(dir)
                 {
+                    // Whole paths: one copied from here works with `-c` from
+                    // any directory.
+                    let paths: Vec<String> = found
+                        .iter()
+                        .map(|name| dir.join(name).display().to_string())
+                        .collect();
                     msg.push_str(&format!(
-                        "\nConfigs in {}: {} — pass one with -c.",
-                        dir.display(),
-                        found.join(", ")
+                        "\nConfigs found: {} — pass one with -c.",
+                        paths.join(", ")
                     ));
                 }
                 anyhow!(msg)

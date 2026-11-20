@@ -25,7 +25,7 @@
 //! would be a tie; that is rejected at load.
 
 use crate::proxy::reserved;
-use crate::proxy::routed_set::{RoutedSet, Specificity};
+use crate::proxy::routed_set::{RoutedSet, Specificity, routing_key};
 use crate::proxy::signaling::{StreamRequest, Target};
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -79,6 +79,11 @@ impl RouteTable {
             if entries.iter().any(|e| e.host == host) {
                 bail!("destination {host:?} is configured more than once");
             }
+            for raw in spec.routed_domains {
+                validate_routed_domain(raw).map_err(|e| {
+                    anyhow::anyhow!("destination {host:?}: routed_domains entry {raw:?}: {e}")
+                })?;
+            }
             let routed = RoutedSet::new(spec.routed_domains, spec.routed_cidrs)
                 .with_context(|| format!("destination {host:?}"))?;
             entries.push(Entry { host, routed });
@@ -129,8 +134,10 @@ impl RouteTable {
         self.entries.iter().map(|e| e.host.as_str())
     }
 
-    /// The index of the destination named `host` (case-insensitive).
+    /// The index of the destination named `host` (case-insensitive, with or
+    /// without the DNS root dot).
     pub fn index_of(&self, host: &str) -> Option<usize> {
+        let host = routing_key(host);
         self.entries
             .iter()
             .position(|e| e.host.eq_ignore_ascii_case(host))
@@ -167,6 +174,21 @@ impl RouteTable {
             None => Route::Direct,
         }
     }
+}
+
+/// Check one `routed_domains` entry: `*`, a hostname, or `*.` and a hostname.
+/// [`RoutedSet::new`] only parses the rule's shape; a name no request could
+/// ever carry — one with a space, say — would sit there as a dead rule, so it
+/// is refused here, where the client's configuration is loaded.
+fn validate_routed_domain(raw: &str) -> Result<(), String> {
+    let entry = routing_key(raw.trim());
+    if entry == "*" {
+        return Ok(());
+    }
+    let name = entry.strip_prefix("*.").unwrap_or(entry);
+    crate::forwards::validate_remote_host(name)
+        .map(|_| ())
+        .map_err(|e| e.replace("Remote host", "the name"))
 }
 
 /// Validate a destination's host name, returning the lowercased form to store.
@@ -352,6 +374,53 @@ mod tests {
         // Malformed rules name their destination.
         assert!(err(&[("m1.internal", &["*.*.example"], &[])]).contains("m1.internal"));
         assert!(err(&[("m1.internal", &[], &["not-a-cidr"])]).contains("m1.internal"));
+    }
+
+    /// A routed domain must be a name a request could carry; the error says
+    /// which destination's field holds which value.
+    #[test]
+    fn malformed_routed_domains_are_rejected() {
+        for bad in ["has space.example", "*.has space.example", "a..b", "", "*.", "-x.example", "ex*mple.com"] {
+            let message = table(&[("m1.internal", &[bad], &[])]).unwrap_err().to_string();
+            assert!(
+                message.contains("\"m1.internal\"")
+                    && message.contains("routed_domains")
+                    && message.contains(&format!("{bad:?}")),
+                "{bad:?}: {message}"
+            );
+        }
+        // Every accepted form still is: the catch-all, exact names (internal
+        // ones with underscores included), wildcards, an address in name form.
+        table(&[(
+            "m1.internal",
+            &["*", "db.internal", "my_host", "*.corp.example", " Padded.Example ", "10.0.0.5", "fqdn.example."],
+            &[],
+        )])
+        .unwrap();
+    }
+
+    /// A name with the DNS root dot is the same name: it takes the same route
+    /// — a destination's own host, an exact rule, the reserved namespace —
+    /// instead of falling through to another destination's catch-all. The
+    /// target itself is forwarded as it was spelled.
+    #[test]
+    fn the_root_dot_selects_the_same_route() {
+        let t = table(&[("a.internal", &["db.example"], &[]), ("b.internal", &["*"], &[])]).unwrap();
+        for host in ["db.example", "db.example.", "DB.Example."] {
+            let target = domain(host, 5432);
+            assert_eq!(t.route(&target), connect_to(0, target.clone()), "{host}");
+        }
+        for host in ["a.internal", "a.internal."] {
+            assert_eq!(
+                t.route(&domain(host, 22)),
+                Route::Tunnel { dest: 0, request: StreamRequest::Loopback(22) },
+                "{host}"
+            );
+        }
+        let other = domain("unrelated.example.", 443);
+        assert_eq!(t.route(&other), connect_to(1, other.clone()));
+        assert_eq!(t.route(&domain("flextunnel.internal.", 80)), Route::ClientStatus);
+        assert_eq!(t.route(&domain("x.flextunnel.internal.", 80)), Route::Reserved);
     }
 
     #[test]

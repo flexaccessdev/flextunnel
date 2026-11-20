@@ -215,6 +215,9 @@ enum Link {
     /// A permanent failure: requests fail with `reason` at once. The manager
     /// leaves this state at `retry_at`.
     Failed { reason: String, retry_at: Instant },
+    /// The client was closed ([`Destination::close`]). Terminal: requests are
+    /// turned away, and no later transition replaces it.
+    Closed,
 }
 
 /// Everything the request path and the manager coordinate on, in **one** watch
@@ -230,6 +233,14 @@ struct DestState {
     /// A one-shot request for a dial attempt with nobody waiting on it (see
     /// [`Destination::kick`]).
     kick: bool,
+    /// When the current connection was authenticated. Kept with the link, so
+    /// a status reads the two as of one moment: `Some` exactly while connected.
+    connected_since: Option<Instant>,
+    /// When the connection was last released — connected, a stream closed, a
+    /// waiter gone. The idle timeout counts from here rather than from when
+    /// the idle check happened to look: a use too short for it to observe
+    /// still pushes the close back.
+    unused_since: Instant,
 }
 
 /// Client-side history of server instance nonces observed for one server id,
@@ -250,7 +261,6 @@ struct ServerNonceTracker {
 /// The parts of a destination's status that are not in [`DestState`].
 #[derive(Default)]
 struct StatusFields {
-    connected_since: Option<Instant>,
     client_node_id: Option<String>,
     failed_attempts: u32,
     next_attempt_at: Option<Instant>,
@@ -272,6 +282,26 @@ struct Outage {
     /// foregrounded app: the endpoint needs the rebind nudge even though the
     /// attempt counter was reset.
     nudge: bool,
+}
+
+/// A destination's claim on its listener's budget of held requests: the holds
+/// set aside for this destination, then the pool every destination shares. A
+/// server that is down can fill its own share and the pool, but never the
+/// share another destination needs to hold its first request while it
+/// connects.
+#[derive(Clone, Copy)]
+pub(crate) struct Holds<'a> {
+    pub(crate) reserved: &'a Semaphore,
+    pub(crate) shared: &'a Semaphore,
+}
+
+impl<'a> Holds<'a> {
+    fn try_acquire(self) -> Option<tokio::sync::SemaphorePermit<'a>> {
+        self.reserved
+            .try_acquire()
+            .or_else(|_| self.shared.try_acquire())
+            .ok()
+    }
 }
 
 impl Outage {
@@ -333,7 +363,10 @@ pub(crate) struct StreamGuard(Arc<Destination>);
 
 impl Drop for StreamGuard {
     fn drop(&mut self) {
-        self.0.state.send_modify(|s| s.streams -= 1);
+        self.0.state.send_modify(|s| {
+            s.streams -= 1;
+            s.unused_since = Instant::now();
+        });
     }
 }
 
@@ -342,7 +375,10 @@ struct WaiterGuard<'a>(&'a Destination);
 
 impl Drop for WaiterGuard<'_> {
     fn drop(&mut self) {
-        self.0.state.send_modify(|s| s.waiters -= 1);
+        self.0.state.send_modify(|s| {
+            s.waiters -= 1;
+            s.unused_since = Instant::now();
+        });
     }
 }
 
@@ -381,6 +417,8 @@ impl Destination {
                 waiters: 0,
                 streams: 0,
                 kick: false,
+                connected_since: None,
+                unused_since: Instant::now(),
             }),
             endpoint: Mutex::new(None),
             building: tokio::sync::Mutex::new(()),
@@ -404,8 +442,23 @@ impl Destination {
         s.waiters > 0 || s.streams > 0 || self.cfg.keep_connected
     }
 
+    /// Move the link, and with it what belongs to it: a connection starts its
+    /// uptime and its idle clock here, and leaving `Connected` ends the
+    /// uptime. `Closed` is terminal and stays.
     fn set_link(&self, link: Link) {
-        self.state.send_modify(|s| s.link = link);
+        self.state.send_if_modified(|s| {
+            if matches!(s.link, Link::Closed) {
+                return false;
+            }
+            s.connected_since = None;
+            if matches!(link, Link::Connected(_)) {
+                let now = Instant::now();
+                s.connected_since = Some(now);
+                s.unused_since = now;
+            }
+            s.link = link;
+            true
+        });
     }
 
     fn status_fields(&self) -> std::sync::MutexGuard<'_, StatusFields> {
@@ -439,6 +492,10 @@ impl Destination {
                 outcome = Err(AcquireError::Failed(reason.clone()));
                 false
             }
+            Link::Closed => {
+                outcome = Err(AcquireError::Closed);
+                false
+            }
             _ => false,
         });
         outcome.map(|conn| {
@@ -456,15 +513,15 @@ impl Destination {
     /// requests can never pin a caller's whole connection budget.
     pub(crate) async fn acquire(
         self: &Arc<Self>,
-        holds: Option<&Semaphore>,
+        holds: Option<Holds<'_>>,
     ) -> Result<Lease, AcquireError> {
         if let Some(lease) = self.try_lease()? {
             return Ok(lease);
         }
         let _hold = match holds {
             Some(holds) => match holds.try_acquire() {
-                Ok(permit) => Some(permit),
-                Err(_) => {
+                Some(permit) => Some(permit),
+                None => {
                     log::debug!("Hold capacity exhausted; not holding request for {}", self.host());
                     self.kick();
                     return Err(AcquireError::HoldCap);
@@ -484,11 +541,10 @@ impl Destination {
             loop {
                 // `wait_for` inspects the current value first, so a publish
                 // racing the registration above is never missed.
-                if live
-                    .wait_for(|s| matches!(s.link, Link::Connected(_) | Link::Failed { .. }))
-                    .await
-                    .is_err()
-                {
+                let settled = |s: &DestState| {
+                    matches!(s.link, Link::Connected(_) | Link::Failed { .. } | Link::Closed)
+                };
+                if live.wait_for(settled).await.is_err() {
                     return Err(AcquireError::Closed);
                 }
                 if let Some(lease) = self.try_lease()? {
@@ -521,23 +577,24 @@ impl Destination {
     }
 
     pub(crate) fn status(&self) -> DestinationStatus {
-        let (state, open_streams, waiting) = {
+        // The state and the uptime that goes with it, as of one moment.
+        let (state, connected_since, open_streams, waiting) = {
             let s = self.state.borrow();
             let state = match s.link {
-                Link::Idle => DestinationState::Idle,
+                Link::Idle | Link::Closed => DestinationState::Idle,
                 Link::Dialing => DestinationState::Connecting,
                 Link::Connected(_) => DestinationState::Connected,
                 Link::Backoff => DestinationState::Backoff,
                 Link::Failed { .. } => DestinationState::Failed,
             };
-            (state, s.streams, s.waiters)
+            (state, s.connected_since, s.streams, s.waiters)
         };
         let fields = self.status_fields();
         DestinationStatus {
             host: self.cfg.host.clone(),
             server_node_id: self.cfg.server_id.to_string(),
             state,
-            connected_since: fields.connected_since.map(Instant::into_std),
+            connected_since: connected_since.map(Instant::into_std),
             open_streams,
             waiting,
             client_node_id: fields.client_node_id.clone(),
@@ -559,7 +616,15 @@ impl Destination {
     /// Close the endpoint at client shutdown, first waiting out an endpoint
     /// build in flight. `Shared::closed` is already latched, so that build
     /// closes the endpoint it produced, and no later one starts.
+    ///
+    /// The link goes to its terminal state first: requests held for this
+    /// destination end at once, and a dialer that outlives the client is
+    /// turned away instead of leasing a connection about to be closed.
     pub(crate) async fn close(&self) {
+        self.state.send_modify(|s| {
+            s.link = Link::Closed;
+            s.connected_since = None;
+        });
         drop(self.building.lock().await);
         let endpoint = self.endpoint.lock().expect("endpoint slot lock").take();
         if let Some(endpoint) = endpoint {
@@ -579,7 +644,6 @@ impl Destination {
                     outage = Outage::default();
                     {
                         let mut fields = self.status_fields();
-                        fields.connected_since = Some(Instant::now());
                         fields.failed_attempts = 0;
                         fields.next_attempt_at = None;
                         fields.last_error = None;
@@ -588,7 +652,6 @@ impl Destination {
                     // [`Self::acquire`].
                     self.set_link(Link::Connected(connection.clone()));
                     let end = self.serve(&connection, ctrl_send, ctrl_recv).await;
-                    self.status_fields().connected_since = None;
                     match end {
                         ConnEnd::Idle => {
                             log::info!(
@@ -663,8 +726,31 @@ impl Destination {
             if !self.wanted(&state.borrow_and_update()) {
                 self.set_link(Link::Idle);
                 self.release_endpoint().await;
-                if state.wait_for(|s| self.wanted(s)).await.is_err() {
-                    std::future::pending::<()>().await;
+                // Rest until something wants the destination — but keep an
+                // eye on the network meanwhile: a path that comes back makes
+                // a retry time set before it went away stale, and the request
+                // that ends this rest must not be made to wait that out.
+                let mut online = *available.borrow_and_update();
+                loop {
+                    tokio::select! {
+                        wanted = async { state.wait_for(|s| self.wanted(s)).await.is_ok() } => {
+                            if !wanted {
+                                std::future::pending::<()>().await;
+                            }
+                            break;
+                        }
+                        changed = available.changed() => {
+                            if changed.is_err() {
+                                std::future::pending::<()>().await;
+                            }
+                            let now_online = *available.borrow_and_update();
+                            if now_online && !online {
+                                log::debug!("{}: network available again while idle", self.host());
+                                self.reset_backoff(outage);
+                            }
+                            online = now_online;
+                        }
+                    }
                 }
                 continue;
             }
@@ -985,6 +1071,14 @@ impl Destination {
         }
     }
 
+    /// Whether the connection may be closed as idle at `now`: connected, not
+    /// in use, and released at least `idle_timeout` ago.
+    fn idle_due(&self, s: &DestState, idle_timeout: Duration, now: Instant) -> bool {
+        !self.in_use(s)
+            && matches!(s.link, Link::Connected(_))
+            && now.saturating_duration_since(s.unused_since) >= idle_timeout
+    }
+
     /// Resolve once the connection has been unused — no stream open, nobody
     /// waiting — for the whole idle timeout, having moved the link to `Idle`
     /// in the same step that confirmed it (so no request can lease the
@@ -995,16 +1089,22 @@ impl Destination {
         };
         let mut state = self.state.subscribe();
         loop {
-            if state.wait_for(|s| !self.in_use(s)).await.is_err() {
+            // The deadline counts from the last release as recorded in the
+            // state, not from when this task saw the connection unused: a
+            // stream opened and closed between two looks leaves the count as
+            // it was, and only its release time says the connection was used.
+            let unused = state.wait_for(|s| !self.in_use(s)).await;
+            let Some(unused_since) = unused.map(|s| s.unused_since).ok() else {
                 return std::future::pending().await;
-            }
+            };
             tokio::select! {
-                _ = tokio::time::sleep(idle_timeout) => {
+                _ = tokio::time::sleep_until(unused_since + idle_timeout) => {
                     let went_idle = self.state.send_if_modified(|s| {
-                        if self.in_use(s) || !matches!(s.link, Link::Connected(_)) {
+                        if !self.idle_due(s, idle_timeout, Instant::now()) {
                             return false;
                         }
                         s.link = Link::Idle;
+                        s.connected_since = None;
                         true
                     });
                     if went_idle {
@@ -1018,11 +1118,13 @@ impl Destination {
     }
 }
 
-/// Resolve when the embedding app comes to the foreground — only if it is
-/// backgrounded right now; otherwise never.
+/// Resolve when the embedding app *comes* to the foreground: the next time it
+/// goes from backgrounded to foregrounded, whether it is backgrounded already
+/// or only becomes so later in the wait. An app that stays in the foreground
+/// never resolves this — its backoff runs its full course.
 async fn foregrounded(background: &watch::Sender<bool>) {
     let mut background = background.subscribe();
-    if *background.borrow() && background.wait_for(|b| !*b).await.is_ok() {
+    if background.wait_for(|b| *b).await.is_ok() && background.wait_for(|b| !*b).await.is_ok() {
         return;
     }
     std::future::pending::<()>().await
@@ -1106,12 +1208,93 @@ mod tests {
     #[tokio::test]
     async fn at_the_hold_cap_a_request_is_refused_but_still_asks_for_a_dial() {
         let d = destination(false);
-        let holds = Semaphore::new(0);
-        let result = d.acquire(Some(&holds)).await.map(|_| ());
+        let (reserved, shared) = (Semaphore::new(0), Semaphore::new(0));
+        let holds = Holds { reserved: &reserved, shared: &shared };
+        let result = d.acquire(Some(holds)).await.map(|_| ());
         assert!(matches!(result, Err(AcquireError::HoldCap)), "{result:?}");
         assert_eq!(d.status().waiting, 0);
         assert!(d.state.borrow().kick, "the destination was asked to dial");
         assert!(d.wanted(&d.state.borrow()));
+    }
+
+    /// A destination's own share of the hold budget is used before the pool
+    /// every destination shares, and is what it still has when another
+    /// destination has drained that pool.
+    #[test]
+    fn holds_come_from_the_reserved_share_then_the_pool() {
+        let (reserved, shared) = (Semaphore::new(1), Semaphore::new(1));
+        let holds = Holds { reserved: &reserved, shared: &shared };
+        let first = holds.try_acquire().expect("the reserved hold");
+        assert_eq!((reserved.available_permits(), shared.available_permits()), (0, 1));
+        let second = holds.try_acquire().expect("then one from the pool");
+        assert!(holds.try_acquire().is_none(), "both exhausted");
+        drop((first, second));
+
+        // Another destination took the whole pool: the reserved hold is left.
+        let drained = Semaphore::new(0);
+        let holds = Holds { reserved: &reserved, shared: &drained };
+        assert!(holds.try_acquire().is_some());
+    }
+
+    /// Closing a destination ends the requests held for it at once and turns
+    /// later ones away — a dialer kept past the client gets an answer, not a
+    /// 45-second wait or a connection that is already gone.
+    #[tokio::test(start_paused = true)]
+    async fn close_turns_requests_away() {
+        let d = destination(false);
+        let held = {
+            let d = d.clone();
+            tokio::spawn(async move { d.acquire(None).await.map(|_| ()) })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(d.status().waiting, 1);
+
+        let started = Instant::now();
+        d.close().await;
+        let result = held.await.unwrap();
+        assert!(matches!(result, Err(AcquireError::Closed)), "{result:?}");
+        assert_eq!(started.elapsed(), Duration::ZERO, "woken by the close, not the hold");
+
+        let result = d.acquire(None).await.map(|_| ());
+        assert!(matches!(result, Err(AcquireError::Closed)), "{result:?}");
+        assert_eq!(d.status().waiting, 0);
+        // Terminal: a manager still winding down cannot reopen it.
+        d.set_link(Link::Idle);
+        d.set_link(Link::Backoff);
+        assert!(matches!(d.state.borrow().link, Link::Closed));
+    }
+
+    /// Every release is stamped, so the idle timeout counts from the last use
+    /// — one the idle check never saw included.
+    #[tokio::test(start_paused = true)]
+    async fn releases_restart_the_idle_clock() {
+        let d = destination(false);
+        let connected_at = d.state.borrow().unused_since;
+        let idle_timeout = Duration::from_secs(300);
+
+        // A stream opened and closed 299s in: the count is back to zero, and
+        // only the release time shows the connection was used.
+        tokio::time::sleep(Duration::from_secs(299)).await;
+        d.state.send_modify(|s| s.streams += 1);
+        drop(StreamGuard(d.clone()));
+        let released_at = d.state.borrow().unused_since;
+        assert_eq!(released_at - connected_at, Duration::from_secs(299));
+        assert_eq!(d.state.borrow().streams, 0);
+
+        // Not connected, so never due; the time test is the same one a
+        // connected destination gets (see `idle_due`).
+        let due_at = |now: Instant| {
+            now.saturating_duration_since(d.state.borrow().unused_since) >= idle_timeout
+        };
+        assert!(!due_at(connected_at + idle_timeout), "300s after connecting is 1s after the use");
+        assert!(due_at(released_at + idle_timeout));
+        assert!(!d.idle_due(&d.state.borrow(), idle_timeout, released_at + idle_timeout));
+
+        // A waiter leaving is a release too.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        d.state.send_modify(|s| s.waiters += 1);
+        drop(WaiterGuard(&d));
+        assert_eq!(d.state.borrow().unused_since - released_at, Duration::from_secs(5));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1155,6 +1338,48 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_secs(10), "the rest of the backoff");
         assert!(!d.state.borrow().kick, "the kick is spent on this attempt");
         assert_eq!(outage.attempt, 2, "waiting does not reset the series");
+    }
+
+    /// A network path that returns while nothing wants the destination still
+    /// ends the outage's backoff: the next request dials at once instead of
+    /// waiting out a retry time set before the path went away. A repeated
+    /// "available" report with no outage in between changes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_path_restored_while_idle_clears_the_stale_backoff() {
+        let d = destination(false);
+        let mut outage = Outage {
+            attempt: 5,
+            next_attempt_at: Some(Instant::now() + Duration::from_secs(60)),
+            ..Outage::default()
+        };
+        {
+            let due = d.wait_until_due(&mut outage);
+            tokio::pin!(due);
+            // Idle, and told "available" again without having been offline.
+            assert!(tokio::time::timeout(Duration::from_secs(1), &mut due).await.is_err());
+            d.shared.network_available.send_replace(true);
+            assert!(tokio::time::timeout(Duration::from_secs(1), &mut due).await.is_err());
+        }
+        assert_eq!(outage.attempt, 5, "no restoration, no reset");
+
+        {
+            let due = d.wait_until_due(&mut outage);
+            tokio::pin!(due);
+            d.shared.network_available.send_replace(false);
+            assert!(tokio::time::timeout(Duration::from_secs(1), &mut due).await.is_err());
+            d.shared.network_available.send_replace(true);
+            // Still idle: restoring the path dials nothing by itself.
+            assert!(tokio::time::timeout(Duration::from_secs(1), &mut due).await.is_err());
+            assert_eq!(d.status().state, DestinationState::Idle);
+
+            // The request that needs it is due at once.
+            d.kick();
+            tokio::time::timeout(Duration::from_millis(1), &mut due)
+                .await
+                .expect("due without waiting out the old backoff");
+        }
+        assert_eq!(outage.attempt, 0, "a restored path starts a fresh series");
+        assert!(outage.nudge, "the endpoint is nudged on the next attempt");
     }
 
     /// With the network reported unavailable a wanted destination parks — no
@@ -1236,6 +1461,28 @@ mod tests {
         d.wait_until_due(&mut outage).await;
         assert_eq!(started.elapsed(), Duration::from_secs(60));
         assert_eq!(outage.attempt, 6);
+
+        // In the foreground when the backoff starts, backgrounded part-way
+        // and brought back: that return ends the wait too.
+        let mut outage = Outage {
+            attempt: 6,
+            next_attempt_at: Some(Instant::now() + Duration::from_secs(60)),
+            ..Outage::default()
+        };
+        let started = Instant::now();
+        {
+            let due = d.wait_until_due(&mut outage);
+            tokio::pin!(due);
+            assert!(tokio::time::timeout(Duration::from_secs(5), &mut due).await.is_err());
+            d.shared.background.send_replace(true);
+            assert!(tokio::time::timeout(Duration::from_secs(5), &mut due).await.is_err());
+            d.shared.background.send_replace(false);
+            tokio::time::timeout(Duration::from_millis(1), &mut due)
+                .await
+                .expect("due as soon as the app returns to the foreground");
+        }
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+        assert_eq!(outage.attempt, 0);
     }
 
     /// A recoverable failure keeps requests waiting for the retry; a permanent

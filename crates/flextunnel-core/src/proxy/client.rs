@@ -6,8 +6,8 @@
 
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::destination::{
-    AcquireError, Destination, DestinationConfig, DestinationStatus, EndpointProvider, Shared,
-    StreamGuard, default_endpoint_provider,
+    AcquireError, Destination, DestinationConfig, DestinationStatus, EndpointProvider, Holds,
+    Shared, StreamGuard, default_endpoint_provider,
 };
 use crate::proxy::route_table::{Route, RouteSpec, RouteTable};
 use crate::proxy::signaling::{self, ControlMsg, StreamRequest, Target};
@@ -155,6 +155,40 @@ const MAX_ACTIVE_LOCAL_CONNS: usize = 256;
 /// an immediate network-unreachable reply (the destination is still asked to
 /// connect).
 const MAX_HELD_CONNS: usize = 64;
+/// How many of a listener's [`MAX_HELD_CONNS`] holds are set aside for each
+/// destination (fewer when there are too many destinations to give each this
+/// many). Every first use of an idle destination needs a hold while it
+/// connects, so without a share of its own a destination whose server is up
+/// would be refused for as long as a burst of retries toward one that is
+/// down fills the budget.
+const HOLDS_RESERVED_PER_DESTINATION: usize = 8;
+
+/// One listener's budget of held requests: [`MAX_HELD_CONNS`] in all, split
+/// into a small share reserved for each destination and a pool they all draw
+/// on once their own share is used.
+pub(crate) struct HoldBudget {
+    /// Indexed like the client's destinations.
+    reserved: Vec<Semaphore>,
+    shared: Semaphore,
+}
+
+impl HoldBudget {
+    pub(crate) fn new(destinations: usize) -> Self {
+        let each = (MAX_HELD_CONNS / destinations.max(1)).min(HOLDS_RESERVED_PER_DESTINATION);
+        Self {
+            reserved: (0..destinations).map(|_| Semaphore::new(each)).collect(),
+            shared: Semaphore::new(MAX_HELD_CONNS - each * destinations),
+        }
+    }
+
+    /// The claim of the destination at index `dest` on this budget.
+    pub(crate) fn for_destination(&self, dest: usize) -> Holds<'_> {
+        Holds {
+            reserved: &self.reserved[dest],
+            shared: &self.shared,
+        }
+    }
+}
 
 /// Configuration for the proxy client.
 pub struct ClientConfig {
@@ -239,6 +273,22 @@ impl Router {
 
     fn destination(&self, host: &str) -> Option<&Arc<Destination>> {
         self.table.index_of(host).map(|dest| &self.destinations[dest])
+    }
+
+    /// Stop reporting the front-end addresses: nothing listens on them now.
+    fn withdraw_listen_addrs(&self) {
+        *self.listen.lock().expect("listen addrs lock") = ListenAddrs::default();
+    }
+}
+
+/// Withdraws the advertised front-end addresses when a [`ProxyClient::run`]
+/// ends, however it ends — returned, or dropped mid-flight — since its
+/// listeners end with it.
+struct AdvertisedAddrs<'a>(&'a Router);
+
+impl Drop for AdvertisedAddrs<'_> {
+    fn drop(&mut self) {
+        self.0.withdraw_listen_addrs();
     }
 }
 
@@ -573,6 +623,9 @@ impl ProxyClient {
             log::info!("SOCKS5 proxy also listening on unix socket {:?}", l.local_addr()?);
         }
         *self.router.listen.lock().expect("listen addrs lock") = listen;
+        // The addresses are advertised for as long as they are served: until
+        // this future ends or is dropped, or the listeners are closed.
+        let _advertised = AdvertisedAddrs(&self.router);
         log::info!(
             "{} destination(s), connected on demand: {}",
             self.router.destinations.len(),
@@ -608,11 +661,20 @@ impl ProxyClient {
             router.destinations.iter().map(|d| d.clone().run()),
         );
 
+        // On the close signal every accept loop drops its listener and parks,
+        // so the session lives on with nothing listening: say so.
+        let listeners_closed = async {
+            listener_closed(&mut self.local_close.subscribe()).await;
+            router.withdraw_listen_addrs();
+            std::future::pending::<ProxyResult<()>>().await
+        };
+
         tokio::select! {
             _ = managers => Ok(()),
             r = socks_accept => r,
             r = http_accept => r,
             r = unix_accept => r,
+            r = listeners_closed => r,
         }
     }
 
@@ -976,7 +1038,7 @@ async fn accept_loop<P: LocalProto>(
     let addr = listener.local_addr()?;
     let mut retry = AcceptRetry::new("Local proxy");
     let limiter = Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_CONNS));
-    let hold_limiter = Arc::new(Semaphore::new(MAX_HELD_CONNS));
+    let hold_limiter = Arc::new(HoldBudget::new(router.destinations.len()));
     let mut warned_saturated = false;
     loop {
         let accepted = tokio::select! {
@@ -1052,7 +1114,7 @@ async fn accept_loop_unix(
         .and_then(|a| a.as_pathname().map(|p| p.to_path_buf()));
     let mut retry = AcceptRetry::new("Unix SOCKS5");
     let limiter = Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_CONNS));
-    let hold_limiter = Arc::new(Semaphore::new(MAX_HELD_CONNS));
+    let hold_limiter = Arc::new(HoldBudget::new(router.destinations.len()));
     let mut warned_saturated = false;
     loop {
         let accepted = tokio::select! {
@@ -1125,14 +1187,15 @@ async fn rebind_unix_listener(path: &std::path::Path) -> ProxyResult<UnixListene
 /// it by the client's table. A target on a destination's list is tunneled to
 /// that destination's server — connecting it first if need be, with the
 /// request held up to [`TUNNEL_RECOVERY_HOLD`] (concurrent holds capped by
-/// `hold_limiter`) and answered network-unreachable if no connection lands. A
+/// `hold_limiter`, per destination and in all) and answered
+/// network-unreachable if no connection lands. A
 /// target on no list is dialed directly from this device. The reserved
 /// `flextunnel.internal` names are answered here, by the client itself.
 async fn handle_local_conn<P: LocalProto, S: LocalStream>(
     proto: P,
     mut tcp: S,
     router: Arc<Router>,
-    hold_limiter: Arc<Semaphore>,
+    hold_limiter: Arc<HoldBudget>,
 ) -> Result<()> {
     // Bound the local handshake so a peer that connects and sends nothing can't
     // pin this task and its socket indefinitely.
@@ -1143,8 +1206,8 @@ async fn handle_local_conn<P: LocalProto, S: LocalStream>(
         .await
         .map_err(|_| anyhow::anyhow!("timed out during local proxy handshake"))??;
 
-    let (destination, request) = match router.table.route(&target) {
-        Route::Tunnel { dest, request } => (&router.destinations[dest], request),
+    let (dest, request) = match router.table.route(&target) {
+        Route::Tunnel { dest, request } => (dest, request),
         // Split-tunnel: a target on no destination's list is dialed directly
         // from this device's own network (its DNS, its IP) — whatever state
         // the destinations are in.
@@ -1170,8 +1233,10 @@ async fn handle_local_conn<P: LocalProto, S: LocalStream>(
     // destination's first use, or a drop being retried — this request is what
     // makes it connect, and is held while it does. Only a connection that
     // never lands answers with an error reply, so the app shows a connection
-    // error for this target instead of hanging forever.
-    let lease = match destination.acquire(Some(&hold_limiter)).await {
+    // error for this target instead of hanging forever. A destination that is
+    // connected takes no hold at all.
+    let destination = &router.destinations[dest];
+    let lease = match destination.acquire(Some(hold_limiter.for_destination(dest))).await {
         Ok(lease) => lease,
         Err(e) => {
             log::debug!("{}: {e}; refusing {target:?}", destination.host());
@@ -1451,6 +1516,36 @@ mod tests {
         }
     }
 
+    /// The hold budget keeps its total, gives every destination a share no
+    /// other can take, and leaves the rest to whoever needs it.
+    #[test]
+    fn the_hold_budget_reserves_a_share_per_destination() {
+        for destinations in [1, 2, 5, 8, 9, 64, 200] {
+            let budget = HoldBudget::new(destinations);
+            let total: usize = budget.reserved.iter().map(Semaphore::available_permits).sum::<usize>()
+                + budget.shared.available_permits();
+            assert_eq!(total, MAX_HELD_CONNS, "{destinations} destinations");
+        }
+        assert_eq!(HoldBudget::new(1).reserved[0].available_permits(), HOLDS_RESERVED_PER_DESTINATION);
+        assert_eq!(HoldBudget::new(200).reserved[0].available_permits(), 0, "too many to reserve for");
+
+        // One destination's server is down and its retries pile up: it holds
+        // everything it can reach...
+        let budget = HoldBudget::new(3);
+        let down = budget.for_destination(0);
+        let mut held = Vec::new();
+        while let Ok(permit) = down.reserved.try_acquire().or_else(|_| down.shared.try_acquire()) {
+            held.push(permit);
+        }
+        assert_eq!(held.len(), MAX_HELD_CONNS - 2 * HOLDS_RESERVED_PER_DESTINATION);
+        // ...and the other destinations can still hold their first requests.
+        for other in [1, 2] {
+            let holds = budget.for_destination(other);
+            assert_eq!(holds.reserved.available_permits(), HOLDS_RESERVED_PER_DESTINATION);
+            assert_eq!(holds.shared.available_permits(), 0);
+        }
+    }
+
     /// `close_local_listeners` must drop the front-end listener — local
     /// connects turn into refusals — while the accept future stays pending, so
     /// the session `select!` it lives in keeps the destinations running.
@@ -1709,7 +1804,7 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         let router = test_client().router.clone();
         tokio::spawn(async move {
-            let holds = Arc::new(Semaphore::new(MAX_HELD_CONNS));
+            let holds = Arc::new(HoldBudget::new(router.destinations.len()));
             let (tcp, _) = proxy.accept().await.unwrap();
             handle_local_conn(HttpProto, tcp, router, holds).await.unwrap();
         });
@@ -1741,7 +1836,7 @@ mod tests {
     async fn exchange<P: LocalProto>(proto: P, router: Arc<Router>, request: Vec<u8>) -> String {
         let (mut app, server) = tokio::io::duplex(64 * 1024);
         let handler = tokio::spawn(async move {
-            let holds = Arc::new(Semaphore::new(MAX_HELD_CONNS));
+            let holds = Arc::new(HoldBudget::new(router.destinations.len()));
             handle_local_conn(proto, server, router, holds).await
         });
         app.write_all(&request).await.unwrap();

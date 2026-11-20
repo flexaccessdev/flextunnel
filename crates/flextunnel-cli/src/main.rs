@@ -529,9 +529,12 @@ async fn run_server(
             "Quick mode: enter this server's EndpointId ({}) at the waiting client's prompt",
             running.endpoint().id()
         ),
+        // A snippet that can be pasted into a client config as it stands.
         None => log::info!(
-            "Clients reach this server with a [[destinations]] entry in their config: \
-             host = \"<a name for this machine>\", server_node_id = \"{}\"",
+            "Clients reach this server with a destination in their config:\n\
+             [[destinations]]\n\
+             host = \"<a name for this machine>\"\n\
+             server_node_id = \"{}\"",
             running.endpoint().id()
         ),
     }

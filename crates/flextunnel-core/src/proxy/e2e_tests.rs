@@ -1042,8 +1042,14 @@ async fn a_request_is_held_until_the_server_is_back() {
     // waits out its backoff and redials.
     let mut app = socks_request(client.socks, "m1.internal", echo_port).await;
     let mut reply = [0u8; 10];
-    let held = tokio::time::timeout(Duration::from_millis(500), app.read_exact(&mut reply)).await;
-    assert!(held.is_err(), "the request was answered instead of held");
+    // Peeked, not read: nothing of a reply that did arrive would be consumed,
+    // and only the timeout — no byte and no close — means it is being held.
+    let mut probe = [0u8; 1];
+    let early = tokio::time::timeout(Duration::from_millis(500), app.peek(&mut probe)).await;
+    assert!(
+        early.is_err(),
+        "the request was answered (or the connection closed) instead of held: {early:?}"
+    );
     assert_eq!(client.status("m1.internal").waiting, 1);
 
     // Resurrect the server on the same identity and publish its new address.
@@ -1212,11 +1218,18 @@ async fn a_servers_status_page_is_fetched_through_the_client() {
     assert_eq!(client.built(), 1, "fetching it connected the destination");
     assert_eq!(client.state("m1.internal"), DestinationState::Connected);
 
-    // HTML at the bare path.
+    // HTML at the bare path. It is the server's content under the client's
+    // own host name, so the client sends it with an origin of its own.
     let response = status_get(client.socks, "/servers/m1.internal/").await;
     assert!(response.contains("Content-Type: text/html"), "{response:.200}");
     assert!(response.contains("flextunnel server status"));
     assert!(response.contains("marker.example.com"));
+    let head = response.split_once("\r\n\r\n").expect("headers").0;
+    assert!(head.contains("Content-Security-Policy: sandbox\r\n"), "{head}");
+    assert!(head.contains("X-Content-Type-Options: nosniff"), "{head}");
+    // The client's own page is its own origin and carries no sandbox.
+    let own = status_get(client.socks, "/").await;
+    assert!(!own.contains("Content-Security-Policy"), "{own:.300}");
 
     // Through the HTTP proxy as a plain GET, with `Accept` picking text.
     let mut app = TcpStream::connect(client.http).await.unwrap();
@@ -1236,6 +1249,58 @@ async fn a_servers_status_page_is_fetched_through_the_client() {
     // The client's own page now shows the destination connected.
     let page = status_get(client.socks, "/status.json").await;
     assert!(page.contains("\"state\": \"connected\""), "{page}");
+}
+
+/// The front-end addresses are part of the status only while something
+/// listens on them: closing the listeners withdraws them — with the
+/// destinations still served, to the dialer — and so does the end of the
+/// session, after which a dialer that outlived it is turned away at once.
+#[tokio::test]
+async fn listener_addresses_are_reported_only_while_served() {
+    let echo_port = spawn_echo().await;
+    let (server_ep, server_addr) = server_endpoint(SecretKey::generate()).await;
+    let server_id = spawn_server(server_ep, temp_blocklist("listen-addrs"));
+    let lookup = MemoryLookup::from_endpoint_info(vec![server_addr]);
+
+    let client = start_client(vec![destination("m1.internal", server_id)], None, lookup.clone()).await;
+    // Reported once the session is serving them (it starts on its own task).
+    wait_until("the listeners to be reported", || {
+        let status = client.client.status();
+        (status.socks_listen, status.http_listen) == (Some(client.socks), Some(client.http))
+    })
+    .await;
+
+    client.client.close_local_listeners();
+    wait_until("the listeners to be withdrawn", || {
+        let status = client.client.status();
+        status.socks_listen.is_none() && status.http_listen.is_none()
+    })
+    .await;
+    // Listener-only: the destination managers are still running.
+    let dialer = client.client.dialer();
+    let target = Target::Domain("m1.internal".into(), echo_port);
+    let mut stream = with_timeout(dialer.connect(&target)).await.expect("still tunnels");
+    expect_echo(&mut stream).await;
+    drop(stream);
+
+    // The session ending withdraws them too, without any close signal.
+    let other = start_client(vec![destination("m1.internal", server_id)], None, lookup).await;
+    wait_until("the second session's listeners to be reported", || {
+        other.client.status().socks_listen.is_some()
+    })
+    .await;
+    other.session.abort();
+    wait_until("the ended session's addresses to be withdrawn", || {
+        let status = other.client.status();
+        status.socks_listen.is_none() && status.http_listen.is_none()
+    })
+    .await;
+
+    // And once the client is closed, a dialer kept past it gets an answer.
+    client.session.abort();
+    client.client.close().await;
+    let refused = with_timeout(dialer.connect(&target)).await.err().expect("closed");
+    assert!(refused.to_string().contains("shutting down"), "{refused:#}");
 }
 
 /// Port forwards bypass the local proxy front-ends: the listener hands an

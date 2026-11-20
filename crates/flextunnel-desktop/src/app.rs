@@ -29,7 +29,7 @@ use crate::tunnel::{
     ClientPhase, ClientSnapshot, ClientSpec, Controller, DestinationId, CLIENT_THREAD_NAME,
 };
 use crate::view;
-use flextunnel_core::proxy::{DestinationStatus, RouteSpec, RouteTable};
+use flextunnel_core::proxy::{DestinationStatus, RouteSpec, RouteTable, validate_destination_host};
 use flextunnel_core::transport::paths::ConnectionSnapshot;
 use iced::futures::Stream;
 use iced::{window, Element, Size, Subscription, Task};
@@ -313,6 +313,10 @@ pub struct ImportSummary {
     /// Imported forwards left out: their local port is one of this computer's
     /// proxy ports.
     pub forwards_skipped: usize,
+    /// The hosts of replaced destinations whose relay auth token was dropped:
+    /// the import changed their relays, and a token is for the relays it was
+    /// entered with.
+    pub relay_tokens_needed: Vec<String>,
 }
 
 impl std::fmt::Display for ImportSummary {
@@ -326,28 +330,63 @@ impl std::fmt::Display for ImportSummary {
             self.forwards_replaced.len()
         )?;
         match self.forwards_skipped {
-            0 => f.write_str("."),
-            n => write!(f, "; {n} skipped (local port used by a proxy here)."),
+            0 => f.write_str(".")?,
+            n => write!(f, "; {n} skipped (local port used by a proxy here).")?,
         }
+        if !self.relay_tokens_needed.is_empty() {
+            write!(
+                f,
+                " The relays of {} changed: its relay auth token was cleared — enter the \
+                 new relays' token if they need one.",
+                self.relay_tokens_needed.join(", ")
+            )?;
+        }
+        Ok(())
     }
 }
 
-/// The client with an imported (already structurally validated) set of
-/// destinations and forwards merged in, or why they do not fit. A destination
-/// whose server node id is already here replaces that destination's settings
-/// but keeps its id, auth-key reference and relay auth token; any other is
-/// added with a fresh id, no key picked and no relay token — imports never
-/// carry them. A forward on a local port already forwarded replaces that
-/// forward (stopped, like any imported one); any other is added. The merged
-/// destinations must still make one valid routing table — a host or a route
-/// claimed twice rejects the whole import, leaving the client as it was.
+/// The client with an imported set of destinations and forwards merged in, or
+/// why they do not fit. An import is all or nothing: the file's destinations
+/// are checked first, every one of them — a host the core would refuse, or a
+/// host or server the file names twice, rejects the import before anything is
+/// merged, rather than quietly leaving an entry out.
+///
+/// A destination whose server node id is already here replaces that
+/// destination's settings but keeps its id and auth-key reference — and its
+/// relay auth token, unless the import changes its relays: a token is for
+/// the relays it was entered with and is not sent to others. Any other
+/// destination is added with a fresh id, no key picked and no relay token —
+/// imports never carry them. A forward on a local port already forwarded
+/// replaces that forward (stopped, like any imported one); any other is
+/// added. The merged destinations must still make one valid routing table — a
+/// host or a route claimed twice rejects the whole import, leaving the client
+/// as it was.
 fn merge_imported(
     client: &ClientSettings,
     imported: Portable,
 ) -> Result<(ClientSettings, ImportSummary), String> {
+    let mut incoming_destinations = imported.destinations;
+    let (mut hosts, mut servers) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+    for destination in &mut incoming_destinations {
+        // Stored the way the core spells it, like a host typed into the form.
+        destination.host = validate_destination_host(&destination.host)?;
+        if !hosts.insert(destination.host.clone()) {
+            return Err(format!(
+                "the file has destination \"{}\" more than once",
+                destination.host
+            ));
+        }
+        if !servers.insert(destination.server_node_id.clone()) {
+            return Err(format!(
+                "the file has more than one destination for server {} (\"{}\" is one)",
+                destination.server_node_id, destination.host
+            ));
+        }
+    }
+
     let mut merged = client.clone();
     let mut summary = ImportSummary::default();
-    for mut incoming in imported.destinations {
+    for mut incoming in incoming_destinations {
         match merged
             .destinations
             .iter()
@@ -357,7 +396,16 @@ fn merge_imported(
                 let current = &merged.destinations[pos];
                 incoming.id = current.id.clone();
                 incoming.auth_key_id = current.auth_key_id.clone();
-                incoming.relay_auth_token = current.relay_auth_token.clone();
+                incoming.relay_auth_token = if incoming.relay_urls == current.relay_urls {
+                    current.relay_auth_token.clone()
+                } else {
+                    // Worth a word only where a token was lost and there are
+                    // relays that may want one.
+                    if current.relay_auth_token.is_some() && !incoming.relay_urls.is_empty() {
+                        summary.relay_tokens_needed.push(incoming.host.clone());
+                    }
+                    None
+                };
                 merged.destinations[pos] = incoming;
                 summary.destinations_replaced += 1;
             }
@@ -397,6 +445,12 @@ fn merge_imported(
     }
     merged.route_table()?;
     Ok((merged, summary))
+}
+
+/// Whether the session behind `snapshot` was started with exactly the saved
+/// settings: the same ports, destinations and key secrets.
+fn runs_saved_settings(snapshot: &ClientSnapshot, client: &ClientSettings, keys: &[AuthKey]) -> bool {
+    snapshot.spec.as_deref() == ClientSpec::resolve(client, keys).as_ref()
 }
 
 /// Editable destination buffers (the add/edit form). `editing_id` is `None`
@@ -456,6 +510,13 @@ impl DestinationForm {
         if server_node_id.is_empty() {
             return Err("Server node id is required".into());
         }
+        // The parser the session starts with, and its spelling of the id: an
+        // id that saves here is one the client can dial, and one server is
+        // one id however it was typed.
+        let server_node_id = server_node_id
+            .parse::<flextunnel_core::iroh::EndpointId>()
+            .map_err(|e| format!("Server node id is not an endpoint id: {e}"))?
+            .to_string();
         // One destination per server: a second name for the same server is an
         // accidental duplicate, not a use case (and the core refuses it).
         if let Some(other) = others().find(|d| d.server_node_id == server_node_id) {
@@ -503,7 +564,7 @@ impl DestinationForm {
         Ok(Destination {
             id: self.editing_id.clone().unwrap_or_else(Destination::new_id),
             host,
-            server_node_id: server_node_id.into(),
+            server_node_id,
             routed_domains,
             routed_cidrs,
             auth_key_id: self.auth_key_id.clone(),
@@ -997,9 +1058,6 @@ pub struct App {
     /// The config the server session was last started with, so the pane can
     /// tell when the saved settings differ from the running ones.
     server_applied: Option<ServerConfig>,
-    /// What the client session was last started with, so the panes can tell
-    /// when the saved settings differ from the running ones.
-    client_applied: Option<ClientSpec>,
     /// The client pane's open forward form.
     pub forward_form: Option<ForwardForm>,
     /// Two-click delete guard: the destination whose Delete was clicked once.
@@ -1029,8 +1087,12 @@ pub struct App {
     /// showing why; cleared when the forward is started again or removed.
     pub forward_errors: HashMap<String, String>,
     /// The forwards' advisory routing table (which destination carries each,
-    /// if any): rebuilt only when a destination's host or routes change.
+    /// if any) by the saved settings: rebuilt only when a destination's host
+    /// or routes change.
     pub routed_cache: view::RoutedCache,
+    /// The same by what the client session is running with — where a forward
+    /// goes right now (see [`App::running_route_table`]).
+    running_routed_cache: view::RoutedCache,
     log_revision: u64,
     /// Logs-pane filter (see [`LogFilter`]).
     pub log_filter: LogFilter,
@@ -1100,7 +1162,6 @@ impl App {
             confirm_remove_client: None,
             confirm_export_server_secret: false,
             server_applied: None,
-            client_applied: None,
             forward_form: None,
             confirm_delete: None,
             confirm_delete_key: None,
@@ -1112,6 +1173,7 @@ impl App {
             store_reset,
             forward_errors: HashMap::new(),
             routed_cache: view::RoutedCache::default(),
+            running_routed_cache: view::RoutedCache::default(),
             // MAX so the first refresh always builds the log text.
             log_revision: u64::MAX,
             log_filter: LogFilter::All,
@@ -1791,15 +1853,21 @@ impl App {
     }
 
     /// How `destination` stands in the client session: live only when the
-    /// session was started with it exactly as saved.
+    /// session was started with it exactly as saved — the same settings and
+    /// the same credential. Both are read from the session's own snapshot, so
+    /// a destination whose key was edited since is pending, not live under
+    /// the new key.
     pub fn destination_live(&self, destination: &Destination) -> DestinationLive<'_> {
         if self.client_snapshot.phase != ClientPhase::Running {
             return DestinationLive::Stopped;
         }
-        let applied = self
-            .client_applied
-            .as_ref()
-            .is_some_and(|spec| spec.destinations.iter().any(|d| d.destination == *destination));
+        let Some(running) = &self.client_snapshot.spec else {
+            return DestinationLive::Stopped;
+        };
+        let secret = config::find_key(&self.keys, &destination.auth_key_id).map(|k| k.secret.as_str());
+        let applied = running.destinations.iter().any(|d| {
+            d.destination == *destination && Some(d.auth_secret.as_str()) == secret
+        });
         if !applied {
             return DestinationLive::Pending;
         }
@@ -1813,6 +1881,16 @@ impl App {
             // Running, with its first status a poll away.
             None => DestinationLive::Stopped,
         }
+    }
+
+    /// The routing table of the running client session — where a forward
+    /// goes right now — or `None` while no session is starting or running.
+    pub fn running_route_table(&self) -> Option<&RouteTable> {
+        let active = matches!(
+            self.client_snapshot.phase,
+            ClientPhase::Starting | ClientPhase::Running
+        ) && self.client_snapshot.spec.is_some();
+        self.running_routed_cache.table.as_ref().filter(|_| active)
     }
 
     fn open_window(&mut self) -> Task<Message> {
@@ -1838,15 +1916,15 @@ impl App {
             self.client_snapshot.phase,
             ClientPhase::Starting | ClientPhase::Running
         ) && self.client.enabled
-            && self.client_applied != ClientSpec::resolve(&self.client, &self.keys)
+            && !runs_saved_settings(&self.client_snapshot, &self.client, &self.keys)
     }
 
-    /// Start a client session with the saved settings, if they resolve.
+    /// Start a client session with the saved settings, if they resolve. What
+    /// a session runs with is what it reports in its snapshot, not what was
+    /// asked for here.
     fn start_client(&mut self) {
         if let Some(spec) = ClientSpec::resolve(&self.client, &self.keys) {
-            self.controller
-                .start_client(spec.clone(), self.client.forwards.clone());
-            self.client_applied = Some(spec);
+            self.controller.start_client(spec, self.client.forwards.clone());
         }
     }
 
@@ -1872,9 +1950,7 @@ impl App {
         match self.client.start_blocker(&self.keys) {
             None => {
                 if let Some(spec) = ClientSpec::resolve(&self.client, &self.keys) {
-                    self.controller
-                        .restart_client(spec.clone(), self.client.forwards.clone());
-                    self.client_applied = Some(spec);
+                    self.controller.restart_client(spec, self.client.forwards.clone());
                 }
             }
             Some(blocker) => {
@@ -1936,9 +2012,12 @@ impl App {
         }
         // The running session still routes to it until it restarts (the
         // panes say so). Without any destination left there is nothing to
-        // restart into: stop.
+        // restart into: stop. And a client that was held back by this very
+        // destination — no key picked for it, say — can start now.
         if self.client.destinations.is_empty() {
             self.controller.stop_client();
+        } else {
+            self.resume_client();
         }
     }
 
@@ -2255,7 +2334,12 @@ impl App {
             self.controller.set_forwards(self.client.forwards.clone());
             self.persist_store();
         }
-        view::refresh_routed_cache(&mut self.routed_cache, &self.client);
+        view::refresh_routed_cache(&mut self.routed_cache, &self.client.destinations);
+        let running = self.client_snapshot.spec.as_deref();
+        view::refresh_routed_cache(
+            &mut self.running_routed_cache,
+            running.into_iter().flat_map(|spec| &spec.destinations).map(|d| &d.destination),
+        );
 
         let revision = logging::revision();
         if revision != self.log_revision {
@@ -2301,11 +2385,10 @@ impl App {
     /// before. Asks the controller rather than the polled snapshot, which a
     /// start made a moment ago has not reached yet.
     fn restart_pending(&self) -> bool {
-        matches!(
-            self.controller.client_snapshot().phase,
-            ClientPhase::Starting | ClientPhase::Running
-        ) && self.client.enabled
-            && self.client_applied != ClientSpec::resolve(&self.client, &self.keys)
+        let snapshot = self.controller.client_snapshot();
+        matches!(snapshot.phase, ClientPhase::Starting | ClientPhase::Running)
+            && self.client.enabled
+            && !runs_saved_settings(&snapshot, &self.client, &self.keys)
     }
 
     /// The notice for a save on a pane that shows the restart banner: "Saved."
@@ -2477,14 +2560,20 @@ impl App {
                 return;
             }
         };
-        self.client = client;
+        // Saved first: an import that is not on disk is not applied — not to
+        // the settings shown, not to the running session — and not reported.
+        let previous = std::mem::replace(&mut self.client, client);
+        self.close_forms();
+        if !self.persist_store() {
+            self.client = previous;
+            self.io_notice = Some("Import failed: the settings could not be saved.".into());
+            return;
+        }
         // A replaced forward comes back stopped, like any fresh load; the
         // session (if live) reconciles to the merged list.
         for id in &summary.forwards_replaced {
             self.forward_errors.remove(id);
         }
-        self.close_forms();
-        self.persist_store();
         self.controller.set_forwards(self.client.forwards.clone());
         self.io_notice = Some(summary.to_string());
         // Added destinations still need an auth key picked, which the client
@@ -2535,21 +2624,27 @@ impl App {
         }
     }
 
-    fn persist_store(&mut self) {
+    /// Save the settings, returning whether they are on disk now. A failure
+    /// leaves its reason in `notice`.
+    fn persist_store(&mut self) -> bool {
         // Backstop: the reset modal blocks the window, but nothing may write
         // over what is on disk before the user chooses to.
         if self.store_reset.is_some() {
             log::warn!("Not saving: the store reset is not confirmed yet");
-            return;
+            return false;
         }
-        if let Err(e) = config::save_store(
+        match config::save_store(
             &self.keys,
             &self.client,
             self.server.as_ref(),
             self.login_item_set_up,
         ) {
-            log::error!("Failed to save the settings: {e:#}");
-            self.notice = Some(format!("Failed to save the settings: {e:#}"));
+            Ok(()) => true,
+            Err(e) => {
+                log::error!("Failed to save the settings: {e:#}");
+                self.notice = Some(format!("Failed to save the settings: {e:#}"));
+                false
+            }
         }
     }
 
@@ -2616,11 +2711,21 @@ mod tests {
         }]
     }
 
+    /// A real endpoint id, the same for the same `seed` and different for
+    /// different ones: the form parses what it is given.
+    fn node_id(seed: &str) -> String {
+        let mut bytes = [0u8; 32];
+        for (slot, byte) in bytes.iter_mut().zip(seed.bytes()) {
+            *slot = byte;
+        }
+        flextunnel_core::iroh::SecretKey::from_bytes(&bytes).public().to_string()
+    }
+
     fn valid_form() -> DestinationForm {
         DestinationForm {
             editing_id: None,
             host: " Prod.Internal ".into(),
-            server_node_id: " node-id ".into(),
+            server_node_id: format!(" {} ", node_id("form")),
             routed_domains: " *.corp.example ,, db.internal ".into(),
             routed_cidrs: " 10.0.0.0/8 ".into(),
             auth_key_id: "k1".into(),
@@ -2652,12 +2757,12 @@ mod tests {
         }
     }
 
-    /// A destination `<id>.internal` on server `node-<id>`, with no routes.
+    /// A destination `<id>.internal` on server `node_id(id)`, with no routes.
     fn existing_destination(id: &str) -> Destination {
         Destination {
             id: id.into(),
             host: format!("{id}.internal"),
-            server_node_id: format!("node-{id}"),
+            server_node_id: node_id(id),
             routed_domains: Vec::new(),
             routed_cidrs: Vec::new(),
             auth_key_id: "k1".into(),
@@ -2772,7 +2877,7 @@ mod tests {
         // relay token on an incoming entry is never trusted (imports strip
         // it); pretend a hand-edited one slipped through to prove that.
         let mut same_server = existing_destination("x");
-        same_server.server_node_id = "node-p1".into();
+        same_server.server_node_id = node_id("p1");
         same_server.host = "renamed.internal".into();
         same_server.routed_domains = vec!["*.corp.example".into()];
         same_server.relay_auth_token = Some("imported-psk".into());
@@ -2796,6 +2901,7 @@ mod tests {
                 forwards_added: 1,
                 forwards_replaced: vec!["f1".to_string()],
                 forwards_skipped: 1,
+                relay_tokens_needed: Vec::new(),
             }
         );
         assert_eq!(
@@ -2832,6 +2938,77 @@ mod tests {
         assert_ne!(merged.forwards[1].id, "f3", "imported forward ids are fresh");
     }
 
+    /// A replaced destination keeps its relay auth token only with the relays
+    /// it was entered for: an import that changes them drops it — and says so
+    /// where the new relays may want one — rather than send it to them.
+    #[test]
+    fn an_import_that_changes_relays_drops_their_token() {
+        let relays = |urls: &[&str]| urls.iter().map(|u| u.to_string()).collect::<Vec<_>>();
+        let mut current = client(1080, vec![]);
+        current.destinations.push(existing_destination("p2"));
+        current.destinations.push(existing_destination("p3"));
+        for destination in &mut current.destinations {
+            destination.relay_urls = relays(&["https://a.example", "https://b.example"]);
+            destination.relay_auth_token = Some("relay-psk".into());
+        }
+        // p1: the same relays. p2: other relays. p3: no custom relays at all.
+        let same = current.destinations[0].clone();
+        let mut moved = current.destinations[1].clone();
+        moved.relay_urls = relays(&["https://c.example", "https://d.example"]);
+        let mut defaulted = current.destinations[2].clone();
+        defaulted.relay_urls.clear();
+        let imported = Portable { destinations: vec![same, moved, defaulted], forwards: Vec::new() };
+
+        let (merged, summary) = merge_imported(&current, imported).expect("fits");
+        assert_eq!(summary.destinations_replaced, 3);
+        assert_eq!(merged.destinations[0].relay_auth_token.as_deref(), Some("relay-psk"));
+        assert_eq!(merged.destinations[1].relay_auth_token, None, "not sent to other relays");
+        assert_eq!(merged.destinations[1].relay_urls, relays(&["https://c.example", "https://d.example"]));
+        assert_eq!(merged.destinations[2].relay_auth_token, None);
+        // Only the one that now has relays to authenticate to is called out.
+        assert_eq!(summary.relay_tokens_needed, ["p2.internal"]);
+        let notice = summary.to_string();
+        assert!(notice.contains("relays of p2.internal changed"), "{notice}");
+        assert!(notice.contains("relay auth token was cleared"), "{notice}");
+    }
+
+    /// Every destination in the file is checked before anything is merged: a
+    /// host the file has twice (for two servers), a server it has twice, or a
+    /// host the core refuses rejects the import, instead of an entry being
+    /// left out without a word.
+    #[test]
+    fn an_import_file_is_checked_whole() {
+        let current = client(1080, vec![]);
+        let import = |destinations: Vec<Destination>| {
+            let forwards = vec![existing_forward("f", 6000)];
+            merge_imported(&current, Portable { destinations, forwards })
+        };
+
+        let mut same_host = existing_destination("b");
+        same_host.host = "a.internal".into();
+        let err = import(vec![existing_destination("a"), same_host]).unwrap_err();
+        assert!(err.contains("\"a.internal\" more than once"), "{err}");
+
+        let mut same_server = existing_destination("b");
+        same_server.server_node_id = node_id("a");
+        let err = import(vec![existing_destination("a"), same_server]).unwrap_err();
+        assert!(err.contains("more than one destination for server"), "{err}");
+
+        for bad_host in ["10.0.0.1", "flextunnel.internal", "bad..host", ""] {
+            let mut bad = existing_destination("b");
+            bad.host = bad_host.into();
+            // A valid entry before it does not get the import through.
+            assert!(import(vec![existing_destination("a"), bad]).is_err(), "{bad_host:?}");
+        }
+
+        // A host spelled another way is stored the way the core spells it.
+        let mut shouting = existing_destination("b");
+        shouting.host = " B.Internal ".into();
+        let (merged, summary) = import(vec![shouting]).expect("a valid host");
+        assert_eq!(merged.destinations[1].host, "b.internal");
+        assert_eq!((summary.destinations_added, summary.forwards_added), (1, 1));
+    }
+
     /// Imported destinations must fit the ones already here: a host or a
     /// route claimed twice rejects the import whole.
     #[test]
@@ -2864,7 +3041,7 @@ mod tests {
     #[test]
     fn validate_trims_and_parses() {
         let destination = valid_form().validate(&[], &test_keys()).expect("valid");
-        assert_eq!(destination.server_node_id, "node-id");
+        assert_eq!(destination.server_node_id, node_id("form"), "stored as the parser spells it");
         assert_eq!(destination.host, "prod.internal", "stored trimmed and lowercased");
         assert_eq!(destination.routed_domains, ["*.corp.example", "db.internal"]);
         assert_eq!(destination.routed_cidrs, ["10.0.0.0/8"]);
@@ -2898,6 +3075,13 @@ mod tests {
         let mut form = valid_form();
         form.server_node_id = "  ".into();
         assert!(form.validate(&[], &keys).is_err());
+        // Anything the session could not dial is refused here, not at start.
+        for bad in ["!", "node-id", "ed25519-pub:abc", &node_id("form")[1..]] {
+            let mut form = valid_form();
+            form.server_node_id = bad.into();
+            let err = form.validate(&[], &keys).unwrap_err();
+            assert!(err.contains("not an endpoint id"), "{bad:?}: {err}");
+        }
 
         // The host is required and must be a name the core accepts; the
         // routes must parse and must not contradict it.
@@ -2953,9 +3137,9 @@ mod tests {
         let mut form = fresh();
         form.host = " P1.internal ".into();
         assert!(form.validate(&existing, &keys).unwrap_err().contains("more than once"));
-        // …or its server…
+        // …or its server, however the id is typed…
         let mut form = fresh();
-        form.server_node_id = "node-p1".into();
+        form.server_node_id = format!("  {}\t", node_id("p1"));
         let err = form.validate(&existing, &keys).unwrap_err();
         assert!(err.contains("\"p1.internal\" already reaches this server"), "{err}");
         // …or one of its rules, or its host as a routed domain.

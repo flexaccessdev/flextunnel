@@ -1,16 +1,20 @@
 //! The reserved `flextunnel.internal` namespace.
 //!
 //! `flextunnel.internal` and every `*.flextunnel.internal` subdomain belong to
-//! flextunnel itself and are answered by the **client**, locally, without
-//! opening any connection: `flextunnel.internal` is the running client's own
-//! status page (see [`super::client_status`]), which also fronts each
-//! destination server's status page; other subdomains are reserved for future
-//! use and answer with an HTTP 404.
+//! flextunnel itself and are answered by the **client**: `flextunnel.internal`
+//! is the running client's own status endpoint (see [`super::client_status`]);
+//! other subdomains are reserved for future use and answer with an HTTP 404.
+//! The client's own status and those 404s are served locally, without opening
+//! any connection. The one exception is `/servers/<host>/` on the status
+//! endpoint, which fetches that destination server's status page and so
+//! connects to the destination if it is not connected.
 //!
 //! The names never reach a server. A client destination may not use one as its
 //! host, and a server rejects them as `[host_aliases]` names (at config
 //! resolution) and as stream targets, so no `routed_domains = ["*"]` or alias
 //! can capture them.
+
+use super::routed_set::routing_key;
 
 /// The client status host: `http://flextunnel.internal` through a client's
 /// proxy returns that client's status page.
@@ -26,7 +30,7 @@ pub fn is_reserved_host(host: &str) -> bool {
     if is_status_host(host) {
         return true;
     }
-    let lower = host.to_ascii_lowercase();
+    let lower = routing_key(host).to_ascii_lowercase();
     // A non-empty subdomain label: strip the suffix and require something left.
     lower
         .strip_suffix(RESERVED_SUFFIX)
@@ -35,7 +39,7 @@ pub fn is_reserved_host(host: &str) -> bool {
 
 /// True only for the exact status host `flextunnel.internal` (case-insensitive).
 pub fn is_status_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case(STATUS_HOST)
+    routing_key(host).eq_ignore_ascii_case(STATUS_HOST)
 }
 
 #[cfg(test)]
@@ -48,6 +52,10 @@ mod tests {
         assert!(is_status_host("FlexTunnel.Internal"));
         assert!(is_reserved_host("flextunnel.internal"));
         assert!(is_reserved_host("FLEXTUNNEL.INTERNAL"));
+        // The root dot names the same host.
+        assert!(is_status_host("flextunnel.internal."));
+        assert!(is_reserved_host("x.flextunnel.internal."));
+        assert!(!is_status_host("x.flextunnel.internal."));
     }
 
     #[test]

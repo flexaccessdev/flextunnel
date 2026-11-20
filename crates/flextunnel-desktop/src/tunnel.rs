@@ -67,6 +67,12 @@ pub enum ClientPhase {
 #[derive(Clone, Default)]
 pub struct ClientSnapshot {
     pub phase: ClientPhase,
+    /// What the session whose state this is was started with — the ports,
+    /// destinations and key secrets actually in use. Published by the session
+    /// itself, with the rest of its state, so it is never a start that was
+    /// only asked for, queued behind a stop, or turned down. `None` while no
+    /// session is starting or running.
+    pub spec: Option<Arc<ClientSpec>>,
     pub running_since: Option<Instant>,
     pub last_error: Option<String>,
     /// Live state per destination of the running session, in its order; empty
@@ -451,6 +457,9 @@ async fn run_loop(
                 Some(_) if client_stopping => pending_client = Some(start),
                 Some(_) => log::warn!("The client is still running"),
                 None => {
+                    // This start is the newest word: a restart whose old
+                    // session ended just now must not start after it.
+                    pending_client = None;
                     let (spec, forwards) = *start;
                     client = spawn_client(spec, forwards, &client_shared);
                 }
@@ -506,7 +515,11 @@ async fn run_loop(
                     // succession).
                     Some(_) if stopping => pending_start = Some(*config),
                     Some(_) => log::warn!("The server is still running"),
-                    None => server = server_session::spawn_server(*config, &server_shared),
+                    None => {
+                        // As for the client: no stale restart behind this.
+                        pending_start = None;
+                        server = server_session::spawn_server(*config, &server_shared);
+                    }
                 }
             }
             Some(Command::RestartServer(config)) => match &server {
@@ -617,9 +630,11 @@ async fn run_client(
     let loopback = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
     let socks_addr = spec.socks_port.map(loopback);
     let http_addr = spec.http_port.map(loopback);
+    let spec = Arc::new(spec);
     slot.update(|s| {
         *s = ClientSnapshot {
             phase: ClientPhase::Starting,
+            spec: Some(spec.clone()),
             ..ClientSnapshot::default()
         };
     });
@@ -726,6 +741,7 @@ async fn run_client(
     // returns, so the supervisor starts nothing new before the close is done.
     slot.update(|s| {
         s.phase = ClientPhase::Stopping;
+        s.spec = None;
         s.running_since = None;
         s.destinations.clear();
         s.forwards.clear();

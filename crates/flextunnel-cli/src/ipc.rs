@@ -2,9 +2,10 @@
 //! commands that attach to it: `flextunnel client control` and
 //! `flextunnel client nc`.
 //!
-//! Transport: a Unix domain socket (`~/.config/flextunnel/client-<name>.sock`)
-//! or a Windows named pipe (`\\.\pipe\flextunnel-client-<name>`), where `<name>`
-//! is the client's instance name (see `instance.rs`). Protocol:
+//! Transport: a Unix domain socket (`~/.config/flextunnel/client-<name>.sock`,
+//! a long name shortened — see [`socket_stem`]) or a Windows named pipe
+//! (`\\.\pipe\flextunnel-client-<user SID>-<name>`), where `<name>` is the
+//! client's instance name (see `instance.rs`). Protocol:
 //! JSON Lines, strict request → response over a long-lived connection. Both
 //! ends are this one binary and the repo has a no-compatibility policy, so
 //! there is no protocol version field.
@@ -18,19 +19,21 @@
 //! Windows named pipe has no half-close, so neither end of the tunnel may rely
 //! on one to carry an EOF. The snapshots describe the
 //! user's network and a tunnel reaches into it, so the Unix socket is chmod'd
-//! 0600 (owner only), in a 0700 directory. Windows pipe names are global and
-//! the default pipe descriptor lets Everyone read, so each pipe instance gets
-//! an owner-only descriptor and attaching commands refuse a pipe another user
-//! owns (see `pipe_security.rs`).
+//! 0600 (owner only), in a 0700 directory. Windows pipe names are one
+//! machine-wide namespace and the default pipe descriptor lets Everyone read,
+//! so the name carries the user's SID (two users' clients of one name do not
+//! collide), each pipe instance gets an owner-only descriptor, and attaching
+//! commands refuse a pipe another user owns (see `pipe_security.rs`).
 //!
 //! The socket is not the single-instance lock — see `lock.rs` for why. But
 //! *because* the caller holds that lock, unconditionally removing a stale
 //! socket file before bind is safe: no other live client of this instance can
 //! own it.
 //!
-//! macOS caps `sun_path` around 104 bytes; with the socket under
-//! `~/.config/flextunnel/` and a name of at most 32 characters, only a
-//! pathological home path overflows — that surfaces as a clear bind error.
+//! macOS caps `sun_path` at 104 bytes; the socket's file name is kept to
+//! [`MAX_SOCKET_FILE_NAME`] bytes whatever the instance name, so under
+//! `~/.config/flextunnel/` the path fits for a home directory of up to 50
+//! bytes. A longer home path still surfaces as a clear bind error.
 
 use anyhow::{Context, Result};
 use flextunnel_core::forwards::validate_remote_host;
@@ -290,14 +293,50 @@ impl TunnelOpener for TunnelDialer {
 // Naming
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
-fn socket_path(name: &str) -> Result<std::path::PathBuf> {
-    Ok(instance::instance_dir()?.join(format!("client-{name}.sock")))
+/// Longest control-socket file name, in bytes: macOS's `sun_path` holds 103
+/// bytes plus a NUL, and `<home>/.config/flextunnel/` takes 20 past the home
+/// directory, so this fits under a home path of up to 50 bytes.
+#[cfg(any(unix, test))]
+const MAX_SOCKET_FILE_NAME: usize = 33;
+/// Longest stem — the part of the file name that comes from the instance name.
+#[cfg(any(unix, test))]
+const MAX_SOCKET_STEM: usize = MAX_SOCKET_FILE_NAME - "client-".len() - ".sock".len();
+
+/// The part of the control socket's file name that stands for the instance
+/// `name`: the name itself when it fits, else its start and a hash of all of
+/// it, joined by a `.` — which no instance name contains, so a shortened stem
+/// is never another instance's name. Only the socket file is named this way;
+/// the instance is still selected, locked and shown by its full name. The
+/// client that binds and the commands that attach both derive it here.
+#[cfg(any(unix, test))]
+fn socket_stem(name: &str) -> String {
+    if name.len() <= MAX_SOCKET_STEM {
+        return name.to_string();
+    }
+    // FNV-1a: fixed by definition, so every build names the socket alike.
+    let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    let digest = format!("{:08x}", hash as u32);
+    // Instance names are ASCII, so any byte offset is a character boundary.
+    let kept = MAX_SOCKET_STEM - 1 - digest.len();
+    format!("{}.{digest}", &name[..kept])
 }
 
+#[cfg(unix)]
+fn socket_path(name: &str) -> Result<std::path::PathBuf> {
+    Ok(instance::instance_dir()?.join(format!("client-{}.sock", socket_stem(name))))
+}
+
+/// The control pipe of this user's client named `name`. Pipe names are one
+/// machine-wide namespace, so the user's SID is part of it: another user's
+/// client of the same name gets a pipe of its own instead of finding this one
+/// taken. The client that serves and the commands that attach both derive it
+/// here.
 #[cfg(windows)]
-fn pipe_name(name: &str) -> String {
-    format!(r"\\.\pipe\flextunnel-client-{name}")
+fn pipe_name(name: &str) -> std::io::Result<String> {
+    let sid = pipe_security::current_user_sid()?;
+    Ok(format!(r"\\.\pipe\flextunnel-client-{sid}-{name}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +373,8 @@ pub fn spawn_ipc_server(
     }
     #[cfg(windows)]
     {
-        spawn_pipe(pipe_name(name), tx, opener)
+        let pipe = pipe_name(name).context("Failed to read the current user's SID")?;
+        spawn_pipe(pipe, tx, opener)
     }
 }
 
@@ -718,7 +758,7 @@ impl IpcClient {
         use tokio::net::windows::named_pipe::ClientOptions;
 
         const ERROR_PIPE_BUSY: i32 = 231;
-        let name = pipe_name(name);
+        let name = pipe_name(name)?;
         let sid = pipe_security::current_user_sid()?;
         // All pipe instances can be momentarily busy between one attacher
         // connecting and the server pre-creating the next instance; retry
@@ -981,7 +1021,7 @@ mod tests {
             (dir, guard)
         };
         #[cfg(windows)]
-        let guard = spawn_pipe(pipe_name(&instance), stub_session(), EchoOpener).unwrap();
+        let guard = spawn_pipe(pipe_name(&instance).unwrap(), stub_session(), EchoOpener).unwrap();
 
         #[cfg(unix)]
         let mut client = {
@@ -1084,7 +1124,8 @@ mod tests {
             }
             #[cfg(windows)]
             {
-                let guard = spawn_pipe(pipe_name(&instance), stub_session(), EchoOpener).unwrap();
+                let pipe = pipe_name(&instance).unwrap();
+                let guard = spawn_pipe(pipe, stub_session(), EchoOpener).unwrap();
                 Self { guard, instance }
             }
         }
@@ -1146,6 +1187,51 @@ mod tests {
         let oversized = ((MAX_FRAME + 1) as u32).to_be_bytes();
         let err = copy_from_frames(&mut &oversized[..], &mut Vec::new()).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// The socket's file name fits macOS's socket address limit for any
+    /// instance name, under a home directory of up to 50 bytes.
+    #[test]
+    fn the_socket_file_name_is_bounded() {
+        // Short names are used as they are.
+        for name in ["default", "work", &"x".repeat(MAX_SOCKET_STEM)] {
+            assert_eq!(socket_stem(name), name);
+        }
+        // Longer ones keep their start and gain a digest of the whole name.
+        let longest = "a".repeat(32);
+        let stem = socket_stem(&longest);
+        assert_eq!(stem.len(), MAX_SOCKET_STEM);
+        assert!(stem.starts_with("aaaaaaaaaaaa."), "{stem}");
+        assert_eq!(stem, socket_stem(&longest), "the same on every call");
+        // Names that share a start do not share a socket, and a shortened
+        // stem (it has a dot) is never some other instance's own name.
+        let sibling = format!("{}b", "a".repeat(31));
+        assert_ne!(socket_stem(&sibling), stem);
+
+        // `<50-byte home>/.config/flextunnel/client-<stem>.sock`, NUL included.
+        let home = format!("/{}", "h".repeat(49));
+        let path = format!("{home}/.config/flextunnel/client-{stem}.sock");
+        assert_eq!(home.len(), 50);
+        assert!(path.len() < 104, "{} bytes", path.len());
+        assert_eq!(format!("client-{stem}.sock").len(), MAX_SOCKET_FILE_NAME);
+    }
+
+    /// Bind and attach agree on the path of a long-named instance, and it is
+    /// short enough to bind where the unshortened name would not be.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_long_instance_name_binds_and_attaches() {
+        let name = "n".repeat(32);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("client-{}.sock", socket_stem(&name)));
+        let guard = spawn_unix(path.clone(), stub_session(), EchoOpener).unwrap();
+        let mut client = IpcClient {
+            name: name.clone(),
+            stream: Some(BufReader::new(tokio::net::UnixStream::connect(&path).await.unwrap())),
+        };
+        assert!(matches!(client.request(&Request::Status).await.unwrap(), Response::Status(_)));
+        assert_eq!(socket_path(&name).unwrap().file_name(), path.file_name());
+        drop(guard);
     }
 
     #[cfg(unix)]

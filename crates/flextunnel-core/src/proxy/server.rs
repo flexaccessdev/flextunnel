@@ -840,7 +840,8 @@ fn apply_alias(target: Target, aliases: &HashMap<String, String>) -> Target {
 /// are validated at config resolution, so a bare `*` and malformed patterns
 /// never reach here.
 fn resolve_alias<'a>(map: &'a HashMap<String, String>, host: &str) -> Option<&'a str> {
-    let host = host.to_ascii_lowercase();
+    // The same name the routed set just matched: without the DNS root dot.
+    let host = crate::proxy::routed_set::routing_key(host).to_ascii_lowercase();
     if let Some(value) = map.get(&host) {
         return Some(value.as_str());
     }
@@ -943,24 +944,33 @@ async fn serve_status(
     log::debug!("Serving the server status page");
     status_page::write_tunnel_success(&mut send).await?;
     let head = status_page::read_request_head(&mut recv).await;
-    let request = status_page::parse_status_request(&head);
-    let format = status_page::status_format_for(&request.path, request.accept);
-    let (status_line, content_type, body) =
-        status_page::render_status(&server.build_status_template(), format);
+    let (status_line, content_type, body) = match status_page::parse_status_request(&head) {
+        Some(request) => {
+            let format = status_page::status_format_for(&request.path, request.accept);
+            status_page::render_status(&server.build_status_template(), format)
+        }
+        None => (
+            "400 Bad Request",
+            status_page::CONTENT_TYPE_TEXT,
+            "not an HTTP request\n".to_string(),
+        ),
+    };
     status_page::write_http_payload(&mut send, status_line, content_type, &body).await?;
     let _ = send.finish();
 
     // Drain the peer's request instead of dropping `recv` immediately: an
     // abrupt drop sends STOP_SENDING, which can truncate the response as the
     // client relays it. We sent `Connection: close`, so the peer closes after
-    // reading the response, giving us EOF. Bounded by both a byte cap and a
-    // per-read timeout so a peer that never sends nor closes can't pin the task.
+    // reading the response, giving us EOF. Bounded by both a byte cap and one
+    // deadline for the whole drain, so a peer that never closes — sending
+    // nothing, or a byte now and then — can't pin the task.
+    let deadline = tokio::time::Instant::now() + status_page::REQUEST_READ_TIMEOUT;
     let mut buf = [0u8; 4096];
     let mut drained = 0usize;
     while drained < status_page::REQUEST_HEAD_LIMIT {
-        match tokio::time::timeout(status_page::REQUEST_READ_TIMEOUT, recv.read(&mut buf)).await {
+        match tokio::time::timeout_at(deadline, recv.read(&mut buf)).await {
             Ok(Ok(Some(n))) => drained += n,
-            // EOF, read error, or drain timeout: stop draining.
+            // EOF, read error, or the deadline: stop draining.
             Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
         }
     }
@@ -1038,6 +1048,12 @@ mod tests {
     #[test]
     fn alias_match_is_case_insensitive() {
         let got = apply_alias(Target::Domain("Server.Internal".into(), 80), &aliases());
+        assert_eq!(got, Target::Domain("127.0.0.1".into(), 80));
+    }
+
+    #[test]
+    fn alias_match_ignores_the_root_dot() {
+        let got = apply_alias(Target::Domain("server.internal.".into(), 80), &aliases());
         assert_eq!(got, Target::Domain("127.0.0.1".into(), 80));
     }
 

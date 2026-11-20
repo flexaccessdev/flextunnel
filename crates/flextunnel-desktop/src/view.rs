@@ -9,7 +9,7 @@ use crate::app::{
     IdentityChoice, KeyChoice, KeyForm, LogFilter, Message, ProxyForm, Selection, ServerForm,
     StoreReset,
 };
-use crate::config::{self, AuthKey, AuthorizedClient, ClientSettings, Destination, ServerConfig};
+use crate::config::{self, AuthKey, AuthorizedClient, Destination, ServerConfig};
 use crate::server_session::ServerPhase;
 use crate::tray::clients_connected;
 use flextunnel_core::forwards::{ForwardState, ForwardStatus, PortForward};
@@ -40,34 +40,40 @@ pub struct RoutedCache {
     pub table: Option<RouteTable>,
 }
 
-/// Rebuild the advisory routing table only when the destinations' hosts or
-/// routes changed.
-pub fn refresh_routed_cache(cache: &mut RoutedCache, client: &ClientSettings) {
+/// Rebuild the advisory routing table over `destinations` only when their
+/// hosts or routes changed.
+pub fn refresh_routed_cache<'a, I>(cache: &mut RoutedCache, destinations: I)
+where
+    I: IntoIterator<Item = &'a Destination>,
+    I::IntoIter: Clone,
+{
+    let destinations = destinations.into_iter();
     let fresh = cache.built_from.as_ref().is_some_and(|built| {
-        built.len() == client.destinations.len()
-            && built.iter().zip(&client.destinations).all(|((host, domains, cidrs), d)| {
+        built.len() == destinations.clone().count()
+            && built.iter().zip(destinations.clone()).all(|((host, domains, cidrs), d)| {
                 *host == d.host && *domains == d.routed_domains && *cidrs == d.routed_cidrs
             })
     });
     if !fresh {
-        cache.table = client
-            .route_table()
+        cache.table = config::route_table_of(destinations.clone())
             .inspect_err(|e| log::debug!("Routes unusable for the forward badges: {e}"))
             .ok();
         cache.built_from = Some(
-            client
-                .destinations
-                .iter()
+            destinations
                 .map(|d| (d.host.clone(), d.routed_domains.clone(), d.routed_cidrs.clone()))
                 .collect(),
         );
     }
 }
 
-/// Everything is tunneled when a destination routes every hostname or an
-/// all-covering network.
+/// Everything is tunneled only when a destination routes all three kinds of
+/// target: every hostname (`*`), every IPv4 address and every IPv6 address.
+/// Each rule covers its own kind alone — `0.0.0.0/0` says nothing about a
+/// hostname or an IPv6 address.
 fn is_full_tunnel(domains: &[String], cidrs: &[String]) -> bool {
-    domains.iter().any(|d| d == "*") || cidrs.iter().any(|c| c == "0.0.0.0/0" || c == "::/0")
+    domains.iter().any(|d| d == "*")
+        && cidrs.iter().any(|c| c == "0.0.0.0/0")
+        && cidrs.iter().any(|c| c == "::/0")
 }
 
 /// The host of the destination that carries a forward, by the client's
@@ -86,6 +92,25 @@ fn forward_route<'a>(
         Route::Tunnel { dest, .. } => table.hosts().nth(dest),
         _ => None,
     })
+}
+
+/// What a forward's row says about its route: the one in effect — by the
+/// running client's table when there is one, else by the saved destinations,
+/// which are what a start will use — and, when the running client routes it
+/// differently than the saved destinations would, what a restart changes it
+/// to. A saved route is never shown as the one a running forward takes.
+fn forward_route_labels<'a>(
+    running: Option<Option<&'a str>>,
+    saved: Option<Option<&'a str>>,
+) -> (Option<Option<&'a str>>, Option<String>) {
+    let Some(running) = running else {
+        return (saved, None);
+    };
+    let after_restart = saved.filter(|saved| *saved != running).map(|saved| match saved {
+        Some(host) => format!("after restart: via {host}"),
+        None => "after restart: no route".to_string(),
+    });
+    (Some(running), after_restart)
 }
 
 /// Live state pill for a forward row: gray "stopped", amber "starting…",
@@ -1024,13 +1049,21 @@ fn forward_card<'a>(app: &'a App, forward: &'a PortForward) -> Element<'a, Messa
     let mut title = row![name, pill(pill_text, pill_color)]
         .spacing(8)
         .align_y(Center);
-    // Which destination carries it — or the problem: nothing does.
-    match forward_route(app.routed_cache.table.as_ref(), forward) {
+    // Which destination carries it — or the problem: nothing does. A running
+    // client carries it by the destinations it started with, which saved
+    // changes have not reached yet.
+    let running = app.running_route_table().and_then(|table| forward_route(Some(table), forward));
+    let saved = forward_route(app.routed_cache.table.as_ref(), forward);
+    let (route, after_restart) = forward_route_labels(running, saved);
+    match route {
         Some(Some(host)) => {
             title = title.push(text(format!("via {host}")).size(11).style(style::dim_text));
         }
         Some(None) => title = title.push(pill("no route".to_string(), AMBER)),
         None => {}
+    }
+    if let Some(after_restart) = after_restart {
+        title = title.push(text(after_restart).size(11).color(AMBER));
     }
 
     let route = arrow_copy_row(forward.local_endpoint(), forward.remote_endpoint(), true);
@@ -1267,7 +1300,10 @@ fn routes_section<'a>(app: &'a App, destination: &'a Destination) -> Element<'a,
     let (domains, cidrs) = (&destination.routed_domains, &destination.routed_cidrs);
     if is_full_tunnel(domains, cidrs) {
         col = col.push(
-            text("Everything no other destination routes more specifically:").size(12),
+            text(
+                "Every hostname and address no other destination routes more specifically:",
+            )
+            .size(12),
         );
     } else if domains.is_empty() && cidrs.is_empty() {
         col = col.push(text("Nothing else is sent through this server.").size(12));
@@ -2597,13 +2633,17 @@ fn input<'a>(
 }
 
 /// Shorten to `max` characters by replacing the middle with an ellipsis.
-/// ASCII-safe inputs only (node ids, addresses).
+/// Counted and cut in characters, so any text is safe — a hand-edited id
+/// with something other than ASCII in it included.
 fn truncate_middle(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    let len = s.chars().count();
+    if len <= max {
         return s.into();
     }
-    let keep = (max - 1) / 2;
-    format!("{}…{}", &s[..keep], &s[s.len() - keep..])
+    let keep = max.saturating_sub(1) / 2;
+    let head: String = s.chars().take(keep).collect();
+    let tail: String = s.chars().skip(len - keep).collect();
+    format!("{head}…{tail}")
 }
 
 fn section_label(label: impl Into<String>) -> Element<'static, Message> {
@@ -2645,6 +2685,7 @@ fn semibold() -> Font {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ClientSettings;
 
     #[test]
     fn middle_truncation() {
@@ -2655,13 +2696,58 @@ mod tests {
         assert!(shown.chars().count() <= 22);
     }
 
+    /// Cuts fall between characters, never inside one: text with multibyte
+    /// characters at the cut — either side of it — is shortened, not a panic.
+    #[test]
+    fn middle_truncation_keeps_characters_whole() {
+        // Two bytes each, so a cut at byte 3 would land inside the second.
+        let id = "ééééééééé";
+        assert_eq!(truncate_middle(id, 7), "ééé…ééé");
+        assert_eq!(truncate_middle(id, 9), id, "nine characters fit in nine");
+        // The character on each side of the cut is a wide one.
+        assert_eq!(truncate_middle("ab日本語cdefg日本h", 7), "ab日…日本h");
+        assert_eq!(truncate_middle("日本語", 2), "…");
+        assert_eq!(truncate_middle("", 0), "");
+    }
+
     #[test]
     fn full_tunnel_derivation() {
         let strings = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert!(!is_full_tunnel(&[], &[]), "no routes: only the host is tunneled");
         assert!(!is_full_tunnel(&strings(&["example.com"]), &[]));
-        assert!(is_full_tunnel(&strings(&["example.com", "*"]), &[]));
-        assert!(is_full_tunnel(&strings(&["example.com"]), &strings(&["0.0.0.0/0"])));
+        // Each catch-all covers its own kind of target only.
+        assert!(!is_full_tunnel(&strings(&["example.com", "*"]), &[]), "hostnames alone");
+        assert!(!is_full_tunnel(&strings(&["example.com"]), &strings(&["0.0.0.0/0"])), "IPv4 alone");
+        assert!(!is_full_tunnel(&strings(&["*"]), &strings(&["0.0.0.0/0"])), "no IPv6");
+        assert!(is_full_tunnel(&strings(&["*"]), &strings(&["10.0.0.0/8", "0.0.0.0/0", "::/0"])));
+    }
+
+    /// A forward's row shows the route in use; the saved one is only ever
+    /// shown as what a restart will bring, never as the running client's.
+    #[test]
+    fn a_forward_shows_the_running_route_and_the_pending_one() {
+        let (a, b) = (Some(Some("a.internal")), Some(Some("b.internal")));
+        // Not running: the saved destinations are what a start will use.
+        assert_eq!(forward_route_labels(None, a), (a, None));
+        assert_eq!(forward_route_labels(None, Some(None)), (Some(None), None));
+        assert_eq!(forward_route_labels(None, None), (None, None), "no valid table: no badge");
+        // Running with the saved settings: one route, nothing pending.
+        assert_eq!(forward_route_labels(a, a), (a, None));
+        // Running on older settings: the running route, and the change to come.
+        assert_eq!(
+            forward_route_labels(a, b),
+            (a, Some("after restart: via b.internal".to_string()))
+        );
+        assert_eq!(
+            forward_route_labels(a, Some(None)),
+            (a, Some("after restart: no route".to_string()))
+        );
+        assert_eq!(
+            forward_route_labels(Some(None), b),
+            (Some(None), Some("after restart: via b.internal".to_string()))
+        );
+        // The saved destinations no longer make a table: only what runs.
+        assert_eq!(forward_route_labels(a, None), (a, None));
     }
 
     #[test]
@@ -2757,23 +2843,23 @@ mod tests {
             ..ClientSettings::default()
         };
         let mut cache = RoutedCache::default();
-        refresh_routed_cache(&mut cache, &client);
+        refresh_routed_cache(&mut cache, &client.destinations);
         assert_eq!(cache.table.as_ref().unwrap().hosts().count(), 1);
 
         // Not a routing change: the table is kept as it is.
         client.destinations[0].auth_key_id = "k".into();
         client.socks_port = None;
         let before = cache.built_from.clone();
-        refresh_routed_cache(&mut cache, &client);
+        refresh_routed_cache(&mut cache, &client.destinations);
         assert_eq!(cache.built_from, before);
 
         client.destinations.push(destination("lab.internal", &[]));
-        refresh_routed_cache(&mut cache, &client);
+        refresh_routed_cache(&mut cache, &client.destinations);
         assert_eq!(cache.table.as_ref().unwrap().hosts().count(), 2);
 
         // Two destinations claiming one rule: no table, so no badges.
         client.destinations[1].routed_domains = vec!["*.corp.example".into()];
-        refresh_routed_cache(&mut cache, &client);
+        refresh_routed_cache(&mut cache, &client.destinations);
         assert!(cache.table.is_none());
     }
 }

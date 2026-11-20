@@ -156,6 +156,10 @@ destination (`host`, `server_node_id`, `state`, `connected_secs`,
 
 `http://flextunnel.internal/servers/<destination>/` is that **server's** status
 page, in the same three forms; fetching it connects to the server if need be.
+The client fetches the page and serves it under headers of its own, sandboxed
+(`Content-Security-Policy: sandbox`), so one server's page shares no browser
+origin with the client's page or another server's; a server that does not
+answer within 30 seconds is a `502`.
 Its JSON includes `version`, `server_node_id`, `routed_domains`,
 `routed_cidrs`, `host_aliases`, `dns_forwards`, `bridges`, `inbound_bridges`,
 and duplicate-id blocklist counts under `duplicate_id_blocklist`.

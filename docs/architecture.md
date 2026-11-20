@@ -238,7 +238,10 @@ per data stream. Authorized keys are loaded at startup.
 The client runs its local listeners independently of its destinations, so they
 stay bound whatever any connection is doing. Each destination is managed by its
 own future inside `ProxyClient::run`. Each proxy listener allows 256 active
-handlers, with at most 64 requests held while a destination connects. At
+handlers, with at most 64 requests held while a destination connects — up to
+8 of them set aside for each destination, the rest shared, so retries toward a
+server that is down cannot use up the holds an idle destination needs for its
+first request. At
 capacity, accepting pauses; excess holds are refused (the destination is still
 asked to connect). Each forward has its own 128-connection cap, within which
 its connections are held the same way.

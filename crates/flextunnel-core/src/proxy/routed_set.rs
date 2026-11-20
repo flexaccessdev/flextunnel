@@ -89,7 +89,7 @@ impl RoutedSet {
         let mut domains_suffix = Vec::new();
         let mut domains_all = false;
         for raw in domains {
-            let entry = raw.trim();
+            let entry = routing_key(raw.trim());
             if entry == "*" {
                 // Full-tunnel catch-all: match every hostname.
                 domains_all = true;
@@ -150,7 +150,7 @@ impl RoutedSet {
         if self.domains_all {
             return true;
         }
-        let host = host.to_ascii_lowercase();
+        let host = routing_key(host).to_ascii_lowercase();
         self.domains_exact.contains(&host)
             || self
                 .domains_suffix
@@ -177,7 +177,7 @@ impl RoutedSet {
     }
 
     fn host_specificity(&self, host: &str) -> Option<Specificity> {
-        let host = host.to_ascii_lowercase();
+        let host = routing_key(host).to_ascii_lowercase();
         if self.domains_exact.contains(&host) {
             return Some(Specificity::Exact);
         }
@@ -227,7 +227,7 @@ impl RoutedSet {
     /// as [`RoutedSet::new`]; the error names the offending rule.
     pub fn validate_rules_reachable(&self, domains: &[String], cidrs: &[String]) -> Result<()> {
         for raw in domains {
-            let entry = raw.trim();
+            let entry = routing_key(raw.trim());
             let reachable = if entry == "*" {
                 // A `*` rule fires for any routed hostname, so it is dead only
                 // when the set routes no hostnames at all.
@@ -295,6 +295,20 @@ impl RoutedSet {
 
 /// Parse a host string as an IP literal, tolerating a single bracketed IPv6 form
 /// (`[2606:4700::1]`). Returns `None` for genuine hostnames.
+/// The form of a hostname that routing compares: without the DNS root dot.
+/// `db.internal.` and `db.internal` are one name, so they must select one
+/// route — on the client's table, a server's routed set and the reserved
+/// namespace alike. Only the comparison uses this; a target keeps its own
+/// spelling for resolution.
+pub(crate) fn routing_key(host: &str) -> &str {
+    match host.strip_suffix('.') {
+        // Only a dot that ends a label is the root: `*.` and `a..` are
+        // malformed, and stay as written for their callers to reject.
+        Some(name) if !name.is_empty() && !name.ends_with(['.', '*']) => name,
+        _ => host,
+    }
+}
+
 fn parse_ip_literal(host: &str) -> Option<IpAddr> {
     let unbracketed = host
         .strip_prefix('[')
@@ -352,6 +366,20 @@ mod tests {
         assert!(full.allows(&domain("anything.example")));
         assert!(full.allows(&ip("8.8.8.8")));
         assert!(full.allows(&ip("[2606:4700::1]")));
+    }
+
+    /// The DNS root dot is not part of the name routing compares: a rule and
+    /// a request match with or without it.
+    #[test]
+    fn the_root_dot_does_not_change_a_match() {
+        let w = rs(&["example.com", "*.corp.example."], &[]);
+        for host in ["example.com", "example.com.", "EXAMPLE.com.", "api.corp.example", "api.corp.example."] {
+            assert!(w.allows(&domain(host)), "{host}");
+        }
+        assert_eq!(w.specificity(&domain("example.com.")), Some(Specificity::Exact));
+        assert!(!w.allows(&domain("corp.example.")), "the apex stays out of a wildcard");
+        assert!(!w.allows(&domain("other.example.")));
+        assert_eq!(w.rules(), ["*.corp.example", "example.com"]);
     }
 
     #[test]
