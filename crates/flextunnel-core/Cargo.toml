@@ -24,7 +24,6 @@ iroh.workspace = true
 log.workspace = true
 n0-future.workspace = true
 rand.workspace = true
-reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
