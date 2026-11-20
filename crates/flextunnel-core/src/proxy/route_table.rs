@@ -185,6 +185,16 @@ fn validate_routed_domain(raw: &str) -> Result<(), String> {
     if entry == "*" {
         return Ok(());
     }
+    // An address here would be a rule that never matches: an IP target is
+    // routed by the networks alone, so the traffic it was meant to tunnel
+    // would connect directly instead.
+    let unbracketed = entry
+        .strip_prefix('[')
+        .and_then(|e| e.strip_suffix(']'))
+        .unwrap_or(entry);
+    if unbracketed.parse::<IpAddr>().is_ok() {
+        return Err("it is an IP address, which routed_cidrs routes — list it there".into());
+    }
     let name = entry.strip_prefix("*.").unwrap_or(entry);
     crate::forwards::validate_remote_host(name)
         .map(|_| ())
@@ -390,13 +400,35 @@ mod tests {
             );
         }
         // Every accepted form still is: the catch-all, exact names (internal
-        // ones with underscores included), wildcards, an address in name form.
+        // ones with underscores included) and wildcards.
         table(&[(
             "m1.internal",
-            &["*", "db.internal", "my_host", "*.corp.example", " Padded.Example ", "10.0.0.5", "fqdn.example."],
+            &["*", "db.internal", "my_host", "*.corp.example", " Padded.Example ", "fqdn.example."],
             &[],
         )])
         .unwrap();
+    }
+
+    /// An address among the routed domains would never match — IP targets are
+    /// routed by the networks only — and so would send what it was meant to
+    /// tunnel out directly. It is refused, with where it belongs.
+    #[test]
+    fn an_address_is_not_a_routed_domain() {
+        for address in ["10.20.30.40", " 10.20.30.40 ", "2001:db8::1", "[2001:db8::1]"] {
+            let message = table(&[("m1.internal", &[address], &[])]).unwrap_err().to_string();
+            assert!(
+                message.contains("routed_domains")
+                    && message.contains(&format!("{address:?}"))
+                    && message.contains("routed_cidrs"),
+                "{address:?}: {message}"
+            );
+        }
+        // Where it belongs, it routes the address in either target form.
+        let t = table(&[("m1.internal", &[], &["10.20.30.40"])]).unwrap();
+        let literal = domain("10.20.30.40", 443);
+        assert_eq!(t.route(&literal), connect_to(0, literal.clone()));
+        let ip = Target::Ip("10.20.30.40:443".parse().unwrap());
+        assert_eq!(t.route(&ip), connect_to(0, ip.clone()));
     }
 
     /// A name with the DNS root dot is the same name: it takes the same route

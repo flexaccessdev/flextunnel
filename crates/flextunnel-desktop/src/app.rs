@@ -347,9 +347,11 @@ impl std::fmt::Display for ImportSummary {
 
 /// The client with an imported set of destinations and forwards merged in, or
 /// why they do not fit. An import is all or nothing: the file's destinations
-/// are checked first, every one of them — a host the core would refuse, or a
-/// host or server the file names twice, rejects the import before anything is
-/// merged, rather than quietly leaving an entry out.
+/// are checked first, every one of them, the way the form checks one — a host,
+/// server node id or relay list the client could not start with, or a host or
+/// server the file names twice, rejects the import before anything is merged,
+/// rather than quietly leaving an entry out or saving one that stops every
+/// destination from starting.
 ///
 /// A destination whose server node id is already here replaces that
 /// destination's settings but keeps its id and auth-key reference — and its
@@ -368,8 +370,15 @@ fn merge_imported(
     let mut incoming_destinations = imported.destinations;
     let (mut hosts, mut servers) = (std::collections::HashSet::new(), std::collections::HashSet::new());
     for destination in &mut incoming_destinations {
-        // Stored the way the core spells it, like a host typed into the form.
+        // Stored the way the core spells them, like what is typed into the
+        // form: one server is one id, so the match against the destinations
+        // already here (and the duplicate check below) is on that spelling.
         destination.host = validate_destination_host(&destination.host)?;
+        let named = |e: String| format!("destination \"{}\": {e}", destination.host);
+        destination.server_node_id =
+            parse_server_node_id(&destination.server_node_id).map_err(named)?;
+        // An import carries no token, so its relays stand on their own.
+        check_relays(&destination.relay_urls, None).map_err(named)?;
         if !hosts.insert(destination.host.clone()) {
             return Err(format!(
                 "the file has destination \"{}\" more than once",
@@ -447,6 +456,29 @@ fn merge_imported(
     Ok((merged, summary))
 }
 
+/// A server node id as the session will parse it, in the parser's own
+/// spelling: an id that is stored is one the client can dial, and one server
+/// is one id however it was typed.
+fn parse_server_node_id(input: &str) -> Result<String, String> {
+    input
+        .trim()
+        .parse::<flextunnel_core::iroh::EndpointId>()
+        .map(|id| id.to_string())
+        .map_err(|e| format!("Server node id is not an endpoint id: {e}"))
+}
+
+/// The core's own relay rules — URLs that parse, enough of them, a token only
+/// with custom relays — so relay settings that are stored are ones the client
+/// can start with.
+fn check_relays(relay_urls: &[String], relay_auth_token: Option<String>) -> Result<(), String> {
+    flextunnel_core::transport::endpoint::RelayConfig::from_urls_with_token(
+        relay_urls,
+        relay_auth_token,
+    )
+    .map(|_| ())
+    .map_err(|e| format!("{e:#}"))
+}
+
 /// Whether the session behind `snapshot` was started with exactly the saved
 /// settings: the same ports, destinations and key secrets.
 fn runs_saved_settings(snapshot: &ClientSnapshot, client: &ClientSettings, keys: &[AuthKey]) -> bool {
@@ -510,13 +542,7 @@ impl DestinationForm {
         if server_node_id.is_empty() {
             return Err("Server node id is required".into());
         }
-        // The parser the session starts with, and its spelling of the id: an
-        // id that saves here is one the client can dial, and one server is
-        // one id however it was typed.
-        let server_node_id = server_node_id
-            .parse::<flextunnel_core::iroh::EndpointId>()
-            .map_err(|e| format!("Server node id is not an endpoint id: {e}"))?
-            .to_string();
+        let server_node_id = parse_server_node_id(server_node_id)?;
         // One destination per server: a second name for the same server is an
         // accidental duplicate, not a use case (and the core refuses it).
         if let Some(other) = others().find(|d| d.server_node_id == server_node_id) {
@@ -554,13 +580,7 @@ impl DestinationForm {
             let token = self.relay_auth_token.trim();
             (!token.is_empty()).then(|| token.to_string())
         };
-        // The core's own relay rules (how many URLs, a token only with custom
-        // relays), so a destination that saves is one the client can start.
-        flextunnel_core::transport::endpoint::RelayConfig::from_urls_with_token(
-            &relay_urls,
-            relay_auth_token.clone(),
-        )
-        .map_err(|e| format!("{e:#}"))?;
+        check_relays(&relay_urls, relay_auth_token.clone())?;
         Ok(Destination {
             id: self.editing_id.clone().unwrap_or_else(Destination::new_id),
             host,
@@ -3000,6 +3020,36 @@ mod tests {
             // A valid entry before it does not get the import through.
             assert!(import(vec![existing_destination("a"), bad]).is_err(), "{bad_host:?}");
         }
+
+        // What the client could not start with is refused too, by name: a
+        // server node id that is not one, relays that do not parse or are
+        // too few.
+        for bad_id in ["", "!", "node-b"] {
+            let mut bad = existing_destination("b");
+            bad.server_node_id = bad_id.into();
+            let err = import(vec![existing_destination("a"), bad]).unwrap_err();
+            assert!(err.contains("\"b.internal\"") && err.contains("not an endpoint id"), "{bad_id:?}: {err}");
+        }
+        for bad_relays in [&["not a url", "https://b.example"][..], &["https://only.example"][..]] {
+            let mut bad = existing_destination("b");
+            bad.relay_urls = bad_relays.iter().map(|u| u.to_string()).collect();
+            let err = import(vec![existing_destination("a"), bad]).unwrap_err();
+            assert!(err.contains("\"b.internal\"") && err.contains("relay"), "{bad_relays:?}: {err}");
+        }
+        // Replacing a working destination is held to the same: its relays
+        // are not swapped for ones that would stop the client starting.
+        let mut breaking = current.destinations[0].clone();
+        breaking.relay_urls = vec!["https://only.example".into()];
+        assert!(import(vec![breaking]).is_err());
+
+        // A server id spelled another way is the same server: it replaces
+        // the destination already here instead of being added beside it.
+        let mut respelled = current.destinations[0].clone();
+        respelled.server_node_id = format!("  {}  ", node_id("p1"));
+        respelled.routed_domains = vec!["*.corp.example".into()];
+        let (merged, summary) = import(vec![respelled]).expect("the same server");
+        assert_eq!((summary.destinations_replaced, summary.destinations_added), (1, 0));
+        assert_eq!(merged.destinations[0].server_node_id, node_id("p1"));
 
         // A host spelled another way is stored the way the core spells it.
         let mut shouting = existing_destination("b");

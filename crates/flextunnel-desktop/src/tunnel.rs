@@ -647,11 +647,12 @@ async fn run_client(
     };
     // Building the client validates the hosts and routes together and dials
     // nothing.
+    // Shared, so a connection-path probe can run on a task of its own.
     let client = match ProxyClient::new(ClientConfig {
         destinations,
         idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
     }) {
-        Ok(client) => client,
+        Ok(client) => Arc::new(client),
         Err(e) => return slot.fail(e.to_string()),
     };
 
@@ -722,8 +723,15 @@ async fn run_client(
                         log::warn!("No destination \"{host}\" in the running client");
                     }
                 }
+                // On its own task, never awaited here: the snapshot probes the
+                // destination's custom relays over HTTP (~3s worst case), and
+                // this loop is what drives the client — its accept loops and
+                // every destination's manager would stand still meanwhile.
                 Some(SessionCmd::QueryConnPath(host, reply)) => {
-                    let _ = reply.send(client.connection_snapshot(&host).await);
+                    let client = Arc::clone(&client);
+                    tokio::spawn(async move {
+                        let _ = reply.send(client.connection_snapshot(&host).await);
+                    });
                 }
                 Some(SessionCmd::Stop) | None => {
                     log::info!("Stopping the client");

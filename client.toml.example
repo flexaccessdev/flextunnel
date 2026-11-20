@@ -54,8 +54,8 @@ auth_key_file = "~/.config/flextunnel/client.key"
 # relay_auth_token = "shared-relay-secret"
 
 # How long a destination's connection is kept with nothing using it, in
-# seconds. Default: 300. `0` never closes an idle connection (it is still only
-# opened on first use). A connection with an open stream — an ssh session, a
+# seconds. Default: 300, at most 31536000 (one year). `0` never closes an idle
+# connection (it is still only opened on first use). A connection with an open stream — an ssh session, a
 # download — is never idle, however long it lasts. The first use after an idle
 # close pays for a fresh connection; raise this if that delay is noticeable
 # (most likely with custom relays, which are probed before each one).
@@ -71,7 +71,8 @@ auth_key_file = "~/.config/flextunnel/client.key"
 #   server_node_id  The server's EndpointId (from `flextunnel show-iroh-id`).
 #   routed_domains  Optional further names sent through this server: an exact
 #                   name, a `*.suffix` wildcard (subdomains only), or `*` for
-#                   every hostname. Resolved on the server (its host aliases
+#                   every hostname. Names only — an IP address goes under
+#                   routed_cidrs. Resolved on the server (its host aliases
 #                   and DNS forwards apply).
 #   routed_cidrs    Optional further networks or bare IPs sent through this
 #                   server. `*` never covers IP literals; pair it with

@@ -155,6 +155,12 @@ const MAX_ACTIVE_LOCAL_CONNS: usize = 256;
 /// an immediate network-unreachable reply (the destination is still asked to
 /// connect).
 const MAX_HELD_CONNS: usize = 64;
+/// Longest idle timeout a client accepts. The timeout is added to the time a
+/// connection was last used, and a value near the limits of the clock would
+/// overflow that sum — a panic, long after start, the first time a connection
+/// falls unused. Nothing sensible is lost: a connection that should never be
+/// closed for idleness has no timeout at all.
+pub const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 /// How many of a listener's [`MAX_HELD_CONNS`] holds are set aside for each
 /// destination (fewer when there are too many destinations to give each this
 /// many). Every first use of an idle destination needs a hold while it
@@ -469,6 +475,16 @@ impl ProxyClient {
         } = config;
         if destinations.is_empty() {
             return Err(ProxyError::config("the client has no destinations configured"));
+        }
+        if let Some(idle_timeout) = idle_timeout
+            && idle_timeout > MAX_IDLE_TIMEOUT
+        {
+            return Err(ProxyError::config(format!(
+                "the idle timeout of {}s is longer than the {}s (one year) allowed; to never \
+                 close an idle connection, set it to 0",
+                idle_timeout.as_secs(),
+                MAX_IDLE_TIMEOUT.as_secs()
+            )));
         }
         let specs: Vec<RouteSpec<'_>> = destinations
             .iter()
@@ -1514,6 +1530,28 @@ mod tests {
                 "os error {code} should be broken"
             );
         }
+    }
+
+    /// An idle timeout the clock could not add to a moment is refused when the
+    /// client is built, not found out by a panic once a connection falls
+    /// unused. No timeout at all stays the way to never close one.
+    #[test]
+    fn an_oversized_idle_timeout_is_refused_at_construction() {
+        let build = |idle_timeout| {
+            ProxyClient::new(ClientConfig {
+                destinations: vec![test_destination("m1.internal", 1, &[], &[])],
+                idle_timeout,
+            })
+        };
+        for too_long in [Duration::MAX, Duration::from_secs(u64::MAX), MAX_IDLE_TIMEOUT + Duration::from_secs(1)] {
+            let err = build(Some(too_long)).err().expect("refused").to_string();
+            assert!(err.contains("idle timeout") && err.contains("set it to 0"), "{err}");
+        }
+        for fine in [None, Some(Duration::ZERO), Some(Duration::from_secs(300)), Some(MAX_IDLE_TIMEOUT)] {
+            assert!(build(fine).is_ok(), "{fine:?}");
+        }
+        // What an accepted timeout is added to cannot overflow.
+        assert!(tokio::time::Instant::now().checked_add(MAX_IDLE_TIMEOUT).is_some());
     }
 
     /// The hold budget keeps its total, gives every destination a share no
