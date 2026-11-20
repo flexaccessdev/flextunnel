@@ -1895,8 +1895,8 @@ dependencies = [
 
 [[package]]
 name = "flexaccess-iroh"
-version = "0.0.15"
-source = "git+https://github.com/flexaccessdev/flexaccess-iroh?tag=v0.0.15#f045159b9f8836e12a0f26d7454122f5ec0521ab"
+version = "0.0.16"
+source = "git+https://github.com/flexaccessdev/flexaccess-iroh?tag=v0.0.16#3ac94ac85fcfc449c591a57b6405a38c484d2b3a"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1905,9 +1905,12 @@ dependencies = [
  "iroh",
  "iroh-mdns-address-lookup",
  "log",
+ "reqwest",
  "rustls",
+ "serde",
  "swarm-discovery",
  "tokio",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1922,7 +1925,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-cli"
-version = "0.0.96"
+version = "0.0.97"
 dependencies = [
  "anyhow",
  "clap",
@@ -1939,7 +1942,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-core"
-version = "0.0.96"
+version = "0.0.97"
 dependencies = [
  "anyhow",
  "askama",
@@ -1956,7 +1959,6 @@ dependencies = [
  "log",
  "n0-future",
  "rand 0.10.4",
- "reqwest",
  "rustls",
  "serde",
  "serde_json",
@@ -1970,7 +1972,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-desktop"
-version = "0.0.96"
+version = "0.0.97"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
@@ -2002,7 +2004,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-ffi"
-version = "0.0.96"
+version = "0.0.97"
 dependencies = [
  "flextunnel-core",
  "iroh",
