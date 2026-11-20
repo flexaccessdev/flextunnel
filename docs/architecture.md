@@ -59,45 +59,35 @@ Core paths below are relative to `crates/flextunnel-core/src/`.
 | `proxy/routed_set.rs` | Domain/CIDR matching on client and server |
 | `proxy/server.rs`, `proxy/dial.rs` | Connection handling, routed-set checks and outbound TCP connections |
 | `proxy/reserved.rs`, `proxy/status_page.rs` | The reserved `flextunnel.internal` namespace; the server status page and shared HTTP plumbing |
-| `proxy/bridge.rs`, `proxy/dns_forward.rs` | Server-to-server bridges and conditional DNS resolution |
+| `proxy/dns_forward.rs` | Conditional DNS resolution on the server |
 | `forwards.rs`, `proxy/forward.rs` | Forward definitions and loopback forward listeners |
 
 `crates/flextunnel-cli/src/` holds command dispatch, client supervision, IPC and
 the read-only terminal panel. `flextunnel-desktop` embeds core directly;
 `flextunnel-ffi` exposes it to the iOS app.
 
-Bridges forward matching targets from server A to server B over a persistent
-`BRIDGE_ALPN` connection. B must allow A's persistent endpoint id in
-`allowed_bridge_servers`; B then checks its own routed set, applies its
-aliases/DNS forwards and connects from its network. Incoming bridge streams are
-never bridged again, so forwarding is single-hop. Startup validation requires
-A's routed set to cover its bridge rules.
-
 ## Connection lifecycle
 
 ### 1. ALPN
 Clients connect with the fixed constant `flextunnel/1` (`transport::ALPN`);
-bridging servers connect with `flextunnel-bridge/1` (`transport::BRIDGE_ALPN`);
 quick-mode clients connect with `flextunnel-quick/1` (`transport::QUICK_ALPN`).
 The ALPN is a protocol-negotiation label sent **unencrypted** in the TLS/QUIC
 handshake, not a secret: it carries the peer's *role*, never a credential.
-Keypair-client access control is the auth handshake below; bridge and quick-client
-access control is an endpoint-id allowlist (`allowed_bridge_servers`, or the
-single client id entered on a quick server), enforced **natively at the TLS
-handshake** by an iroh `EndpointHooks::after_handshake` hook
-(`transport::endpoint::AllowlistHook` over `EndpointAllowlists`) — a
-non-allowlisted peer's connection is closed with the reason before it ever
+Keypair-client access control is the auth handshake below; quick-client access
+control is an endpoint-id allowlist (the single client id entered on a quick
+server), enforced **natively at the TLS handshake** by an iroh
+`EndpointHooks::after_handshake` hook (`transport::endpoint::AllowlistHook`) —
+a non-allowlisted client's connection is closed with the reason before it ever
 reaches the accept loop, and the id needs no further proof because iroh's
-handshake authenticates it. An empty set disables its ALPN entirely (a normal
-server rejects every quick dial; a no-bridging server rejects every bridge).
+handshake authenticates it. An empty allowlist disables the quick ALPN
+entirely (a normal server rejects every quick dial).
 
 ### 2. Auth handshake (control stream)
 The protocol version is `PROTOCOL_VERSION = 14`. On the first bi-stream a
 client sends
 `Hello { version, auth?, client_instance_nonce, duplicate_server_observed }`
 where `auth` is `ClientAuthPayload { public_key, endpoint_id, signature }`
-(a bridge sends the minimal `BridgeHello { version }` — its authentication
-already happened at the TLS handshake) and the server replies
+and the server replies
 `HelloResponse { version, accepted, reject_reason, server_instance_nonce }`,
 both length-prefixed JSON via `signaling::write_message` / `read_message` (4-byte
 big-endian length + payload, capped at `MAX_HANDSHAKE_SIZE` = 64 KiB). On the
@@ -151,17 +141,14 @@ local app with no translation table. The header is parsed with `read_exact`
 
 ### 4. Server-side resolve + connect
 The server reads the `StreamRequest`. Two kinds are served outside the
-routed-set whitelist, bridges and host aliases: **loopback** is dialed as the
-server's own `localhost` on the requested port, and **status** answers the HTTP
-request that follows with the server status page. Both are refused on a stream
-that arrived over a bridge — a bridging server forwards its clients' routed
-targets, nothing else.
+routed-set whitelist and host aliases: **loopback** is dialed as the server's
+own `localhost` on the requested port, and **status** answers the HTTP request
+that follows with the server status page.
 
-A **connect** request is checked against the routed set before selecting a
-bridge or applying a host alias; a name in the reserved `flextunnel.internal`
-namespace is refused before that check, so no `routed_domains = ["*"]` can
-capture it (the client answers that namespace itself and never sends it). A
-matching bridge receives the original target; otherwise the server applies any
+A **connect** request is checked against the routed set before a host alias is
+applied; a name in the reserved `flextunnel.internal` namespace is refused
+before that check, so no `routed_domains = ["*"]` can capture it (the client
+answers that namespace itself and never sends it). The server then applies any
 alias and dials locally. Hostnames use a matching conditional DNS forward or
 the server's system resolver, and the server tries the resolved addresses in
 turn until one accepts. Loopback targets try both IPv4 and IPv6; other literal
@@ -373,8 +360,8 @@ catches accidental identity reuse.
 - Normal clients authenticate with an Ed25519 signature bound to their
   TLS-authenticated endpoint id under flextunnel's auth context. Key encoding
   and files use [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys).
-- Bridges and quick-mode clients authenticate through endpoint-id allowlists.
-  ALPN labels select the protocol role and carry no credential.
+- Quick-mode clients authenticate through an endpoint-id allowlist. ALPN
+  labels select the protocol role and carry no credential.
 - Every admitted client can reach the server's own loopback services (a
   loopback stream request, which a client sends for a destination's own host)
   and its status page, whatever the routed set says. Authorize keys
@@ -400,7 +387,7 @@ catches accidental identity reuse.
 | `IDLE_CLOSE_TIMEOUT` (idle destination, endpoint close) | 5s | `proxy/destination.rs` |
 | `DEFAULT_IDLE_TIMEOUT` (unused connection kept) | 300s | `config.rs` |
 | `CONNECT_TIMEOUT` (client server connect) | 30s | `proxy/client.rs` |
-| `HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs`, `proxy/server.rs`, `proxy/bridge.rs` |
+| `HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs`, `proxy/server.rs` |
 | `REQUEST_READ_TIMEOUT` / `REQUEST_HEAD_LIMIT` (status requests) | 5s / 64 KiB | `proxy/status_page.rs` |
 | `LOCAL_HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs` |
 | `TUNNEL_OPEN_TIMEOUT` | 30s | `proxy/client.rs` |
@@ -416,7 +403,6 @@ catches accidental identity reuse.
 | `PROTOCOL_VERSION` | 14 | `proxy/signaling.rs` |
 | client key encoding | ed25519, base64url (32-byte keys, 64-byte sigs) | flexaccess-keys, flexaccess-iroh `auth` |
 | `ALPN` | `flextunnel/1` | `transport/mod.rs` |
-| `BRIDGE_ALPN` | `flextunnel-bridge/1` | `transport/mod.rs` |
 | `QUICK_ALPN` | `flextunnel-quick/1` | `transport/mod.rs` |
 
 ## Relation to ezvpn

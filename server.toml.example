@@ -25,17 +25,6 @@ authorized_keys_file = "./authorized_keys"
 # relay_urls = ["https://relay.example"]
 # relay_auth_token = "shared-relay-secret"
 
-# Optional INBOUND bridging: allow other flextunnel servers to bridge INTO this
-# server (the inbound counterpart to the [bridges.*] OUTBOUND routes at the
-# bottom of this file). The allowlist is the sole bridge credential: a
-# connecting bridge's endpoint id (TLS-authenticated by iroh, no extra proof
-# needed) must be listed here, enforced natively at the handshake. An
-# empty/absent allowlist disables inbound bridging entirely. Bridged-in
-# targets must also be on this server's routed set (routed_domains/routed_cidrs
-# below). This is a top-level key, so it must appear BEFORE the [tables]
-# below (bare keys after a [table] header would bind to that table).
-# allowed_bridge_servers = ["<endpoint id of the bridging server>"]
-
 # Duplicate-id blocklist (JSON). This path is fixed at
 # ~/.config/flextunnel/blocklist.json and is deliberately not configurable. The
 # server records confirmed duplicate client ids here, and its own id if it
@@ -139,32 +128,3 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 # [dns_forwards]
 # "local.168234.xyz" = ["10.0.0.53"]              # -> internal resolver on :53
 # "corp.example.com" = ["10.1.0.10:5353", "10.1.0.11"]  # custom port + failover
-
-# Optional OUTBOUND bridge routes: forward matching targets to ANOTHER
-# flextunnel server over a persistent server-to-server connection (split-tunnel
-# across servers), instead of dialing them from this server's network. The
-# matched target is forwarded VERBATIM — the target server applies its own
-# host_aliases and dns_forwards, resolves domain targets on its side, and
-# re-enforces its own routed set. Single hop: a stream that arrived over a
-# bridge is never bridged again, so two servers bridging at each other cannot
-# loop.
-#
-# Each entry needs the target server's endpoint id and at least one rule; no
-# credential — this server dials out with its own server identity, and that
-# TLS-authenticated endpoint id is what the target server must list in ITS
-# allowed_bridge_servers. Rules use the routed-set syntax above (domains:
-# exact, `*.x`, or `*`; cidrs: CIDR or bare IP). Checked BEFORE
-# [host_aliases]/local dialing; when several bridges match, the first in name
-# order wins. Every rule must be reachable through the routed set above (the
-# whitelist runs first), or the server refuses to start. The upstream
-# connection is maintained with reconnect/backoff; while it is down, matching
-# requests fail as host-unreachable.
-# [bridges.lab]
-# endpoint_id = "<endpoint id of the target server>"
-# domains = ["*.svc"]
-# cidrs = ["fd34::/64"]
-
-# INBOUND bridging (letting other flextunnel servers bridge INTO this one) is
-# configured via the top-level `allowed_bridge_servers` key near the top of
-# this file — top-level keys must precede the [tables] above, so it can't live
-# down here beside the outbound routes.

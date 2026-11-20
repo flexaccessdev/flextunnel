@@ -1,13 +1,13 @@
 //! flextunnel's endpoints: what this program layers onto the shared
-//! [`flexaccess_iroh::endpoint`] builder — its three ALPNs, the native
-//! per-ALPN allowlist hook, the client/server identity rules, and the
+//! [`flexaccess_iroh::endpoint`] builder — its two ALPNs, the native
+//! quick-client allowlist hook, the client/server identity rules, and the
 //! client's rebuildable endpoint handle ([`ClientEndpoint`], the reconnect
 //! loop's escalation for a wedged endpoint). Relay configuration, the
 //! per-relay startup probe, the bind-and-come-online policy, and the server's
 //! in-place home-relay failover come from the shared crate; the server's
 //! secret-key file is [`crate::secret`]'s.
 
-use crate::transport::{ALPN, BRIDGE_ALPN, QUICK_ALPN, build_quic_transport_config};
+use crate::transport::{ALPN, QUICK_ALPN, build_quic_transport_config};
 use anyhow::{Context, Result};
 use flexaccess_iroh::endpoint::{
     CreatedEndpoint, EndpointOptions, create_endpoint, endpoint_builder,
@@ -26,79 +26,49 @@ use std::time::Duration;
 
 pub use flexaccess_iroh::relay::{RELAY_CONNECT_TIMEOUT, RelayConfig};
 
-/// QUIC application close code sent when a connection is rejected by an
-/// endpoint-id allowlist — a non-allowlisted bridge on [`BRIDGE_ALPN`] or a
-/// non-allowlisted quick client on [`QUICK_ALPN`] (distinct from the in-band
+/// QUIC application close code sent when a quick client on [`QUICK_ALPN`] is
+/// rejected by the endpoint-id allowlist (distinct from the in-band
 /// auth-failure code `1` and the duplicate-id code `2` used on the keypair
 /// client path).
 pub const CLOSE_NOT_ALLOWLISTED: u32 = 3;
 
-/// The server's per-ALPN endpoint-id allowlists, enforced natively at the TLS
-/// handshake by [`AllowlistHook`]. An empty set disables its ALPN entirely —
-/// the allowlist is the sole and mandatory credential on both.
-#[derive(Debug, Default, Clone)]
-pub struct EndpointAllowlists {
-    /// Servers allowed to bridge into this server over [`BRIDGE_ALPN`].
-    pub bridge_servers: HashSet<EndpointId>,
-    /// Clients allowed to connect over [`QUICK_ALPN`] (quick mode — normally a
-    /// single id, entered on the quick server).
-    pub quick_clients: HashSet<EndpointId>,
-}
-
 /// Native allowlist access control: an [`EndpointHooks`] that rejects inbound
-/// [`BRIDGE_ALPN`] / [`QUICK_ALPN`] connections whose TLS-authenticated
-/// endpoint id is not on the matching [`EndpointAllowlists`] set. Runs the
-/// moment the handshake completes, so a rejected peer never reaches the accept
-/// loop; the dialer sees the connection close with [`CLOSE_NOT_ALLOWLISTED`]
-/// and the reason text.
+/// [`QUICK_ALPN`] connections whose TLS-authenticated endpoint id is not one
+/// of the allowed quick clients. Runs the moment the handshake completes, so
+/// a rejected peer never reaches the accept loop; the dialer sees the
+/// connection close with [`CLOSE_NOT_ALLOWLISTED`] and the reason text.
 ///
-/// Only the accepting side is gated: outbound dials (this server bridging
-/// *out*) pass through, as do inbound [`ALPN`] client connections (gated by
-/// their keypair handshake).
+/// The allowlist is the sole and mandatory credential on that ALPN, so an
+/// empty set disables quick mode entirely. Inbound [`ALPN`] client
+/// connections pass through (gated by their keypair handshake).
 #[derive(Debug)]
 pub struct AllowlistHook {
-    allowlists: EndpointAllowlists,
+    /// Clients allowed to connect over [`QUICK_ALPN`] (normally a single id,
+    /// entered on the quick server).
+    quick_clients: HashSet<EndpointId>,
 }
 
 impl AllowlistHook {
-    pub fn new(allowlists: EndpointAllowlists) -> Self {
-        Self { allowlists }
+    pub fn new(quick_clients: HashSet<EndpointId>) -> Self {
+        Self { quick_clients }
     }
 }
 
 impl EndpointHooks for AllowlistHook {
     async fn after_handshake(&self, conn: &Connection) -> AfterHandshakeOutcome {
-        if conn.side() != Side::Server {
+        if conn.side() != Side::Server || conn.alpn() != QUICK_ALPN {
             return AfterHandshakeOutcome::Accept;
         }
-        let alpn = conn.alpn();
-        let (allowed, kind, disabled_reason, rejected_reason) = if alpn == BRIDGE_ALPN {
-            (
-                &self.allowlists.bridge_servers,
-                "bridge",
-                "bridging is not enabled on this server",
-                "server id is not on this server's bridge allowlist",
-            )
-        } else if alpn == QUICK_ALPN {
-            (
-                &self.allowlists.quick_clients,
-                "quick client",
-                "quick mode is not enabled on this server",
-                "client id is not on this server's quick-client allowlist",
-            )
-        } else {
-            return AfterHandshakeOutcome::Accept;
-        };
         let remote_id = conn.remote_id();
-        if allowed.contains(&remote_id) {
+        if self.quick_clients.contains(&remote_id) {
             return AfterHandshakeOutcome::Accept;
         }
-        let reason = if allowed.is_empty() {
-            disabled_reason
+        let reason = if self.quick_clients.is_empty() {
+            "quick mode is not enabled on this server"
         } else {
-            rejected_reason
+            "client id is not on this server's quick-client allowlist"
         };
-        log::warn!("Rejecting {kind} {remote_id}: {reason}");
+        log::warn!("Rejecting quick client {remote_id}: {reason}");
         AfterHandshakeOutcome::Reject {
             error_code: VarInt::from_u32(CLOSE_NOT_ALLOWLISTED),
             reason: reason.as_bytes().to_vec(),
@@ -121,28 +91,27 @@ fn base_builder(relay_config: &RelayConfig, publish_address: bool) -> Result<End
 }
 
 /// A server endpoint builder: persistent identity (published on the default
-/// relays), all three server ALPNs, the allowlist hook.
+/// relays), both server ALPNs, the allowlist hook.
 fn server_builder(
     relay_config: &RelayConfig,
     secret: SecretKey,
-    allowlists: EndpointAllowlists,
+    quick_clients: HashSet<EndpointId>,
 ) -> Result<EndpointBuilder> {
     Ok(base_builder(relay_config, true)?
-        .alpns(vec![ALPN.to_vec(), BRIDGE_ALPN.to_vec(), QUICK_ALPN.to_vec()])
-        .hooks(AllowlistHook::new(allowlists))
+        .alpns(vec![ALPN.to_vec(), QUICK_ALPN.to_vec()])
+        .hooks(AllowlistHook::new(quick_clients))
         .secret_key(secret))
 }
 
 /// Create a server endpoint with a persistent identity, accepting the client
-/// [`ALPN`], the bridge [`BRIDGE_ALPN`], and the quick-client [`QUICK_ALPN`].
-/// Inbound bridge and quick-client connections are gated natively by an
-/// [`AllowlistHook`] over `allowlists` (an empty set = that path disabled).
+/// [`ALPN`] and the quick-client [`QUICK_ALPN`]. Inbound quick-client
+/// connections are gated natively by an [`AllowlistHook`] over
+/// `quick_clients` (an empty set = quick mode disabled).
 ///
 /// A single endpoint serves both relay modes. With the default relays internet
 /// discovery is on, so the server publishes its current home relay and clients
 /// resolve it by endpoint ID. With custom relays discovery is off, so clients
-/// reach the server through relay hints, while outbound bridges attach those
-/// same hints to their target `EndpointAddr`. Every custom relay is probed
+/// reach the server through relay hints. Every custom relay is probed
 /// (startup fails only if none answers), the endpoint is bound without the
 /// relays that failed and must come online. The relays left out come back in
 /// [`CreatedEndpoint::relays_left_out`] for the home-relay failover (run by
@@ -150,9 +119,9 @@ fn server_builder(
 pub async fn create_server_endpoint(
     relay_config: &RelayConfig,
     secret: SecretKey,
-    allowlists: EndpointAllowlists,
+    quick_clients: HashSet<EndpointId>,
 ) -> Result<CreatedEndpoint> {
-    create_endpoint(relay_config, server_builder(relay_config, secret, allowlists)?).await
+    create_endpoint(relay_config, server_builder(relay_config, secret, quick_clients)?).await
 }
 
 /// A client endpoint builder. A client never publishes its address (it only

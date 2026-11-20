@@ -81,8 +81,7 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Connect to `addr` with `alpn` bounded by [`CONNECT_TIMEOUT`], mapping both
-/// the timeout and the underlying connect error to a signaling error. Shared by
-/// the client (`ALPN`) and bridge (`BRIDGE_ALPN`) `establish()` flows.
+/// the timeout and the underlying connect error to a signaling error.
 pub(crate) async fn connect_with_timeout(
     endpoint: &Endpoint,
     addr: EndpointAddr,
@@ -422,10 +421,8 @@ fn target_host(target: &Target) -> String {
     }
 }
 
-/// Exponential backoff with jitter for the Nth (1-based) reconnect attempt.
-///
-/// Shared by every client destination and by [`crate::proxy::bridge`], whose
-/// reconnect policy mirrors the client's.
+/// Exponential backoff with jitter for the Nth (1-based) reconnect attempt,
+/// shared by every client destination.
 pub(crate) fn calculate_backoff(attempt: u32) -> Duration {
     // 2^(attempt-1) seconds; the shift is bounded well past where the cap
     // takes over, so it can never overflow.
@@ -716,10 +713,6 @@ impl ProxyClient {
 /// recomputed from the last heartbeat, so a foreground flip 50s into an idle
 /// minute sends the overdue beat immediately, and a background flip stretches
 /// the pending wait instead of firing one more fast beat.
-///
-/// Shared with [`crate::proxy::bridge`]: a bridge also sends heartbeats over its
-/// retained control stream, so it reuses this loop (with a receiver that is
-/// permanently foreground — servers have no battery to protect).
 pub(crate) async fn client_heartbeat_loop(
     mut send: SendStream,
     mut recv: RecvStream,

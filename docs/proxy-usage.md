@@ -161,8 +161,8 @@ The client fetches the page and serves it under headers of its own, sandboxed
 origin with the client's page or another server's; a server that does not
 answer within 30 seconds is a `502`.
 Its JSON includes `version`, `server_node_id`, `routed_domains`,
-`routed_cidrs`, `host_aliases`, `dns_forwards`, `bridges`, `inbound_bridges`,
-and duplicate-id blocklist counts under `duplicate_id_blocklist`.
+`routed_cidrs`, `host_aliases`, `dns_forwards`, and duplicate-id blocklist
+counts under `duplicate_id_blocklist`.
 
 `machine1.internal:<port>` — the destination's own host — is the server's own
 `localhost:<port>`, bypassing the server's routed set and host aliases.

@@ -79,9 +79,9 @@ Normal client connections authenticate with an ed25519 keypair:
   the secret never leaves the client, and a captured handshake cannot be
   replayed from another endpoint.
 
-(The keyless exceptions are server-to-server bridges and `--quick` sessions,
-whose credential is the peer's TLS-authenticated **EndpointId**, checked
-natively against an allowlist at the handshake — the `authorized_keys` model.)
+(The keyless exception is a `--quick` session, whose credential is the
+client's TLS-authenticated **EndpointId**, checked natively against an
+allowlist at the handshake — the `authorized_keys` model.)
 
 The QUIC ALPN is a fixed protocol identifier (`flextunnel/1`), not a secret: it
 ensures both peers speak the flextunnel protocol but provides no access control
@@ -349,8 +349,8 @@ For a throwaway "route everything through this box for a few minutes" session,
 `--quick` skips all of the above — no key files, no config. There is
 no keypair auth at all: each side enters the **other side's EndpointId**. The
 client's id becomes the server's one-entry allowlist (enforced natively at the
-TLS handshake, like bridge allowlisting), and dialing the server's id is itself
-what authenticates the server:
+TLS handshake), and dialing the server's id is itself what authenticates the
+server:
 
 ```sh
 # On the client host: prints this client's EndpointId (enter it on the server)
@@ -419,8 +419,8 @@ curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/servers/machine1
 ```
 
 That JSON includes `version`, `server_node_id`, `routed_domains`,
-`routed_cidrs`, `host_aliases`, `dns_forwards`, `bridges`, `inbound_bridges`,
-and duplicate-id blocklist counts under `duplicate_id_blocklist`.
+`routed_cidrs`, `host_aliases`, `dns_forwards`, and duplicate-id blocklist
+counts under `duplicate_id_blocklist`.
 
 Other `*.flextunnel.internal` names are reserved and answer with an HTTP 404.
 
@@ -428,7 +428,7 @@ Other `*.flextunnel.internal` names are reserved and answer with an HTTP 404.
 
 A destination's `host` **is** the server machine: `machine1.internal:8000` is
 port 8000 on that server's own `localhost`. No server config is needed — it
-bypasses the server's routed set, bridges and host aliases — and it is dialed
+bypasses the server's routed set and host aliases — and it is dialed
 on both `127.0.0.1` and `::1`, so a service bound to only one of them is still
 reached. It works from the proxies, as a forward's `remote_host`, and with
 `client nc`:
@@ -672,11 +672,8 @@ Private keys are always file references in a config (`secret_file`,
 and override any of these (`--auth-key` exists only as a CLI flag).
 
 The client's `[[destinations]]` and `[[forwards]]` are config-file only, as are
-the server's `routed_domains`, `routed_cidrs`, `host_aliases`, `dns_forwards`,
-outbound `[bridges.<name>]`, and inbound `allowed_bridge_servers`: they
-describe routing policy. Bridges carry no keypair: a bridging server
-authenticates by its TLS-authenticated endpoint id, which the receiving server
-must list in `allowed_bridge_servers` (enforced natively at the handshake).
+the server's `routed_domains`, `routed_cidrs`, `host_aliases` and
+`dns_forwards`: they describe routing policy.
 
 ## Host aliases (server-side)
 
