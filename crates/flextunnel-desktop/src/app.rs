@@ -2582,13 +2582,16 @@ impl App {
         };
         // Saved first: an import that is not on disk is not applied — not to
         // the settings shown, not to the running session — and not reported.
+        // An open form stays open then, with what was typed into it: nothing
+        // it was editing has changed.
         let previous = std::mem::replace(&mut self.client, client);
-        self.close_forms();
         if !self.persist_store() {
             self.client = previous;
             self.io_notice = Some("Import failed: the settings could not be saved.".into());
             return;
         }
+        // Imported: a form opened on the settings from before is obsolete.
+        self.close_forms();
         // A replaced forward comes back stopped, like any fresh load; the
         // session (if live) reconciles to the merged list.
         for id in &summary.forwards_replaced {

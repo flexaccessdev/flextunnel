@@ -323,7 +323,7 @@ pub(crate) fn parse_status_request(head: &[u8]) -> Option<StatusRequest> {
     let mut lines = head.split("\r\n");
     let mut parts = lines.next()?.split(' ');
     let (method, target, version) = (parts.next()?, parts.next()?, parts.next()?);
-    if method.is_empty() || target.is_empty() || !version.starts_with("HTTP/") || parts.next().is_some()
+    if method.is_empty() || target.is_empty() || !is_http_version(version) || parts.next().is_some()
     {
         return None;
     }
@@ -347,6 +347,15 @@ pub(crate) fn parse_status_request(head: &[u8]) -> Option<StatusRequest> {
         path: request_target_path(target).to_string(),
         accept: accept.map(|(_, format)| format),
     })
+}
+
+/// Whether `token` is a whole HTTP version: `HTTP/`, a digit, a dot, a digit
+/// (`HTTP/1.1`, `HTTP/1.0`) — the name is case-sensitive.
+fn is_http_version(token: &str) -> bool {
+    matches!(
+        token.strip_prefix("HTTP/").map(str::as_bytes),
+        Some([major, b'.', minor]) if major.is_ascii_digit() && minor.is_ascii_digit()
+    )
 }
 
 /// The format a status request asks for: the path's (`/status.txt`,
@@ -435,6 +444,9 @@ mod tests {
                 accept: None,
             }
         );
+        // Either version a client speaks is a request.
+        assert_eq!(parse("GET /status.txt HTTP/1.0\r\n\r\n").path, "/status.txt");
+        assert_eq!(parse("GET /status.txt HTTP/1.1\r\nHost: x\r\n\r\n").path, "/status.txt");
         // The method is kept as sent, for the caller's exact `GET` check.
         assert_eq!(parse("get / HTTP/1.1\r\n\r\n").method, "get");
         assert_eq!(parse("POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n").method, "POST");
@@ -453,6 +465,17 @@ mod tests {
             "GET  / HTTP/1.1\r\n\r\n",
             "GET / HTTP/1.1 extra\r\n\r\n",
             "\r\n\r\n",
+            // The version is the whole token `HTTP/digit.digit`, or nothing.
+            "GET / \r\n\r\n",
+            "GET / HTTP/\r\n\r\n",
+            "GET / HTTP/garbage\r\n\r\n",
+            "GET / HTTP/1\r\n\r\n",
+            "GET / HTTP/1.\r\n\r\n",
+            "GET / HTTP/.1\r\n\r\n",
+            "GET / HTTP/1.1x\r\n\r\n",
+            "GET / HTTP/11.1\r\n\r\n",
+            "GET / HTTP/1,1\r\n\r\n",
+            "GET / http/1.1\r\n\r\n",
         ] {
             assert_eq!(parse_status_request(head.as_bytes()), None, "{head:?}");
         }

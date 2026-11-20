@@ -439,7 +439,9 @@ where
 /// Take a server's status response apart into what is relayed: one of the
 /// three content types served here, and the body. Anything else — another
 /// status, another type, a response cut short or too long — is refused with
-/// the reason.
+/// the reason. A response that states its `Content-Length` must carry exactly
+/// that many body bytes: a stream that ended early would otherwise be relayed
+/// as a whole page. One without the header is delimited by the stream's end.
 fn parse_server_status(response: &[u8]) -> Result<(&'static str, &str), String> {
     if response.len() > SERVER_STATUS_LIMIT {
         return Err("the server's status page is too large".to_string());
@@ -450,17 +452,28 @@ fn parse_server_status(response: &[u8]) -> Result<(&'static str, &str), String> 
     let mut lines = head.split("\r\n");
     let mut status_line = lines.next().unwrap_or_default().splitn(3, ' ');
     let (version, code) = (status_line.next().unwrap_or_default(), status_line.next());
+    let header = |wanted: &str| {
+        lines
+            .clone()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+            .map(|(_, value)| value.trim())
+    };
     if !version.starts_with("HTTP/") {
         return Err(malformed());
     }
     if code != Some("200") {
         return Err(format!("the server answered {}", code.unwrap_or("without a status")));
     }
-    let content_type = lines
-        .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-        .map(|(_, value)| value.trim().to_ascii_lowercase())
-        .unwrap_or_default();
+    if let Some(stated) = header("content-length")
+        && stated.parse::<usize>().ok() != Some(body.len())
+    {
+        return Err(format!(
+            "the server's status page is incomplete: {} body bytes for a Content-Length of {stated}",
+            body.len()
+        ));
+    }
+    let content_type = header("content-type").unwrap_or_default().to_ascii_lowercase();
     let content_type = match content_type.split(';').next().unwrap_or_default().trim() {
         "text/html" => CONTENT_TYPE_HTML,
         "text/plain" => CONTENT_TYPE_TEXT,
@@ -628,6 +641,41 @@ mod tests {
             let err = parse_server_status(&bad).unwrap_err();
             assert!(err.contains(why), "{why}: {err}");
         }
+    }
+
+    /// A stated `Content-Length` is held to: a body the stream cut short (or
+    /// ran past, or a length that is no number) is not a page to relay. With
+    /// no length stated, the end of the stream is the end of the body.
+    #[test]
+    fn a_server_status_body_must_match_its_stated_length() {
+        let response = |length: &str, body: &str| {
+            format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n{length}\r\n\r\n{body}").into_bytes()
+        };
+        // Bytes, not characters: "é" is two.
+        assert_eq!(
+            parse_server_status(&response("Content-Length: 6", "héllo")),
+            Ok((CONTENT_TYPE_TEXT, "héllo"))
+        );
+        assert_eq!(
+            parse_server_status(&response("content-length:  0 ", "")),
+            Ok((CONTENT_TYPE_TEXT, ""))
+        );
+        for (length, body) in [
+            ("Content-Length: 500", "cut short"),
+            ("Content-Length: 3", "longer than stated"),
+            ("Content-Length: 5", ""),
+            ("Content-Length: lots", "lots"),
+            ("Content-Length: -4", "four"),
+            ("Content-Length:", "x"),
+        ] {
+            let err = parse_server_status(&response(length, body)).unwrap_err();
+            assert!(err.contains("incomplete"), "{length:?}: {err}");
+        }
+        // Close-delimited: no length to hold it to.
+        assert_eq!(
+            parse_server_status(&response("Connection: close", "to the end")),
+            Ok((CONTENT_TYPE_TEXT, "to the end"))
+        );
     }
 
     /// The exchange with the server has one deadline: a server that takes
