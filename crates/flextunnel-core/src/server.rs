@@ -241,9 +241,20 @@ impl PreparedServer {
         })
     }
 
-    /// Serve on a caller-built endpoint (hermetic loopback tests).
+    /// [`bind`](Self::bind) on a caller-built base instead of the relay
+    /// setup, which needs a network (hermetic loopback tests). The identity,
+    /// the ALPNs and the quick-client allowlist are applied as `bind` applies
+    /// them.
     #[cfg(test)]
-    pub(crate) fn bind_on(self, endpoint: Endpoint) -> RunningServer {
+    pub(crate) async fn bind_with(self, base: iroh::endpoint::Builder) -> RunningServer {
+        let endpoint = crate::transport::endpoint::server_setup(
+            base,
+            self.secret_key,
+            self.quick_clients,
+        )
+        .bind()
+        .await
+        .expect("bind the test endpoint");
         RunningServer {
             endpoint,
             server: self.server,

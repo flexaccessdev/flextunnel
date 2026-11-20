@@ -28,10 +28,10 @@ use crate::proxy::{
     EndpointProvider, ForwardManager, ForwardSpec, LocalListeners, ProxyClient, ProxyServer,
     ProxyServerParams, RoutedSet,
 };
-use crate::transport::endpoint::{AllowlistHook, ClientEndpoint, RelayConfig};
+use crate::transport::endpoint::{ClientEndpoint, RelayConfig, server_setup};
 use crate::transport::{ALPN, QUICK_ALPN, build_quic_transport_config};
 use iroh::address_lookup::MemoryLookup;
-use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
+use iroh::endpoint::{presets, Builder as EndpointBuilder, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -73,31 +73,33 @@ async fn loopback_endpoint(secret: SecretKey, is_server: bool) -> Endpoint {
     loopback_endpoint_full(secret, is_server, MemoryLookup::new(), HashSet::new()).await
 }
 
-/// The full-knob loopback endpoint: servers accept both ALPNs and install the
-/// native allowlist hook over `quick_clients` (mirroring
-/// `create_server_endpoint`); clients only dial. `lookup` holds out-of-band
-/// addresses for the peers this endpoint dials by id alone, so those dials
-/// resolve hermetically (no relay, no discovery).
+/// The hermetic base every test endpoint is built on, in place of the relay
+/// setup: relay off, no discovery, `127.0.0.1:0`. `lookup` holds out-of-band
+/// addresses for the peers the endpoint dials by id alone.
+fn loopback_base(lookup: MemoryLookup) -> EndpointBuilder {
+    Endpoint::builder(presets::Empty)
+        .relay_mode(RelayMode::Disabled)
+        .transport_config(build_quic_transport_config().unwrap())
+        .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .unwrap()
+        .address_lookup(lookup)
+}
+
+/// The full-knob loopback endpoint: a server is made one as a real server is
+/// (both ALPNs, the native allowlist hook over `quick_clients`); clients only
+/// dial.
 async fn loopback_endpoint_full(
     secret: SecretKey,
     is_server: bool,
     lookup: MemoryLookup,
     quick_clients: HashSet<EndpointId>,
 ) -> Endpoint {
-    let builder = Endpoint::builder(presets::Empty)
-        .relay_mode(RelayMode::Disabled)
-        .transport_config(build_quic_transport_config().unwrap())
-        .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .secret_key(secret)
-        .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
-        .unwrap()
-        .address_lookup(lookup);
+    let base = loopback_base(lookup);
     let builder = if is_server {
-        builder
-            .alpns(vec![ALPN.to_vec(), QUICK_ALPN.to_vec()])
-            .hooks(AllowlistHook::new(quick_clients))
+        server_setup(base, secret, quick_clients)
     } else {
-        builder
+        base.secret_key(secret)
     };
     builder.bind().await.unwrap()
 }
@@ -1353,9 +1355,10 @@ async fn prepared_server_serves_an_authorized_client() {
     .unwrap();
     assert_eq!(prepared.own_id(), secret.public());
 
-    let server_ep = loopback_endpoint(secret, true).await;
+    let running = Arc::new(prepared.bind_with(loopback_base(MemoryLookup::new())).await);
+    let server_ep = running.endpoint();
+    assert_eq!(server_ep.id(), secret.public(), "bound under the configured identity");
     let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
-    let running = Arc::new(prepared.bind_on(server_ep));
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let served = tokio::spawn({
         let running = running.clone();
@@ -1814,6 +1817,53 @@ async fn quick_client_authenticates_by_endpoint_id() {
         handshake_on_alpn(&client_ep, server_addr, QUICK_ALPN, 1, false).await;
     assert!(resp.accepted, "allowlisted quick client must be accepted: {:?}", resp.reject_reason);
     assert_echo_roundtrip(&conn, echo_port).await;
+}
+
+/// [`crate::server::ServerOptions::quick_client`] reaches the endpoint's
+/// allowlist through the shared startup path: on a server prepared with it,
+/// and with no client keys at all, the entered client id is served over the
+/// quick ALPN and any other id is rejected at the handshake.
+#[tokio::test]
+async fn prepared_quick_server_admits_only_the_entered_client() {
+    let bl_path = temp_blocklist("prepared-quick");
+    let echo_port = spawn_echo().await;
+    let client_secret = SecretKey::generate();
+    let (_, routed_cidrs) = loopback_cidr_set();
+    let prepared = crate::server::prepare(crate::server::ServerOptions {
+        secret_key: SecretKey::generate(),
+        authorized_keys: Default::default(),
+        quick_client: Some(client_secret.public()),
+        first_client: None,
+        relay_urls: Vec::new(),
+        relay_auth_token: None,
+        host_aliases: HashMap::new(),
+        routed_domains: Vec::new(),
+        routed_cidrs,
+        dns_forwards: HashMap::new(),
+        blocklist_file: bl_path.clone(),
+    })
+    .unwrap();
+    let running = Arc::new(prepared.bind_with(loopback_base(MemoryLookup::new())).await);
+    let server_ep = running.endpoint();
+    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
+    let served = tokio::spawn({
+        let running = running.clone();
+        async move { running.serve().await }
+    });
+
+    let client_ep = loopback_endpoint(client_secret, false).await;
+    let (conn, _cs, _cr, resp) =
+        handshake_on_alpn(&client_ep, server_addr.clone(), QUICK_ALPN, 1, false).await;
+    assert!(resp.accepted, "the entered client must be accepted: {:?}", resp.reject_reason);
+    assert_echo_roundtrip(&conn, echo_port).await;
+
+    let stranger = loopback_endpoint(SecretKey::generate(), false).await;
+    assert_quick_client_rejected(&stranger, server_addr, "allowlist").await;
+
+    served.abort();
+    let _ = served.await;
+    running.endpoint().close().await;
+    let _ = std::fs::remove_file(bl_path);
 }
 
 /// Quick-mode gating, enforced natively by the endpoint's allowlist hook: a

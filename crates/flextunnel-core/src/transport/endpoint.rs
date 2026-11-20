@@ -90,17 +90,28 @@ fn base_builder(relay_config: &RelayConfig, publish_address: bool) -> Result<End
     ))
 }
 
-/// A server endpoint builder: persistent identity (published on the default
-/// relays), both server ALPNs, the allowlist hook.
+/// What makes an endpoint a flextunnel server's, whatever base it is built
+/// on: its persistent identity, both server ALPNs and the allowlist hook over
+/// `quick_clients`. Applied here and nowhere else, so the hermetic tests'
+/// loopback servers get exactly what a real one does.
+pub(crate) fn server_setup(
+    base: EndpointBuilder,
+    secret: SecretKey,
+    quick_clients: HashSet<EndpointId>,
+) -> EndpointBuilder {
+    base.alpns(vec![ALPN.to_vec(), QUICK_ALPN.to_vec()])
+        .hooks(AllowlistHook::new(quick_clients))
+        .secret_key(secret)
+}
+
+/// A server endpoint builder: the shared base (the identity is published on
+/// the default relays) made a server's by [`server_setup`].
 fn server_builder(
     relay_config: &RelayConfig,
     secret: SecretKey,
     quick_clients: HashSet<EndpointId>,
 ) -> Result<EndpointBuilder> {
-    Ok(base_builder(relay_config, true)?
-        .alpns(vec![ALPN.to_vec(), QUICK_ALPN.to_vec()])
-        .hooks(AllowlistHook::new(quick_clients))
-        .secret_key(secret))
+    Ok(server_setup(base_builder(relay_config, true)?, secret, quick_clients))
 }
 
 /// Create a server endpoint with a persistent identity, accepting the client
