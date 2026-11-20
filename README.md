@@ -126,8 +126,8 @@ published to `ghcr.io/flexaccessdev/flextunnel`.
 Stable releases also include the desktop app
 (`flextunnel-desktop-macos-arm64.dmg` and
 `flextunnel-desktop-windows-amd64.msi`), a tray app with two roles of equal
-weight, either one optional: client connections to any number of servers
-elsewhere, and this computer's own server (a generated identity, then the
+weight, either one optional: a client of any number of servers elsewhere
+(one destination per server, connected on demand), and this computer's own server (a generated identity, then the
 clients you authorize). See [its README](crates/flextunnel-desktop/README.md).
 The installers are **unsigned** — if you'd rather not apply the workarounds
 below, build it yourself instead:
@@ -632,8 +632,8 @@ server, which enforces its routed set and resolves the host; a host that no
 destination routes is refused rather than connected directly. It fails with the
 reason (client not running, no destination routes the host, server unreachable,
 target refused), which ssh prints. It reaches clients started with `client
-start`; the desktop app's connections have no control socket, so reach those
-through their SOCKS port instead
+start`; the desktop app's client has no control socket, so reach it
+through its SOCKS port instead
 (`ProxyCommand nc -X 5 -x 127.0.0.1:<port> %h %p`).
 
 ## Configuration files

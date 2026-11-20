@@ -1,17 +1,21 @@
-//! Profile, server and auth-key persistence. Client auth keys live in a shared,
-//! named list so several profiles can authenticate with the same keypair; each
-//! profile references one by [`AuthKey::id`]. The optional [`ServerConfig`]
-//! runs the one flextunnel server the app hosts in-process. The non-secret
-//! data (key names and public halves, profile names, server ids, ports,
-//! forwards, the server's tunnel set and authorized clients) lives in a plaintext `profiles.json` under the local data dir — same
-//! treatment as the iOS app's `forwards.json`. The secrets (auth-key secret
-//! halves, the server's identity key, and the profiles' and server's custom
-//! relay auth tokens) ride in the same file, sealed the way
-//! Chrome/Slack/Notion store their secrets: a single keychain entry
-//! ("Flextunnel Safe Storage", macOS Keychain / Windows Credential Manager)
-//! holds a random 256-bit master key, and the id → secret map (key ids, the
-//! reserved [`SERVER_SECRET_ID`] and [`SERVER_RELAY_SECRET_ID`], and a
-//! [`PROFILE_RELAY_PREFIX`]ed id per profile relay token) is
+//! Client, server and auth-key persistence. The app runs one client
+//! ([`ClientSettings`]): its local proxy ports, its port forwards, and any
+//! number of [`Destination`]s — a host name for one flextunnel server each.
+//! Client auth keys live in a shared, named list so several destinations can
+//! authenticate with the same keypair; each destination references one by
+//! [`AuthKey::id`]. The optional [`ServerConfig`] runs the one flextunnel
+//! server the app hosts in-process. The non-secret data (key names and public
+//! halves, destination hosts, server ids, routes, ports, forwards, the
+//! server's tunnel set and authorized clients) lives in a plaintext
+//! `profiles.json` under the local data dir — same treatment as the iOS app's
+//! `forwards.json`. The secrets (auth-key secret halves, the server's identity
+//! key, and the destinations' and server's custom relay auth tokens) ride in
+//! the same file, sealed the way Chrome/Slack/Notion store their secrets: a
+//! single keychain entry ("Flextunnel Safe Storage", macOS Keychain / Windows
+//! Credential Manager) holds a random 256-bit master key, and the id → secret
+//! map (key ids, the reserved [`SERVER_SECRET_ID`] and
+//! [`SERVER_RELAY_SECRET_ID`], and a [`DESTINATION_RELAY_PREFIX`]ed id per
+//! destination relay token) is
 //! AES-256-GCM-encrypted with it into the file's `sealed_keys` blob. The
 //! keychain holds one small fixed-size entry regardless of how many keys
 //! exist, so a fresh install (or a rebuilt, differently-signed binary)
@@ -31,8 +35,8 @@
 //! the store is sealed into a `mock-profiles.json` of its own, emptied at start:
 //! the account's keychain and `profiles.json` are never read or written.
 
-use flextunnel_core::forwards::PortForward;
-use flextunnel_core::proxy::{RouteSpec, RouteTable};
+use flextunnel_core::forwards::{PortForward, validate_label, validate_remote_host};
+use flextunnel_core::proxy::{RouteSpec, RouteTable, validate_destination_host};
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit};
 use anyhow::{Context, Result};
@@ -43,7 +47,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 pub const DEFAULT_SOCKS_PORT: u16 = 1080;
-/// Suggested HTTP proxy port for the profile form. Deliberately high — 8080
+/// Suggested HTTP proxy port for the proxy form. Deliberately high — 8080
 /// is taken by half the dev servers in the world (mirrors the iOS FFI's
 /// choice of 18080 for its SOCKS default).
 pub const DEFAULT_HTTP_PORT: u16 = 18080;
@@ -65,7 +69,7 @@ const SAFE_STORAGE_USER: &str = "Flextunnel";
 const SEALED_VERSION: u32 = 1;
 
 /// Set this (to `1`/`true` for the default dev path, or to an explicit file
-/// path) to store profiles as plaintext JSON instead of the system keychain.
+/// path) to store the settings as plaintext JSON instead of the system keychain.
 /// Development only — see the module docs.
 const DEV_CONFIG_ENV: &str = "FLEXTUNNEL_DEV_CONFIG";
 
@@ -89,9 +93,9 @@ enum Backend {
     DevFile(PathBuf),
 }
 
-/// One named client auth keypair, shared across profiles: any number of
-/// profiles can pick the same key to authenticate with (its public half then
-/// only needs one line on each server's authorized-keys file).
+/// One named client auth keypair, shared across destinations: any number of
+/// destinations can pick the same key to authenticate with (its public half
+/// then only needs one line on each server's authorized-keys file).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthKey {
     pub id: String,
@@ -123,7 +127,7 @@ fn random_id() -> String {
     format!("{:016x}", rand::random::<u64>())
 }
 
-/// A well-formed profile or key name: 1-64 characters, words separated by
+/// A well-formed key or authorized-client name: 1-64 characters, words separated by
 /// single spaces — no leading/trailing spaces, no consecutive spaces, no
 /// other whitespace. The forms normalize into this shape; only a hand-edited
 /// file can violate it.
@@ -136,20 +140,18 @@ pub fn is_valid_name(name: &str) -> bool {
         && !name.chars().any(|c| c.is_whitespace() && c != ' ')
 }
 
-/// One connection profile — the desktop equivalent of a `client.toml` with a
-/// single destination. Each active profile runs its own client session with
-/// optional local proxy front-ends and its own port forwards; the session
-/// connects to the profile's server when something is first sent to it.
+/// One destination of the client — the desktop equivalent of a
+/// `[[destinations]]` table in `client.toml`: a host name for one flextunnel
+/// server, the key to authenticate with, and what else to send through it.
+/// The client connects to it when something is first sent there.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Profile {
+pub struct Destination {
     pub id: String,
-    pub name: String,
-    pub server_node_id: String,
-    /// The destination name for this profile's server: `<host>:<port>` through
-    /// the profile's proxy or a forward reaches that port on the server's own
-    /// loopback. Empty until set — a profile without one cannot connect.
-    #[serde(default)]
+    /// The destination's name, in the core's stored (lowercased) form:
+    /// `<host>:<port>` through the client's proxy or a forward reaches that
+    /// port on the server's own loopback.
     pub host: String,
+    pub server_node_id: String,
     /// Further domains sent through the server (exact, `*.suffix`, or `*`).
     /// The server must route them too.
     #[serde(default)]
@@ -158,53 +160,117 @@ pub struct Profile {
     /// route them too.
     #[serde(default)]
     pub routed_cidrs: Vec<String>,
-    /// Which shared [`AuthKey`] this profile authenticates with; empty when
-    /// none is picked yet (fresh import). A plain reference, not a secret —
-    /// it serializes with the rest of the profile.
+    /// Which shared [`AuthKey`] this destination authenticates with; empty
+    /// when none is picked yet (fresh import). A plain reference, not a
+    /// secret — it serializes with the rest of the destination.
     #[serde(default)]
     pub auth_key_id: String,
-    /// Local SOCKS5 proxy port; `None` leaves that front-end disabled.
-    #[serde(default)]
-    pub socks_port: Option<u16>,
-    /// Local HTTP proxy port; `None` leaves the HTTP front-end disabled.
-    #[serde(default)]
-    pub http_port: Option<u16>,
     #[serde(default)]
     pub relay_urls: Vec<String>,
     /// Shared bearer token sent to every custom relay (custom relays only).
     /// A secret, so never serialized here: in keychain mode it rides in the
-    /// store's encrypted `sealed_keys` blob; the dev file backend re-adds it
-    /// via [`StoredProfile`]. Never exported or imported either.
+    /// store's encrypted `sealed_keys` blob; the dev file keeps it in
+    /// [`DevFile::destination_relay_tokens`]. Never exported or imported.
     #[serde(skip)]
     pub relay_auth_token: Option<String>,
-    #[serde(default)]
-    pub forwards: Vec<PortForward>,
 }
 
-impl Profile {
+impl Destination {
     pub fn new_id() -> String {
         random_id()
     }
+}
 
-    /// Whether the profile can be connected: it must name its server, give it
-    /// a valid host with routes the core accepts, and reference a key whose
-    /// secret is present. The secret goes missing when the key's keychain
-    /// entry was lost (re-entered in the Keys pane).
-    pub fn is_ready(&self, keys: &[AuthKey]) -> bool {
-        !self.server_node_id.is_empty()
-            && self.route_table().is_ok()
-            && find_key(keys, &self.auth_key_id).is_some_and(|k| !k.secret.is_empty())
+/// The app's one client — the desktop equivalent of a `client.toml`: the local
+/// proxy front-ends, the port forwards, and the destinations they reach. One
+/// session serves them all, connecting to each destination on demand.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClientSettings {
+    /// Whether the client is meant to run: an enabled client starts with the
+    /// app, and once it becomes startable (its first destination added); a
+    /// disabled one stays stopped, at every launch, until enabled again.
+    pub enabled: bool,
+    /// Local SOCKS5 proxy port; `None` leaves that front-end disabled.
+    pub socks_port: Option<u16>,
+    /// Local HTTP proxy port; `None` leaves the HTTP front-end disabled.
+    pub http_port: Option<u16>,
+    pub destinations: Vec<Destination>,
+    pub forwards: Vec<PortForward>,
+}
+
+impl Default for ClientSettings {
+    /// A fresh install's client: enabled, so it starts with its first
+    /// destination, with the SOCKS5 proxy on its usual port.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            socks_port: Some(DEFAULT_SOCKS_PORT),
+            http_port: None,
+            destinations: Vec::new(),
+            forwards: Vec::new(),
+        }
+    }
+}
+
+impl ClientSettings {
+    pub fn destination(&self, id: &str) -> Option<&Destination> {
+        self.destinations.iter().find(|d| d.id == id)
     }
 
-    /// The profile's routing as the core will see it: its one destination's
-    /// host and routes, validated. The error says what to fix.
+    /// The client's routing as the core will see it: every destination's host
+    /// and routes, validated together. The error names what to fix.
     pub fn route_table(&self) -> Result<RouteTable, String> {
-        RouteTable::new(&[RouteSpec {
-            host: &self.host,
-            routed_domains: &self.routed_domains,
-            routed_cidrs: &self.routed_cidrs,
-        }])
-        .map_err(|e| format!("{e:#}"))
+        let specs: Vec<RouteSpec<'_>> = self
+            .destinations
+            .iter()
+            .map(|d| RouteSpec {
+                host: &d.host,
+                routed_domains: &d.routed_domains,
+                routed_cidrs: &d.routed_cidrs,
+            })
+            .collect();
+        RouteTable::new(&specs).map_err(|e| format!("{e:#}"))
+    }
+
+    /// Why the client cannot start, if it can't: it has no destination, one of
+    /// them lacks its server or a usable key (the secret goes missing when the
+    /// key's keychain entry was lost — re-entered in the Keys pane), or the
+    /// destinations' routes do not fit together. A destination that cannot be
+    /// used blocks the whole client rather than being left out: its routes
+    /// would otherwise quietly connect directly.
+    pub fn start_blocker(&self, keys: &[AuthKey]) -> Option<String> {
+        if self.destinations.is_empty() {
+            return Some("Add a destination to start the client.".into());
+        }
+        for destination in &self.destinations {
+            let host = &destination.host;
+            if destination.server_node_id.is_empty() {
+                return Some(format!("Destination \"{host}\" has no server node id — edit it."));
+            }
+            match find_key(keys, &destination.auth_key_id) {
+                None => {
+                    return Some(format!(
+                        "Destination \"{host}\" has no auth key — edit it to pick one."
+                    ));
+                }
+                Some(key) if key.secret.is_empty() => {
+                    return Some(format!(
+                        "The secret of key \"{}\" (used by \"{host}\") is missing — re-enter \
+                         it in the Keys pane.",
+                        key.name
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        self.route_table()
+            .err()
+            .map(|e| format!("Fix the destinations' hosts and routes: {e}"))
+    }
+
+    pub fn is_ready(&self, keys: &[AuthKey]) -> bool {
+        self.start_blocker(keys).is_none()
     }
 }
 
@@ -214,17 +280,17 @@ impl Profile {
 const SERVER_SECRET_ID: &str = "server";
 /// The server's custom relay auth token in the sealed map.
 const SERVER_RELAY_SECRET_ID: &str = "server-relay";
-/// A profile's custom relay auth token is sealed under this prefix plus the
-/// profile id.
-const PROFILE_RELAY_PREFIX: &str = "relay:";
+/// A destination's custom relay auth token is sealed under this prefix plus
+/// the destination id.
+const DESTINATION_RELAY_PREFIX: &str = "relay:";
 
-fn profile_relay_secret_id(profile_id: &str) -> String {
-    format!("{PROFILE_RELAY_PREFIX}{profile_id}")
+fn destination_relay_secret_id(destination_id: &str) -> String {
+    format!("{DESTINATION_RELAY_PREFIX}{destination_id}")
 }
 
 /// Whether a key id would collide with a non-key entry of the sealed map.
 fn is_reserved_secret_id(id: &str) -> bool {
-    id == SERVER_SECRET_ID || id == SERVER_RELAY_SECRET_ID || id.starts_with(PROFILE_RELAY_PREFIX)
+    id == SERVER_SECRET_ID || id == SERVER_RELAY_SECRET_ID || id.starts_with(DESTINATION_RELAY_PREFIX)
 }
 
 /// One client the server lets in: the public half of the client's auth key,
@@ -264,7 +330,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub relay_urls: Vec<String>,
     /// Shared bearer token sent to every custom relay (custom relays only).
-    /// Sealed like [`Profile::relay_auth_token`]; the dev file re-adds it via
+    /// Sealed like [`Destination::relay_auth_token`]; the dev file re-adds it via
     /// [`StoredServer`].
     #[serde(skip)]
     pub relay_auth_token: Option<String>,
@@ -349,15 +415,15 @@ fn drop_invalid_clients(clients: Vec<AuthorizedClient>) -> Vec<AuthorizedClient>
         .collect()
 }
 
-/// Everything the app persists: the shared key list plus the profiles that
-/// reference into it, and the server. Saved as one JSON document so a
-/// profile can never be written without the key list it points into.
+/// Everything the app persists: the shared key list plus the client whose
+/// destinations reference into it, and the server. Saved as one JSON document
+/// so a destination can never be written without the key list it points into.
 #[derive(Default, Serialize, Deserialize)]
 pub struct Store {
     #[serde(default)]
     pub keys: Vec<AuthKey>,
     #[serde(default)]
-    pub profiles: Vec<Profile>,
+    pub client: ClientSettings,
     #[serde(default)]
     pub server: Option<ServerConfig>,
     /// Whether the first-launch login-item registration has happened (see
@@ -393,7 +459,7 @@ pub struct Store {
 #[derive(Serialize)]
 struct StoreRef<'a> {
     keys: &'a [AuthKey],
-    profiles: &'a [Profile],
+    client: &'a ClientSettings,
     server: Option<&'a ServerConfig>,
     login_item_set_up: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -409,15 +475,6 @@ struct StoredKey {
     secret: String,
     #[serde(flatten)]
     key: AuthKey,
-}
-
-/// Dev file twin of [`StoredKey`] for a profile's relay auth token.
-#[derive(Serialize, Deserialize)]
-struct StoredProfile {
-    #[serde(default)]
-    relay_auth_token: Option<String>,
-    #[serde(flatten)]
-    profile: Profile,
 }
 
 /// Dev file twin of [`StoredKey`] for the server's identity secret and relay
@@ -438,14 +495,17 @@ struct DevFile {
     #[serde(default)]
     keys: Vec<StoredKey>,
     #[serde(default)]
-    profiles: Vec<StoredProfile>,
+    client: ClientSettings,
+    /// Destination id → relay auth token, inline like the other secrets.
+    #[serde(default)]
+    destination_relay_tokens: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     server: Option<StoredServer>,
     #[serde(default)]
     login_item_set_up: bool,
 }
 
-/// Path to the plaintext dev profiles file when `FLEXTUNNEL_DEV_CONFIG` is
+/// Path to the plaintext dev settings file when `FLEXTUNNEL_DEV_CONFIG` is
 /// set, else `None`. `1`/`true` picks a default location under the local data
 /// dir; any other value is treated as an explicit file path.
 fn dev_config_path() -> Option<PathBuf> {
@@ -478,7 +538,7 @@ fn sealed_path(mock: bool) -> Result<PathBuf> {
     let name = if mock { "mock-profiles.json" } else { "profiles.json" };
     dirs::data_local_dir()
         .map(|d| d.join("flextunnel").join(name))
-        .ok_or_else(|| anyhow::anyhow!("no local data directory to store profiles in"))
+        .ok_or_else(|| anyhow::anyhow!("no local data directory to store settings in"))
 }
 
 fn backend() -> Result<&'static Backend> {
@@ -504,7 +564,7 @@ pub fn init_store() -> Result<()> {
     if let Some(path) = dev_config_path() {
         anyhow::ensure!(!mock, "{DEV_CONFIG_ENV} and {KEYCHAIN_ENV}=mock are both set; pick one");
         log::warn!(
-            "{DEV_CONFIG_ENV} set: storing profiles (secret keys included) UNENCRYPTED at {} \
+            "{DEV_CONFIG_ENV} set: storing settings (secret keys included) UNENCRYPTED at {} \
              (development only)",
             path.display()
         );
@@ -576,21 +636,21 @@ fn safe_storage_key() -> Result<[u8; 32]> {
 }
 
 /// The `(id, secret)` pairs sealed into `sealed_keys`: every auth key, every
-/// profile's relay auth token, plus the server identity under
+/// destination's relay auth token, plus the server identity under
 /// [`SERVER_SECRET_ID`] and its relay auth token under
 /// [`SERVER_RELAY_SECRET_ID`].
 fn secret_entries<'a>(
     keys: &'a [AuthKey],
-    profiles: &'a [Profile],
+    destinations: &'a [Destination],
     server: Option<&'a ServerConfig>,
 ) -> impl Iterator<Item = (String, &'a str)> {
     let relay = |token: &'a Option<String>| token.as_deref().unwrap_or_default();
     keys.iter()
         .map(|k| (k.id.clone(), k.secret.as_str()))
         .chain(
-            profiles
+            destinations
                 .iter()
-                .map(move |p| (profile_relay_secret_id(&p.id), relay(&p.relay_auth_token))),
+                .map(move |d| (destination_relay_secret_id(&d.id), relay(&d.relay_auth_token))),
         )
         .chain(server.into_iter().flat_map(move |s| {
             [
@@ -601,7 +661,7 @@ fn secret_entries<'a>(
 }
 
 /// Seal the id → secret map of `entries` into the `sealed_keys` blob.
-/// Secretless entries (lost secrets, profiles without a relay token) are left
+/// Secretless entries (lost secrets, destinations without a relay token) are left
 /// out so a later load warns about them again instead of loading an empty
 /// secret; an all-secretless list seals to the empty string, which
 /// `open_secrets` never sees.
@@ -644,7 +704,7 @@ fn open_secrets(
 
 /// Drop structurally invalid keys from a (possibly hand-edited) store,
 /// keeping the first occurrence of duplicates: an empty id would match
-/// profiles with no key picked, duplicate ids break the profile references
+/// destinations with no key picked, duplicate ids break the destinations' references
 /// and the keychain keying, malformed or duplicate names break the picker,
 /// and a duplicate public key means the same keypair was accidentally added
 /// twice. The form rejects all of these; this is the backstop.
@@ -654,7 +714,7 @@ fn drop_invalid_keys(keys: Vec<AuthKey>) -> Vec<AuthKey> {
     let mut publics = std::collections::HashSet::new();
     keys.into_iter()
         .filter(|k| {
-            // An empty id would match every profile that has no key picked
+            // An empty id would match every destination that has no key picked
             // (`auth_key_id` defaults to empty) — see `find_key`.
             if k.id.is_empty() {
                 log::error!("Ignoring key \"{}\": empty key id", k.name);
@@ -693,40 +753,66 @@ fn drop_invalid_keys(keys: Vec<AuthKey>) -> Vec<AuthKey> {
         .collect()
 }
 
-/// Drop structurally invalid entries from a (possibly hand-edited) profiles
-/// file, keeping the first occurrence of duplicates: duplicate profile ids
-/// break the session/snapshot keying, malformed or duplicate names break
-/// everything keyed by name (session thread names / log attribution, tray
-/// submenus), and duplicate server node ids mean two profiles for one server.
-/// The form rejects all of these; this is the backstop.
-fn drop_invalid(profiles: Vec<Profile>) -> Vec<Profile> {
+/// Drop structurally invalid destinations from a (possibly hand-edited)
+/// store, keeping the first occurrence of duplicates: duplicate ids break the
+/// selection and the relay-token keying, a host the core would not store as
+/// written (or a duplicate one) breaks everything keyed by host, and a
+/// duplicate server node id means two destinations for one server, which the
+/// core refuses. The form rejects all of these; this is the backstop.
+fn drop_invalid(destinations: Vec<Destination>) -> Vec<Destination> {
     let mut ids = std::collections::HashSet::new();
-    let mut names = std::collections::HashSet::new();
+    let mut hosts = std::collections::HashSet::new();
     let mut servers = std::collections::HashSet::new();
-    profiles
+    destinations
         .into_iter()
-        .filter(|p| {
-            if !ids.insert(p.id.clone()) {
-                log::error!("Ignoring profile \"{}\": duplicate profile id {}", p.name, p.id);
+        .filter(|d| {
+            if !ids.insert(d.id.clone()) {
+                log::error!("Ignoring destination \"{}\": duplicate id {}", d.host, d.id);
                 return false;
             }
-            if !is_valid_name(&p.name) {
+            if validate_destination_host(&d.host).as_deref() != Ok(d.host.as_str()) {
+                log::error!("Ignoring destination {}: invalid host {:?}", d.id, d.host);
+                return false;
+            }
+            if !hosts.insert(d.host.clone()) {
+                log::error!("Ignoring a destination: duplicate host \"{}\"", d.host);
+                return false;
+            }
+            if !servers.insert(d.server_node_id.clone()) {
                 log::error!(
-                    "Ignoring profile {}: invalid name {:?} (1-64 chars, single spaces \
-                     between words only)",
-                    p.id,
-                    p.name
+                    "Ignoring destination \"{}\": another destination already uses its server \
+                     node id",
+                    d.host
                 );
                 return false;
             }
-            if !names.insert(p.name.clone()) {
-                log::error!("Ignoring a profile: duplicate profile name \"{}\"", p.name);
+            true
+        })
+        .collect()
+}
+
+/// Drop forwards a (possibly hand-edited) store or import file gets wrong —
+/// a field the form would reject, or a second forward on one local port —
+/// keeping the first occurrence.
+fn drop_invalid_forwards(forwards: Vec<PortForward>) -> Vec<PortForward> {
+    let mut ids = std::collections::HashSet::new();
+    let mut ports = std::collections::HashSet::new();
+    forwards
+        .into_iter()
+        .filter(|f| {
+            let well_formed = f.local_port != 0
+                && f.remote_port != 0
+                && validate_label(&f.label).as_deref() == Ok(f.label.as_str())
+                && validate_remote_host(&f.remote_host).as_deref() == Ok(f.remote_host.as_str());
+            if !well_formed {
+                log::error!("Ignoring forward \"{}\": invalid entry", f.display_name());
                 return false;
             }
-            if !servers.insert(p.server_node_id.clone()) {
+            if !ids.insert(f.id.clone()) || !ports.insert(f.local_port) {
                 log::error!(
-                    "Ignoring profile \"{}\": another profile already uses its server node id",
-                    p.name
+                    "Ignoring forward \"{}\": duplicate id or local port {}",
+                    f.display_name(),
+                    f.local_port
                 );
                 return false;
             }
@@ -771,9 +857,9 @@ fn unseal_store(store: &mut Store) -> Result<std::collections::HashMap<String, S
 /// filled from the unsealed
 /// `sealed_keys` blob — a missing secret (or a blob the current Safe Storage
 /// key can't decrypt) loads as an empty secret with a warning instead of
-/// failing. Structurally invalid keys and profiles are ignored (see the
-/// `drop_invalid*` backstops); a profile referencing an unknown key is kept
-/// but can't connect until a key is picked.
+/// failing. Structurally invalid keys, destinations and forwards are ignored (see the
+/// `drop_invalid*` backstops); a destination referencing an unknown key is
+/// kept, and the client can't start until a key is picked for it.
 pub fn load_store() -> Result<Store> {
     let mut store = match backend()? {
         Backend::DevFile(path) => {
@@ -796,9 +882,9 @@ pub fn load_store() -> Result<Store> {
                 }
             }
             // A relay token is optional, so a missing one is not lost.
-            for profile in &mut store.profiles {
-                profile.relay_auth_token =
-                    secrets.get(&profile_relay_secret_id(&profile.id)).cloned();
+            for destination in &mut store.client.destinations {
+                destination.relay_auth_token =
+                    secrets.get(&destination_relay_secret_id(&destination.id)).cloned();
             }
             if let Some(server) = &mut store.server {
                 match secrets.get(SERVER_SECRET_ID) {
@@ -812,48 +898,50 @@ pub fn load_store() -> Result<Store> {
             store
         }
     };
-    store.profiles = drop_invalid(store.profiles);
+    store.client.destinations = drop_invalid(std::mem::take(&mut store.client.destinations));
+    store.client.forwards = drop_invalid_forwards(std::mem::take(&mut store.client.forwards));
     if let Some(server) = &mut store.server {
         let clients = std::mem::take(&mut server.authorized_clients);
         server.authorized_clients = drop_invalid_clients(clients);
     }
-    for profile in &store.profiles {
-        if !profile.auth_key_id.is_empty() && find_key(&store.keys, &profile.auth_key_id).is_none()
+    for destination in &store.client.destinations {
+        if !destination.auth_key_id.is_empty()
+            && find_key(&store.keys, &destination.auth_key_id).is_none()
         {
             log::warn!(
-                "Profile \"{}\" references an unknown auth key; pick one to connect",
-                profile.name
+                "Destination \"{}\" references an unknown auth key; pick one to use it",
+                destination.host
             );
         }
     }
     Ok(store)
 }
 
-/// Persist the key list, profiles and server, secrets sealed. This is the
+/// Persist the key list, client and server, secrets sealed. This is the
 /// whole save: one atomic file write covers adds, edits, and deletions alike.
 /// The Safe Storage key is cached after its first use, so routine saves after
 /// a forward toggle never touch the keychain (and a store holding no secrets
 /// skips it entirely).
 pub fn save_store(
     keys: &[AuthKey],
-    profiles: &[Profile],
+    client: &ClientSettings,
     server: Option<&ServerConfig>,
     login_item_set_up: bool,
 ) -> Result<()> {
     match backend()? {
-        Backend::DevFile(path) => save_dev_file(path, keys, profiles, server, login_item_set_up),
+        Backend::DevFile(path) => save_dev_file(path, keys, client, server, login_item_set_up),
         backend => {
-            let sealed_keys =
-                if secret_entries(keys, profiles, server).all(|(_, s)| s.is_empty()) {
-                    String::new()
-                } else {
-                    seal_secrets(&safe_storage_key()?, secret_entries(keys, profiles, server))?
-                };
+            let entries = || secret_entries(keys, &client.destinations, server);
+            let sealed_keys = if entries().all(|(_, s)| s.is_empty()) {
+                String::new()
+            } else {
+                seal_secrets(&safe_storage_key()?, entries())?
+            };
             write_json(
                 &sealed_path(matches!(backend, Backend::MockKeychain))?,
                 &StoreRef {
                     keys,
-                    profiles,
+                    client,
                     server,
                     login_item_set_up,
                     sealed_keys,
@@ -864,68 +952,91 @@ pub fn save_store(
     }
 }
 
-/// Export all profiles to a user-chosen file. Non-secrets only, whatever the
-/// backend: a profile's one secret, its relay auth token, never serializes.
-/// Profile ids, forward ids, and the auth-key reference are
-/// stripped too — they are app-local keys that mean nothing in another
-/// install, not part of the portable data.
-pub fn export_profiles(path: &Path, profiles: &[Profile]) -> Result<()> {
-    let mut values = serde_json::to_value(profiles)?;
-    for entry in values.as_array_mut().into_iter().flatten() {
-        if let Some(profile) = entry.as_object_mut() {
-            profile.remove("id");
-            profile.remove("auth_key_id");
-            for forward in forwards_of(profile) {
-                forward.remove("id");
-            }
-        }
+/// What an export file carries and an import reads back: the client's
+/// destinations and forwards. The proxy ports stay behind — which local ports
+/// are free is this computer's business.
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Portable {
+    #[serde(default)]
+    pub destinations: Vec<Destination>,
+    #[serde(default)]
+    pub forwards: Vec<PortForward>,
+}
+
+/// Export the client's destinations and forwards to a user-chosen file.
+/// Non-secrets only, whatever the backend: a destination's one secret, its
+/// relay auth token, never serializes. Destination ids, forward ids, and the
+/// auth-key reference are stripped too — they are app-local keys that mean
+/// nothing in another install, not part of the portable data.
+pub fn export_client(path: &Path, client: &ClientSettings) -> Result<()> {
+    let mut doc = serde_json::json!({
+        "destinations": client.destinations,
+        "forwards": client.forwards,
+    });
+    for destination in objects_of(&mut doc, "destinations") {
+        destination.remove("id");
+        destination.remove("auth_key_id");
     }
-    write_json(path, &values)
+    for forward in objects_of(&mut doc, "forwards") {
+        forward.remove("id");
+    }
+    write_json(path, &doc)
 }
 
 /// Read an export file back, applying the same structural validation as a
-/// load (malformed names and in-file duplicates are dropped with logs). The
-/// caller merges the result into the current profiles and assigns final ids;
+/// load (invalid entries and in-file duplicates are dropped with logs). The
+/// caller merges the result into the current client and assigns final ids;
 /// missing ids (the normal export shape) get placeholders here so the entries
 /// deserialize. No secret or key reference is imported: neither is ever in an
 /// export, and a hand-written auth-key reference is dropped rather than
 /// trusted (a hand-written relay auth token never deserializes), so imported
-/// entries come back with both empty.
-pub fn import_profiles(path: &Path) -> Result<Vec<Profile>> {
-    let mut values: serde_json::Value = read_json(path)?
+/// destinations come back with both empty.
+pub fn import_client(path: &Path) -> Result<Portable> {
+    let mut doc: serde_json::Value = read_json(path)?
         .ok_or_else(|| anyhow::anyhow!("{} does not exist", path.display()))?;
-    for entry in values.as_array_mut().into_iter().flatten() {
-        if let Some(profile) = entry.as_object_mut() {
-            profile
-                .entry("id")
-                .or_insert_with(|| Profile::new_id().into());
-            profile.remove("auth_key_id");
-            for forward in forwards_of(profile) {
-                forward
-                    .entry("id")
-                    .or_insert_with(|| PortForward::new_id().into());
-            }
-        }
+    anyhow::ensure!(
+        doc.is_object(),
+        "{} is not a flextunnel export (destinations and forwards)",
+        path.display()
+    );
+    for destination in objects_of(&mut doc, "destinations") {
+        destination
+            .entry("id")
+            .or_insert_with(|| Destination::new_id().into());
+        destination.remove("auth_key_id");
     }
-    let profiles: Vec<Profile> = serde_json::from_value(values)
+    for forward in objects_of(&mut doc, "forwards") {
+        forward
+            .entry("id")
+            .or_insert_with(|| PortForward::new_id().into());
+    }
+    let portable: Portable = serde_json::from_value(doc)
         .with_context(|| format!("Failed to parse {}", path.display()))?;
-    Ok(drop_invalid(profiles))
+    Ok(Portable {
+        destinations: drop_invalid(portable.destinations),
+        forwards: drop_invalid_forwards(portable.forwards),
+    })
 }
 
-/// The mutable forward objects of a profile JSON object (empty when absent).
-fn forwards_of(
-    profile: &mut serde_json::Map<String, serde_json::Value>,
-) -> impl Iterator<Item = &mut serde_json::Map<String, serde_json::Value>> {
-    profile
-        .get_mut("forwards")
-        .and_then(|f| f.as_array_mut())
+/// The mutable objects of the array at `key` of a JSON document (empty when
+/// absent or not an array).
+fn objects_of<'a>(
+    doc: &'a mut serde_json::Value,
+    key: &str,
+) -> impl Iterator<Item = &'a mut serde_json::Map<String, serde_json::Value>> {
+    doc.get_mut(key)
+        .and_then(|v| v.as_array_mut())
         .into_iter()
         .flatten()
-        .filter_map(|f| f.as_object_mut())
+        .filter_map(|v| v.as_object_mut())
 }
 
 fn load_dev_file(path: &Path) -> Result<Store> {
-    let stored: DevFile = read_json(path)?.unwrap_or_default();
+    let mut stored: DevFile = read_json(path)?.unwrap_or_default();
+    let mut client = std::mem::take(&mut stored.client);
+    for destination in &mut client.destinations {
+        destination.relay_auth_token = stored.destination_relay_tokens.remove(&destination.id);
+    }
     Ok(Store {
         keys: stored
             .keys
@@ -935,14 +1046,7 @@ fn load_dev_file(path: &Path) -> Result<Store> {
                 ..s.key
             })
             .collect(),
-        profiles: stored
-            .profiles
-            .into_iter()
-            .map(|s| Profile {
-                relay_auth_token: s.relay_auth_token,
-                ..s.profile
-            })
-            .collect(),
+        client,
         server: stored.server.map(|s| ServerConfig {
             secret: s.secret,
             relay_auth_token: s.relay_auth_token,
@@ -959,7 +1063,7 @@ fn load_dev_file(path: &Path) -> Result<Store> {
 fn save_dev_file(
     path: &Path,
     keys: &[AuthKey],
-    profiles: &[Profile],
+    client: &ClientSettings,
     server: Option<&ServerConfig>,
     login_item_set_up: bool,
 ) -> Result<()> {
@@ -971,12 +1075,11 @@ fn save_dev_file(
                 key: k.clone(),
             })
             .collect(),
-        profiles: profiles
+        client: client.clone(),
+        destination_relay_tokens: client
+            .destinations
             .iter()
-            .map(|p| StoredProfile {
-                relay_auth_token: p.relay_auth_token.clone(),
-                profile: p.clone(),
-            })
+            .filter_map(|d| Some((d.id.clone(), d.relay_auth_token.clone()?)))
             .collect(),
         server: server.map(|s| StoredServer {
             secret: s.secret.clone(),
@@ -1003,7 +1106,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let dir = path
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("profiles path has no parent directory"))?;
+        .ok_or_else(|| anyhow::anyhow!("settings path has no parent directory"))?;
     std::fs::create_dir_all(dir)
         .with_context(|| format!("Failed to create {}", dir.display()))?;
     let tmp = path.with_extension("json.tmp");
@@ -1053,48 +1156,72 @@ mod tests {
         seal_secrets(master, secret_entries(keys, &[], None)).unwrap()
     }
 
-    fn profile() -> Profile {
-        Profile {
+    fn destination() -> Destination {
+        Destination {
             id: "00000000deadbeef".into(),
-            name: "prod".into(),
-            server_node_id: "node".into(),
             host: "prod.internal".into(),
+            server_node_id: "node".into(),
             routed_domains: vec!["*.corp.example".into()],
             routed_cidrs: vec!["10.0.0.0/8".into()],
             auth_key_id: "key1".into(),
-            socks_port: Some(1085),
-            http_port: Some(8081),
             relay_urls: vec!["https://relay.example".into()],
             relay_auth_token: Some("ftc-secret-relaypsk".into()),
-            forwards: vec![PortForward {
-                id: "aaaa".into(),
-                label: "db".into(),
-                local_port: 5432,
-                remote_host: "db.internal".into(),
-                remote_port: 5432,
-                enabled: true,
-            }],
+        }
+    }
+
+    fn forward() -> PortForward {
+        PortForward {
+            id: "aaaa".into(),
+            label: "db".into(),
+            local_port: 5432,
+            remote_host: "db.internal".into(),
+            remote_port: 5432,
+            enabled: true,
+        }
+    }
+
+    fn client() -> ClientSettings {
+        ClientSettings {
+            enabled: true,
+            socks_port: Some(1085),
+            http_port: Some(8081),
+            destinations: vec![destination()],
+            forwards: vec![forward()],
         }
     }
 
     #[test]
     fn optional_fields_default_when_absent() {
-        let p: Profile = serde_json::from_str(
-            r#"{"id":"1","name":"n","server_node_id":"abc"}"#,
-        )
-        .unwrap();
-        assert_eq!(p.socks_port, None);
-        assert_eq!(p.http_port, None);
-        assert!(p.relay_urls.is_empty());
-        assert!(p.forwards.is_empty());
-        assert!(p.auth_key_id.is_empty());
+        let d: Destination =
+            serde_json::from_str(r#"{"id":"1","host":"n.internal","server_node_id":"abc"}"#)
+                .unwrap();
+        assert!(d.routed_domains.is_empty() && d.routed_cidrs.is_empty());
+        assert!(d.relay_urls.is_empty());
+        assert!(d.auth_key_id.is_empty());
+    }
+
+    /// A store written before there was a client loads with a fresh one:
+    /// enabled, SOCKS5 on its usual port, nothing to reach yet. A saved client
+    /// keeps what it says, a switched-off proxy included.
+    #[test]
+    fn a_missing_client_is_a_fresh_one() {
+        let store: Store = serde_json::from_str("{}").unwrap();
+        assert_eq!(store.client, ClientSettings::default());
+        assert!(store.client.enabled);
+        assert_eq!(store.client.socks_port, Some(DEFAULT_SOCKS_PORT));
+        assert_eq!(store.client.http_port, None);
+
+        let store: Store =
+            serde_json::from_str(r#"{"client":{"enabled":false,"socks_port":null}}"#).unwrap();
+        assert!(!store.client.enabled);
+        assert_eq!(store.client.socks_port, None);
     }
 
     #[test]
     fn secret_never_serializes_in_store() {
         let json = serde_json::to_string(&StoreRef {
             keys: &[key()],
-            profiles: &[profile()],
+            client: &client(),
             server: Some(&server()),
             login_item_set_up: false,
             sealed_keys: String::new(),
@@ -1106,36 +1233,39 @@ mod tests {
         // The server's public identity and settings persist.
         assert!(json.contains("\"endpoint_id\":\"endpoint\""), "endpoint id dropped: {json}");
         assert!(json.contains("*.internal"), "tunnel set dropped: {json}");
-        // The non-secret halves of the key persist, as does the profile's
+        // The non-secret halves of the key persist, as does the destination's
         // reference to it.
         assert!(json.contains("ed25519-pub:abc"), "public key dropped: {json}");
         assert!(json.contains("\"auth_key_id\":\"key1\""), "reference dropped: {json}");
         // `enabled` is runtime-only on forwards and must not leak either; the
         // server's is its persisted intent.
         let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let forward = &doc["profiles"][0]["forwards"][0];
+        let forward = &doc["client"]["forwards"][0];
+        assert_eq!(forward["local_port"], 5432);
         assert!(forward.get("enabled").is_none(), "forward enabled leaked: {json}");
         assert_eq!(doc["server"]["enabled"], true, "server enabled dropped: {json}");
+        assert_eq!(doc["client"]["enabled"], true, "client enabled dropped: {json}");
+        assert_eq!(doc["client"]["destinations"][0]["host"], "prod.internal");
         // The relay tokens are secrets: sealed, never plaintext.
         assert!(!json.contains("relay_auth_token"), "relay token field leaked: {json}");
-        assert!(!json.contains("ftc-secret-relaypsk"), "profile relay token leaked: {json}");
+        assert!(!json.contains("ftc-secret-relaypsk"), "destination relay token leaked: {json}");
         assert!(!json.contains("ftc-secret-serverpsk"), "server relay token leaked: {json}");
     }
 
     #[test]
     fn sealed_secrets_roundtrip_without_leaking_plaintext() {
         let master = [7u8; 32];
-        let mut no_relay = profile();
+        let mut no_relay = destination();
         no_relay.id = "00000000feedface".into();
         no_relay.relay_auth_token = None;
-        let (keys, profiles, server) = ([key()], [profile(), no_relay], server());
+        let (keys, destinations, server) = ([key()], [destination(), no_relay], server());
         let sealed =
-            seal_secrets(&master, secret_entries(&keys, &profiles, Some(&server))).unwrap();
+            seal_secrets(&master, secret_entries(&keys, &destinations, Some(&server))).unwrap();
         assert!(!sealed.contains("ftc-secret-authtok"), "secret leaked: {sealed}");
         assert!(!sealed.contains("ftc-secret-identity"), "server secret leaked: {sealed}");
         assert!(!sealed.contains("ftc-secret-relaypsk"), "relay token leaked: {sealed}");
         let map = open_secrets(&master, &sealed).unwrap();
-        // The profile without a relay token seals nothing.
+        // The destination without a relay token seals nothing.
         assert_eq!(map.len(), 4);
         assert_eq!(map.get("key1").map(String::as_str), Some("ftc-secret-authtok"));
         assert_eq!(map.get(SERVER_SECRET_ID).map(String::as_str), Some("ftc-secret-identity"));
@@ -1144,7 +1274,7 @@ mod tests {
             Some("ftc-secret-serverpsk")
         );
         assert_eq!(
-            map.get(&profile_relay_secret_id(&profile().id)).map(String::as_str),
+            map.get(&destination_relay_secret_id(&destination().id)).map(String::as_str),
             Some("ftc-secret-relaypsk")
         );
     }
@@ -1197,43 +1327,47 @@ mod tests {
     }
 
     #[test]
-    fn is_ready_requires_a_resolvable_secret() {
+    fn client_start_blockers() {
         let keys = [key()];
-        assert!(profile().is_ready(&keys));
+        assert_eq!(client().start_blocker(&keys), None);
+        assert!(client().is_ready(&keys));
+
+        let empty = ClientSettings::default();
+        assert!(empty.start_blocker(&keys).unwrap().contains("Add a destination"));
 
         let mut lost = key();
         lost.secret = String::new();
-        assert!(!profile().is_ready(&[lost]), "lost keychain entry");
+        let blocker = client().start_blocker(&[lost]).unwrap();
+        assert!(blocker.contains("work laptop") && blocker.contains("Keys pane"), "{blocker}");
 
-        assert!(!profile().is_ready(&[]), "dangling key reference");
+        assert!(
+            client().start_blocker(&[]).unwrap().contains("no auth key"),
+            "dangling key reference"
+        );
+        let mut unpicked = client();
+        unpicked.destinations[0].auth_key_id = String::new();
+        assert!(unpicked.start_blocker(&keys).unwrap().contains("no auth key"));
 
-        let mut unpicked = profile();
-        unpicked.auth_key_id = String::new();
-        assert!(!unpicked.is_ready(&keys), "no key picked");
+        let mut serverless = client();
+        serverless.destinations[0].server_node_id = String::new();
+        assert!(serverless.start_blocker(&keys).unwrap().contains("server node id"));
 
-        // A profile needs a host the core accepts, and routes that validate.
-        let mut hostless = profile();
-        hostless.host = String::new();
-        assert!(!hostless.is_ready(&keys), "no host");
-        assert!(hostless.route_table().is_err());
-        let mut bad_route = profile();
-        bad_route.routed_cidrs = vec!["not-a-cidr".into()];
-        assert!(!bad_route.is_ready(&keys), "invalid route");
-        let mut bare = profile();
-        bare.routed_domains.clear();
-        bare.routed_cidrs.clear();
-        assert!(bare.is_ready(&keys), "a host alone is enough");
-    }
-
-    #[test]
-    fn a_profile_without_host_or_routes_still_loads() {
-        // Host and routes default to empty when absent: such a profile loads
-        // and shows, but cannot connect until it is given a host.
-        let json = r#"{"id":"p1","name":"prod","server_node_id":"node"}"#;
-        let profile: Profile = serde_json::from_str(json).unwrap();
-        assert!(profile.host.is_empty());
-        assert!(profile.routed_domains.is_empty() && profile.routed_cidrs.is_empty());
-        assert!(!profile.is_ready(&[key()]));
+        // The destinations' routes are checked together, by the core's table.
+        let mut bad_route = client();
+        bad_route.destinations[0].routed_cidrs = vec!["not-a-cidr".into()];
+        assert!(bad_route.start_blocker(&keys).unwrap().contains("routes"));
+        let mut overlap = client();
+        let mut second = destination();
+        second.id = "second".into();
+        second.host = "staging.internal".into();
+        second.server_node_id = "node-2".into();
+        overlap.destinations.push(second);
+        let blocker = overlap.start_blocker(&keys).unwrap();
+        assert!(blocker.contains("both route"), "{blocker}");
+        overlap.destinations[1].routed_domains.clear();
+        overlap.destinations[1].routed_cidrs.clear();
+        assert_eq!(overlap.start_blocker(&keys), None, "a host alone is enough");
+        assert_eq!(overlap.route_table().unwrap().hosts().count(), 2);
     }
 
     #[test]
@@ -1292,15 +1426,15 @@ mod tests {
         reserved_id.id = SERVER_SECRET_ID.into();
         reserved_id.name = "reserved".into();
         reserved_id.public_key = "ed25519-pub:pqr".into();
-        // The relay tokens' slots: the server's and a profile's.
+        // The relay tokens' slots: the server's and a destination's.
         let mut server_relay_id = key();
         server_relay_id.id = SERVER_RELAY_SECRET_ID.into();
         server_relay_id.name = "server relay".into();
         server_relay_id.public_key = "ed25519-pub:stu".into();
-        let mut profile_relay_id = key();
-        profile_relay_id.id = profile_relay_secret_id("00000000deadbeef");
-        profile_relay_id.name = "profile relay".into();
-        profile_relay_id.public_key = "ed25519-pub:vwx".into();
+        let mut destination_relay_id = key();
+        destination_relay_id.id = destination_relay_secret_id("00000000deadbeef");
+        destination_relay_id.name = "destination relay".into();
+        destination_relay_id.public_key = "ed25519-pub:vwx".into();
         let mut unique = key();
         unique.id = "key5".into();
         unique.name = "home".into();
@@ -1315,39 +1449,54 @@ mod tests {
             empty_id,
             reserved_id,
             server_relay_id,
-            profile_relay_id,
+            destination_relay_id,
             unique.clone(),
         ]);
         assert_eq!(kept, vec![a, unique]);
     }
 
     #[test]
-    fn duplicate_ids_and_servers_are_dropped() {
-        let a = profile();
-        let mut same_server = profile();
-        same_server.id = "b".into();
-        same_server.name = "b".into();
-        let mut same_id = profile();
-        same_id.name = "c".into();
-        same_id.server_node_id = "other".into();
-        let mut same_name = profile();
-        same_name.id = "n".into();
-        same_name.server_node_id = "elsewhere".into();
-        let mut bad_name = profile();
-        bad_name.id = "w".into();
-        bad_name.name = " padded ".into();
-        bad_name.server_node_id = "padded-server".into();
-        let mut unique = profile();
-        unique.id = "d".into();
-        unique.name = "d".into();
-        unique.server_node_id = "unique".into();
-
+    fn invalid_and_duplicate_destinations_are_dropped() {
+        let a = destination();
+        let variant = |id: &str, host: &str, server: &str| Destination {
+            id: id.into(),
+            host: host.into(),
+            server_node_id: server.into(),
+            ..destination()
+        };
+        let unique = variant("d", "staging.internal", "unique");
         let kept = drop_invalid(vec![
             a.clone(),
-            same_server,
-            same_id,
-            same_name,
-            bad_name,
+            variant("b", "b.internal", "node"),
+            variant("00000000deadbeef", "c.internal", "other"),
+            variant("n", "prod.internal", "elsewhere"),
+            // Not the form the core stores: uppercase, an address, reserved.
+            variant("u", "Upper.Internal", "upper"),
+            variant("i", "10.0.0.1", "address"),
+            variant("r", "flextunnel.internal", "reserved"),
+            variant("e", "", "hostless"),
+            unique.clone(),
+        ]);
+        assert_eq!(kept, vec![a, unique]);
+    }
+
+    #[test]
+    fn invalid_and_duplicate_forwards_are_dropped() {
+        let a = forward();
+        let variant = |id: &str, local_port: u16, remote_host: &str| PortForward {
+            id: id.into(),
+            local_port,
+            remote_host: remote_host.into(),
+            ..forward()
+        };
+        let unique = variant("bbbb", 5433, "db.internal");
+        let kept = drop_invalid_forwards(vec![
+            a.clone(),
+            variant("cccc", 5432, "other.internal"),
+            variant("aaaa", 6000, "other.internal"),
+            variant("dddd", 0, "db.internal"),
+            variant("eeee", 7000, "bad..host"),
+            variant("ffff", 7001, " padded "),
             unique.clone(),
         ]);
         assert_eq!(kept, vec![a, unique]);
@@ -1358,7 +1507,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("export.json");
 
-        export_profiles(&path, &[profile()]).unwrap();
+        export_client(&path, &client()).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("\"id\""), "ids leaked into the export: {raw}");
         assert!(
@@ -1369,21 +1518,23 @@ mod tests {
             !raw.contains("ftc-secret-relaypsk") && !raw.contains("relay_auth_token"),
             "relay auth token leaked into the export: {raw}"
         );
+        // The proxy ports and the on/off switch are this computer's own.
+        assert!(!raw.contains("socks_port") && !raw.contains("enabled"), "{raw}");
         // The non-secret relay setting it pairs with still travels.
         assert!(raw.contains("https://relay.example"), "relay urls dropped: {raw}");
 
-        let imported = import_profiles(&path).unwrap();
-        assert_eq!(imported.len(), 1);
-        let p = &imported[0];
-        assert!(!p.id.is_empty(), "placeholder profile id assigned");
-        assert!(p.auth_key_id.is_empty());
-        assert_eq!(p.relay_auth_token, None);
-        assert_eq!(p.relay_urls, profile().relay_urls);
-        assert_eq!(p.name, profile().name);
-        assert_eq!(p.socks_port, profile().socks_port);
-        assert_eq!(p.forwards.len(), 1);
-        assert!(!p.forwards[0].id.is_empty(), "placeholder forward id assigned");
-        assert_eq!(p.forwards[0].local_port, profile().forwards[0].local_port);
+        let imported = import_client(&path).unwrap();
+        assert_eq!(imported.destinations.len(), 1);
+        let d = &imported.destinations[0];
+        assert!(!d.id.is_empty(), "placeholder destination id assigned");
+        assert!(d.auth_key_id.is_empty());
+        assert_eq!(d.relay_auth_token, None);
+        assert_eq!(d.relay_urls, destination().relay_urls);
+        assert_eq!(d.host, destination().host);
+        assert_eq!(d.routed_domains, destination().routed_domains);
+        assert_eq!(imported.forwards.len(), 1);
+        assert!(!imported.forwards[0].id.is_empty(), "placeholder forward id assigned");
+        assert_eq!(imported.forwards[0].local_port, forward().local_port);
     }
 
     /// Hand-written files can carry the relay token or an auth-key reference;
@@ -1394,18 +1545,25 @@ mod tests {
         let path = dir.path().join("export.json");
         std::fs::write(
             &path,
-            r#"[{"name":"prod","server_node_id":"node",
+            r#"{"destinations":[{"host":"prod.internal","server_node_id":"node",
                  "auth_key_id":"key1",
                  "relay_urls":["https://relay.example"],
-                 "relay_auth_token":"ftc-secret-relaypsk"}]"#,
+                 "relay_auth_token":"ftc-secret-relaypsk"}]}"#,
         )
         .unwrap();
 
-        let imported = import_profiles(&path).unwrap();
-        assert_eq!(imported.len(), 1);
-        assert!(imported[0].auth_key_id.is_empty());
-        assert_eq!(imported[0].relay_auth_token, None);
-        assert_eq!(imported[0].relay_urls, vec!["https://relay.example"]);
+        let imported = import_client(&path).unwrap();
+        assert_eq!(imported.destinations.len(), 1);
+        assert!(imported.destinations[0].auth_key_id.is_empty());
+        assert_eq!(imported.destinations[0].relay_auth_token, None);
+        assert_eq!(imported.destinations[0].relay_urls, vec!["https://relay.example"]);
+        assert!(imported.forwards.is_empty());
+
+        // A file of another shape — a bare list — is refused, not read as empty.
+        std::fs::write(&path, r#"[{"host":"prod.internal","server_node_id":"node"}]"#).unwrap();
+        let e = import_client(&path).unwrap_err();
+        assert!(format!("{e:#}").contains("not a flextunnel export"), "{e:#}");
+        assert!(import_client(&dir.path().join("missing.json")).is_err());
     }
 
     #[test]
@@ -1428,12 +1586,13 @@ mod tests {
         let path = dir.path().join("nested").join("dev-profiles.json");
 
         let empty = load_dev_file(&path).unwrap();
-        assert!(empty.keys.is_empty() && empty.profiles.is_empty() && empty.server.is_none());
+        assert!(empty.keys.is_empty() && empty.server.is_none());
+        assert_eq!(empty.client, ClientSettings::default());
 
         let keys = vec![key()];
-        let mut profiles = vec![profile()];
+        let mut client = client();
         let server = server();
-        save_dev_file(&path, &keys, &profiles, Some(&server), true).unwrap();
+        save_dev_file(&path, &keys, &client, Some(&server), true).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(
             raw.contains("\"secret\": \"ftc-secret-authtok\""),
@@ -1444,8 +1603,8 @@ mod tests {
             "server secret missing: {raw}"
         );
         assert!(
-            raw.contains("\"relay_auth_token\": \"ftc-secret-relaypsk\""),
-            "profile relay token missing: {raw}"
+            raw.contains("\"00000000deadbeef\": \"ftc-secret-relaypsk\""),
+            "destination relay token missing: {raw}"
         );
         assert!(
             raw.contains("\"relay_auth_token\": \"ftc-secret-serverpsk\""),
@@ -1453,10 +1612,10 @@ mod tests {
         );
 
         // Forward `enabled` is runtime-only: comes back off.
-        profiles[0].forwards[0].enabled = false;
+        client.forwards[0].enabled = false;
         let loaded = load_dev_file(&path).unwrap();
         assert_eq!(loaded.keys, keys);
-        assert_eq!(loaded.profiles, profiles);
+        assert_eq!(loaded.client, client);
         assert_eq!(loaded.server, Some(server));
         assert!(loaded.login_item_set_up);
     }

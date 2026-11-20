@@ -1,9 +1,9 @@
 # flextunnel-desktop
 
 The native desktop app for [flextunnel](../..) — a system-tray app for **macOS
-and Windows** with two roles of equal weight, either one optional:
-**connections** to any number of flextunnel servers elsewhere, and this
-computer's own **server**, run in-process. Nothing ever needs a terminal.
+and Windows** with two roles of equal weight, either one optional: a
+**client** of any number of flextunnel servers elsewhere, and this computer's
+own **server**, run in-process. Nothing ever needs a terminal.
 
 It embeds [`flextunnel-core`](../flextunnel-core) directly (no FFI layer) and is
 built on [iced](https://iced.rs/)'s daemon runtime: the process lives in the
@@ -12,13 +12,14 @@ window loses nothing — the tray owns the lifecycle and re-opens it on demand.
 
 ```
 ┌── tray / menu bar ─────────────────┐   ┌──────────── window ─────────────────┐
-│ Open flextunnel…                    │   │ CONNECTIONS   +   home-lab ● conn.  │
-│ Connections: 1 of 2 connected       │   │ ● home-lab        SOCKS 1080        │
-│ Server running · 2 clients connected│ ⇄ │ ○ staging         PORT FORWARDS     │
-│ Disable Server                      │   │ SERVER            ● db  5432        │
-│ Copy Endpoint ID                    │   │ ● This computer                     │
-│ ☑ Open at Login                     │   │ Keys · Logs                         │
-│ Quit flextunnel                     │   │                                     │
+│ Open flextunnel…                    │   │ CLIENT            Client ● running  │
+│ Client running · 1 of 2 connected   │   │ ● Proxy & forwards   [Enabled ◉]    │
+│ Disable Client                      │   │ DESTINATIONS  +   PROXIES           │
+│ Server running · 2 clients connected│ ⇄ │ ● nas.internal    SOCKS5 127.0.0.1… │
+│ Disable Server                      │   │ ○ lab.internal    PORT FORWARDS     │
+│ Copy Endpoint ID                    │   │ SERVER            ● db  5432  via   │
+│ ☑ Open at Login                     │   │ ● This computer        nas.internal │
+│ Quit flextunnel                     │   │ Keys · Logs                         │
 └─────────────────────────────────────┘   └─────────────────────────────────────┘
 ```
 
@@ -26,53 +27,70 @@ window loses nothing — the tray owns the lifecycle and re-opens it on demand.
 
 With nothing set up, the window opens with nothing selected, pointing at the
 sidebar: there is no role to pick. Either is set up from there whenever wanted
-— "+" next to Connections, or "Set up server…", which opens the server's
+— "+" next to Destinations, or "Set up server…", which opens the server's
 welcome first.
 
-## Client connections
+## The client
 
-Each **connection profile** is the desktop equivalent of a `client.toml` with
-one destination — a server `EndpointId`, a **host** name for it, an auth key,
-and the local front-ends you want. Profiles are independent: any number can be
-connected at once, and each runs its own session with its own optional local
-**SOCKS5** and **HTTP** proxy listeners plus its own **port forwards**.
-Starting a session (*Connect*) is always manual.
+The app runs one client — the desktop equivalent of a `client.toml`: two
+optional local proxies, any number of port forwards, and the **destinations**
+they reach. It is one session for all of them.
 
-- **Host and routes** — the profile's **host** is your name for its server:
-  `<host>:<port>` through the profile's proxy, or as a forward's remote host,
-  reaches that port on the server machine itself. *Routed domains* and *Routed
-  CIDRs* are optional further targets to send through the server (which must
-  allow them in its own tunnel set). Everything else connects directly. A
-  profile needs a host to connect; one saved without it shows a prompt to edit
-  it.
-- **Connects on demand** — *Connect* starts the session and makes one
-  connection attempt, so you see whether the server is reachable. After that
-  the connection follows use: it closes once nothing has used it for five
-  minutes and the profile shows **standby** — still listening, proxy and
-  forwards included — and the next request connects it again, waiting while it
-  does. A dropped connection is likewise re-established when something next
-  needs it, not before.
+- **Destinations** — each is a **host** name for one server (`nas.internal`),
+  the server's `EndpointId`, and an auth key. `<host>:<port>` through the
+  proxy, or as a forward's remote host, reaches that port on the server
+  machine itself. *Routed domains* and *Routed CIDRs* are optional further
+  targets to send through that server (which must allow them in its own tunnel
+  set). Where two destinations overlap, the more specific rule wins; the same
+  rule on two destinations is refused. Anything no destination routes connects
+  directly from this computer.
+- **Connects on demand** — a running client only listens. A destination is
+  connected when something is first sent to it — the request waits while it
+  connects — and disconnected again once nothing has used it for five minutes,
+  when it shows **idle**. A dropped connection is likewise re-established when
+  something next needs it, not before. *Connect now* on a destination's pane
+  asks for one attempt right away, to see whether the server is reachable.
+- **Enabled** — the client's only on/off control: a switch on its pane (and
+  *Enable/Disable Client* in the tray). An enabled client runs: it starts with
+  the app (at login or by hand), and as soon as it becomes startable — its
+  first destination added. Disabling stops it and keeps it stopped across
+  launches. After a failure (a local port already taken), change what failed,
+  or switch it off and on to retry.
+- **Restart to apply** — the client runs with the proxy ports and destinations
+  it started with. After a change to either — or to a key a destination uses —
+  its pane and every destination's offer *Restart now*, which closes the
+  connections that are open. A destination added or edited since shows
+  **restart to apply** until then. Port forwards are the exception: they apply
+  at once.
+- **A refused key** — a server that does not authorize a destination's key
+  fails that destination alone, which shows **refused** with the server's
+  reason; the others keep working, and it is tried again when next needed.
 - **Shared auth keys** — the Keys pane holds this computer's client keypairs;
-  any number of profiles can use the same one. Each server a key connects to
-  must authorize its public half.
-- **Local SOCKS5 / HTTP proxies** — enable either or both per profile; point any
-  proxy-aware app at `127.0.0.1:<port>` and its traffic to the profile's host
-  and routes rides the tunnel.
-- **Port forwards** — bind a local port to a `host:port` reached through the
-  server, so tools that can't use a proxy reach private services as if local.
-  A forward always goes through the server, so its remote host must be the
-  profile's host or one of its routes; one that isn't shows a **no route**
-  badge.
-- **Status pages** — `http://flextunnel.internal/` through the profile's proxy
-  is the session's own status; `http://flextunnel.internal/servers/<host>/` is
-  the server's, with its tunnel set, host aliases, DNS forwards and bridges.
-  Both are listed on the profile pane.
-- **Connection path** — a modal that reports whether a connected profile is
-  reaching the server directly (hole-punched) or via relay.
-- **Export / import** — move profiles between machines via native save/open
-  dialogs. (Secrets are re-entered on import: neither the auth token nor the
-  custom-relay auth token is written to the export file. Importing over an
-  existing profile — matched by server id — keeps that profile's secrets.)
+  any number of destinations can use the same one. Each server a key connects
+  to must authorize its public half.
+- **Local SOCKS5 / HTTP proxies** — enable either or both; point any
+  proxy-aware app at `127.0.0.1:<port>` and its traffic to a destination's
+  host or routes rides that destination. Use the SOCKS5 proxy with remote name
+  resolution (`socks5h://`), so the destination names reach it.
+- **Port forwards** — bind a local port to a `host:port` reached through a
+  destination, so tools that can't use a proxy reach private services as if
+  local. A forward never connects directly, so its remote host must be a
+  destination's host or one of its routes: its row says which destination
+  carries it (**via nas.internal**), or shows a **no route** badge.
+- **Status pages** — `http://flextunnel.internal/` through either proxy is the
+  client's own status, answered locally without connecting anything;
+  `http://flextunnel.internal/servers/<host>/` is that server's, with its
+  tunnel set, host aliases, DNS forwards and bridges (opening it connects the
+  destination). Both are listed in the window.
+- **Connection path** — a modal that reports whether a connected destination
+  is reached directly (hole-punched) or via relay.
+- **Export / import** — move the destinations and forwards between machines
+  via native save/open dialogs; the proxy ports stay behind. (Secrets are
+  re-entered on import: neither an auth key nor a custom-relay auth token is
+  written to the export file. An imported destination whose server is already
+  here replaces that destination and keeps its key and relay token; an
+  imported forward replaces the one on the same local port. An import whose
+  hosts or routes clash with the ones here is refused whole.)
 
 ## The server
 
@@ -123,19 +141,22 @@ showing the endpoint id it gives — and *Create server* goes straight on to aut
 
 ## Tray
 
-The menu shows the connections' aggregate line, then the server's status line
-with Enable/Disable Server and Copy Endpoint ID (or "Set Up Server…" while
-there is none). With an enabled server, the icon shows the server's state —
-dimmed while it is down, a **dot** while it is starting or stopping, and a
-**checkmark** while it runs (how many clients are connected shows in the menu
-and the server pane); client connections don't change it then. Without a
-server, or with a disabled one, the app is client-only: the icon is at full
-strength (dark on macOS) while a connection is up and dimmed otherwise, with no
-badge — except an **empty circle** for a disabled server while no connection is up.
-A profile in standby counts as up, in the icon and in the menu's count.
+Once the client has destinations, the menu shows its status line — running,
+and how many destinations are connected right now — with Enable/Disable
+Client; then the server's status line with Enable/Disable Server and Copy
+Endpoint ID (or "Set Up Server…" while there is none). With an enabled server,
+the icon shows the server's state — dimmed while it is down, a **dot** while
+it is starting or stopping, and a **checkmark** while it runs (how many
+clients are connected shows in the menu and the server pane); the client
+doesn't change it then. Without a server, or with a disabled one, the app is
+client-only: the icon is at full strength (dark on macOS) while the client is
+running and dimmed otherwise, with no badge — except an **empty circle** for a
+disabled server while the client is down. A running client counts as up
+whether or not a destination is connected at the moment.
 
-- **Live logs** — an in-app Logs pane; every session's log lines (core
-  internals included) are attributed to the server or their profile.
+- **Live logs** — an in-app Logs pane; every log line (core internals
+  included) is attributed to the client or the server, and can be filtered to
+  either.
 - **Start at login** — on by default: the first launch registers the app as a
   per-user login item (a LaunchAgent plist in `~/Library/LaunchAgents` on
   macOS, a `HKCU\…\CurrentVersion\Run` value on Windows — the same
@@ -150,7 +171,8 @@ A profile in standby counts as up, in the icon and in the menu's count.
 ## Where settings live
 
 Settings live in `profiles.json` in the platform's local data directory.
-Names, endpoint ids, ports, forwards, relay URLs and public keys are plaintext.
+Hosts, endpoint ids, routes, ports, forwards, relay URLs and public keys are
+plaintext.
 Auth-key secrets, the server identity key and relay auth tokens are sealed in
 that file with AES-256-GCM. Only the random master key is kept in the system
 keychain (macOS Keychain or Windows Credential Manager), under "Flextunnel Safe
@@ -164,9 +186,9 @@ build that wrote the file. If the store does not unseal because the Safe
 Storage entry was deleted or replaced, quit and restore that entry.
 
 > **Development escape hatch:** setting `FLEXTUNNEL_DEV_CONFIG` (to `1` or to an
-> explicit file path) stores everything, tokens included, in a single plaintext
+> explicit file path) stores everything, secrets included, in a single plaintext
 > JSON file, so an unsigned rebuild loop doesn't trigger the keychain access
-> prompt on every launch. **Never set it for a real install** — the tokens are
+> prompt on every launch. **Never set it for a real install** — the secrets are
 > stored unencrypted.
 
 > **Mock keychain for end-to-end tests:** `FLEXTUNNEL_KEYCHAIN=mock` keeps the
@@ -225,15 +247,15 @@ Requires a recent Rust toolchain (edition 2024).
 ```
 src/main.rs     entry point; boots the iced daemon and the tray
    app.rs       the daemon state machine (sidebar + detail pane + tray glue)
-   view.rs      the window UI (sidebar, server + profile panes, modals)
-   tray.rs      system-tray icon + connections/server status menu
+   view.rs      the window UI (sidebar, client + destination + server panes, modals)
+   tray.rs      system-tray icon + client/server status menu
    server_session.rs  the in-process server: one session, connected clients
    autostart.rs login-item registration (LaunchAgent / Run key)
-   tunnel.rs    background controller: the server + one session per profile
-   config.rs    profile persistence (profiles.json + keychain tokens)
+   tunnel.rs    background controller: the client session + the server session
+   config.rs    settings persistence (profiles.json + the keychain master key)
    icon.rs      tray glyph rendered at runtime
    style.rs     iced theme
-   logging.rs   per-profile log attribution
+   logging.rs   log ring + file, lines attributed to client or server
 ```
 
 For the tunnel protocol, transport, and security model, see the

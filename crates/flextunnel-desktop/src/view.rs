@@ -1,21 +1,22 @@
-//! Widget tree for the sidebar (the client connections, then the server) +
-//! detail-pane window, rendered from
+//! Widget tree for the sidebar (the client and its destinations, then the
+//! server) + detail-pane window, rendered from
 //! [`App`] state — all pure functions of `&App`, every mutation flows back
 //! through a [`Message`]. The look (cards, pills, ghost buttons, sidebar rows)
 //! comes from the design system in [`crate::style`].
 
 use crate::app::{
-    format_duration, App, ClientForm, ForwardForm, IdentityChoice, KeyChoice, KeyForm, LogFilter,
-    Message, ProfileForm, Selection, ServerForm, StoreReset,
+    format_duration, App, ClientForm, DestinationForm, DestinationLive, ForwardForm,
+    IdentityChoice, KeyChoice, KeyForm, LogFilter, Message, ProxyForm, Selection, ServerForm,
+    StoreReset,
 };
-use crate::config::{self, AuthKey, AuthorizedClient, Profile, ServerConfig};
+use crate::config::{self, AuthKey, AuthorizedClient, ClientSettings, Destination, ServerConfig};
 use crate::server_session::ServerPhase;
 use crate::tray::clients_connected;
 use flextunnel_core::forwards::{ForwardState, ForwardStatus, PortForward};
 use crate::style::{self, AMBER, GRAY, GREEN, RED};
-use crate::tunnel::{Phase, Snapshot};
+use crate::tunnel::ClientPhase;
 use flextunnel_core::proxy::signaling::Target;
-use flextunnel_core::proxy::{Route, RouteTable, reserved};
+use flextunnel_core::proxy::{DestinationState, Route, RouteTable, reserved};
 use flextunnel_core::transport::paths::{ConnPathKind, ConnectionSnapshot, CustomRelayStatus};
 use iced::widget::{
     button, center, checkbox, column, container, mouse_area, opaque, pick_list, row, scrollable,
@@ -24,46 +25,67 @@ use iced::widget::{
 use iced::{Center, Color, Element, Fill, Font};
 use std::net::SocketAddr;
 
-/// Advisory-badge cache: the profile's routing table, rebuilt only when its
-/// host or routes change (`None` inside means they do not validate — the
-/// profile then cannot connect, and no badge is shown).
-pub type RoutedCache = Option<(String, Vec<String>, Vec<String>, Option<RouteTable>)>;
+/// One destination's routing input: `(host, routed domains, routed CIDRs)`.
+type RouteKey = (String, Vec<String>, Vec<String>);
 
-/// Rebuild the advisory-badge routing table only when the profile's host or
-/// routes change.
-pub fn refresh_routed_cache(cache: &mut RoutedCache, profile: &Profile) {
-    let fresh = matches!(cache,
-        Some((host, domains, cidrs, _)) if *host == profile.host
-            && *domains == profile.routed_domains
-            && *cidrs == profile.routed_cidrs);
+/// The forwards' advisory routing table — which destination carries each, if
+/// any — rebuilt only when a destination's host or routes change.
+#[derive(Default)]
+pub struct RoutedCache {
+    /// What the table was built from, per destination; `None` before the
+    /// first build.
+    built_from: Option<Vec<RouteKey>>,
+    /// `None` when the destinations do not make a valid table: the client
+    /// then cannot start, and no badge is shown.
+    pub table: Option<RouteTable>,
+}
+
+/// Rebuild the advisory routing table only when the destinations' hosts or
+/// routes changed.
+pub fn refresh_routed_cache(cache: &mut RoutedCache, client: &ClientSettings) {
+    let fresh = cache.built_from.as_ref().is_some_and(|built| {
+        built.len() == client.destinations.len()
+            && built.iter().zip(&client.destinations).all(|((host, domains, cidrs), d)| {
+                *host == d.host && *domains == d.routed_domains && *cidrs == d.routed_cidrs
+            })
+    });
     if !fresh {
-        let table = profile
+        cache.table = client
             .route_table()
-            .inspect_err(|e| log::debug!("Routes unusable for the badge: {e}"))
+            .inspect_err(|e| log::debug!("Routes unusable for the forward badges: {e}"))
             .ok();
-        *cache = Some((
-            profile.host.clone(),
-            profile.routed_domains.clone(),
-            profile.routed_cidrs.clone(),
-            table,
-        ));
+        cache.built_from = Some(
+            client
+                .destinations
+                .iter()
+                .map(|d| (d.host.clone(), d.routed_domains.clone(), d.routed_cidrs.clone()))
+                .collect(),
+        );
     }
 }
 
-/// Everything is tunneled when the profile routes every hostname or an
+/// Everything is tunneled when a destination routes every hostname or an
 /// all-covering network.
 fn is_full_tunnel(domains: &[String], cidrs: &[String]) -> bool {
     domains.iter().any(|d| d == "*") || cidrs.iter().any(|c| c == "0.0.0.0/0" || c == "::/0")
 }
 
-/// Whether the profile's routing carries a forward to its server (`None` =
-/// unknown, no badge). Mirrors the core's routing decision — the profile's
-/// own host, or a host on its routed lists — and matters more for a forward
-/// than for the proxy: a forward never connects directly, so one whose host
-/// nothing routes can only fail.
-fn forward_routed(table: Option<&RouteTable>, forward: &PortForward) -> Option<bool> {
+/// The host of the destination that carries a forward, by the client's
+/// routing: `Some(None)` when none does, `None` when unknown (no badge).
+/// Mirrors the core's routing decision — a destination's own host, or a host
+/// on its routed lists — and matters more for a forward than for the proxy: a
+/// forward never connects directly, so one whose host nothing routes can only
+/// fail.
+fn forward_route<'a>(
+    table: Option<&'a RouteTable>,
+    forward: &PortForward,
+) -> Option<Option<&'a str>> {
+    let table = table?;
     let target = Target::Domain(forward.remote_host.clone(), forward.remote_port);
-    Some(matches!(table?.route(&target), Route::Tunnel { .. }))
+    Some(match table.route(&target) {
+        Route::Tunnel { dest, .. } => table.hosts().nth(dest),
+        _ => None,
+    })
 }
 
 /// Live state pill for a forward row: gray "stopped", amber "starting…",
@@ -71,7 +93,7 @@ fn forward_routed(table: Option<&RouteTable>, forward: &PortForward) -> Option<b
 fn forward_pill(
     forward: &PortForward,
     status: Option<&ForwardStatus>,
-    phase: Phase,
+    phase: ClientPhase,
 ) -> (String, Color) {
     if !forward.enabled {
         return ("stopped".into(), GRAY);
@@ -85,23 +107,52 @@ fn forward_pill(
             ForwardState::Listening => ("listening".into(), GREEN),
             ForwardState::Failed(_) => ("failed".into(), RED),
         },
-        // No status = no running session for this forward. The profile's
-        // connection banner explains the disconnected case in one place.
+        // No status = no running session for this forward. The client's
+        // banner explains the not-running case in one place.
         None => match phase {
-            Phase::Idle | Phase::Failed => ("stopped".into(), GRAY),
-            _ => ("starting…".into(), AMBER),
+            ClientPhase::Starting | ClientPhase::Running => ("starting…".into(), AMBER),
+            _ => ("stopped".into(), GRAY),
         },
     }
 }
 
-fn phase_color(phase: Phase) -> Color {
+fn client_phase_color(phase: ClientPhase) -> Color {
     match phase {
-        Phase::Idle => GRAY,
-        Phase::Connecting | Phase::Reconnecting => AMBER,
-        // Standby is a healthy state: everything is listening and the server
-        // is one use away.
-        Phase::Connected | Phase::Standby => GREEN,
-        Phase::Failed => RED,
+        ClientPhase::Stopped => GRAY,
+        ClientPhase::Starting | ClientPhase::Stopping => AMBER,
+        ClientPhase::Running => GREEN,
+        ClientPhase::Failed => RED,
+    }
+}
+
+fn client_phase_label(phase: ClientPhase) -> &'static str {
+    match phase {
+        ClientPhase::Stopped => "stopped",
+        ClientPhase::Starting => "starting…",
+        ClientPhase::Running => "running",
+        ClientPhase::Stopping => "stopping…",
+        ClientPhase::Failed => "failed",
+    }
+}
+
+/// A destination's state word and color. Idle is the resting state of a
+/// destination nobody is using — gray, not a fault — unless its last attempt
+/// failed: the core rests it all the same once nothing is waiting (a refused
+/// key, after its retry delay), and that must not read as healthy.
+fn destination_state(live: &DestinationLive<'_>) -> (&'static str, Color) {
+    match live {
+        DestinationLive::Stopped => ("client off", GRAY),
+        DestinationLive::Pending => ("restart to apply", AMBER),
+        DestinationLive::Live(status) => match status.state {
+            DestinationState::Idle if status.last_error.is_some() => {
+                ("last attempt failed", AMBER)
+            }
+            DestinationState::Idle => ("idle", GRAY),
+            DestinationState::Connecting => ("connecting…", AMBER),
+            DestinationState::Connected => ("connected", GREEN),
+            DestinationState::Backoff => ("retrying…", AMBER),
+            DestinationState::Failed => ("refused", RED),
+        },
     }
 }
 
@@ -124,21 +175,10 @@ fn server_phase_label(phase: ServerPhase) -> &'static str {
     }
 }
 
-/// Whether a full-pane form (profile or server) replaces the detail pane, so
-/// no sidebar row reads as selected.
+/// Whether a full-pane form (destination or server) replaces the detail pane,
+/// so no sidebar row reads as selected.
 fn form_open(app: &App) -> bool {
-    app.profile_form.is_some() || app.server_form.is_some()
-}
-
-fn phase_label(phase: Phase) -> &'static str {
-    match phase {
-        Phase::Idle => "disconnected",
-        Phase::Connecting => "connecting…",
-        Phase::Connected => "connected",
-        Phase::Standby => "standby",
-        Phase::Reconnecting => "reconnecting…",
-        Phase::Failed => "failed",
-    }
+    app.destination_form.is_some() || app.server_form.is_some()
 }
 
 pub fn root(app: &App) -> Element<'_, Message> {
@@ -212,11 +252,11 @@ fn store_reset_modal(reset: &StoreReset) -> Element<'_, Message> {
             "Saved settings can't be read",
             format!(
                 "flextunnel couldn't load its settings: {error}. It is running with none: \
-                 no connections, keys or server."
+                 no destinations, keys or server."
             ),
             "fix the cause (for example, allow flextunnel to read its \"Flextunnel Safe \
              Storage\" keychain entry) and open flextunnel again.",
-            "replaces them with empty settings, deleting every connection, key and the \
+            "replaces them with empty settings, deleting every destination, key and the \
              server",
         ),
     };
@@ -251,8 +291,8 @@ fn store_reset_modal(reset: &StoreReset) -> Element<'_, Message> {
         .into()
 }
 
-/// The connection-path modal card: a point-in-time snapshot of how the profile
-/// reaches the server, each path dotted by transport (direct/relay) with the
+/// The connection-path modal card: a point-in-time snapshot of how the client
+/// reaches a destination's server, each path dotted by transport (direct/relay) with the
 /// active one pilled — mirrors `ezvpn client status`.
 fn conn_path_modal(snapshot: &ConnectionSnapshot) -> Element<'_, Message> {
     let mut card = column![
@@ -265,7 +305,7 @@ fn conn_path_modal(snapshot: &ConnectionSnapshot) -> Element<'_, Message> {
                 .on_press(Message::DismissConnPath),
         ]
         .align_y(Center),
-        text("Snapshot taken just now — how this profile reaches the server.")
+        text("Snapshot taken just now — how the client reaches this server.")
             .size(11)
             .style(style::dim_text),
     ]
@@ -346,27 +386,29 @@ fn custom_relay_row(relay: &CustomRelayStatus) -> Element<'_, Message> {
 // Sidebar
 
 fn sidebar(app: &App) -> Element<'_, Message> {
-    // Client connections, then the server — one per user, so a single slot
-    // rather than a list: its row, or the way to set it up. Neither is
-    // required; each is set up here whenever wanted.
-    let mut list = column![
+    // The client — its one row, then the destinations it reaches — and the
+    // server: one per user, so a single slot rather than a list: its row, or
+    // the way to set it up. Neither role is required; each is set up here
+    // whenever wanted.
+    let mut list = column![section_label("CLIENT"), sidebar_client_row(app)].spacing(2);
+    list = list.push(space().height(10));
+    list = list.push(
         row![
-            section_label("CONNECTIONS"),
+            section_label("DESTINATIONS"),
             space().width(Fill),
             button(text("+").size(14).font(semibold()))
                 .padding([1, 9])
                 .style(style::tinted)
-                .on_press(Message::AddProfile),
+                .on_press(Message::AddDestination),
         ]
-        .align_y(Center)
-    ]
-    .spacing(2);
-    for profile in &app.profiles {
-        list = list.push(sidebar_profile_row(app, profile));
+        .align_y(Center),
+    );
+    for destination in &app.client.destinations {
+        list = list.push(sidebar_destination_row(app, destination));
     }
-    if app.profiles.is_empty() {
+    if app.client.destinations.is_empty() {
         list = list.push(
-            container(text("No connections yet.").size(11).style(style::faint_text))
+            container(text("No destinations yet.").size(11).style(style::faint_text))
                 .padding([4, 10]),
         );
     }
@@ -375,7 +417,7 @@ fn sidebar(app: &App) -> Element<'_, Message> {
     // Unset, the slot leads to the server's welcome, and stays selected
     // through the setup form it opens.
     let welcome_selected = app.server_form.is_some()
-        || (app.selection == Selection::Server && app.profile_form.is_none());
+        || (app.selection == Selection::Server && app.destination_form.is_none());
     list = list.push(match &app.server {
         Some(server) => sidebar_server_row(app, server),
         None => button(text("Set up server…").size(13).style(style::dim_text))
@@ -400,15 +442,17 @@ fn sidebar(app: &App) -> Element<'_, Message> {
         .style(style::sidebar_row(logs_selected))
         .on_press(Message::Select(Selection::Logs));
 
+    // Destinations and forwards, to move them to another computer.
+    let exportable = !app.client.destinations.is_empty() || !app.client.forwards.is_empty();
     let io_row = row![
         button(text("Export").size(11))
             .padding([3, 10])
             .style(style::ghost)
-            .on_press_maybe((!app.profiles.is_empty()).then_some(Message::ExportProfiles)),
+            .on_press_maybe(exportable.then_some(Message::ExportClient)),
         button(text("Import").size(11))
             .padding([3, 10])
             .style(style::ghost)
-            .on_press(Message::ImportProfiles),
+            .on_press(Message::ImportClient),
     ]
     .spacing(4);
 
@@ -430,68 +474,104 @@ fn sidebar(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-fn sidebar_profile_row<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message> {
-    let snapshot = app.snapshot_for(&profile.id);
-    let selected = app.selection == Selection::Profile(profile.id.clone()) && !form_open(app);
-
-    let title = row![
-        dot(phase_color(snapshot.phase), 8.0),
-        text(profile.name.as_str()).size(13).font(semibold()),
-    ]
-    .spacing(7)
-    .align_y(Center);
-
-    let running = profile
-        .forwards
-        .iter()
-        .filter(|f| {
-            f.enabled
-                && snapshot
-                    .forwards
-                    .iter()
-                    .any(|s| s.id == f.id && s.state == ForwardState::Listening)
-        })
-        .count();
-    let mut counts = format!(
-        "{} forward{}",
-        profile.forwards.len(),
-        if profile.forwards.len() == 1 { "" } else { "s" }
-    );
-    if running > 0 {
-        counts.push_str(&format!(" · {running} running"));
+/// The client's state word and color for its hero and sidebar row: a disabled
+/// client that has stopped reads as "disabled", not "stopped".
+fn client_state(app: &App) -> (&'static str, Color) {
+    let phase = app.client_snapshot.phase;
+    if !app.client.enabled && phase == ClientPhase::Stopped {
+        ("disabled", GRAY)
+    } else {
+        (client_phase_label(phase), client_phase_color(phase))
     }
+}
 
-    let mut content = column![title].spacing(3);
-    content = content.push(
+/// The client's one-line state for the sidebar: running with how many
+/// destinations are connected, what it is waiting for, or its phase.
+fn client_row_status(app: &App) -> String {
+    let snapshot = &app.client_snapshot;
+    match snapshot.phase {
+        ClientPhase::Running => {
+            let connected = snapshot
+                .destinations
+                .iter()
+                .filter(|d| d.state == DestinationState::Connected)
+                .count();
+            match connected {
+                0 => "running · none connected".into(),
+                n => format!("running · {n} connected"),
+            }
+        }
+        ClientPhase::Stopped if app.client.enabled && app.client.destinations.is_empty() => {
+            "needs a destination".into()
+        }
+        _ => client_state(app).0.into(),
+    }
+}
+
+fn sidebar_client_row(app: &App) -> Element<'_, Message> {
+    let selected = app.selection == Selection::Client && !form_open(app);
+    let running = app.client_snapshot.phase == ClientPhase::Running;
+    let content = column![
+        row![
+            dot(client_state(app).1, 8.0),
+            text("Proxy & forwards").size(13).font(semibold()),
+        ]
+        .spacing(7)
+        .align_y(Center),
         row![
             space().width(15),
-            text(counts).size(11).style(if running > 0 {
+            text(client_row_status(app)).size(11).style(if running {
                 |_: &iced::Theme| iced::widget::text::Style { color: Some(GREEN) }
             } else {
                 style::faint_text
             }),
-        ]
-        .align_y(Center),
-    );
-    for forward in &profile.forwards {
-        let status = snapshot.forwards.iter().find(|s| s.id == forward.id);
-        let (_, color) = forward_pill(forward, status, snapshot.phase);
-        content = content.push(
-            row![
-                space().width(15),
-                dot(color, 5.0),
-                text(forward.display_name()).size(11).style(style::dim_text),
-            ]
-            .spacing(6)
-            .align_y(Center),
-        );
-    }
-
+        ],
+    ]
+    .spacing(3);
     button(content)
         .padding([7, 10])
         .width(Fill)
         .style(style::sidebar_row(selected))
-        .on_press(Message::Select(Selection::Profile(profile.id.clone())))
+        .on_press(Message::Select(Selection::Client))
+        .into()
+}
+
+fn sidebar_destination_row<'a>(
+    app: &'a App,
+    destination: &'a Destination,
+) -> Element<'a, Message> {
+    let live = app.destination_live(destination);
+    let (label, color) = destination_state(&live);
+    let selected =
+        app.selection == Selection::Destination(destination.id.clone()) && !form_open(app);
+    let mut status = label.to_string();
+    if let DestinationLive::Live(live) = &live
+        && live.open_streams > 0
+    {
+        status.push_str(&format!(" · {} open", live.open_streams));
+    }
+    let content = column![
+        row![
+            dot(color, 8.0),
+            text(destination.host.as_str()).size(13).font(semibold()),
+        ]
+        .spacing(7)
+        .align_y(Center),
+        row![
+            space().width(15),
+            text(status).size(11).style(if color == GREEN {
+                |_: &iced::Theme| iced::widget::text::Style { color: Some(GREEN) }
+            } else {
+                style::faint_text
+            }),
+        ],
+    ]
+    .spacing(3);
+    button(content)
+        .padding([7, 10])
+        .width(Fill)
+        .style(style::sidebar_row(selected))
+        .on_press(Message::Select(Selection::Destination(destination.id.clone())))
         .into()
 }
 
@@ -549,17 +629,18 @@ fn sidebar_server_row<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a,
 // Detail pane
 
 fn detail_pane(app: &App) -> Element<'_, Message> {
-    let content: Element<'_, Message> = if let Some(form) = &app.profile_form {
-        profile_form_view(app, form)
+    let content: Element<'_, Message> = if let Some(form) = &app.destination_form {
+        destination_form_view(app, form)
     } else if let Some(form) = &app.server_form {
         server_form_view(app, form)
     } else {
         match &app.selection {
             Selection::Empty => empty_state(),
+            Selection::Client => client_detail(app),
             Selection::Keys => keys_pane(app),
             Selection::Logs => logs_pane(app),
-            Selection::Profile(id) => match app.profile(id) {
-                Some(profile) => profile_detail(app, profile),
+            Selection::Destination(id) => match app.client.destination(id) {
+                Some(destination) => destination_detail(app, destination),
                 None => empty_state(),
             },
             Selection::Server => match &app.server {
@@ -578,7 +659,7 @@ fn empty_state() -> Element<'static, Message> {
         column![
             text("Nothing selected").size(14).font(semibold()),
             text(
-                "Use + next to Connections to reach a flextunnel server elsewhere, or \
+                "Use + next to Destinations to reach a flextunnel server elsewhere, or \
                  Set up server… to let your other devices reach this computer. Use \
                  either one, or both.",
             )
@@ -595,18 +676,57 @@ fn empty_state() -> Element<'static, Message> {
     .into()
 }
 
-fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message> {
-    let snapshot = app.snapshot_for(&profile.id);
-    let ready = profile.is_ready(&app.keys);
+/// A tinted one-line banner: a dot, a message, and optionally a button.
+fn banner<'a>(
+    color: Color,
+    message: impl text::IntoFragment<'a>,
+    action: Option<(&'static str, Message)>,
+) -> Element<'a, Message> {
+    let mut r = row![dot(color, 8.0), text(message).size(12)]
+        .spacing(8)
+        .align_y(Center);
+    if let Some((label, message)) = action {
+        r = r.push(space().width(Fill));
+        r = r.push(
+            button(text(label).size(11).font(semibold()))
+                .padding([3, 10])
+                .style(style::tinted)
+                .on_press(message),
+        );
+    }
+    container(r)
+        .padding([9, 12])
+        .width(Fill)
+        .style(style::banner(color))
+        .into()
+}
 
+/// The banner offering the restart that applies saved settings to a running
+/// client. Shown on the client pane and on every destination's.
+fn restart_banner<'a>() -> Element<'a, Message> {
+    banner(
+        AMBER,
+        "Saved changes apply once the client restarts, which closes its open connections.",
+        Some(("Restart now", Message::RestartClient)),
+    )
+}
+
+/// The client pane: its on/off switch and state, the proxy front-ends, and
+/// the port forwards. Where it goes is the destinations' business.
+fn client_detail(app: &App) -> Element<'_, Message> {
+    let client = &app.client;
+    let snapshot = &app.client_snapshot;
+    let running = snapshot.phase == ClientPhase::Running;
+
+    let (label, color) = client_state(app);
     let mut hero = row![
-        dot(phase_color(snapshot.phase), 12.0),
-        text(profile.name.as_str()).size(20).font(semibold()),
-        pill(phase_label(snapshot.phase).to_string(), phase_color(snapshot.phase)),
+        dot(color, 12.0),
+        text("Client").size(20).font(semibold()),
+        pill(label.to_string(), color),
     ]
     .spacing(10)
     .align_y(Center);
-    if let Some(since) = snapshot.connected_since {
+    if let Some(since) = snapshot.running_since {
         hero = hero.push(
             text(format!("for {}", format_duration(since.elapsed())))
                 .size(13)
@@ -614,153 +734,140 @@ fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message
         );
     }
     hero = hero.push(space().width(Fill));
-    hero = hero.push(match snapshot.phase {
-        Phase::Idle | Phase::Failed => button(text("Connect").size(13).font(semibold()))
-            .padding([7, 16])
-            .style(style::primary)
-            .on_press_maybe(ready.then(|| Message::Connect(profile.id.clone()))),
-        _ => button(text("Disconnect").size(13))
-            .padding([7, 16])
-            .style(style::outlined)
-            .on_press(Message::Disconnect(profile.id.clone())),
-    });
+    // The client's only on/off control, persisted: enabled, it runs (and
+    // starts with the app); disabled, it stays stopped across launches. Not
+    // switchable while its endpoints are still closing.
+    let mut switch = toggler(client.enabled)
+        .label("Enabled")
+        .text_size(13)
+        .size(20)
+        .style(style::switch);
+    if snapshot.phase != ClientPhase::Stopping {
+        switch = switch.on_toggle(Message::SetClientEnabled);
+    }
+    hero = hero.push(switch);
 
     let mut col = column![hero].spacing(12);
-
     if let Some(notice) = &app.notice {
         col = col.push(text(notice.as_str()).size(12).style(style::dim_text));
     }
     if let Some(error) = &snapshot.last_error {
         col = col.push(text(error.as_str()).size(12).color(RED));
     }
-    if snapshot.phase == Phase::Standby {
+    if client.enabled && snapshot.phase == ClientPhase::Failed {
         col = col.push(
-            text("Not connected right now — it connects again when something is sent to it.")
+            text("Change what failed, or switch it off and on again to retry.")
                 .size(12)
                 .style(style::dim_text),
         );
     }
-    if !ready {
-        let fix = match config::find_key(&app.keys, &profile.auth_key_id) {
-            // The key exists but its secret was lost from the keychain.
-            Some(key) if key.secret.is_empty() => format!(
-                "The secret of key \"{}\" is missing — re-enter it in the Keys pane.",
-                key.name
-            ),
-            // The key is fine: the host (or a route) is what is missing.
-            Some(_) if profile.host.trim().is_empty() => {
-                "No host set — edit the profile to give this server a host name.".into()
-            }
-            Some(_) => match profile.route_table() {
-                Err(e) => format!("Edit the profile to fix its host and routes: {e}"),
-                Ok(_) => "Edit the profile to complete it.".into(),
-            },
-            None => "No auth key picked — edit the profile to pick one.".into(),
-        };
-        col = col.push(text(fix).size(12).color(AMBER));
+    if client.enabled
+        && !running
+        && let Some(blocker) = client.start_blocker(&app.keys)
+    {
+        let add = client
+            .destinations
+            .is_empty()
+            .then_some(("Add destination", Message::AddDestination));
+        col = col.push(banner(AMBER, blocker, add));
     }
-
-    // CONNECTION card
-    let node_id = profile.server_node_id.clone();
-    let socks = snapshot
-        .socks_addr
-        .or_else(|| profile.socks_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p))))
-        .map(|addr| addr.to_string());
-    let http = snapshot
-        .http_addr
-        .or_else(|| profile.http_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p))))
-        .map(|a| a.to_string());
-
-    let copy_node = (!node_id.is_empty()).then(|| node_id.clone());
-    let mut info = column![
-        // The full id never fits (and iced has no ellipsis overflow); both
-        // ends stay visible for eyeballing, Copy carries the whole thing.
-        info_row("Server node id", truncate_middle(&node_id, 22), copy_node),
-    ]
-    .spacing(8);
-    if !profile.host.is_empty() {
-        info = info.push(info_row("Host", profile.host.clone(), Some(profile.host.clone())));
+    if app.client_needs_restart() {
+        col = col.push(restart_banner());
     }
-    // The key's public half is not a secret — always shown unmasked so it can
-    // be copied onto the server's authorized-keys file. (The secret never
-    // appears anywhere in the UI.)
-    if let Some(key) = config::find_key(&app.keys, &profile.auth_key_id) {
-        info = info.push(info_row(
-            "Auth key",
-            format!("{} ({})", key.name, truncate_middle(&key.public_key, 14)),
-            Some(key.public_key.clone()),
-        ));
-    }
-    if let Some(socks) = socks {
-        let copy = Some(format!("socks5://{socks}"));
-        info = info.push(info_row("SOCKS5 proxy", socks, copy));
-    }
-    if let Some(http) = http {
-        let copy = Some(format!("http://{http}"));
-        info = info.push(info_row("HTTP proxy", http, copy));
-    }
-    let mut header = row![section_label("CONNECTION"), space().width(Fill)].align_y(Center);
-    if snapshot.phase == Phase::Connected {
-        // A one-shot readout of the live iroh path, shown in a dismissable
-        // modal overlay (see `App::conn_path_modal`) — a point-in-time check
-        // rather than a live field.
-        header = header.push(
-            button(text("Connection path").size(12))
-                .padding([3, 10])
-                .style(style::ghost)
-                .on_press(Message::ShowConnPath),
-        );
-    }
-    header = header.push(
-        button(text("Edit").size(12))
-            .padding([3, 10])
-            .style(style::ghost)
-            .on_press(Message::EditProfile(profile.id.clone())),
-    );
-    col = col.push(header);
-    col = col.push(container(info).padding([12, 14]).width(Fill).style(style::card));
-
-    // The routing is the profile's own configuration, so it shows whatever
-    // the connection is doing.
-    if !profile.host.is_empty() {
-        col = col.push(section_label("ROUTING"));
+    if running {
         col = col.push(
-            container(routes_section(profile))
-                .padding([12, 14])
-                .width(Fill)
-                .style(style::card),
+            text(
+                "Listening. Each destination is connected when something is first sent to \
+                 it, and disconnected again after five minutes without use.",
+            )
+            .size(12)
+            .style(style::dim_text),
         );
     }
 
-    // FORWARDINGS
-    if let Some(banner) = connection_banner(profile, ready, snapshot) {
-        col = col.push(banner);
-    }
+    // PROXIES card (or its form)
     col = col.push(
         row![
-            section_label(if profile.forwards.is_empty() {
+            section_label("PROXIES"),
+            space().width(Fill),
+            button(text("Edit").size(12))
+                .padding([3, 10])
+                .style(style::ghost)
+                .on_press(Message::EditProxies),
+        ]
+        .align_y(Center),
+    );
+    if let Some(form) = &app.proxy_form {
+        col = col.push(proxy_form_view(app, form));
+    } else {
+        let loopback = |port: u16| SocketAddr::from(([127, 0, 0, 1], port)).to_string();
+        let mut info = column![].spacing(8);
+        info = info.push(match client.socks_port.map(loopback) {
+            Some(addr) => {
+                let copy = Some(format!("socks5h://{addr}"));
+                info_row("SOCKS5 proxy", addr, copy)
+            }
+            None => info_row("SOCKS5 proxy", "off".into(), None),
+        });
+        info = info.push(match client.http_port.map(loopback) {
+            Some(addr) => {
+                let copy = Some(format!("http://{addr}"));
+                info_row("HTTP proxy", addr, copy)
+            }
+            None => info_row("HTTP proxy", "off".into(), None),
+        });
+        if client.socks_port.is_some() || client.http_port.is_some() {
+            // The client's own status page lives under the reserved name,
+            // answered locally through either proxy — surface it so it is
+            // discoverable (and copyable).
+            let page = format!("http://{}/", reserved::STATUS_HOST);
+            info = info.push(info_row("Status page", page.clone(), Some(page)));
+        }
+        col = col.push(container(info).padding([12, 14]).width(Fill).style(style::card));
+        col = col.push(
+            text(
+                "Point a proxy-aware app at either one. A request for a destination's host \
+                 or one of its routes goes through that destination; anything else connects \
+                 directly from this computer.",
+            )
+            .size(11)
+            .style(style::faint_text),
+        );
+    }
+
+    // PORT FORWARDS
+    col = col.push(
+        row![
+            section_label(if client.forwards.is_empty() {
                 "PORT FORWARDS".to_string()
             } else {
-                format!("PORT FORWARDS · {}", profile.forwards.len())
+                format!("PORT FORWARDS · {}", client.forwards.len())
             }),
             space().width(Fill),
             button(text("+ Add").size(12).font(semibold()))
                 .padding([4, 12])
                 .style(style::tinted)
-                .on_press(Message::AddForward(profile.id.clone())),
+                .on_press(Message::AddForward),
         ]
         .align_y(Center),
     );
+    if !client.forwards.is_empty()
+        && !matches!(snapshot.phase, ClientPhase::Starting | ClientPhase::Running)
+    {
+        col = col.push(banner(
+            GRAY,
+            "The client is not running — forwards are inactive until it is.",
+            None,
+        ));
+    }
 
     // Inline add/edit form — one at a time; an inline card fits the window
     // better than a separate one.
-    if let Some((form_profile, form)) = &app.forward_form
-        && *form_profile == profile.id
-    {
+    if let Some(form) = &app.forward_form {
         col = col.push(forward_form_view(app, form));
     }
 
-    if profile.forwards.is_empty() {
+    if client.forwards.is_empty() {
         col = col.push(
             container(
                 text("No port forwards yet. Add one to expose a remote service on localhost.")
@@ -773,93 +880,76 @@ fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message
             .style(style::card),
         );
     } else {
-        let table = app
-            .routed_caches
-            .get(&profile.id)
-            .and_then(|c| c.as_ref())
-            .and_then(|(_, _, _, table)| table.as_ref());
-        for forward in &profile.forwards {
-            col = col.push(forward_card(app, profile, forward, snapshot, table));
+        for forward in &client.forwards {
+            col = col.push(forward_card(app, forward));
         }
         col = col.push(
             text(
                 "Forwards listen on localhost only (127.0.0.1 and ::1) and always go \
-                 through the server, never directly — so the remote host must be this \
-                 profile's host or one of its routes. The server rejects targets outside \
-                 its tunnel set.",
+                 through a destination, never directly — so the remote host must be a \
+                 destination's host or one of its routes. That server rejects targets \
+                 outside its tunnel set.",
             )
             .size(11)
             .style(style::faint_text),
         );
     }
 
-    // Delete, tucked at the very bottom behind a two-click confirm.
-    let confirming = app.confirm_delete.as_deref() == Some(profile.id.as_str());
-    col = col.push(space().height(8));
-    col = col.push(
-        row![button(
-            text(if confirming {
-                "Click again to delete this profile"
-            } else {
-                "Delete profile…"
-            })
-            .size(12)
-        )
-        .padding([4, 12])
-        .style(style::ghost_danger)
-        .on_press(Message::DeleteProfile(profile.id.clone()))]
-        .align_y(Center),
-    );
-
     scrollable(col.padding([0, 4])).height(Fill).spacing(4).into()
 }
 
-/// One tinted banner explaining why forwards aren't live, with an inline
-/// Connect button where that's the fix — instead of every row repeating it.
-fn connection_banner<'a>(
-    profile: &'a Profile,
-    ready: bool,
-    snapshot: &'a Snapshot,
-) -> Option<Element<'a, Message>> {
-    let (color, message, show_connect) = match snapshot.phase {
-        // In standby the forwards are listening; using one connects.
-        Phase::Connected | Phase::Standby => return None,
-        Phase::Idle => (
-            AMBER,
-            "Not connected — forwards are inactive until you connect.",
-            true,
-        ),
-        Phase::Failed => (
-            RED,
-            "Connection failed — forwards are inactive until you reconnect.",
-            true,
-        ),
-        Phase::Connecting => (AMBER, "Connecting — forwards work as soon as it is up.", false),
-        Phase::Reconnecting => (AMBER, "Reconnecting — forwards resume automatically.", false),
-    };
-    let mut r = row![dot(color, 8.0), text(message).size(12)]
-        .spacing(8)
-        .align_y(Center);
-    if show_connect {
-        r = r.push(space().width(Fill));
-        r = r.push(
-            button(text("Connect").size(11).font(semibold()))
-                .padding([3, 10])
-                .style(style::tinted)
-                .on_press_maybe(ready.then(|| Message::Connect(profile.id.clone()))),
-        );
+fn proxy_form_view<'a>(app: &'a App, form: &'a ProxyForm) -> Element<'a, Message> {
+    let mut socks = row![checkbox(form.socks_enabled)
+        .label("enable")
+        .text_size(13)
+        .on_toggle(Message::SocksEnabledToggled)
+        .style(style::check)]
+    .spacing(10)
+    .align_y(Center);
+    if form.socks_enabled {
+        socks = socks.push(text("port").size(12).style(style::dim_text));
+        socks = socks.push(input("", &form.socks_port, Message::SocksPortChanged).width(90));
     }
-    Some(
-        container(r)
-            .padding([9, 12])
-            .width(Fill)
-            .style(style::banner(color))
-            .into(),
-    )
+    let mut http = row![checkbox(form.http_enabled)
+        .label("enable")
+        .text_size(13)
+        .on_toggle(Message::HttpEnabledToggled)
+        .style(style::check)]
+    .spacing(10)
+    .align_y(Center);
+    if form.http_enabled {
+        http = http.push(text("port").size(12).style(style::dim_text));
+        http = http.push(input("", &form.http_port, Message::HttpPortChanged).width(90));
+    }
+
+    let validated = form.validate(&app.client);
+    let mut col = column![form_row("SOCKS5 proxy", socks), form_row("HTTP proxy", http)]
+        .spacing(10);
+    if let Err(message) = &validated {
+        col = col.push(text(message.clone()).size(12).color(AMBER));
+    }
+    col = col.push(
+        row![
+            button(text("Save").size(13).font(semibold()))
+                .padding([6, 16])
+                .style(style::primary)
+                .on_press_maybe(validated.is_ok().then_some(Message::ProxyFormSave)),
+            button(text("Cancel").size(13))
+                .padding([6, 16])
+                .style(style::outlined)
+                .on_press(Message::ProxyFormCancel),
+        ]
+        .spacing(8),
+    );
+    container(col)
+        .padding([12, 14])
+        .width(Fill)
+        .style(style::card)
+        .into()
 }
 
 fn forward_form_view<'a>(app: &'a App, form: &'a ForwardForm) -> Element<'a, Message> {
-    let validated = form.validate(&app.profiles);
+    let validated = form.validate(&app.client);
 
     let mut col = column![
         text(if form.is_edit() {
@@ -880,7 +970,7 @@ fn forward_form_view<'a>(app: &'a App, form: &'a ForwardForm) -> Element<'a, Mes
         form_row(
             "Remote host",
             input(
-                "host or IP — resolved server-side",
+                "a destination's host, or one of its routes",
                 &form.remote_host,
                 Message::FormRemoteHostChanged,
             ),
@@ -922,13 +1012,8 @@ fn forward_form_view<'a>(app: &'a App, form: &'a ForwardForm) -> Element<'a, Mes
         .into()
 }
 
-fn forward_card<'a>(
-    app: &'a App,
-    profile: &'a Profile,
-    forward: &'a PortForward,
-    snapshot: &'a Snapshot,
-    table: Option<&RouteTable>,
-) -> Element<'a, Message> {
+fn forward_card<'a>(app: &'a App, forward: &'a PortForward) -> Element<'a, Message> {
+    let snapshot = &app.client_snapshot;
     let status = snapshot.forwards.iter().find(|s| s.id == forward.id);
     let (pill_text, pill_color) = forward_pill(forward, status, snapshot.phase);
 
@@ -939,10 +1024,13 @@ fn forward_card<'a>(
     let mut title = row![name, pill(pill_text, pill_color)]
         .spacing(8)
         .align_y(Center);
-    // Only the problem is worth a badge: a forward the profile routes is the
-    // normal case.
-    if forward_routed(table, forward) == Some(false) {
-        title = title.push(pill("no route".to_string(), AMBER));
+    // Which destination carries it — or the problem: nothing does.
+    match forward_route(app.routed_cache.table.as_ref(), forward) {
+        Some(Some(host)) => {
+            title = title.push(text(format!("via {host}")).size(11).style(style::dim_text));
+        }
+        Some(None) => title = title.push(pill("no route".to_string(), AMBER)),
+        None => {}
     }
 
     let route = arrow_copy_row(forward.local_endpoint(), forward.remote_endpoint(), true);
@@ -962,24 +1050,21 @@ fn forward_card<'a>(
         info = info.push(text(error).size(11).color(AMBER));
     }
 
-    let profile_id = profile.id.clone();
     let forward_id = forward.id.clone();
     let controls = row![
         button(text("Edit").size(12))
             .padding([4, 10])
             .style(style::ghost)
-            .on_press(Message::EditForward(profile.id.clone(), forward.id.clone())),
+            .on_press(Message::EditForward(forward.id.clone())),
         button(text("Delete").size(12))
             .padding([4, 10])
             .style(style::ghost_danger)
-            .on_press(Message::DeleteForward(profile.id.clone(), forward.id.clone())),
+            .on_press(Message::DeleteForward(forward.id.clone())),
         // Desired state, but not a plain checkbox: enabling attempts the
         // setup now, and a setup failure snaps the switch back off (see
         // disable_failed_forwards).
         toggler(forward.enabled)
-            .on_toggle(move |enabled| {
-                Message::ToggleForward(profile_id.clone(), forward_id.clone(), enabled)
-            })
+            .on_toggle(move |enabled| Message::ToggleForward(forward_id.clone(), enabled))
             .size(20)
             .style(style::switch),
     ]
@@ -993,98 +1078,250 @@ fn forward_card<'a>(
         .into()
 }
 
-fn routes_section(profile: &Profile) -> Element<'_, Message> {
+/// One destination's pane: how it stands right now, the server behind its
+/// name, and what is sent through it.
+fn destination_detail<'a>(app: &'a App, destination: &'a Destination) -> Element<'a, Message> {
+    let live = app.destination_live(destination);
+    let (label, color) = destination_state(&live);
+    let status = match &live {
+        DestinationLive::Live(status) => Some(*status),
+        _ => None,
+    };
+
+    let mut hero = row![
+        dot(color, 12.0),
+        text(destination.host.as_str()).size(20).font(semibold()),
+        pill(label.to_string(), color),
+    ]
+    .spacing(10)
+    .align_y(Center);
+    if let Some(since) = status.and_then(|s| s.connected_since) {
+        hero = hero.push(
+            text(format!("for {}", format_duration(since.elapsed())))
+                .size(13)
+                .style(style::dim_text),
+        );
+    }
+    hero = hero.push(space().width(Fill));
+    // Connecting is on demand; this asks for one attempt now, to see whether
+    // the server is reachable without sending anything to it.
+    if let Some(status) = status
+        && matches!(
+            status.state,
+            DestinationState::Idle | DestinationState::Backoff | DestinationState::Failed
+        )
+    {
+        hero = hero.push(
+            button(text("Connect now").size(13).font(semibold()))
+                .padding([7, 16])
+                .style(style::primary)
+                .on_press(Message::ConnectNow(destination.id.clone())),
+        );
+    }
+
+    let mut col = column![hero].spacing(12);
+    if let Some(notice) = &app.notice {
+        col = col.push(text(notice.as_str()).size(12).style(style::dim_text));
+    }
+    match &live {
+        DestinationLive::Stopped => {
+            let why = if app.client.enabled {
+                "The client is not running, so nothing reaches this destination — see \
+                 Proxy & forwards."
+            } else {
+                "The client is disabled, so nothing reaches this destination — enable it \
+                 under Proxy & forwards."
+            };
+            col = col.push(text(why).size(12).style(style::dim_text));
+        }
+        DestinationLive::Pending => {}
+        DestinationLive::Live(status) => {
+            if let Some(error) = &status.last_error {
+                let color = if status.state == DestinationState::Failed { RED } else { AMBER };
+                col = col.push(text(error.as_str()).size(12).color(color));
+            }
+            let explain = match status.state {
+                DestinationState::Idle if status.last_error.is_some() => Some(
+                    "Not connected: the last attempt failed. It is tried again when \
+                     something next needs it, or with Connect now.",
+                ),
+                DestinationState::Idle => Some(
+                    "Not connected right now — it connects when something is sent to it.",
+                ),
+                DestinationState::Backoff => {
+                    Some("The last attempt failed — retrying while something is waiting for it.")
+                }
+                DestinationState::Failed => Some(
+                    "The server refused this client: it must authorize the auth key's public \
+                     half below. It is tried again when something next needs it.",
+                ),
+                DestinationState::Connecting | DestinationState::Connected => None,
+            };
+            if let Some(explain) = explain {
+                col = col.push(text(explain).size(12).style(style::dim_text));
+            }
+        }
+    }
+    if app.client_needs_restart() {
+        col = col.push(restart_banner());
+    }
+
+    // DESTINATION card
+    let node_id = destination.server_node_id.clone();
+    let copy_node = (!node_id.is_empty()).then(|| node_id.clone());
+    let mut info = column![
+        info_row("Host", destination.host.clone(), Some(destination.host.clone())),
+        // The full id never fits (and iced has no ellipsis overflow); both
+        // ends stay visible for eyeballing, Copy carries the whole thing.
+        info_row("Server node id", truncate_middle(&node_id, 22), copy_node),
+    ]
+    .spacing(8);
+    // The key's public half is not a secret — always shown unmasked so it can
+    // be copied onto the server's authorized-keys file. (The secret never
+    // appears anywhere in the UI.)
+    info = info.push(match config::find_key(&app.keys, &destination.auth_key_id) {
+        Some(key) => info_row(
+            "Auth key",
+            format!("{} ({})", key.name, truncate_middle(&key.public_key, 14)),
+            Some(key.public_key.clone()),
+        ),
+        None => info_row("Auth key", "none picked — edit to pick one".into(), None),
+    });
+    let relays = if destination.relay_urls.is_empty() {
+        "default".to_string()
+    } else {
+        destination.relay_urls.join(", ")
+    };
+    info = info.push(info_row("Relays", relays, None));
+    if let Some(status) = status
+        && status.state == DestinationState::Connected
+    {
+        info = info.push(info_row("Open streams", status.open_streams.to_string(), None));
+    }
+    let mut header = row![section_label("DESTINATION"), space().width(Fill)].align_y(Center);
+    if status.is_some_and(|s| s.state == DestinationState::Connected) {
+        // A one-shot readout of the live iroh path, shown in a dismissable
+        // modal overlay (see `App::conn_path_modal`) — a point-in-time check
+        // rather than a live field.
+        header = header.push(
+            button(text("Connection path").size(12))
+                .padding([3, 10])
+                .style(style::ghost)
+                .on_press(Message::ShowConnPath),
+        );
+    }
+    header = header.push(
+        button(text("Edit").size(12))
+            .padding([3, 10])
+            .style(style::ghost)
+            .on_press(Message::EditDestination(destination.id.clone())),
+    );
+    col = col.push(header);
+    col = col.push(container(info).padding([12, 14]).width(Fill).style(style::card));
+
+    col = col.push(section_label("ROUTING"));
+    col = col.push(
+        container(routes_section(app, destination))
+            .padding([12, 14])
+            .width(Fill)
+            .style(style::card),
+    );
+    col = col.push(
+        text(
+            "The server enforces its own tunnel set, so list a route here only if the \
+             server allows it too. Where two destinations overlap, the more specific rule \
+             wins.",
+        )
+        .size(11)
+        .style(style::faint_text),
+    );
+
+    // Delete, tucked at the very bottom behind a two-click confirm.
+    let confirming = app.confirm_delete.as_deref() == Some(destination.id.as_str());
+    col = col.push(space().height(8));
+    col = col.push(
+        row![button(
+            text(if confirming {
+                "Click again to delete this destination"
+            } else {
+                "Delete destination…"
+            })
+            .size(12)
+        )
+        .padding([4, 12])
+        .style(style::ghost_danger)
+        .on_press(Message::DeleteDestination(destination.id.clone()))]
+        .align_y(Center),
+    );
+
+    scrollable(col.padding([0, 4])).height(Fill).spacing(4).into()
+}
+
+fn routes_section<'a>(app: &'a App, destination: &'a Destination) -> Element<'a, Message> {
     let mut col = column![].spacing(3);
-    // The profile's own name is always the server itself.
+    // The destination's own name is always the server itself.
     col = col.push(text("This server's own loopback, on any port:").size(12));
-    col = col.push(route_row(profile.host.clone(), None));
+    col = col.push(route_row(destination.host.clone(), None));
 
     col = col.push(space().height(8));
-    if is_full_tunnel(&profile.routed_domains, &profile.routed_cidrs) {
-        col = col.push(text("Everything else through the tunnel").size(12));
-    } else if profile.routed_domains.is_empty() && profile.routed_cidrs.is_empty() {
+    let (domains, cidrs) = (&destination.routed_domains, &destination.routed_cidrs);
+    if is_full_tunnel(domains, cidrs) {
         col = col.push(
-            text("Nothing else is routed — every other target connects directly.").size(12),
+            text("Everything no other destination routes more specifically:").size(12),
         );
+    } else if domains.is_empty() && cidrs.is_empty() {
+        col = col.push(text("Nothing else is sent through this server.").size(12));
     } else {
         col = col.push(
             text(format!(
-                "Split tunnel — {} domain(s), {} CIDR(s) routed through the server; \
-                 everything else connects directly:",
-                profile.routed_domains.len(),
-                profile.routed_cidrs.len()
+                "{} domain(s), {} CIDR(s) also sent through this server:",
+                domains.len(),
+                cidrs.len()
             ))
             .size(12),
         );
-        for domain in &profile.routed_domains {
-            col = col.push(route_row(domain.clone(), None));
-        }
-        for cidr in &profile.routed_cidrs {
-            col = col.push(route_row(cidr.clone(), None));
-        }
+    }
+    for rule in domains.iter().chain(cidrs) {
+        col = col.push(route_row(rule.clone(), None));
     }
 
-    // The status pages live under the reserved name, answered by this
-    // profile's own proxy — surface them so they're discoverable (and
-    // copyable). The server's page is where its routed set, host aliases, DNS
-    // forwards and bridges are shown.
-    col = col.push(space().height(8));
-    col = col.push(text("Status pages, through this profile's proxy:").size(12));
-    col = col.push(route_row(format!("http://{}/", reserved::STATUS_HOST), None));
-    col = col.push(route_row(
-        format!("http://{}/servers/{}/", reserved::STATUS_HOST, profile.host),
-        None,
-    ));
+    // The server's own status page — its tunnel set, host aliases, DNS
+    // forwards and bridges — is fetched through the client's status endpoint,
+    // so it needs a proxy to ask through. Opening it connects the destination.
+    if app.client.socks_port.is_some() || app.client.http_port.is_some() {
+        col = col.push(space().height(8));
+        col = col.push(text("The server's status page, through the client's proxy:").size(12));
+        col = col.push(route_row(
+            format!("http://{}/servers/{}/", reserved::STATUS_HOST, destination.host),
+            None,
+        ));
+    }
     col.into()
 }
 
 // ---------------------------------------------------------------------------
-// Profile form
+// Destination form
 
-fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Message> {
-    let mut socks = row![checkbox(form.socks_enabled)
-        .label("enable")
-        .text_size(13)
-        .on_toggle(Message::SocksEnabledToggled)
-        .style(style::check)]
-    .spacing(10)
-    .align_y(Center);
-    if form.socks_enabled {
-        socks = socks.push(text("port").size(12).style(style::dim_text));
-        socks = socks.push(input("", &form.socks_port, Message::SocksPortChanged).width(90));
-    }
-    let mut http = row![checkbox(form.http_enabled)
-        .label("enable")
-        .text_size(13)
-        .on_toggle(Message::HttpEnabledToggled)
-        .style(style::check)]
-    .spacing(10)
-    .align_y(Center);
-    if form.http_enabled {
-        http = http.push(text("port").size(12).style(style::dim_text));
-        http = http.push(input("", &form.http_port, Message::HttpPortChanged).width(90));
-    }
-
-    let validated = form.validate(&app.profiles, &app.keys);
+fn destination_form_view<'a>(app: &'a App, form: &'a DestinationForm) -> Element<'a, Message> {
+    let validated = form.validate(&app.client.destinations, &app.keys);
 
     let mut card = column![
-        form_row("Name", input("e.g. prod", &form.name, Message::ProfileNameChanged)),
-        form_row(
-            "Server node id",
-            input("", &form.server_node_id, Message::ServerNodeIdChanged),
-        ),
         // The name this server goes by: `<host>:<port>` reaches the server's
         // own loopback.
         form_row(
             "Host",
-            input("e.g. nas.internal", &form.host, Message::ProfileHostChanged),
+            input("a name for this server, e.g. nas.internal", &form.host, Message::DestinationHostChanged),
+        ),
+        form_row(
+            "Server node id",
+            input("the server's endpoint id", &form.server_node_id, Message::ServerNodeIdChanged),
         ),
         form_row(
             "Routed domains",
             input(
                 "comma-separated, optional — e.g. *.corp.example",
                 &form.routed_domains,
-                Message::ProfileRoutedDomainsChanged,
+                Message::DestinationRoutedDomainsChanged,
             ),
         ),
         form_row(
@@ -1092,7 +1329,7 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
             input(
                 "comma-separated, optional — e.g. 10.0.0.0/8",
                 &form.routed_cidrs,
-                Message::ProfileRoutedCidrsChanged,
+                Message::DestinationRoutedCidrsChanged,
             ),
         ),
     ]
@@ -1126,8 +1363,9 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
             card = card.push(text(message.clone()).size(12).color(AMBER));
         }
     } else {
-        // Keys are shared across profiles: pick one from the list (managed in
-        // the Keys pane), or mint a fresh one right here with "New key…".
+        // Keys are shared across destinations: pick one from the list
+        // (managed in the Keys pane), or mint a fresh one right here with
+        // "New key…".
         let choices: Vec<KeyChoice> = app
             .keys
             .iter()
@@ -1169,12 +1407,10 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
         }
     }
     card = card.extend([
-        form_row("SOCKS5 proxy", socks),
-        form_row("HTTP proxy", http),
         form_row(
             "Relay URLs",
             input(
-                "comma-separated, optional",
+                "comma-separated, optional — at least two",
                 &form.relay_urls,
                 Message::RelayUrlsChanged,
             ),
@@ -1198,11 +1434,11 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
         button(text("Save").size(13).font(semibold()))
             .padding([6, 16])
             .style(style::primary)
-            .on_press_maybe(validated.is_ok().then_some(Message::ProfileFormSave)),
+            .on_press_maybe(validated.is_ok().then_some(Message::DestinationFormSave)),
         button(text("Cancel").size(13))
             .padding([6, 16])
             .style(style::outlined)
-            .on_press(Message::ProfileFormCancel),
+            .on_press(Message::DestinationFormCancel),
     ]
     .spacing(8)
     .align_y(Center);
@@ -1213,14 +1449,16 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
 
     column![
         section_label(if form.is_edit() {
-            "EDIT PROFILE"
+            "EDIT DESTINATION"
         } else {
-            "NEW PROFILE"
+            "NEW DESTINATION"
         }),
         container(card).padding([12, 14]).width(Fill).style(style::card),
-        text("Auth keys are shared — any number of profiles can pick the same one (manage them \
-              in the Keys pane). The server must authorize the key's public half: on a \
-              flextunnel desktop server under Authorized clients, on a CLI server in its \
+        text("The host is your name for this server: host:port through the proxy, or as a \
+              forward's remote host, reaches that port on the server machine itself. Auth \
+              keys are shared — any number of destinations can pick the same one (manage \
+              them in the Keys pane). The server must authorize the key's public half: on \
+              a flextunnel desktop server under Authorized clients, on a CLI server in its \
               authorized-keys file.")
             .size(11)
             .style(style::faint_text),
@@ -2025,8 +2263,8 @@ fn keys_pane(app: &App) -> Element<'_, Message> {
     if app.keys.is_empty() {
         col = col.push(
             container(
-                text("No auth keys yet. Add one to authenticate profiles with — any number \
-                      of profiles can share the same key.")
+                text("No auth keys yet. Add one to authenticate with — any number of \
+                      destinations can share the same key.")
                     .size(12)
                     .style(style::dim_text),
             )
@@ -2046,7 +2284,7 @@ fn keys_pane(app: &App) -> Element<'_, Message> {
         col = col.push(key_card(app, key));
     }
     col = col.push(
-        text("These are this computer's client keys, for its connections. Secret halves live \
+        text("These are this computer's client keys, for its destinations. Secret halves live \
               in the system keychain; names and public keys in a local file. Each server a \
               key connects to must authorize its public half.")
             .size(11)
@@ -2058,10 +2296,11 @@ fn keys_pane(app: &App) -> Element<'_, Message> {
 
 fn key_card<'a>(app: &'a App, key: &'a AuthKey) -> Element<'a, Message> {
     let users: Vec<&str> = app
-        .profiles
+        .client
+        .destinations
         .iter()
-        .filter(|p| p.auth_key_id == key.id)
-        .map(|p| p.name.as_str())
+        .filter(|d| d.auth_key_id == key.id)
+        .map(|d| d.host.as_str())
         .collect();
     let confirming = app.confirm_delete_key.as_deref() == Some(key.id.as_str());
     let exporting = app.confirm_export_key.as_deref() == Some(key.id.as_str());
@@ -2111,7 +2350,7 @@ fn key_card<'a>(app: &'a App, key: &'a AuthKey) -> Element<'a, Message> {
     }
     card = card.push(
         text(if users.is_empty() {
-            "Not used by any profile.".to_string()
+            "Not used by any destination.".to_string()
         } else {
             format!("Used by: {}", users.join(", "))
         })
@@ -2192,12 +2431,11 @@ fn key_form_view<'a>(app: &'a App, form: &'a KeyForm) -> Element<'a, Message> {
 // Logs
 
 fn logs_pane(app: &App) -> Element<'_, Message> {
-    let mut filter_options = vec![LogFilter::All];
+    let mut filter_options = vec![LogFilter::All, LogFilter::Client];
     if app.server.is_some() {
         filter_options.push(LogFilter::Server);
     }
-    filter_options.extend(app.profiles.iter().map(|p| LogFilter::Profile(p.name.clone())));
-    let selected = app.log_filter.clone();
+    let selected = app.log_filter;
 
     let header = row![
         section_label("LOGS".to_string()),
@@ -2427,12 +2665,20 @@ mod tests {
     }
 
     #[test]
-    fn forward_badge_follows_the_profiles_routes() {
-        let table = RouteTable::new(&[flextunnel_core::proxy::RouteSpec {
-            host: "nas.internal",
-            routed_domains: &["*.corp.example".to_string()],
-            routed_cidrs: &["10.0.0.0/8".to_string()],
-        }])
+    fn a_forward_names_the_destination_that_carries_it() {
+        let spec = |host, domains: &'static [String], cidrs: &'static [String]| {
+            flextunnel_core::proxy::RouteSpec {
+                host,
+                routed_domains: domains,
+                routed_cidrs: cidrs,
+            }
+        };
+        let corp: &'static [String] = Box::leak(Box::new(["*.corp.example".to_string()]));
+        let ten: &'static [String] = Box::leak(Box::new(["10.0.0.0/8".to_string()]));
+        let table = RouteTable::new(&[
+            spec("nas.internal", corp, &[]),
+            spec("lab.internal", &[], ten),
+        ])
         .unwrap();
         let forward = |host: &str| PortForward {
             id: "f".into(),
@@ -2442,13 +2688,92 @@ mod tests {
             remote_port: 5432,
             enabled: true,
         };
-        for routed in ["nas.internal", "db.corp.example", "10.1.2.3"] {
-            assert_eq!(forward_routed(Some(&table), &forward(routed)), Some(true), "{routed}");
+        for (host, via) in [
+            ("nas.internal", "nas.internal"),
+            ("db.corp.example", "nas.internal"),
+            ("lab.internal", "lab.internal"),
+            ("10.1.2.3", "lab.internal"),
+        ] {
+            assert_eq!(forward_route(Some(&table), &forward(host)), Some(Some(via)), "{host}");
         }
         for unrouted in ["example.org", "192.168.1.1", "localhost"] {
-            assert_eq!(forward_routed(Some(&table), &forward(unrouted)), Some(false), "{unrouted}");
+            assert_eq!(forward_route(Some(&table), &forward(unrouted)), Some(None), "{unrouted}");
         }
         // Routes that do not validate: no verdict, no badge.
-        assert_eq!(forward_routed(None, &forward("nas.internal")), None);
+        assert_eq!(forward_route(None, &forward("nas.internal")), None);
+    }
+
+    /// A destination that rests after a failed attempt (a refused key, once
+    /// its retry delay has passed) is idle to the core, but not healthy.
+    #[test]
+    fn an_idle_destination_shows_its_failed_attempt() {
+        let status = |state, last_error: Option<&str>| flextunnel_core::proxy::DestinationStatus {
+            host: "nas.internal".into(),
+            server_node_id: String::new(),
+            state,
+            connected_since: None,
+            open_streams: 0,
+            waiting: 0,
+            client_node_id: None,
+            failed_attempts: 0,
+            next_attempt_at: None,
+            last_error: last_error.map(String::from),
+            routed_domains: Vec::new(),
+            routed_cidrs: Vec::new(),
+            relay_urls: Vec::new(),
+        };
+        let word = |status: &flextunnel_core::proxy::DestinationStatus| {
+            destination_state(&DestinationLive::Live(status))
+        };
+        assert_eq!(word(&status(DestinationState::Idle, None)), ("idle", GRAY));
+        assert_eq!(
+            word(&status(DestinationState::Idle, Some("Authentication failed"))),
+            ("last attempt failed", AMBER)
+        );
+        assert_eq!(
+            word(&status(DestinationState::Failed, Some("Authentication failed"))),
+            ("refused", RED)
+        );
+        // A connection keeps no error; the word is the state's own.
+        assert_eq!(word(&status(DestinationState::Connected, None)), ("connected", GREEN));
+        assert_eq!(destination_state(&DestinationLive::Stopped), ("client off", GRAY));
+        assert_eq!(destination_state(&DestinationLive::Pending), ("restart to apply", AMBER));
+    }
+
+    #[test]
+    fn the_route_cache_rebuilds_only_on_a_routing_change() {
+        let destination = |host: &str, domains: &[&str]| Destination {
+            id: host.into(),
+            host: host.into(),
+            server_node_id: format!("node-{host}"),
+            routed_domains: domains.iter().map(|d| d.to_string()).collect(),
+            routed_cidrs: Vec::new(),
+            auth_key_id: String::new(),
+            relay_urls: Vec::new(),
+            relay_auth_token: None,
+        };
+        let mut client = ClientSettings {
+            destinations: vec![destination("nas.internal", &["*.corp.example"])],
+            ..ClientSettings::default()
+        };
+        let mut cache = RoutedCache::default();
+        refresh_routed_cache(&mut cache, &client);
+        assert_eq!(cache.table.as_ref().unwrap().hosts().count(), 1);
+
+        // Not a routing change: the table is kept as it is.
+        client.destinations[0].auth_key_id = "k".into();
+        client.socks_port = None;
+        let before = cache.built_from.clone();
+        refresh_routed_cache(&mut cache, &client);
+        assert_eq!(cache.built_from, before);
+
+        client.destinations.push(destination("lab.internal", &[]));
+        refresh_routed_cache(&mut cache, &client);
+        assert_eq!(cache.table.as_ref().unwrap().hosts().count(), 2);
+
+        // Two destinations claiming one rule: no table, so no badges.
+        client.destinations[1].routed_domains = vec!["*.corp.example".into()];
+        refresh_routed_cache(&mut cache, &client);
+        assert!(cache.table.is_none());
     }
 }

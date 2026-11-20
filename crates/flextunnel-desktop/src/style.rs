@@ -168,7 +168,7 @@ pub fn outlined(theme: &Theme, status: button::Status) -> button::Style {
     style
 }
 
-/// The profile sidebar: a raised column visually split from the detail pane.
+/// The sidebar: a raised column visually split from the detail pane.
 pub fn sidebar(theme: &Theme) -> container::Style {
     let t = tokens(theme);
     container::Style {
@@ -177,7 +177,7 @@ pub fn sidebar(theme: &Theme) -> container::Style {
     }
 }
 
-/// One sidebar row (profile or Logs): accent-tinted when selected, quiet
+/// One sidebar row (a destination, say, or Logs): accent-tinted when selected, quiet
 /// otherwise.
 pub fn sidebar_row(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
@@ -276,7 +276,7 @@ pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
     }
 }
 
-/// Dropdown field (the Logs pane's profile filter), matching `input`.
+/// Dropdown field (the Logs pane's filter), matching `input`.
 pub fn picker(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
     let t = tokens(theme);
     let open = matches!(status, pick_list::Status::Opened { .. });

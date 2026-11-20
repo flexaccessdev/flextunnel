@@ -2,12 +2,12 @@
 //! roles of equal weight, either optional: a client of any number of servers
 //! elsewhere, and this computer's one flextunnel server, run in-process. Embeds
 //! `flextunnel-core` directly — no FFI layer — and drives a sidebar window
-//! (connections, then the server) plus a system tray icon that shows the
-//! server's state. Each client profile is its
-//! own client config and can run its own concurrent session with its own
-//! optional local SOCKS5 and HTTP proxies plus port forwards; starting a
-//! session is always manual, and a running session connects to its server on
-//! demand.
+//! (the client and its destinations, then the server) plus a system tray icon
+//! that shows the server's state. The client is one session — optional local
+//! SOCKS5 and HTTP proxies plus port forwards — over every destination, each a
+//! host name for one server that is connected when something is first sent to
+//! it. Client and server are each enabled or disabled, and start with the app
+//! while enabled.
 //!
 //! Built on iced's daemon runtime: the process keeps running with no window
 //! open (the tray owns the lifecycle), the window is opened at launch and

@@ -5,7 +5,8 @@
 //! matching the iOS "tinted" appearance — with the server's state shown by
 //! opacity plus a corner status badge: a plain dot while it is starting or
 //! stopping, upgrading to a checkmark once it is running, and an empty circle
-//! while it is disabled. The badge is the server's alone; an app with client connections only shows them by opacity.
+//! while it is disabled. The badge is the server's alone; an app that is only
+//! a client shows by opacity whether the client is running.
 //! The badge stays monochrome on macOS so
 //! the icon remains a crisp template (a colored icon renders as a blurry
 //! non-template image in the menu bar); on Windows it is green on the full-color
@@ -18,12 +19,12 @@ use tiny_skia::{
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrayState {
-    /// Nothing up: the server is stopped or failed (or, with no server, no
-    /// client connection is up). Dimmed.
+    /// Nothing up: the server is stopped or failed (or, with no server, the
+    /// client is not running). Dimmed.
     Off,
-    /// No server, and a client connection is in progress. Half-dimmed.
+    /// No server, and the client is starting or stopping. Half-dimmed.
     Busy,
-    /// No server, and a client connection is up: full opacity, no badge.
+    /// No server, and the client is running: full opacity, no badge.
     Active,
     /// The server is starting or stopping — a plain status dot.
     Changing,

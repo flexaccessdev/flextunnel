@@ -1,18 +1,22 @@
-//! The iced daemon state machine: a sidebar of client connection profiles and
-//! the app's server plus a detail pane, driven alongside the system tray. The
-//! two roles weigh the same and either can go unused: each profile can run its
-//! own tunnel session concurrently (its optional proxy ports and direct
-//! forwards); the server is a flextunnel server run in-process (the app hosts
-//! one; its lock, per identity, is shared with the CLI), started with the app
-//! and kept running unless stopped. The daemon owns all state, so closing the window (which destroys it) loses nothing —
-//! the tray re-opens it on demand. Tray/menu events are forwarded from
-//! tray-icon's handlers into a channel drained by a [`Subscription`], so a
-//! tray click wakes the runtime even while no window exists; a 500 ms tick
-//! keeps the snapshots and the tray state fresh the rest of the time.
+//! The iced daemon state machine: a sidebar of the client, its destinations
+//! and the app's server plus a detail pane, driven alongside the system tray.
+//! The two roles weigh the same and either can go unused. The client is one
+//! session over every destination — its optional proxy ports and its port
+//! forwards — that connects to a destination when something is first sent to
+//! it; the server is a flextunnel server run in-process (the app hosts one;
+//! its lock, per identity, is shared with the CLI). Each is enabled or
+//! disabled, started with the app while enabled, and restarted to apply
+//! changed settings. The daemon owns all state, so closing the window (which
+//! destroys it) loses nothing — the tray re-opens it on demand. Tray/menu
+//! events are forwarded from tray-icon's handlers into a channel drained by a
+//! [`Subscription`], so a tray click wakes the runtime even while no window
+//! exists; a 500 ms tick keeps the snapshots and the tray state fresh the rest
+//! of the time.
 
 use crate::autostart;
 use crate::config::{
-    self, AuthKey, AuthorizedClient, Profile, ServerConfig, DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT,
+    self, AuthKey, AuthorizedClient, ClientSettings, Destination, Portable, ServerConfig,
+    DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT,
 };
 use flextunnel_core::forwards::{
     PortForward, disable_failed_forwards, parse_port, validate_label, validate_remote_host,
@@ -21,9 +25,11 @@ use crate::icon;
 use crate::logging;
 use crate::server_session::{self, ServerPhase, ServerSnapshot};
 use crate::tray::{self, Tray};
-use crate::tunnel::{Controller, Phase, ProfileId, Snapshot};
+use crate::tunnel::{
+    ClientPhase, ClientSnapshot, ClientSpec, Controller, DestinationId, CLIENT_THREAD_NAME,
+};
 use crate::view;
-use flextunnel_core::proxy::{RouteSpec, RouteTable};
+use flextunnel_core::proxy::{DestinationStatus, RouteSpec, RouteTable};
 use flextunnel_core::transport::paths::ConnectionSnapshot;
 use iced::futures::Stream;
 use iced::{window, Element, Size, Subscription, Task};
@@ -55,7 +61,9 @@ pub enum Selection {
     /// Nothing set up yet: the pane points at the sidebar, offering neither
     /// role as the one to pick.
     Empty,
-    Profile(ProfileId),
+    /// The client pane: its on/off switch, proxy ports and port forwards.
+    Client,
+    Destination(DestinationId),
     /// The server pane — or, with no server set up, its welcome, whose
     /// buttons open the setup form.
     Server,
@@ -63,7 +71,18 @@ pub enum Selection {
     Logs,
 }
 
-/// One entry of the profile form's auth-key picker. Keys are picked by name
+/// How a destination stands in the client session right now.
+pub enum DestinationLive<'a> {
+    /// The client is not running: nothing reaches any destination.
+    Stopped,
+    /// The client runs, but not with this destination as saved — it was added
+    /// or edited since the session started, and applies on a restart.
+    Pending,
+    /// The destination's state in the running session.
+    Live(&'a DestinationStatus),
+}
+
+/// One entry of the destination form's auth-key picker. Keys are picked by name
 /// (names are unique — see `drop_invalid_keys`); the id travels along so the
 /// selection maps back to the key.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,8 +110,8 @@ pub enum Message {
     /// An edit attempt on a read-only field (shown in a text input only so
     /// its value can be selected and copied by hand): ignored.
     ReadOnlyEdited,
-    /// Fetch the current iroh connection path (relay/direct) once and open the
-    /// modal showing it.
+    /// Fetch the selected destination's current iroh connection path
+    /// (relay/direct) once and open the modal showing it.
     ShowConnPath,
     /// Close the connection-path modal.
     DismissConnPath,
@@ -101,33 +120,51 @@ pub enum Message {
     /// without what could not be read.
     StoreResetQuit,
     StoreResetContinue,
-    // Profiles
-    AddProfile,
-    EditProfile(ProfileId),
-    DeleteProfile(ProfileId),
-    Connect(ProfileId),
-    Disconnect(ProfileId),
-    ExportProfiles,
-    ImportProfiles,
+    // Client
+    /// The client pane's Enabled switch and the tray's Enable/Disable item —
+    /// the client's only on/off control: enabled, it runs (starting with the
+    /// app); disabled, it stops and stays stopped across launches.
+    SetClientEnabled(bool),
+    /// Restart the running client so changed settings take effect.
+    RestartClient,
+    /// Open the client pane's proxy-ports form.
+    EditProxies,
+    SocksEnabledToggled(bool),
+    SocksPortChanged(String),
+    HttpEnabledToggled(bool),
+    HttpPortChanged(String),
+    ProxyFormSave,
+    ProxyFormCancel,
+    ExportClient,
+    ImportClient,
     ExportPicked(Option<std::path::PathBuf>),
     ImportPicked(Option<std::path::PathBuf>),
-    // Profile form
-    ProfileNameChanged(String),
+    // Destinations
+    AddDestination,
+    EditDestination(DestinationId),
+    DeleteDestination(DestinationId),
+    /// Ask the running client for one connection attempt to the destination
+    /// now, instead of waiting for its first use.
+    ConnectNow(DestinationId),
+    // Destination form
+    DestinationHostChanged(String),
     ServerNodeIdChanged(String),
-    /// The destination host of the profile being edited.
-    ProfileHostChanged(String),
-    ProfileRoutedDomainsChanged(String),
-    ProfileRoutedCidrsChanged(String),
-    /// Pick a shared auth key for the profile being edited.
+    DestinationRoutedDomainsChanged(String),
+    DestinationRoutedCidrsChanged(String),
+    /// Pick a shared auth key for the destination being edited.
     AuthKeyPicked(KeyChoice),
-    /// Open the profile form's "New key" prompt (a name field next to the
+    /// Open the destination form's "New key" prompt (a name field next to the
     /// picker).
     NewKeyPrompt,
     NewKeyNameChanged(String),
     /// Generate a keypair under the prompted name, add it to the shared list,
-    /// and select it in the profile form.
+    /// and select it in the destination form.
     NewKeyCreate,
     NewKeyCancel,
+    RelayUrlsChanged(String),
+    RelayAuthTokenChanged(String),
+    DestinationFormSave,
+    DestinationFormCancel,
     // Auth keys (the Keys pane)
     AddKey,
     EditKey(String),
@@ -141,19 +178,11 @@ pub enum Message {
     KeyGenerateSecret,
     KeyFormSave,
     KeyFormCancel,
-    SocksEnabledToggled(bool),
-    SocksPortChanged(String),
-    HttpEnabledToggled(bool),
-    HttpPortChanged(String),
-    RelayUrlsChanged(String),
-    RelayAuthTokenChanged(String),
-    ProfileFormSave,
-    ProfileFormCancel,
     // Forwards
-    AddForward(ProfileId),
-    EditForward(ProfileId, String),
-    DeleteForward(ProfileId, String),
-    ToggleForward(ProfileId, String, bool),
+    AddForward,
+    EditForward(String),
+    DeleteForward(String),
+    ToggleForward(String, bool),
     FormLabelChanged(String),
     FormLocalPortChanged(String),
     FormRemoteHostChanged(String),
@@ -193,7 +222,7 @@ pub enum Message {
     ClientNameChanged(String),
     ClientPublicKeyChanged(String),
     /// Fill the client form with one of the app's own auth keys (for a client
-    /// profile on another of the user's machines that shares it).
+    /// on another of the user's machines that shares it).
     ClientUseOwnKey(KeyChoice),
     ClientFormSave,
     ClientFormCancel,
@@ -218,23 +247,23 @@ pub enum Message {
     CopyLogs,
 }
 
-/// The Logs pane's filter: everything, one profile's session threads
-/// (`[tunnel-<name>]`), or the server's (`[server]`).
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+/// The Logs pane's filter: everything, the client session's threads
+/// (`[client]`), or the server's (`[server]`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum LogFilter {
     #[default]
     All,
-    Profile(String),
+    Client,
     Server,
 }
 
 impl std::fmt::Display for LogFilter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LogFilter::All => f.write_str("All"),
-            LogFilter::Profile(name) => f.write_str(name),
-            LogFilter::Server => f.write_str("Server"),
-        }
+        f.write_str(match self {
+            LogFilter::All => "All",
+            LogFilter::Client => "Client",
+            LogFilter::Server => "Server",
+        })
     }
 }
 
@@ -248,131 +277,136 @@ fn split_list(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// Human description of what already occupies a local port, across every
-/// profile — profiles can run concurrently, so all local ports share one
-/// namespace. `exclude_profile` skips that profile's proxy ports (its own
-/// form edits them); `exclude_forward` skips the forward being edited.
+/// Human description of what already occupies a local port of the client: one
+/// of its proxy front-ends or a forward — they share one namespace.
+/// `exclude_proxies` skips the proxy ports (their own form edits them);
+/// `exclude_forward` skips the forward being edited.
 fn port_owner(
-    profiles: &[Profile],
+    client: &ClientSettings,
     port: u16,
-    exclude_profile: Option<&str>,
+    exclude_proxies: bool,
     exclude_forward: Option<&str>,
 ) -> Option<String> {
-    for profile in profiles {
-        if Some(profile.id.as_str()) != exclude_profile {
-            if profile.socks_port == Some(port) {
-                return Some(format!("the SOCKS5 port of profile \"{}\"", profile.name));
-            }
-            if profile.http_port == Some(port) {
-                return Some(format!("the HTTP port of profile \"{}\"", profile.name));
-            }
+    if !exclude_proxies {
+        if client.socks_port == Some(port) {
+            return Some("the SOCKS5 proxy".into());
         }
-        for forward in &profile.forwards {
-            if Some(forward.id.as_str()) == exclude_forward {
-                continue;
-            }
-            if forward.local_port == port {
-                return Some(format!(
-                    "forward \"{}\" in profile \"{}\"",
-                    forward.display_name(),
-                    profile.name
-                ));
-            }
+        if client.http_port == Some(port) {
+            return Some("the HTTP proxy".into());
         }
     }
-    None
+    client
+        .forwards
+        .iter()
+        .find(|f| f.local_port == port && Some(f.id.as_str()) != exclude_forward)
+        .map(|f| format!("forward \"{}\"", f.display_name()))
 }
 
-/// `desired` if `taken` reports it free, else the first free "desired - 2",
-/// "desired - 3", … The base is shortened if a suffix would push past the
-/// 64-character name limit.
-fn unique_name(desired: String, taken: impl Fn(&str) -> bool) -> String {
-    if !taken(&desired) {
-        return desired;
+/// What an import changed, for its notice.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ImportSummary {
+    pub destinations_added: usize,
+    pub destinations_replaced: usize,
+    pub forwards_added: usize,
+    /// The ids of the forwards the import replaced (matched by local port).
+    pub forwards_replaced: Vec<String>,
+    /// Imported forwards left out: their local port is one of this computer's
+    /// proxy ports.
+    pub forwards_skipped: usize,
+}
+
+impl std::fmt::Display for ImportSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Imported: {} destination(s) added, {} replaced; {} forward(s) added, {} replaced",
+            self.destinations_added,
+            self.destinations_replaced,
+            self.forwards_added,
+            self.forwards_replaced.len()
+        )?;
+        match self.forwards_skipped {
+            0 => f.write_str("."),
+            n => write!(f, "; {n} skipped (local port used by a proxy here)."),
+        }
     }
-    (2..)
-        .map(|n| {
-            let suffix = format!(" - {n}");
-            let mut base = desired.clone();
-            while base.len() + suffix.len() > 64 {
-                base.pop();
-            }
-            format!("{}{suffix}", base.trim_end())
-        })
-        .find(|candidate| !taken(candidate))
-        .expect("some numbered name is free")
 }
 
-/// Merge an imported (already structurally validated) profile list into the
-/// current one. A matching server node id replaces that profile's settings
-/// and forwards but keeps its id, auth-key reference, and relay auth token;
-/// anything else is added as a new profile with a fresh id, no key picked,
-/// and no relay token — imports never carry them. Colliding names get a
-/// " - N" suffix, and imported forwards get fresh ids so they stay globally
-/// unique. Returns `(added, replaced-profile ids)`.
+/// The client with an imported (already structurally validated) set of
+/// destinations and forwards merged in, or why they do not fit. A destination
+/// whose server node id is already here replaces that destination's settings
+/// but keeps its id, auth-key reference and relay auth token; any other is
+/// added with a fresh id, no key picked and no relay token — imports never
+/// carry them. A forward on a local port already forwarded replaces that
+/// forward (stopped, like any imported one); any other is added. The merged
+/// destinations must still make one valid routing table — a host or a route
+/// claimed twice rejects the whole import, leaving the client as it was.
 fn merge_imported(
-    profiles: &mut Vec<Profile>,
-    imported: Vec<Profile>,
-) -> (usize, Vec<ProfileId>) {
-    let mut added = 0;
-    let mut replaced = Vec::new();
-    let profile_name_taken = |profiles: &[Profile], name: &str, own_id: Option<&str>| {
-        profiles
+    client: &ClientSettings,
+    imported: Portable,
+) -> Result<(ClientSettings, ImportSummary), String> {
+    let mut merged = client.clone();
+    let mut summary = ImportSummary::default();
+    for mut incoming in imported.destinations {
+        match merged
+            .destinations
             .iter()
-            .any(|p| p.name == name && Some(p.id.as_str()) != own_id)
-    };
-    for mut incoming in imported {
-        for forward in &mut incoming.forwards {
-            forward.id = PortForward::new_id();
-        }
-        match profiles
-            .iter()
-            .position(|p| p.server_node_id == incoming.server_node_id)
+            .position(|d| d.server_node_id == incoming.server_node_id)
         {
             Some(pos) => {
-                incoming.id = profiles[pos].id.clone();
-                incoming.auth_key_id = profiles[pos].auth_key_id.clone();
-                incoming.relay_auth_token = profiles[pos].relay_auth_token.clone();
-                incoming.name = unique_name(incoming.name.clone(), |name| {
-                    profile_name_taken(profiles, name, Some(&incoming.id))
-                });
-                profiles[pos] = incoming;
-                replaced.push(profiles[pos].id.clone());
+                let current = &merged.destinations[pos];
+                incoming.id = current.id.clone();
+                incoming.auth_key_id = current.auth_key_id.clone();
+                incoming.relay_auth_token = current.relay_auth_token.clone();
+                merged.destinations[pos] = incoming;
+                summary.destinations_replaced += 1;
             }
             None => {
-                incoming.id = Profile::new_id();
+                incoming.id = Destination::new_id();
                 incoming.auth_key_id = String::new();
                 incoming.relay_auth_token = None;
-                incoming.name = unique_name(incoming.name.clone(), |name| {
-                    profile_name_taken(profiles, name, None)
-                });
-                profiles.push(incoming);
-                added += 1;
+                merged.destinations.push(incoming);
+                summary.destinations_added += 1;
             }
         }
     }
-    (added, replaced)
-}
-
-/// First port from the default upward not used by any profile or forward, as
-/// the suggested SOCKS5 port for a new profile.
-fn next_free_port(profiles: &[Profile]) -> u16 {
-    let mut port = DEFAULT_SOCKS_PORT;
-    while port_owner(profiles, port, None, None).is_some() && port < u16::MAX {
-        port += 1;
+    for mut incoming in imported.forwards {
+        incoming.enabled = false;
+        if port_owner(&merged, incoming.local_port, false, None)
+            .is_some_and(|owner| owner.ends_with("proxy"))
+        {
+            summary.forwards_skipped += 1;
+            continue;
+        }
+        match merged
+            .forwards
+            .iter()
+            .position(|f| f.local_port == incoming.local_port)
+        {
+            Some(pos) => {
+                incoming.id = merged.forwards[pos].id.clone();
+                summary.forwards_replaced.push(incoming.id.clone());
+                merged.forwards[pos] = incoming;
+            }
+            None => {
+                incoming.id = PortForward::new_id();
+                merged.forwards.push(incoming);
+                summary.forwards_added += 1;
+            }
+        }
     }
-    port
+    merged.route_table()?;
+    Ok((merged, summary))
 }
 
-/// Editable profile buffers (the add/edit form). `editing_id` is `None` when
-/// adding.
+/// Editable destination buffers (the add/edit form). `editing_id` is `None`
+/// when adding.
 #[derive(Default)]
-pub struct ProfileForm {
-    editing_id: Option<ProfileId>,
-    pub name: String,
-    pub server_node_id: String,
-    /// The destination host: `<host>:<port>` is the server's own loopback.
+pub struct DestinationForm {
+    editing_id: Option<DestinationId>,
+    /// The destination's name: `<host>:<port>` is the server's own loopback.
     pub host: String,
+    pub server_node_id: String,
     /// Comma-separated further domains sent through the server.
     pub routed_domains: String,
     /// Comma-separated further networks sent through the server.
@@ -381,110 +415,129 @@ pub struct ProfileForm {
     pub auth_key_id: String,
     /// The "New key" prompt's name buffer; `None` while the prompt is closed.
     pub new_key_name: Option<String>,
-    pub socks_enabled: bool,
-    pub socks_port: String,
-    pub http_enabled: bool,
-    pub http_port: String,
     pub relay_urls: String,
     pub relay_auth_token: String,
 }
 
-impl ProfileForm {
+impl DestinationForm {
     pub fn is_edit(&self) -> bool {
         self.editing_id.is_some()
     }
 
-    fn add(profiles: &[Profile]) -> Self {
+    fn edit(destination: &Destination) -> Self {
         Self {
-            socks_enabled: true,
-            socks_port: next_free_port(profiles).to_string(),
-            http_port: DEFAULT_HTTP_PORT.to_string(),
-            ..Self::default()
-        }
-    }
-
-    fn edit(profile: &Profile) -> Self {
-        Self {
-            editing_id: Some(profile.id.clone()),
-            name: profile.name.clone(),
-            server_node_id: profile.server_node_id.clone(),
-            host: profile.host.clone(),
-            routed_domains: profile.routed_domains.join(", "),
-            routed_cidrs: profile.routed_cidrs.join(", "),
-            auth_key_id: profile.auth_key_id.clone(),
+            editing_id: Some(destination.id.clone()),
+            host: destination.host.clone(),
+            server_node_id: destination.server_node_id.clone(),
+            routed_domains: destination.routed_domains.join(", "),
+            routed_cidrs: destination.routed_cidrs.join(", "),
+            auth_key_id: destination.auth_key_id.clone(),
             new_key_name: None,
-            socks_enabled: profile.socks_port.is_some(),
-            socks_port: profile
-                .socks_port
-                .map(|port| port.to_string())
-                .unwrap_or_else(|| DEFAULT_SOCKS_PORT.to_string()),
-            http_enabled: profile.http_port.is_some(),
-            http_port: profile
-                .http_port
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| DEFAULT_HTTP_PORT.to_string()),
-            relay_urls: profile.relay_urls.join(", "),
-            relay_auth_token: profile.relay_auth_token.clone().unwrap_or_default(),
+            relay_urls: destination.relay_urls.join(", "),
+            relay_auth_token: destination.relay_auth_token.clone().unwrap_or_default(),
         }
     }
 
-    pub fn validate(&self, profiles: &[Profile], keys: &[AuthKey]) -> Result<Profile, String> {
-        // Normalize into the stored shape (see `Profile::is_valid_name`):
-        // words separated by single spaces, nothing leading or trailing.
-        let name = self.name.split_whitespace().collect::<Vec<_>>().join(" ");
-        if name.is_empty() {
-            return Err("Profile name is required".into());
-        }
-        if name.len() > 64 {
-            return Err("Profile name must be 64 characters or fewer".into());
-        }
-        // Unique names keep the tray submenus and the per-profile log
-        // attribution (thread names) unambiguous.
-        if profiles
-            .iter()
-            .any(|p| p.name == name && Some(p.id.as_str()) != self.editing_id.as_deref())
-        {
-            return Err(format!("Another profile is already named \"{name}\""));
+    /// The destination this form describes, checked against the others: the
+    /// host and routes are validated by the core's own routing table over
+    /// every destination — the same check the session makes — so what saves
+    /// here starts.
+    pub fn validate(
+        &self,
+        destinations: &[Destination],
+        keys: &[AuthKey],
+    ) -> Result<Destination, String> {
+        let editing = self.editing_id.as_deref();
+        let others = || destinations.iter().filter(|d| Some(d.id.as_str()) != editing);
+        if self.host.trim().is_empty() {
+            return Err("Host is required — a name for this server, e.g. nas.internal".into());
         }
         let server_node_id = self.server_node_id.trim();
         if server_node_id.is_empty() {
             return Err("Server node id is required".into());
         }
-        // One profile per server: a second profile against the same server is
-        // an accidental duplicate, not a use case.
-        if let Some(other) = profiles.iter().find(|p| {
-            p.server_node_id == server_node_id
-                && Some(p.id.as_str()) != self.editing_id.as_deref()
-        }) {
+        // One destination per server: a second name for the same server is an
+        // accidental duplicate, not a use case (and the core refuses it).
+        if let Some(other) = others().find(|d| d.server_node_id == server_node_id) {
             return Err(format!(
-                "Profile \"{}\" already connects to this server",
-                other.name
+                "Destination \"{}\" already reaches this server",
+                other.host
             ));
-        }
-        // The host and routes are validated by the core's own routing table —
-        // the same check the session makes — so what saves here connects.
-        if self.host.trim().is_empty() {
-            return Err("Host is required — a name for this server, e.g. nas.internal".into());
         }
         let routed_domains = split_list(&self.routed_domains);
         let routed_cidrs = split_list(&self.routed_cidrs);
-        let host = RouteTable::new(&[RouteSpec {
+        // This destination goes last, so its stored host is the table's last.
+        let mut specs: Vec<RouteSpec<'_>> = others()
+            .map(|d| RouteSpec {
+                host: &d.host,
+                routed_domains: &d.routed_domains,
+                routed_cidrs: &d.routed_cidrs,
+            })
+            .collect();
+        specs.push(RouteSpec {
             host: &self.host,
             routed_domains: &routed_domains,
             routed_cidrs: &routed_cidrs,
-        }])
-        .map_err(|e| format!("{e:#}"))?
-        .hosts()
-        .next()
-        .map(String::from)
-        .expect("a one-destination table has one host");
+        });
+        let host = RouteTable::new(&specs)
+            .map_err(|e| format!("{e:#}"))?
+            .hosts()
+            .last()
+            .map(String::from)
+            .expect("the table has this destination");
         if config::find_key(keys, &self.auth_key_id).is_none() {
             return Err("Pick an auth key (or create one with New key)".into());
         }
-        let editing = self.editing_id.as_deref();
+        let relay_urls = split_list(&self.relay_urls);
+        let relay_auth_token = {
+            let token = self.relay_auth_token.trim();
+            (!token.is_empty()).then(|| token.to_string())
+        };
+        // The core's own relay rules (how many URLs, a token only with custom
+        // relays), so a destination that saves is one the client can start.
+        flextunnel_core::transport::endpoint::RelayConfig::from_urls_with_token(
+            &relay_urls,
+            relay_auth_token.clone(),
+        )
+        .map_err(|e| format!("{e:#}"))?;
+        Ok(Destination {
+            id: self.editing_id.clone().unwrap_or_else(Destination::new_id),
+            host,
+            server_node_id: server_node_id.into(),
+            routed_domains,
+            routed_cidrs,
+            auth_key_id: self.auth_key_id.clone(),
+            relay_urls,
+            relay_auth_token,
+        })
+    }
+}
+
+/// Editable buffers for the client's two proxy front-ends (the client pane's
+/// inline form).
+pub struct ProxyForm {
+    pub socks_enabled: bool,
+    pub socks_port: String,
+    pub http_enabled: bool,
+    pub http_port: String,
+}
+
+impl ProxyForm {
+    fn edit(client: &ClientSettings) -> Self {
+        Self {
+            socks_enabled: client.socks_port.is_some(),
+            socks_port: client.socks_port.unwrap_or(DEFAULT_SOCKS_PORT).to_string(),
+            http_enabled: client.http_port.is_some(),
+            http_port: client.http_port.unwrap_or(DEFAULT_HTTP_PORT).to_string(),
+        }
+    }
+
+    /// The `(SOCKS5, HTTP)` ports this form gives the client; `None` leaves a
+    /// front-end off. Neither may be a forward's local port.
+    pub fn validate(&self, client: &ClientSettings) -> Result<(Option<u16>, Option<u16>), String> {
         let socks_port = if self.socks_enabled {
             let port = parse_port(&self.socks_port, "SOCKS5 port")?;
-            if let Some(owner) = port_owner(profiles, port, editing, None) {
+            if let Some(owner) = port_owner(client, port, true, None) {
                 return Err(format!("SOCKS5 port {port} is already used by {owner}"));
             }
             Some(port)
@@ -496,42 +549,14 @@ impl ProfileForm {
             if socks_port == Some(port) {
                 return Err("HTTP port must differ from the SOCKS5 port".into());
             }
-            if let Some(owner) = port_owner(profiles, port, editing, None) {
+            if let Some(owner) = port_owner(client, port, true, None) {
                 return Err(format!("HTTP port {port} is already used by {owner}"));
             }
             Some(port)
         } else {
             None
         };
-        let relay_urls = split_list(&self.relay_urls);
-        let relay_auth_token = {
-            let token = self.relay_auth_token.trim();
-            (!token.is_empty()).then(|| token.to_string())
-        };
-        // A relay token only applies to custom relays, so reject it with none set
-        // (mirrors the core `RelayConfig` guard and ezvpn-apple's form check).
-        if relay_auth_token.is_some() && relay_urls.is_empty() {
-            return Err("A relay auth token requires at least one relay URL".into());
-        }
-        // Editing keeps the profile's forwards; the form doesn't touch them.
-        let forwards = editing
-            .and_then(|id| profiles.iter().find(|p| p.id == id))
-            .map(|p| p.forwards.clone())
-            .unwrap_or_default();
-        Ok(Profile {
-            id: self.editing_id.clone().unwrap_or_else(Profile::new_id),
-            name,
-            server_node_id: server_node_id.into(),
-            host,
-            routed_domains,
-            routed_cidrs,
-            auth_key_id: self.auth_key_id.clone(),
-            socks_port,
-            http_port,
-            relay_urls,
-            relay_auth_token,
-            forwards,
-        })
+        Ok((socks_port, http_port))
     }
 }
 
@@ -584,7 +609,7 @@ impl KeyForm {
             .map_err(|e| format!("Invalid secret key: {e}"))?;
         let public_key = client_key.public_str();
         // The same keypair twice under two names is an accidental re-add, not
-        // a use case — profiles share one entry instead.
+        // a use case — destinations share one entry instead.
         if let Some(other) = keys
             .iter()
             .find(|k| k.public_key == public_key && Some(k.id.as_str()) != self.editing_id.as_deref())
@@ -600,10 +625,10 @@ impl KeyForm {
     }
 }
 
-/// Normalize and validate a key name (same shape as profile names — see
-/// `config::is_valid_name`), rejecting duplicates of any key other than
-/// `own_id`. Shared by the Keys form and the profile form's New key prompt;
-/// unique names keep the profile form's picker unambiguous.
+/// Normalize and validate a key name (see `config::is_valid_name`), rejecting
+/// duplicates of any key other than `own_id`. Shared by the Keys form and the
+/// destination form's New key prompt; unique names keep that form's picker
+/// unambiguous.
 pub fn validate_key_name(
     name: &str,
     keys: &[AuthKey],
@@ -849,16 +874,14 @@ impl ForwardForm {
         }
     }
 
-    /// Validate against every profile: local ports share one namespace since
-    /// any set of profiles can run concurrently.
-    pub fn validate(&self, profiles: &[Profile]) -> Result<PortForward, String> {
+    /// Validate against the client: its proxy ports and forwards share one
+    /// namespace of local ports.
+    pub fn validate(&self, client: &ClientSettings) -> Result<PortForward, String> {
         let label = validate_label(&self.label)?;
         let local_port = parse_port(&self.local_port, "Local port")?;
         let remote_host = validate_remote_host(&self.remote_host)?;
         let remote_port = parse_port(&self.remote_port, "Remote port")?;
-        if let Some(owner) =
-            port_owner(profiles, local_port, None, self.editing_id.as_deref())
-        {
+        if let Some(owner) = port_owner(client, local_port, false, self.editing_id.as_deref()) {
             return Err(format!("Local port {local_port} is already used by {owner}"));
         }
         Ok(PortForward {
@@ -946,18 +969,22 @@ pub struct App {
     controller: Controller,
     tray: Option<Tray>,
     window: Option<window::Id>,
-    /// Ordered source of truth; persisted via `config::save_store`.
-    pub profiles: Vec<Profile>,
-    /// The shared auth keys profiles reference into; persisted alongside.
+    /// The client — its proxy ports, forwards and destinations (in sidebar
+    /// order); persisted via `config::save_store`.
+    pub client: ClientSettings,
+    /// The shared auth keys destinations reference into; persisted alongside.
     pub keys: Vec<AuthKey>,
     /// The app's one server, when configured; persisted alongside.
     pub server: Option<ServerConfig>,
     pub selection: Selection,
-    pub profile_form: Option<ProfileForm>,
+    /// The open destination add/edit form (replaces the detail pane).
+    pub destination_form: Option<DestinationForm>,
+    /// The client pane's open proxy-ports form.
+    pub proxy_form: Option<ProxyForm>,
     /// The Keys pane's open add/edit form.
     pub key_form: Option<KeyForm>,
     /// The open server setup/settings form (replaces the detail pane, like
-    /// the profile form).
+    /// the destination form).
     pub server_form: Option<ServerForm>,
     /// The server pane's open "authorize a client" form.
     pub client_form: Option<ClientForm>,
@@ -970,10 +997,13 @@ pub struct App {
     /// The config the server session was last started with, so the pane can
     /// tell when the saved settings differ from the running ones.
     server_applied: Option<ServerConfig>,
-    /// The open forward form and the profile it belongs to.
-    pub forward_form: Option<(ProfileId, ForwardForm)>,
-    /// Two-click delete guard: the profile whose Delete was clicked once.
-    pub confirm_delete: Option<ProfileId>,
+    /// What the client session was last started with, so the panes can tell
+    /// when the saved settings differ from the running ones.
+    client_applied: Option<ClientSpec>,
+    /// The client pane's open forward form.
+    pub forward_form: Option<ForwardForm>,
+    /// Two-click delete guard: the destination whose Delete was clicked once.
+    pub confirm_delete: Option<DestinationId>,
     /// Two-click delete guard for the Keys pane.
     pub confirm_delete_key: Option<String>,
     /// Two-click delete guard for the server.
@@ -997,11 +1027,10 @@ pub struct App {
     /// Setup-failure reason per forward id, retained after the failed forward
     /// is auto-stopped (see [`disable_failed_forwards`]) so the row can keep
     /// showing why; cleared when the forward is started again or removed.
-    /// Forward ids are globally unique, so one map covers every profile.
     pub forward_errors: HashMap<String, String>,
-    /// Advisory-badge caches per profile: each routing table rebuilt only
-    /// when that profile's host or routes change.
-    pub routed_caches: HashMap<ProfileId, view::RoutedCache>,
+    /// The forwards' advisory routing table (which destination carries each,
+    /// if any): rebuilt only when a destination's host or routes change.
+    pub routed_cache: view::RoutedCache,
     log_revision: u64,
     /// Logs-pane filter (see [`LogFilter`]).
     pub log_filter: LogFilter,
@@ -1009,8 +1038,9 @@ pub struct App {
     /// rebuilt on revision or filter change only.
     pub log_text: String,
     clipboard: Option<arboard::Clipboard>,
-    /// Refreshed by [`App::refresh`] on every tick, rendered by `view`.
-    pub snapshots: HashMap<ProfileId, Snapshot>,
+    /// The client session's snapshot, refreshed by [`App::refresh`] on every
+    /// tick, rendered by `view`.
+    pub client_snapshot: ClientSnapshot,
     /// The server session's snapshot, refreshed alongside.
     pub server_snapshot: ServerSnapshot,
     /// Whether the app is registered as a login item — the OS's answer
@@ -1045,23 +1075,24 @@ impl App {
             }
         };
         let store_intact = store_reset.is_none();
-        // The first connection, else the server — or, with neither, the
-        // empty pane pointing at the sidebar.
-        let selection = match (store.profiles.first(), &store.server) {
-            (Some(profile), _) => Selection::Profile(profile.id.clone()),
-            (None, Some(_)) => Selection::Server,
-            (None, None) => Selection::Empty,
+        // The client once it has somewhere to go, else the server — or, with
+        // neither, the empty pane pointing at the sidebar.
+        let selection = match (store.client.destinations.is_empty(), &store.server) {
+            (false, _) => Selection::Client,
+            (true, Some(_)) => Selection::Server,
+            (true, None) => Selection::Empty,
         };
 
         let mut app = Self {
             controller,
             tray: None,
             window: None,
-            profiles: store.profiles,
+            client: store.client,
             keys: store.keys,
             server: store.server,
             selection,
-            profile_form: None,
+            destination_form: None,
+            proxy_form: None,
             key_form: None,
             server_form: None,
             client_form: None,
@@ -1069,6 +1100,7 @@ impl App {
             confirm_remove_client: None,
             confirm_export_server_secret: false,
             server_applied: None,
+            client_applied: None,
             forward_form: None,
             confirm_delete: None,
             confirm_delete_key: None,
@@ -1079,13 +1111,13 @@ impl App {
             io_notice: None,
             store_reset,
             forward_errors: HashMap::new(),
-            routed_caches: HashMap::new(),
+            routed_cache: view::RoutedCache::default(),
             // MAX so the first refresh always builds the log text.
             log_revision: u64::MAX,
             log_filter: LogFilter::All,
             log_text: String::new(),
             clipboard: None,
-            snapshots: HashMap::new(),
+            client_snapshot: ClientSnapshot::default(),
             server_snapshot: ServerSnapshot::default(),
             launch_at_login: false,
             login_item_set_up: store.login_item_set_up,
@@ -1126,6 +1158,16 @@ impl App {
                 Some(blocker) => log::warn!("Not starting the server yet: {blocker}"),
             }
             app.resume_server();
+        }
+        // So is an enabled client. Starting it binds its local ports only: it
+        // connects to a destination when something is first sent there.
+        if !app.client.destinations.is_empty() {
+            match app.client.start_blocker(&app.keys) {
+                _ if !app.client.enabled => log::info!("The client is disabled; not starting it"),
+                None => log::info!("Starting the client"),
+                Some(blocker) => log::warn!("Not starting the client yet: {blocker}"),
+            }
+            app.resume_client();
         }
         // Launched as a login item, the app stays in the tray; the window is
         // a click away — unless the store reset warning needs answering.
@@ -1224,8 +1266,10 @@ impl App {
                 // point-in-time snapshot that sits above the layout (not in it)
                 // so it can't be mistaken for a live field and leaves the pane
                 // untouched.
-                if let Selection::Profile(id) = &self.selection {
-                    let snapshot = self.controller.query_conn_path(&id.clone());
+                if let Selection::Destination(id) = &self.selection
+                    && let Some(destination) = self.client.destination(id)
+                {
+                    let snapshot = self.controller.query_conn_path(&destination.host);
                     self.conn_path_modal = Some(snapshot);
                 }
                 Task::none()
@@ -1243,40 +1287,61 @@ impl App {
                 self.persist_store();
                 Task::none()
             }
-            Message::AddProfile => {
-                self.close_forms();
-                self.profile_form = Some(ProfileForm::add(&self.profiles));
+            Message::SetClientEnabled(enabled) => self.set_client_enabled(enabled),
+            Message::RestartClient => {
+                self.restart_client();
                 Task::none()
             }
-            Message::EditProfile(id) => {
-                if let Some(profile) = self.profiles.iter().find(|p| p.id == id) {
-                    let form = ProfileForm::edit(profile);
-                    self.close_forms();
-                    self.profile_form = Some(form);
+            Message::EditProxies => {
+                self.forward_form = None;
+                self.notice = None;
+                self.proxy_form = Some(ProxyForm::edit(&self.client));
+                Task::none()
+            }
+            Message::SocksEnabledToggled(enabled) => {
+                if let Some(form) = &mut self.proxy_form {
+                    form.socks_enabled = enabled;
                 }
                 Task::none()
             }
-            Message::DeleteProfile(id) => {
-                self.delete_profile(id);
+            Message::SocksPortChanged(value) => {
+                if let Some(form) = &mut self.proxy_form {
+                    form.socks_port = value;
+                }
                 Task::none()
             }
-            Message::Connect(id) => self.connect_profile(&id),
-            Message::Disconnect(id) => {
-                self.controller.disconnect(&id);
+            Message::HttpEnabledToggled(enabled) => {
+                if let Some(form) = &mut self.proxy_form {
+                    form.http_enabled = enabled;
+                }
                 Task::none()
             }
-            Message::ExportProfiles => Task::perform(
+            Message::HttpPortChanged(value) => {
+                if let Some(form) = &mut self.proxy_form {
+                    form.http_port = value;
+                }
+                Task::none()
+            }
+            Message::ProxyFormSave => {
+                self.save_proxy_form();
+                Task::none()
+            }
+            Message::ProxyFormCancel => {
+                self.proxy_form = None;
+                Task::none()
+            }
+            Message::ExportClient => Task::perform(
                 async {
                     rfd::AsyncFileDialog::new()
                         .add_filter("JSON", &["json"])
-                        .set_file_name("flextunnel-profiles.json")
+                        .set_file_name("flextunnel-destinations.json")
                         .save_file()
                         .await
                         .map(|file| file.path().to_path_buf())
                 },
                 Message::ExportPicked,
             ),
-            Message::ImportProfiles => Task::perform(
+            Message::ImportClient => Task::perform(
                 async {
                     rfd::AsyncFileDialog::new()
                         .add_filter("JSON", &["json"])
@@ -1288,8 +1353,12 @@ impl App {
             ),
             Message::ExportPicked(path) => {
                 if let Some(path) = path {
-                    self.io_notice = Some(match config::export_profiles(&path, &self.profiles) {
-                        Ok(()) => format!("Exported {} profile(s).", self.profiles.len()),
+                    self.io_notice = Some(match config::export_client(&path, &self.client) {
+                        Ok(()) => format!(
+                            "Exported {} destination(s), {} forward(s).",
+                            self.client.destinations.len(),
+                            self.client.forwards.len()
+                        ),
                         Err(e) => {
                             log::error!("{e:#}");
                             format!("Export failed: {e:#}")
@@ -1300,48 +1369,65 @@ impl App {
             }
             Message::ImportPicked(path) => {
                 if let Some(path) = path {
-                    self.import_profiles(&path);
+                    self.import_client(&path);
                 }
                 Task::none()
             }
-            Message::ProfileNameChanged(value) => {
-                if let Some(form) = &mut self.profile_form {
-                    form.name = value;
+            Message::AddDestination => {
+                self.close_forms();
+                self.destination_form = Some(DestinationForm::default());
+                Task::none()
+            }
+            Message::EditDestination(id) => {
+                if let Some(destination) = self.client.destination(&id) {
+                    let form = DestinationForm::edit(destination);
+                    self.close_forms();
+                    self.destination_form = Some(form);
                 }
                 Task::none()
             }
-            Message::ServerNodeIdChanged(value) => {
-                if let Some(form) = &mut self.profile_form {
-                    form.server_node_id = value;
+            Message::DeleteDestination(id) => {
+                self.delete_destination(id);
+                Task::none()
+            }
+            Message::ConnectNow(id) => {
+                if let Some(destination) = self.client.destination(&id) {
+                    self.controller.connect_now(&destination.host);
                 }
                 Task::none()
             }
-            Message::ProfileHostChanged(value) => {
-                if let Some(form) = &mut self.profile_form {
+            Message::DestinationHostChanged(value) => {
+                if let Some(form) = &mut self.destination_form {
                     form.host = value;
                 }
                 Task::none()
             }
-            Message::ProfileRoutedDomainsChanged(value) => {
-                if let Some(form) = &mut self.profile_form {
+            Message::ServerNodeIdChanged(value) => {
+                if let Some(form) = &mut self.destination_form {
+                    form.server_node_id = value;
+                }
+                Task::none()
+            }
+            Message::DestinationRoutedDomainsChanged(value) => {
+                if let Some(form) = &mut self.destination_form {
                     form.routed_domains = value;
                 }
                 Task::none()
             }
-            Message::ProfileRoutedCidrsChanged(value) => {
-                if let Some(form) = &mut self.profile_form {
+            Message::DestinationRoutedCidrsChanged(value) => {
+                if let Some(form) = &mut self.destination_form {
                     form.routed_cidrs = value;
                 }
                 Task::none()
             }
             Message::AuthKeyPicked(choice) => {
-                if let Some(form) = &mut self.profile_form {
+                if let Some(form) = &mut self.destination_form {
                     form.auth_key_id = choice.id;
                 }
                 Task::none()
             }
             Message::NewKeyPrompt => {
-                if let Some(form) = &mut self.profile_form
+                if let Some(form) = &mut self.destination_form
                     && form.new_key_name.is_none()
                 {
                     form.new_key_name = Some(String::new());
@@ -1349,7 +1435,7 @@ impl App {
                 Task::none()
             }
             Message::NewKeyNameChanged(value) => {
-                if let Some(form) = &mut self.profile_form
+                if let Some(form) = &mut self.destination_form
                     && let Some(buffer) = &mut form.new_key_name
                 {
                     *buffer = value;
@@ -1357,13 +1443,33 @@ impl App {
                 Task::none()
             }
             Message::NewKeyCreate => {
-                self.create_key_for_profile_form();
+                self.create_key_for_destination_form();
                 Task::none()
             }
             Message::NewKeyCancel => {
-                if let Some(form) = &mut self.profile_form {
+                if let Some(form) = &mut self.destination_form {
                     form.new_key_name = None;
                 }
+                Task::none()
+            }
+            Message::RelayUrlsChanged(value) => {
+                if let Some(form) = &mut self.destination_form {
+                    form.relay_urls = value;
+                }
+                Task::none()
+            }
+            Message::RelayAuthTokenChanged(value) => {
+                if let Some(form) = &mut self.destination_form {
+                    form.relay_auth_token = value;
+                }
+                Task::none()
+            }
+            Message::DestinationFormSave => {
+                self.save_destination_form();
+                Task::none()
+            }
+            Message::DestinationFormCancel => {
+                self.destination_form = None;
                 Task::none()
             }
             Message::AddKey => {
@@ -1416,82 +1522,30 @@ impl App {
                 self.key_form = None;
                 Task::none()
             }
-            Message::SocksEnabledToggled(enabled) => {
-                if let Some(form) = &mut self.profile_form {
-                    form.socks_enabled = enabled;
+            Message::AddForward => {
+                self.proxy_form = None;
+                self.forward_form = Some(ForwardForm::add());
+                Task::none()
+            }
+            Message::EditForward(forward_id) => {
+                if let Some(forward) = self.client.forwards.iter().find(|f| f.id == forward_id) {
+                    self.proxy_form = None;
+                    self.forward_form = Some(ForwardForm::edit(forward));
                 }
                 Task::none()
             }
-            Message::SocksPortChanged(value) => {
-                if let Some(form) = &mut self.profile_form {
-                    form.socks_port = value;
+            Message::DeleteForward(forward_id) => {
+                let before = self.client.forwards.len();
+                self.client.forwards.retain(|f| f.id != forward_id);
+                if self.client.forwards.len() != before {
+                    self.forward_errors.remove(&forward_id);
+                    self.commit_forwards();
                 }
                 Task::none()
             }
-            Message::HttpEnabledToggled(enabled) => {
-                if let Some(form) = &mut self.profile_form {
-                    form.http_enabled = enabled;
-                }
-                Task::none()
-            }
-            Message::HttpPortChanged(value) => {
-                if let Some(form) = &mut self.profile_form {
-                    form.http_port = value;
-                }
-                Task::none()
-            }
-            Message::RelayUrlsChanged(value) => {
-                if let Some(form) = &mut self.profile_form {
-                    form.relay_urls = value;
-                }
-                Task::none()
-            }
-            Message::RelayAuthTokenChanged(value) => {
-                if let Some(form) = &mut self.profile_form {
-                    form.relay_auth_token = value;
-                }
-                Task::none()
-            }
-            Message::ProfileFormSave => {
-                self.save_profile_form();
-                Task::none()
-            }
-            Message::ProfileFormCancel => {
-                self.profile_form = None;
-                Task::none()
-            }
-            Message::AddForward(profile_id) => {
-                self.forward_form = Some((profile_id, ForwardForm::add()));
-                Task::none()
-            }
-            Message::EditForward(profile_id, forward_id) => {
-                if let Some(forward) = self
-                    .profiles
-                    .iter()
-                    .find(|p| p.id == profile_id)
-                    .and_then(|p| p.forwards.iter().find(|f| f.id == forward_id))
-                {
-                    self.forward_form = Some((profile_id, ForwardForm::edit(forward)));
-                }
-                Task::none()
-            }
-            Message::DeleteForward(profile_id, forward_id) => {
-                if let Some(profile) = self.profiles.iter_mut().find(|p| p.id == profile_id) {
-                    let before = profile.forwards.len();
-                    profile.forwards.retain(|f| f.id != forward_id);
-                    if profile.forwards.len() != before {
-                        self.forward_errors.remove(&forward_id);
-                        self.commit_forwards(&profile_id);
-                    }
-                }
-                Task::none()
-            }
-            Message::ToggleForward(profile_id, forward_id, enabled) => {
-                if let Some(forward) = self
-                    .profiles
-                    .iter_mut()
-                    .find(|p| p.id == profile_id)
-                    .and_then(|p| p.forwards.iter_mut().find(|f| f.id == forward_id))
+            Message::ToggleForward(forward_id, enabled) => {
+                if let Some(forward) =
+                    self.client.forwards.iter_mut().find(|f| f.id == forward_id)
                 {
                     // Desired state, but not a plain checkbox: enabling
                     // attempts the setup now, and a setup failure snaps the
@@ -1501,36 +1555,36 @@ impl App {
                         // A fresh start attempt supersedes the old failure.
                         self.forward_errors.remove(&forward_id);
                     }
-                    self.commit_forwards(&profile_id);
+                    self.commit_forwards();
                 }
                 Task::none()
             }
             Message::FormLabelChanged(value) => {
-                if let Some((_, form)) = &mut self.forward_form {
+                if let Some(form) = &mut self.forward_form {
                     form.label = value;
                 }
                 Task::none()
             }
             Message::FormLocalPortChanged(value) => {
-                if let Some((_, form)) = &mut self.forward_form {
+                if let Some(form) = &mut self.forward_form {
                     form.local_port = value;
                 }
                 Task::none()
             }
             Message::FormRemoteHostChanged(value) => {
-                if let Some((_, form)) = &mut self.forward_form {
+                if let Some(form) = &mut self.forward_form {
                     form.remote_host = value;
                 }
                 Task::none()
             }
             Message::FormRemotePortChanged(value) => {
-                if let Some((_, form)) = &mut self.forward_form {
+                if let Some(form) = &mut self.forward_form {
                     form.remote_port = value;
                 }
                 Task::none()
             }
             Message::FormEnabledToggled(enabled) => {
-                if let Some((_, form)) = &mut self.forward_form {
+                if let Some(form) = &mut self.forward_form {
                     form.enabled = enabled;
                 }
                 Task::none()
@@ -1736,16 +1790,28 @@ impl App {
         }
     }
 
-    pub fn profile(&self, id: &str) -> Option<&Profile> {
-        self.profiles.iter().find(|p| p.id == id)
-    }
-
-    /// The profile's latest snapshot, or the shared idle one before its first
-    /// session.
-    pub fn snapshot_for(&self, id: &str) -> &Snapshot {
-        match self.snapshots.get(id) {
-            Some(snapshot) => snapshot,
-            None => Snapshot::empty(),
+    /// How `destination` stands in the client session: live only when the
+    /// session was started with it exactly as saved.
+    pub fn destination_live(&self, destination: &Destination) -> DestinationLive<'_> {
+        if self.client_snapshot.phase != ClientPhase::Running {
+            return DestinationLive::Stopped;
+        }
+        let applied = self
+            .client_applied
+            .as_ref()
+            .is_some_and(|spec| spec.destinations.iter().any(|d| d.destination == *destination));
+        if !applied {
+            return DestinationLive::Pending;
+        }
+        match self
+            .client_snapshot
+            .destinations
+            .iter()
+            .find(|status| status.host == destination.host)
+        {
+            Some(status) => DestinationLive::Live(status),
+            // Running, with its first status a poll away.
+            None => DestinationLive::Stopped,
         }
     }
 
@@ -1763,94 +1829,123 @@ impl App {
         }
     }
 
-    fn connect_profile(&mut self, id: &str) -> Task<Message> {
-        let Some(profile) = self.profile(id).cloned() else {
-            return Task::none();
-        };
-        match config::find_key(&self.keys, &profile.auth_key_id) {
-            Some(key)
-                if !key.secret.is_empty()
-                    && !profile.server_node_id.is_empty()
-                    && profile.route_table().is_ok() =>
-            {
-                let secret = key.secret.clone();
-                self.controller.connect(profile, secret);
-                Task::none()
+    /// Whether the running client was started with other settings than the
+    /// saved ones — its ports, its destinations or a key they use — so a
+    /// restart is needed to apply them. Forwards never need one.
+    pub fn client_needs_restart(&self) -> bool {
+        // A client just disabled is stopping, not waiting for a restart.
+        matches!(
+            self.client_snapshot.phase,
+            ClientPhase::Starting | ClientPhase::Running
+        ) && self.client.enabled
+            && self.client_applied != ClientSpec::resolve(&self.client, &self.keys)
+    }
+
+    /// Start a client session with the saved settings, if they resolve.
+    fn start_client(&mut self) {
+        if let Some(spec) = ClientSpec::resolve(&self.client, &self.keys) {
+            self.controller
+                .start_client(spec.clone(), self.client.forwards.clone());
+            self.client_applied = Some(spec);
+        }
+    }
+
+    /// Start the client if it is enabled, down, and can start: at launch, and
+    /// after a change that may have made it startable — its first destination
+    /// added, a lost key secret re-entered, a taken port changed. A client
+    /// still stopping gets the start queued behind the stop.
+    fn resume_client(&mut self) {
+        let down = matches!(
+            self.controller.client_snapshot().phase,
+            ClientPhase::Stopped | ClientPhase::Failed | ClientPhase::Stopping
+        );
+        if down && self.client.enabled && self.client.is_ready(&self.keys) {
+            self.start_client();
+        }
+    }
+
+    /// Restart the running client with the saved settings — or, when they no
+    /// longer start (the last destination deleted, a key lost), stop the stale
+    /// session rather than leave it running.
+    fn restart_client(&mut self) {
+        self.notice = None;
+        match self.client.start_blocker(&self.keys) {
+            None => {
+                if let Some(spec) = ClientSpec::resolve(&self.client, &self.keys) {
+                    self.controller
+                        .restart_client(spec.clone(), self.client.forwards.clone());
+                    self.client_applied = Some(spec);
+                }
             }
-            Some(key) if key.secret.is_empty() => {
-                // The key's keychain entry was lost — re-enter its secret.
-                let (key_name, key_form) = (key.name.clone(), KeyForm::edit(key));
-                self.selection = Selection::Keys;
-                self.profile_form = None;
-                self.key_form = Some(key_form);
-                self.notice = Some(format!(
-                    "Re-enter the secret of key \"{key_name}\" to connect."
-                ));
-                self.show_window()
-            }
-            key => {
-                // `Some` here means the key is usable (the empty-secret case
-                // was caught above) and something else is missing: the server
-                // node id (only a hand-edited file gets there), or the host —
-                // a profile saved before profiles had one, or one whose routes
-                // the core rejects. `None` is no key picked (fresh import) or
-                // a dangling reference.
-                let notice = if key.is_none() {
-                    "Pick an auth key to connect.".to_string()
-                } else if profile.server_node_id.is_empty() {
-                    "Enter the server node id to connect.".to_string()
-                } else if profile.host.trim().is_empty() {
-                    "Give this server a host name to connect.".to_string()
-                } else {
-                    match profile.route_table() {
-                        Err(e) => format!("Fix the profile's host and routes to connect: {e}"),
-                        Ok(_) => "Check the profile to connect.".to_string(),
-                    }
-                };
-                self.selection = Selection::Profile(profile.id.clone());
-                self.profile_form = Some(ProfileForm::edit(&profile));
-                self.notice = Some(notice);
-                self.show_window()
+            Some(blocker) => {
+                self.controller.stop_client();
+                self.notice = Some(blocker);
             }
         }
     }
 
-    fn delete_profile(&mut self, id: ProfileId) {
+    /// Enable or disable the client, persisted: enabling starts it — or shows
+    /// what it is missing — and disabling stops it and keeps it stopped.
+    /// Switching it off and on again is also how a failed client is retried.
+    fn set_client_enabled(&mut self, enabled: bool) -> Task<Message> {
+        if self.client.enabled != enabled {
+            self.client.enabled = enabled;
+            self.notice = None;
+            self.persist_store();
+        }
+        if !enabled {
+            self.controller.stop_client();
+            return Task::none();
+        }
+        let Some(blocker) = self.client.start_blocker(&self.keys) else {
+            self.start_client();
+            return Task::none();
+        };
+        // Show what is missing; with nowhere to go yet, that is a destination
+        // (its form open).
+        self.close_forms();
+        self.selection = Selection::Client;
+        if self.client.destinations.is_empty() {
+            self.destination_form = Some(DestinationForm::default());
+        }
+        self.notice = Some(blocker);
+        self.show_window()
+    }
+
+    fn delete_destination(&mut self, id: DestinationId) {
         if self.confirm_delete.as_deref() != Some(id.as_str()) {
             self.confirm_delete = Some(id);
             return;
         }
         self.confirm_delete = None;
-        let Some(pos) = self.profiles.iter().position(|p| p.id == id) else {
+        let Some(pos) = self.client.destinations.iter().position(|d| d.id == id) else {
             return;
         };
-        self.controller.remove_profile(&id);
-        // The referenced auth key stays — it's shared, managed in the Keys pane.
-        let removed = self.profiles.remove(pos);
-        for forward in &removed.forwards {
-            self.forward_errors.remove(&forward.id);
-        }
-        self.routed_caches.remove(&id);
-        self.snapshots.remove(&id);
-        self.forward_form = None;
-        if self.log_filter == LogFilter::Profile(removed.name) {
-            self.log_filter = LogFilter::All;
-            self.rebuild_log_text();
-        }
+        // The referenced auth key stays — it's shared, managed in the Keys
+        // pane. So do the forwards: one that pointed here now shows "no route".
+        self.client.destinations.remove(pos);
+        self.notice = None;
         self.persist_store();
-        if self.selection == Selection::Profile(id) {
+        if self.selection == Selection::Destination(id) {
             self.selection = self
-                .profiles
-                .get(pos.min(self.profiles.len().saturating_sub(1)))
-                .map(|p| Selection::Profile(p.id.clone()))
-                .or_else(|| self.server.as_ref().map(|_| Selection::Server))
-                .unwrap_or(Selection::Logs);
+                .client
+                .destinations
+                .get(pos.min(self.client.destinations.len().saturating_sub(1)))
+                .map(|d| Selection::Destination(d.id.clone()))
+                .unwrap_or(Selection::Client);
+        }
+        // The running session still routes to it until it restarts (the
+        // panes say so). Without any destination left there is nothing to
+        // restart into: stop.
+        if self.client.destinations.is_empty() {
+            self.controller.stop_client();
         }
     }
 
     /// Close every form and two-click guard of the detail pane.
     fn close_forms(&mut self) {
-        self.profile_form = None;
+        self.destination_form = None;
+        self.proxy_form = None;
         self.key_form = None;
         self.server_form = None;
         self.client_form = None;
@@ -1870,7 +1965,7 @@ impl App {
     /// is only one server, so once set up this just selects it.
     fn set_up_server(&mut self) -> Task<Message> {
         // Already showing it (a setup form half filled in, say): left as is.
-        if self.selection != Selection::Server || self.profile_form.is_some() {
+        if self.selection != Selection::Server || self.destination_form.is_some() {
             self.close_forms();
         }
         self.selection = Selection::Server;
@@ -1965,11 +2060,11 @@ impl App {
         // its identity secret.
         self.persist_store();
         if self.selection == Selection::Server {
-            self.selection = self
-                .profiles
-                .first()
-                .map(|p| Selection::Profile(p.id.clone()))
-                .unwrap_or(Selection::Logs);
+            self.selection = if self.client.destinations.is_empty() {
+                Selection::Empty
+            } else {
+                Selection::Client
+            };
         }
     }
 
@@ -2114,6 +2209,7 @@ impl App {
                 self.controller.shutdown();
                 iced::exit()
             }
+            tray::MENU_TOGGLE_CLIENT => self.set_client_enabled(!self.client.enabled),
             tray::MENU_TOGGLE_SERVER => match &self.server {
                 Some(server) => self.set_server_enabled(!server.enabled),
                 None => Task::none(),
@@ -2143,38 +2239,23 @@ impl App {
         }
     }
 
-    /// Poll the tunnel snapshots and derived state; runs on every tick and
+    /// Poll the session snapshots and derived state; runs on every tick and
     /// after the tray is created.
     fn refresh(&mut self) {
-        self.snapshots = self.controller.snapshots();
+        self.client_snapshot = self.controller.client_snapshot();
         self.server_snapshot = self.controller.server_snapshot();
         self.sync_launch_at_login(false);
 
         // Runs every tick so a forward whose setup failed snaps back to
-        // stopped promptly, per profile.
-        let mut failed_in: Vec<ProfileId> = Vec::new();
-        for profile in &mut self.profiles {
-            let Some(snapshot) = self.snapshots.get(&profile.id) else {
-                continue;
-            };
-            let failed = disable_failed_forwards(&mut profile.forwards, &snapshot.forwards);
-            if !failed.is_empty() {
-                self.forward_errors.extend(failed);
-                failed_in.push(profile.id.clone());
-            }
-            view::refresh_routed_cache(
-                self.routed_caches.entry(profile.id.clone()).or_default(),
-                profile,
-            );
-        }
-        for id in &failed_in {
-            if let Some(profile) = self.profile(id) {
-                self.controller.set_forwards(id, profile.forwards.clone());
-            }
-        }
-        if !failed_in.is_empty() {
+        // stopped promptly.
+        let failed =
+            disable_failed_forwards(&mut self.client.forwards, &self.client_snapshot.forwards);
+        if !failed.is_empty() {
+            self.forward_errors.extend(failed);
+            self.controller.set_forwards(self.client.forwards.clone());
             self.persist_store();
         }
+        view::refresh_routed_cache(&mut self.routed_cache, &self.client);
 
         let revision = logging::revision();
         if revision != self.log_revision {
@@ -2184,58 +2265,80 @@ impl App {
 
         if let Some(tray) = &mut self.tray {
             tray.sync(
-                &self.profiles,
-                &self.snapshots,
+                &self.client,
+                &self.client_snapshot,
                 self.server.as_ref(),
                 &self.server_snapshot,
             );
         }
     }
 
-    fn save_profile_form(&mut self) {
-        let Some(form) = &self.profile_form else {
+    fn save_destination_form(&mut self) {
+        let Some(form) = &self.destination_form else {
             return;
         };
-        let Ok(profile) = form.validate(&self.profiles, &self.keys) else {
+        let Ok(destination) = form.validate(&self.client.destinations, &self.keys) else {
             return;
         };
-        let id = profile.id.clone();
-        let running = self.snapshots.get(&id).is_some_and(|s| {
-            matches!(s.phase, Phase::Connecting | Phase::Connected | Phase::Reconnecting)
-        });
-        match self.profiles.iter().position(|p| p.id == id) {
-            Some(pos) => {
-                // Follow a rename with the log filter (new lines carry the
-                // new thread name; old lines keep matching by text only).
-                let filter_renamed = self.log_filter
-                    == LogFilter::Profile(self.profiles[pos].name.clone())
-                    && self.profiles[pos].name != profile.name;
-                if filter_renamed {
-                    self.log_filter = LogFilter::Profile(profile.name.clone());
-                    self.rebuild_log_text();
-                }
-                self.profiles[pos] = profile;
-            }
-            None => self.profiles.push(profile),
+        let id = destination.id.clone();
+        match self.client.destinations.iter_mut().find(|d| d.id == id) {
+            Some(slot) => *slot = destination,
+            None => self.client.destinations.push(destination),
         }
+        // A save failure's notice wins over the outcome below.
+        self.notice = None;
         self.persist_store();
+        self.selection = Selection::Destination(id);
+        self.destination_form = None;
+        // The first destination is what an enabled client was waiting for.
+        self.resume_client();
         if self.notice.is_none() {
-            self.notice = Some(if running {
-                "Saved — reconnect to apply.".into()
-            } else {
-                "Saved.".into()
-            });
+            self.notice = self.saved_notice();
         }
-        self.selection = Selection::Profile(id);
-        self.profile_form = None;
     }
 
-    /// The profile form's "New key" prompt: generate a keypair under the
+    /// Whether a save just now left a running client on the settings from
+    /// before. Asks the controller rather than the polled snapshot, which a
+    /// start made a moment ago has not reached yet.
+    fn restart_pending(&self) -> bool {
+        matches!(
+            self.controller.client_snapshot().phase,
+            ClientPhase::Starting | ClientPhase::Running
+        ) && self.client.enabled
+            && self.client_applied != ClientSpec::resolve(&self.client, &self.keys)
+    }
+
+    /// The notice for a save on a pane that shows the restart banner: "Saved."
+    /// unless that banner is about to say more.
+    fn saved_notice(&self) -> Option<String> {
+        (!self.restart_pending()).then(|| "Saved.".into())
+    }
+
+    fn save_proxy_form(&mut self) {
+        let Some(form) = &self.proxy_form else {
+            return;
+        };
+        let Ok((socks_port, http_port)) = form.validate(&self.client) else {
+            return;
+        };
+        self.client.socks_port = socks_port;
+        self.client.http_port = http_port;
+        self.proxy_form = None;
+        self.notice = None;
+        self.persist_store();
+        // A taken port is what a failed client was waiting to have changed.
+        self.resume_client();
+        if self.notice.is_none() {
+            self.notice = self.saved_notice();
+        }
+    }
+
+    /// The destination form's "New key" prompt: generate a keypair under the
     /// entered name, add it to the shared list, and select it in the form.
-    /// (Cancelling the profile form afterwards keeps the key — it's in the
-    /// list, deletable from the Keys pane.)
-    fn create_key_for_profile_form(&mut self) {
-        let Some(name) = self.profile_form.as_ref().and_then(|f| f.new_key_name.clone()) else {
+    /// (Cancelling the destination form afterwards keeps the key — it's in
+    /// the list, deletable from the Keys pane.)
+    fn create_key_for_destination_form(&mut self) {
+        let Some(name) = self.destination_form.as_ref().and_then(|f| f.new_key_name.clone()) else {
             return;
         };
         // The view disables Create on an invalid name; this is the backstop.
@@ -2252,7 +2355,7 @@ impl App {
         let id = key.id.clone();
         self.keys.push(key);
         self.persist_store();
-        if let Some(form) = &mut self.profile_form {
+        if let Some(form) = &mut self.destination_form {
             form.auth_key_id = id;
             form.new_key_name = None;
         }
@@ -2269,22 +2372,31 @@ impl App {
             Some(slot) => *slot = key,
             None => self.keys.push(key),
         }
+        self.notice = None;
         self.persist_store();
-        if self.notice.is_none() {
-            // An edited secret reaches running sessions on their next connect.
-            self.notice = Some("Saved — profiles using this key apply it on reconnect.".into());
-        }
         self.key_form = None;
+        // A re-entered secret is what a client blocked on it was waiting for;
+        // a running one takes an edited secret on its next restart, offered
+        // on the client's pane — this one has no banner to say so.
+        self.resume_client();
+        if self.notice.is_none() {
+            self.notice = Some(if self.restart_pending() {
+                "Saved — restart the client (under Proxy & forwards) to apply.".into()
+            } else {
+                "Saved.".into()
+            });
+        }
     }
 
     fn delete_key(&mut self, id: String) {
         self.confirm_export_key = None;
-        // Shared keys never delete out from under a profile; repoint or
-        // delete the profiles first.
-        if let Some(user) = self.profiles.iter().find(|p| p.auth_key_id == id) {
+        // Shared keys never delete out from under a destination; repoint or
+        // delete the destinations first.
+        if let Some(user) = self.client.destinations.iter().find(|d| d.auth_key_id == id) {
             self.notice = Some(format!(
-                "This key is used by profile \"{}\" — repoint or delete that profile first.",
-                user.name
+                "This key is used by destination \"{}\" — repoint or delete that destination \
+                 first.",
+                user.host
             ));
             self.confirm_delete_key = None;
             return;
@@ -2328,14 +2440,10 @@ impl App {
     }
 
     fn save_forward_form(&mut self) {
-        let Some((profile_id, form)) = &self.forward_form else {
+        let Some(form) = &self.forward_form else {
             return;
         };
-        let profile_id = profile_id.clone();
-        let Ok(saved) = form.validate(&self.profiles) else {
-            return;
-        };
-        let Some(profile) = self.profiles.iter_mut().find(|p| p.id == profile_id) else {
+        let Ok(saved) = form.validate(&self.client) else {
             return;
         };
         if saved.enabled {
@@ -2343,64 +2451,63 @@ impl App {
             // start attempt supersedes the old failure.
             self.forward_errors.remove(&saved.id);
         }
-        match profile.forwards.iter_mut().find(|f| f.id == saved.id) {
+        match self.client.forwards.iter_mut().find(|f| f.id == saved.id) {
             Some(slot) => *slot = saved,
-            None => profile.forwards.push(saved),
+            None => self.client.forwards.push(saved),
         }
-        self.commit_forwards(&profile_id);
+        self.commit_forwards();
         self.forward_form = None;
     }
 
-    /// Persist all profiles and push one profile's forwards to its session
-    /// (live apply).
-    fn commit_forwards(&mut self, profile_id: &str) {
+    /// Persist the forwards and push them to the client session (live apply).
+    fn commit_forwards(&mut self) {
         self.persist_store();
-        if let Some(profile) = self.profile(profile_id) {
-            self.controller
-                .set_forwards(profile_id, profile.forwards.clone());
-        }
+        self.controller.set_forwards(self.client.forwards.clone());
     }
 
-    fn import_profiles(&mut self, path: &std::path::Path) {
-        let imported = match config::import_profiles(path) {
-            Ok(imported) => imported,
+    fn import_client(&mut self, path: &std::path::Path) {
+        let merged = config::import_client(path)
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|imported| merge_imported(&self.client, imported));
+        let (client, summary) = match merged {
+            Ok(merged) => merged,
             Err(e) => {
-                log::error!("{e:#}");
-                self.io_notice = Some(format!("Import failed: {e:#}"));
+                log::error!("Import failed: {e}");
+                self.io_notice = Some(format!("Import failed: {e}"));
                 return;
             }
         };
-        let (added, replaced) = merge_imported(&mut self.profiles, imported);
-        // A replaced profile's session (if live) reconciles to the imported
-        // forward list — which loads all-disabled, like any fresh load.
-        for id in &replaced {
-            if let Some(profile) = self.profile(id) {
-                self.controller.set_forwards(id, profile.forwards.clone());
-            }
+        self.client = client;
+        // A replaced forward comes back stopped, like any fresh load; the
+        // session (if live) reconciles to the merged list.
+        for id in &summary.forwards_replaced {
+            self.forward_errors.remove(id);
         }
+        self.close_forms();
         self.persist_store();
-        self.io_notice = Some(format!(
-            "Imported: {added} added, {} replaced.",
-            replaced.len()
-        ));
-        // Land somewhere sensible if nothing (or a since-removed profile) was
-        // selected; added profiles still need an auth key picked.
-        if !matches!(&self.selection, Selection::Profile(id) if self.profile(id).is_some())
-            && let Some(profile) = self.profiles.first()
-        {
-            self.selection = Selection::Profile(profile.id.clone());
+        self.controller.set_forwards(self.client.forwards.clone());
+        self.io_notice = Some(summary.to_string());
+        // Added destinations still need an auth key picked, which the client
+        // pane says; land there unless something that still exists is shown.
+        let shown = match &self.selection {
+            Selection::Destination(id) => self.client.destination(id).is_some(),
+            Selection::Empty => false,
+            _ => true,
+        };
+        if !shown {
+            self.selection = Selection::Client;
         }
-        self.profile_form = None;
+        self.resume_client();
     }
 
-    /// Re-join the log ring for the Logs pane, keeping only the filtered
-    /// profile's or the server's session-thread lines (`[tunnel-<name>]` /
-    /// `[server]`) when a filter is on.
+    /// Re-join the log ring for the Logs pane, keeping only the client's or
+    /// the server's session-thread lines (`[client]` / `[server]`) when a
+    /// filter is on.
     fn rebuild_log_text(&mut self) {
         let lines = logging::recent_lines();
         let tag = match &self.log_filter {
             LogFilter::All => None,
-            LogFilter::Profile(name) => Some(format!("[tunnel-{name}]")),
+            LogFilter::Client => Some(format!("[{CLIENT_THREAD_NAME}]")),
             LogFilter::Server => Some(format!("[{}]", server_session::THREAD_NAME)),
         };
         self.log_text = match tag {
@@ -2437,12 +2544,12 @@ impl App {
         }
         if let Err(e) = config::save_store(
             &self.keys,
-            &self.profiles,
+            &self.client,
             self.server.as_ref(),
             self.login_item_set_up,
         ) {
-            log::error!("Failed to save profiles: {e:#}");
-            self.notice = Some(format!("Failed to save profiles: {e:#}"));
+            log::error!("Failed to save the settings: {e:#}");
+            self.notice = Some(format!("Failed to save the settings: {e:#}"));
         }
     }
 
@@ -2509,20 +2616,15 @@ mod tests {
         }]
     }
 
-    fn valid_form() -> ProfileForm {
-        ProfileForm {
+    fn valid_form() -> DestinationForm {
+        DestinationForm {
             editing_id: None,
-            name: " prod ".into(),
-            server_node_id: " node-id ".into(),
             host: " Prod.Internal ".into(),
+            server_node_id: " node-id ".into(),
             routed_domains: " *.corp.example ,, db.internal ".into(),
             routed_cidrs: " 10.0.0.0/8 ".into(),
             auth_key_id: "k1".into(),
             new_key_name: None,
-            socks_enabled: true,
-            socks_port: "1080".into(),
-            http_enabled: false,
-            http_port: "8080".into(),
             relay_urls: " https://a.example ,, https://b.example ".into(),
             relay_auth_token: String::new(),
         }
@@ -2550,27 +2652,33 @@ mod tests {
         }
     }
 
-    fn existing_profile(id: &str, socks_port: u16, forwards: Vec<PortForward>) -> Profile {
-        Profile {
+    /// A destination `<id>.internal` on server `node-<id>`, with no routes.
+    fn existing_destination(id: &str) -> Destination {
+        Destination {
             id: id.into(),
-            name: format!("profile-{id}"),
-            server_node_id: "node".into(),
             host: format!("{id}.internal"),
+            server_node_id: format!("node-{id}"),
             routed_domains: Vec::new(),
             routed_cidrs: Vec::new(),
             auth_key_id: "k1".into(),
-            socks_port: Some(socks_port),
-            http_port: None,
             relay_urls: Vec::new(),
             relay_auth_token: None,
+        }
+    }
+
+    fn client(socks_port: u16, forwards: Vec<PortForward>) -> ClientSettings {
+        ClientSettings {
+            enabled: true,
+            socks_port: Some(socks_port),
+            http_port: None,
+            destinations: vec![existing_destination("p1")],
             forwards,
         }
     }
 
     #[test]
     fn forward_form_trims_and_builds() {
-        let profiles = [existing_profile("p1", 1080, vec![])];
-        let forward = valid_forward_form().validate(&profiles).expect("valid");
+        let forward = valid_forward_form().validate(&client(1080, vec![])).expect("valid");
         assert_eq!(forward.label, "db");
         assert_eq!(forward.local_port, 5432);
         assert_eq!(forward.remote_host, "db.internal");
@@ -2581,7 +2689,7 @@ mod tests {
 
     #[test]
     fn forward_form_rejects_bad_input() {
-        let base = [existing_profile("p1", 1080, vec![])];
+        let base = client(1080, vec![]);
 
         let mut form = valid_forward_form();
         form.local_port = "0".into();
@@ -2603,15 +2711,15 @@ mod tests {
         form.remote_port = "70000".into();
         assert!(form.validate(&base).is_err());
 
-        // Collisions with any profile's proxy ports.
+        // Collisions with the client's proxy ports.
         let form = valid_forward_form();
-        assert!(form.validate(&[existing_profile("p1", 5432, vec![])]).is_err());
-        let mut http_profile = existing_profile("p1", 1080, vec![]);
-        http_profile.http_port = Some(5432);
-        assert!(form.validate(std::slice::from_ref(&http_profile)).is_err());
+        assert!(form.validate(&client(5432, vec![])).unwrap_err().contains("SOCKS5 proxy"));
+        let mut http = client(1080, vec![]);
+        http.http_port = Some(5432);
+        assert!(form.validate(&http).unwrap_err().contains("HTTP proxy"));
 
-        // Duplicate local port among any profile's forwards…
-        let taken = [existing_profile("p2", 1081, vec![existing_forward("aaaa", 5432)])];
+        // Duplicate local port among the forwards…
+        let taken = client(1080, vec![existing_forward("aaaa", 5432)]);
         assert!(form.validate(&taken).is_err());
 
         // …unless it is the forward being edited (id reused).
@@ -2622,34 +2730,81 @@ mod tests {
     }
 
     #[test]
-    fn import_merges_by_server_id_and_uniquifies_names() {
-        // "profile-p1" on server "node" (with a token), "profile-p2" on
-        // "node-2".
-        let mut current = vec![
-            existing_profile("p1", 1080, vec![existing_forward("f1", 5000)]),
-            existing_profile("p2", 1081, vec![]),
-        ];
-        current[1].server_node_id = "node-2".into();
-        current[0].auth_key_id = "key-ref".into();
-        current[0].relay_auth_token = Some("relay-psk".into());
+    fn proxy_ports_share_one_namespace_with_the_forwards() {
+        let current = client(1080, vec![existing_forward("f1", 5000)]);
+        let form = |socks: Option<&str>, http: Option<&str>| ProxyForm {
+            socks_enabled: socks.is_some(),
+            socks_port: socks.unwrap_or_default().into(),
+            http_enabled: http.is_some(),
+            http_port: http.unwrap_or_default().into(),
+        };
+        // The form opens on what is saved, with a suggestion for what is off.
+        let open = ProxyForm::edit(&current);
+        assert!(open.socks_enabled && !open.http_enabled);
+        assert_eq!((open.socks_port.as_str(), open.http_port.as_str()), ("1080", "18080"));
+        // The client's own current port is not a clash with itself.
+        assert_eq!(open.validate(&current), Ok((Some(1080), None)));
 
-        // Same server as p1: replaces settings/forwards, keeps id + secrets.
-        // A relay token on an incoming entry is never trusted (imports strip
+        assert_eq!(form(Some("1081"), Some("8081")).validate(&current), Ok((Some(1081), Some(8081))));
+        assert_eq!(form(None, None).validate(&current), Ok((None, None)), "forwards only");
+        assert!(form(Some("0"), None).validate(&current).is_err());
+        assert!(form(Some("1081"), Some("1081")).validate(&current).is_err(), "same port twice");
+        // A forward's local port, as SOCKS or HTTP.
+        assert!(form(Some("5000"), None).validate(&current).unwrap_err().contains("forward"));
+        assert!(form(Some("1081"), Some("5000")).validate(&current).is_err());
+        // A switched-off front-end's port buffer is not looked at.
+        let mut off = form(None, None);
+        off.socks_port = "garbage".into();
+        assert!(off.validate(&current).is_ok());
+    }
+
+    #[test]
+    fn import_merges_destinations_by_server_and_forwards_by_port() {
+        // "p1.internal" (with a key and a relay token) and "p2.internal", one
+        // forward on 5000, SOCKS on 1080.
+        let mut current = client(1080, vec![existing_forward("f1", 5000)]);
+        current.destinations.push(existing_destination("p2"));
+        current.destinations[0].auth_key_id = "key-ref".into();
+        current.destinations[0].relay_auth_token = Some("relay-psk".into());
+        current.forwards[0].enabled = true;
+
+        // Same server as p1: replaces its settings, keeps id + key + token. A
+        // relay token on an incoming entry is never trusted (imports strip
         // it); pretend a hand-edited one slipped through to prove that.
-        let mut same_server = existing_profile("x", 2080, vec![existing_forward("f2", 6000)]);
-        same_server.name = "renamed".into();
+        let mut same_server = existing_destination("x");
+        same_server.server_node_id = "node-p1".into();
+        same_server.host = "renamed.internal".into();
+        same_server.routed_domains = vec!["*.corp.example".into()];
         same_server.relay_auth_token = Some("imported-psk".into());
-        // New server, but colliding with p2's name: gets " - 2".
-        let mut name_clash = existing_profile("y", 3080, vec![]);
-        name_clash.name = "profile-p2".into();
-        name_clash.server_node_id = "node-3".into();
-        name_clash.relay_auth_token = Some("imported-psk".into());
+        let mut new_server = existing_destination("y");
+        new_server.relay_auth_token = Some("imported-psk".into());
 
-        let (added, replaced) = merge_imported(&mut current, vec![same_server, name_clash]);
-        assert_eq!(added, 1);
-        assert_eq!(replaced, vec!["p1".to_string()]);
+        let mut replacing = existing_forward("f2", 5000);
+        replacing.remote_host = "renamed.internal".into();
+        replacing.enabled = true;
+        let imported = Portable {
+            destinations: vec![same_server, new_server],
+            forwards: vec![replacing, existing_forward("f3", 6000), existing_forward("f4", 1080)],
+        };
 
-        let p1 = &current[0];
+        let (merged, summary) = merge_imported(&current, imported).expect("fits");
+        assert_eq!(
+            summary,
+            ImportSummary {
+                destinations_added: 1,
+                destinations_replaced: 1,
+                forwards_added: 1,
+                forwards_replaced: vec!["f1".to_string()],
+                forwards_skipped: 1,
+            }
+        );
+        assert_eq!(
+            summary.to_string(),
+            "Imported: 1 destination(s) added, 1 replaced; 1 forward(s) added, 1 replaced; \
+             1 skipped (local port used by a proxy here)."
+        );
+
+        let p1 = &merged.destinations[0];
         assert_eq!(p1.id, "p1", "id kept");
         assert_eq!(p1.auth_key_id, "key-ref", "key reference kept");
         assert_eq!(
@@ -2657,96 +2812,87 @@ mod tests {
             Some("relay-psk"),
             "existing relay token kept, not overwritten by the import"
         );
-        assert_eq!(p1.name, "renamed");
-        assert_eq!(p1.socks_port, Some(2080));
-        assert_eq!(p1.forwards.len(), 1);
-        assert_ne!(p1.forwards[0].id, "f2", "imported forward ids are fresh");
+        assert_eq!(p1.host, "renamed.internal");
+        assert_eq!(p1.routed_domains, ["*.corp.example"]);
+        assert_eq!(merged.destinations[1], current.destinations[1], "untouched");
 
-        let new = &current[2];
-        assert_eq!(new.name, "profile-p2 - 2");
+        let new = &merged.destinations[2];
+        assert_eq!(new.host, "y.internal");
         assert!(new.auth_key_id.is_empty(), "no key reference in imports");
         assert_eq!(new.relay_auth_token, None, "no relay secret in imports");
-        assert_ne!(new.id, "y", "imported profile ids are fresh");
+        assert_ne!(new.id, "y", "imported destination ids are fresh");
 
-        // A second import of the same name-clashing profile bumps to " - 3"
-        // only if its server is also new; same server replaces in place.
-        let mut again = existing_profile("z", 4080, vec![]);
-        again.name = "profile-p2".into();
-        again.server_node_id = "node-4".into();
-        let (added, replaced) = merge_imported(&mut current, vec![again]);
-        assert_eq!((added, replaced.len()), (1, 0));
-        assert_eq!(current[3].name, "profile-p2 - 3");
+        // The proxy ports are this computer's own; forwards come back stopped.
+        assert_eq!((merged.socks_port, merged.http_port), (Some(1080), None));
+        assert_eq!(merged.forwards.len(), 2);
+        assert_eq!(merged.forwards[0].id, "f1", "a replaced forward keeps its id");
+        assert_eq!(merged.forwards[0].remote_host, "renamed.internal");
+        assert!(!merged.forwards[0].enabled);
+        assert_eq!(merged.forwards[1].local_port, 6000);
+        assert_ne!(merged.forwards[1].id, "f3", "imported forward ids are fresh");
     }
 
+    /// Imported destinations must fit the ones already here: a host or a
+    /// route claimed twice rejects the import whole.
     #[test]
-    fn unique_name_respects_length_limit() {
-        let taken = existing_profile("p1", 1080, vec![]);
-        let mut long = existing_profile("p2", 1081, vec![]);
-        long.name = "a".repeat(64);
-        let profiles = [taken, long.clone()];
-        let is_taken = |name: &str| profiles.iter().any(|p| p.name == name);
+    fn an_import_that_breaks_the_routing_changes_nothing() {
+        let mut current = client(1080, vec![]);
+        current.destinations[0].routed_domains = vec!["*.corp.example".into()];
 
-        assert_eq!(
-            unique_name("fresh".into(), is_taken),
-            "fresh",
-            "free names pass through"
-        );
-        let bumped = unique_name(long.name.clone(), is_taken);
-        assert_eq!(bumped, format!("{} - 2", "a".repeat(60)));
-        assert!(bumped.len() <= 64);
-        assert!(bumped.ends_with(" - 2"));
-        assert!(config::is_valid_name(&bumped));
-    }
+        // Another server under a host already taken.
+        let mut same_host = existing_destination("z");
+        same_host.host = "p1.internal".into();
+        let clash = Portable { destinations: vec![same_host], forwards: Vec::new() };
+        assert!(merge_imported(&current, clash).unwrap_err().contains("more than once"));
 
-    #[test]
-    fn name_whitespace_is_normalized() {
-        let mut form = valid_form();
-        form.name = "  staging   aws \t kube  ".into();
-        let profile = form.validate(&[], &test_keys()).expect("valid");
-        assert_eq!(profile.name, "staging aws kube");
-        assert!(config::is_valid_name(&profile.name));
+        // Another server claiming a rule already routed.
+        let mut same_rule = existing_destination("z");
+        same_rule.routed_domains = vec!["*.corp.example".into()];
+        let clash = Portable {
+            destinations: vec![existing_destination("ok"), same_rule],
+            forwards: vec![existing_forward("f", 6000)],
+        };
+        assert!(merge_imported(&current, clash).unwrap_err().contains("both route"));
+
+        // Nothing to import is fine, and changes nothing.
+        let (merged, summary) = merge_imported(&current, Portable::default()).unwrap();
+        assert_eq!(merged, current);
+        assert_eq!(summary, ImportSummary::default());
+        assert!(summary.to_string().ends_with("0 replaced."));
     }
 
     #[test]
     fn validate_trims_and_parses() {
-        let profile = valid_form().validate(&[], &test_keys()).expect("valid");
-        assert_eq!(profile.name, "prod");
-        assert_eq!(profile.server_node_id, "node-id");
-        assert_eq!(profile.host, "prod.internal", "stored trimmed and lowercased");
-        assert_eq!(profile.routed_domains, ["*.corp.example", "db.internal"]);
-        assert_eq!(profile.routed_cidrs, ["10.0.0.0/8"]);
-        assert!(profile.route_table().is_ok());
-        assert_eq!(profile.socks_port, Some(1080));
-        assert_eq!(profile.http_port, None);
+        let destination = valid_form().validate(&[], &test_keys()).expect("valid");
+        assert_eq!(destination.server_node_id, "node-id");
+        assert_eq!(destination.host, "prod.internal", "stored trimmed and lowercased");
+        assert_eq!(destination.routed_domains, ["*.corp.example", "db.internal"]);
+        assert_eq!(destination.routed_cidrs, ["10.0.0.0/8"]);
+        assert_eq!(destination.auth_key_id, "k1");
         assert_eq!(
-            profile.relay_urls,
+            destination.relay_urls,
             vec!["https://a.example".to_string(), "https://b.example".to_string()]
         );
-        assert!(!profile.id.is_empty());
-        assert!(profile.forwards.is_empty());
+        assert_eq!(destination.relay_auth_token, None);
+        assert!(!destination.id.is_empty());
+
+        // Editing keeps the id and reads back what was saved.
+        let form = DestinationForm::edit(&destination);
+        assert!(form.is_edit());
+        assert_eq!(form.routed_domains, "*.corp.example, db.internal");
+        let again = form.validate(std::slice::from_ref(&destination), &test_keys()).unwrap();
+        assert_eq!(again, destination);
     }
 
     #[test]
     fn validate_rejects_bad_input() {
         let keys = test_keys();
-        let mut form = valid_form();
-        form.name = "  ".into();
-        assert!(form.validate(&[], &keys).is_err());
 
         // No key picked, and a reference to a key that doesn't exist.
         let mut form = valid_form();
         form.auth_key_id = String::new();
         assert!(form.validate(&[], &keys).is_err());
         form.auth_key_id = "missing".into();
-        assert!(form.validate(&[], &keys).is_err());
-
-        let mut form = valid_form();
-        form.socks_port = "0".into();
-        assert!(form.validate(&[], &keys).is_err());
-
-        let mut form = valid_form();
-        form.http_enabled = true;
-        form.http_port = form.socks_port.clone();
         assert!(form.validate(&[], &keys).is_err());
 
         let mut form = valid_form();
@@ -2775,22 +2921,61 @@ mod tests {
         form.routed_cidrs = String::new();
         assert!(form.validate(&[], &keys).is_ok());
 
-        // Duplicate profile name (they key tray submenus and log threads)…
-        let existing = [existing_profile("p1", 2080, vec![])];
+        // The core's relay rules: custom relays come in pairs at least, and a
+        // token needs them.
         let mut form = valid_form();
-        form.name = " profile-p1 ".into();
-        assert!(form.validate(&existing, &keys).is_err());
-        // …unless it is the profile being edited.
-        form.editing_id = Some("p1".into());
+        form.relay_urls = "https://only.example".into();
+        assert!(form.validate(&[], &keys).is_err(), "a single custom relay");
+        let mut form = valid_form();
+        form.relay_urls = String::new();
+        assert!(form.validate(&[], &keys).is_ok(), "the default relays");
+        form.relay_auth_token = "psk".into();
+        assert!(form.validate(&[], &keys).is_err(), "token without relays");
+    }
+
+    /// A destination is checked against the others, with the core's own
+    /// table: one host, one server and one owner per rule.
+    #[test]
+    fn destinations_must_fit_together() {
+        let keys = test_keys();
+        let mut existing = existing_destination("p1");
+        existing.routed_domains = vec!["*.corp.example".into()];
+        existing.routed_cidrs = vec!["10.0.0.0/8".into()];
+        let existing = [existing];
+        let fresh = || DestinationForm {
+            routed_domains: String::new(),
+            routed_cidrs: String::new(),
+            ..valid_form()
+        };
+        assert!(fresh().validate(&existing, &keys).is_ok());
+
+        // Another destination's host…
+        let mut form = fresh();
+        form.host = " P1.internal ".into();
+        assert!(form.validate(&existing, &keys).unwrap_err().contains("more than once"));
+        // …or its server…
+        let mut form = fresh();
+        form.server_node_id = "node-p1".into();
+        let err = form.validate(&existing, &keys).unwrap_err();
+        assert!(err.contains("\"p1.internal\" already reaches this server"), "{err}");
+        // …or one of its rules, or its host as a routed domain.
+        let mut form = fresh();
+        form.routed_cidrs = "10.0.0.0/8".into();
+        assert!(form.validate(&existing, &keys).unwrap_err().contains("both route"));
+        let mut form = fresh();
+        form.routed_domains = "p1.internal".into();
+        assert!(form.validate(&existing, &keys).unwrap_err().contains("own host"));
+        // A narrower rule inside another destination's is fine: it wins.
+        let mut form = fresh();
+        form.routed_domains = "db.corp.example".into();
+        form.routed_cidrs = "10.1.0.0/16".into();
         assert!(form.validate(&existing, &keys).is_ok());
 
-        // Duplicate server node id…
-        let mut form = valid_form();
-        form.server_node_id = "node".into();
-        assert!(form.validate(&existing, &keys).is_err());
-        // …unless it is the profile being edited.
-        form.editing_id = Some("p1".into());
-        assert!(form.validate(&existing, &keys).is_ok());
+        // None of it applies to the destination being edited itself.
+        let mut form = DestinationForm::edit(&existing[0]);
+        form.routed_domains = "*.corp.example, extra.example".into();
+        let edited = form.validate(&existing, &keys).expect("own host, server and rules");
+        assert_eq!(edited.id, "p1");
     }
 
     #[test]
@@ -2972,44 +3157,5 @@ mod tests {
         named.set_public_key(format!("{key} alice laptop"));
         assert_eq!((named.name.as_str(), named.public_key.as_str()), ("phone", key.as_str()));
         assert!(named.validate(&[]).is_ok());
-    }
-
-    #[test]
-    fn profile_ports_share_one_namespace() {
-        let keys = test_keys();
-        let existing = [existing_profile("p1", 1080, vec![existing_forward("f1", 5000)])];
-
-        // Another profile's SOCKS port.
-        let form = valid_form();
-        assert!(form.validate(&existing, &keys).is_err());
-
-        // Another profile's forward local port (as SOCKS or HTTP).
-        let mut form = valid_form();
-        form.socks_port = "5000".into();
-        assert!(form.validate(&existing, &keys).is_err());
-        let mut form = valid_form();
-        form.socks_port = "1090".into();
-        form.http_enabled = true;
-        form.http_port = "5000".into();
-        assert!(form.validate(&existing, &keys).is_err());
-
-        // A free port is fine.
-        let mut form = valid_form();
-        form.socks_port = "1081".into();
-        assert!(form.validate(&existing, &keys).is_ok());
-
-        // Editing a profile skips its own proxy ports but keeps its forwards.
-        let mut form = valid_form();
-        form.editing_id = Some("p1".into());
-        form.socks_port = "1080".into();
-        let edited = form
-            .validate(&existing, &keys)
-            .expect("own port is not a clash");
-        assert_eq!(edited.id, "p1");
-        assert_eq!(edited.forwards, existing[0].forwards);
-
-        // A forward in another profile can't take a port a new profile's own
-        // forward holds — and vice versa (covered by forward_form tests).
-        assert_eq!(next_free_port(&existing), 1081);
     }
 }

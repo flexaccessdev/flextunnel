@@ -2,8 +2,9 @@
 //! semantics and default filter as the CLI), teeing every record into a
 //! bounded in-memory ring for the Logs pane and a size-rotated file in the
 //! platform log directory. Every line carries the emitting thread's name —
-//! each profile's session runs on threads named `tunnel-<profile>` (see
-//! `tunnel::spawn_session`), so that column tells profiles' logs apart.
+//! the client session runs on threads named `client` and the server's on
+//! threads named `server` (see `tunnel` and `server_session`), so that column
+//! tells the two sessions' logs apart.
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
