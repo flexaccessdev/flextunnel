@@ -1922,7 +1922,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-cli"
-version = "0.0.95"
+version = "0.0.96"
 dependencies = [
  "anyhow",
  "clap",
@@ -1939,7 +1939,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-core"
-version = "0.0.95"
+version = "0.0.96"
 dependencies = [
  "anyhow",
  "askama",
@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-desktop"
-version = "0.0.95"
+version = "0.0.96"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
@@ -2002,7 +2002,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-ffi"
-version = "0.0.95"
+version = "0.0.96"
 dependencies = [
  "flextunnel-core",
  "iroh",
