@@ -9,8 +9,7 @@
 //!
 //! Resolution itself is purely server-side — it changes only which nameserver
 //! answers a name, not the wire protocol. The configured suffix→servers table is
-//! additionally pushed to clients (informationally) in the handshake so their
-//! status UIs can show it, exactly like host aliases; see
+//! shown on the server status page, exactly like host aliases; see
 //! [`DnsForwarder::forwards`].
 //!
 //! Config shape (`[dns_forwards]` in the server file): each key is a bare domain
@@ -123,8 +122,8 @@ impl DnsForwarder {
     }
 
     /// The configured forwards as `(suffix, upstream servers)` pairs, sorted by
-    /// suffix for stable output. Purely informational: pushed to clients in the
-    /// handshake and rendered on the server status page. The servers are the
+    /// suffix for stable output. Purely informational: rendered on the server
+    /// status page. The servers are the
     /// specs as configured (trimmed), not the resolved socket addresses.
     pub fn forwards(&self) -> Vec<(String, Vec<String>)> {
         let mut out: Vec<(String, Vec<String>)> = self

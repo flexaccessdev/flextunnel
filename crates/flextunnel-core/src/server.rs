@@ -46,8 +46,8 @@ pub struct ServerOptions {
     pub relay_auth_token: Option<String>,
     /// Server-side host aliases, keys lowercased.
     pub host_aliases: HashMap<String, String>,
-    /// The tunnel set; may be empty (the reserved `flextunnel.internal`
-    /// namespace is always routed).
+    /// The tunnel set; may be empty (the server's own loopback and status
+    /// page are reachable regardless).
     pub routed_domains: Vec<String>,
     pub routed_cidrs: Vec<String>,
     /// Conditional DNS-forwarding rules, suffix keys lowercased.
@@ -178,9 +178,8 @@ pub fn prepare(opts: ServerOptions) -> Result<PreparedServer> {
         );
     }
 
-    // The tunnel set may be empty: the reserved `flextunnel.internal` namespace
-    // (the status page and `localhost.flextunnel.internal`, the server's own
-    // loopback) is always routed regardless of it.
+    // The tunnel set may be empty: a client reaches the server's own loopback
+    // and its status page regardless of it.
     let routed_set = RoutedSet::new(&routed_domains, &routed_cidrs)
         .context("Invalid routed-set configuration")?;
 
@@ -271,7 +270,7 @@ pub fn prepare(opts: ServerOptions) -> Result<PreparedServer> {
         );
     }
     log::info!(
-        "Tunnel set: {} domain rule(s), {} CIDR(s) — off-list tunnel requests are rejected; pushed to clients on connect",
+        "Tunnel set: {} domain rule(s), {} CIDR(s) — off-list tunnel requests are rejected",
         routed_domains.len(),
         routed_cidrs.len()
     );
@@ -457,7 +456,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut opts = options(dir.path());
         opts.routed_domains.clear();
-        assert!(prepare(opts).is_ok(), "the reserved namespace is always routed");
+        assert!(prepare(opts).is_ok(), "loopback and status need no routed set");
     }
 
     #[test]

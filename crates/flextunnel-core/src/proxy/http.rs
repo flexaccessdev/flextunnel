@@ -4,9 +4,10 @@
 //! Both modes map the destination to a wire [`Target`] — a hostname becomes
 //! [`Target::Domain`] (name resolution deferred), a literal IP becomes
 //! [`Target::Ip`] (already an address). Where a domain is ultimately resolved is
-//! decided later by the route policy, not here: a tunneled (on-list) target is
-//! resolved on the **server** (flextunnel's whole point), while an off-list
-//! target is dialed — and so resolved — locally (see
+//! decided later by the client's routing table, not here: a target a
+//! destination routes is resolved on that **server** (flextunnel's whole
+//! point), while one on no destination's list is dialed — and so resolved —
+//! locally (see
 //! [`crate::proxy::client`]'s `direct_connect`). This mirrors the ATYP DOMAIN vs
 //! IP split in [`crate::proxy::socks5::read_connect_request`].
 //!

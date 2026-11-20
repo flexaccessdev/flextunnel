@@ -23,6 +23,7 @@ use crate::server_session::{self, ServerPhase, ServerSnapshot};
 use crate::tray::{self, Tray};
 use crate::tunnel::{Controller, Phase, ProfileId, Snapshot};
 use crate::view;
+use flextunnel_core::proxy::{RouteSpec, RouteTable};
 use flextunnel_core::transport::paths::ConnectionSnapshot;
 use iced::futures::Stream;
 use iced::{window, Element, Size, Subscription, Task};
@@ -113,6 +114,10 @@ pub enum Message {
     // Profile form
     ProfileNameChanged(String),
     ServerNodeIdChanged(String),
+    /// The destination host of the profile being edited.
+    ProfileHostChanged(String),
+    ProfileRoutedDomainsChanged(String),
+    ProfileRoutedCidrsChanged(String),
     /// Pick a shared auth key for the profile being edited.
     AuthKeyPicked(KeyChoice),
     /// Open the profile form's "New key" prompt (a name field next to the
@@ -366,6 +371,12 @@ pub struct ProfileForm {
     editing_id: Option<ProfileId>,
     pub name: String,
     pub server_node_id: String,
+    /// The destination host: `<host>:<port>` is the server's own loopback.
+    pub host: String,
+    /// Comma-separated further domains sent through the server.
+    pub routed_domains: String,
+    /// Comma-separated further networks sent through the server.
+    pub routed_cidrs: String,
     /// The picked shared key ([`AuthKey::id`]); empty while none is picked.
     pub auth_key_id: String,
     /// The "New key" prompt's name buffer; `None` while the prompt is closed.
@@ -397,6 +408,9 @@ impl ProfileForm {
             editing_id: Some(profile.id.clone()),
             name: profile.name.clone(),
             server_node_id: profile.server_node_id.clone(),
+            host: profile.host.clone(),
+            routed_domains: profile.routed_domains.join(", "),
+            routed_cidrs: profile.routed_cidrs.join(", "),
             auth_key_id: profile.auth_key_id.clone(),
             new_key_name: None,
             socks_enabled: profile.socks_port.is_some(),
@@ -447,6 +461,23 @@ impl ProfileForm {
                 other.name
             ));
         }
+        // The host and routes are validated by the core's own routing table —
+        // the same check the session makes — so what saves here connects.
+        if self.host.trim().is_empty() {
+            return Err("Host is required — a name for this server, e.g. nas.internal".into());
+        }
+        let routed_domains = split_list(&self.routed_domains);
+        let routed_cidrs = split_list(&self.routed_cidrs);
+        let host = RouteTable::new(&[RouteSpec {
+            host: &self.host,
+            routed_domains: &routed_domains,
+            routed_cidrs: &routed_cidrs,
+        }])
+        .map_err(|e| format!("{e:#}"))?
+        .hosts()
+        .next()
+        .map(String::from)
+        .expect("a one-destination table has one host");
         if config::find_key(keys, &self.auth_key_id).is_none() {
             return Err("Pick an auth key (or create one with New key)".into());
         }
@@ -491,6 +522,9 @@ impl ProfileForm {
             id: self.editing_id.clone().unwrap_or_else(Profile::new_id),
             name,
             server_node_id: server_node_id.into(),
+            host,
+            routed_domains,
+            routed_cidrs,
             auth_key_id: self.auth_key_id.clone(),
             socks_port,
             http_port,
@@ -965,8 +999,8 @@ pub struct App {
     /// showing why; cleared when the forward is started again or removed.
     /// Forward ids are globally unique, so one map covers every profile.
     pub forward_errors: HashMap<String, String>,
-    /// Advisory-badge caches per profile: each `RoutedSet` rebuilt only when
-    /// that profile's pushed domains/CIDRs change.
+    /// Advisory-badge caches per profile: each routing table rebuilt only
+    /// when that profile's host or routes change.
     pub routed_caches: HashMap<ProfileId, view::RoutedCache>,
     log_revision: u64,
     /// Logs-pane filter (see [`LogFilter`]).
@@ -1279,6 +1313,24 @@ impl App {
             Message::ServerNodeIdChanged(value) => {
                 if let Some(form) = &mut self.profile_form {
                     form.server_node_id = value;
+                }
+                Task::none()
+            }
+            Message::ProfileHostChanged(value) => {
+                if let Some(form) = &mut self.profile_form {
+                    form.host = value;
+                }
+                Task::none()
+            }
+            Message::ProfileRoutedDomainsChanged(value) => {
+                if let Some(form) = &mut self.profile_form {
+                    form.routed_domains = value;
+                }
+                Task::none()
+            }
+            Message::ProfileRoutedCidrsChanged(value) => {
+                if let Some(form) = &mut self.profile_form {
+                    form.routed_cidrs = value;
                 }
                 Task::none()
             }
@@ -1716,7 +1768,11 @@ impl App {
             return Task::none();
         };
         match config::find_key(&self.keys, &profile.auth_key_id) {
-            Some(key) if !key.secret.is_empty() && !profile.server_node_id.is_empty() => {
+            Some(key)
+                if !key.secret.is_empty()
+                    && !profile.server_node_id.is_empty()
+                    && profile.route_table().is_ok() =>
+            {
                 let secret = key.secret.clone();
                 self.controller.connect(profile, secret);
                 Task::none()
@@ -1734,17 +1790,26 @@ impl App {
             }
             key => {
                 // `Some` here means the key is usable (the empty-secret case
-                // was caught above) and the server node id is empty (only a
-                // hand-edited file gets there); `None` is no key picked (fresh
-                // import) or a dangling reference.
-                let notice = if key.is_some() {
-                    "Enter the server node id to connect."
+                // was caught above) and something else is missing: the server
+                // node id (only a hand-edited file gets there), or the host —
+                // a profile saved before profiles had one, or one whose routes
+                // the core rejects. `None` is no key picked (fresh import) or
+                // a dangling reference.
+                let notice = if key.is_none() {
+                    "Pick an auth key to connect.".to_string()
+                } else if profile.server_node_id.is_empty() {
+                    "Enter the server node id to connect.".to_string()
+                } else if profile.host.trim().is_empty() {
+                    "Give this server a host name to connect.".to_string()
                 } else {
-                    "Pick an auth key to connect."
+                    match profile.route_table() {
+                        Err(e) => format!("Fix the profile's host and routes to connect: {e}"),
+                        Ok(_) => "Check the profile to connect.".to_string(),
+                    }
                 };
                 self.selection = Selection::Profile(profile.id.clone());
                 self.profile_form = Some(ProfileForm::edit(&profile));
-                self.notice = Some(notice.into());
+                self.notice = Some(notice);
                 self.show_window()
             }
         }
@@ -2099,7 +2164,7 @@ impl App {
             }
             view::refresh_routed_cache(
                 self.routed_caches.entry(profile.id.clone()).or_default(),
-                &snapshot.routes,
+                profile,
             );
         }
         for id in &failed_in {
@@ -2449,6 +2514,9 @@ mod tests {
             editing_id: None,
             name: " prod ".into(),
             server_node_id: " node-id ".into(),
+            host: " Prod.Internal ".into(),
+            routed_domains: " *.corp.example ,, db.internal ".into(),
+            routed_cidrs: " 10.0.0.0/8 ".into(),
             auth_key_id: "k1".into(),
             new_key_name: None,
             socks_enabled: true,
@@ -2487,6 +2555,9 @@ mod tests {
             id: id.into(),
             name: format!("profile-{id}"),
             server_node_id: "node".into(),
+            host: format!("{id}.internal"),
+            routed_domains: Vec::new(),
+            routed_cidrs: Vec::new(),
             auth_key_id: "k1".into(),
             socks_port: Some(socks_port),
             http_port: None,
@@ -2641,6 +2712,10 @@ mod tests {
         let profile = valid_form().validate(&[], &test_keys()).expect("valid");
         assert_eq!(profile.name, "prod");
         assert_eq!(profile.server_node_id, "node-id");
+        assert_eq!(profile.host, "prod.internal", "stored trimmed and lowercased");
+        assert_eq!(profile.routed_domains, ["*.corp.example", "db.internal"]);
+        assert_eq!(profile.routed_cidrs, ["10.0.0.0/8"]);
+        assert!(profile.route_table().is_ok());
         assert_eq!(profile.socks_port, Some(1080));
         assert_eq!(profile.http_port, None);
         assert_eq!(
@@ -2677,6 +2752,28 @@ mod tests {
         let mut form = valid_form();
         form.server_node_id = "  ".into();
         assert!(form.validate(&[], &keys).is_err());
+
+        // The host is required and must be a name the core accepts; the
+        // routes must parse and must not contradict it.
+        for host in ["  ", "10.0.0.1", "localhost", "flextunnel.internal", "bad..host"] {
+            let mut form = valid_form();
+            form.host = host.into();
+            assert!(form.validate(&[], &keys).is_err(), "host {host:?}");
+        }
+        let mut form = valid_form();
+        form.routed_domains = "*.*.example".into();
+        assert!(form.validate(&[], &keys).is_err());
+        let mut form = valid_form();
+        form.routed_cidrs = "not-a-cidr".into();
+        assert!(form.validate(&[], &keys).is_err());
+        let mut form = valid_form();
+        form.routed_domains = "prod.internal".into();
+        assert!(form.validate(&[], &keys).unwrap_err().contains("own host"));
+        // No extra routes at all is fine: the host alone reaches the server.
+        let mut form = valid_form();
+        form.routed_domains = String::new();
+        form.routed_cidrs = String::new();
+        assert!(form.validate(&[], &keys).is_ok());
 
         // Duplicate profile name (they key tray submenus and log threads)…
         let existing = [existing_profile("p1", 2080, vec![])];

@@ -1,11 +1,11 @@
 //! flextunnel
 //!
 //! A SOCKS5/HTTP-proxy- and port-forward-over-QUIC split tunnel via iroh P2P
-//! connections. The
-//! client runs optional local SOCKS5/HTTP proxy listeners and server-direct
-//! port forwards (declared in its config; `flextunnel client control` shows
-//! their state); routed
-//! targets are tunneled as reliable QUIC bi-streams to the server, which
+//! connections. The client names any number of servers as destinations in its
+//! config and runs optional local SOCKS5/HTTP proxy listeners and port
+//! forwards (also declared there; `flextunnel client control` shows their
+//! state); a routed target is tunneled as a reliable QUIC bi-stream to its
+//! destination's server — connected on first use, closed when idle — which
 //! resolves DNS and connects from its own network. Uses a fixed ALPN for
 //! protocol selection, client keypairs (ed25519) for access control, and TLS
 //! 1.3/QUIC for encryption. Neither side needs admin/root (no TUN device).
@@ -13,7 +13,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
-use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -133,10 +132,12 @@ enum ServerAction {
 #[derive(Subcommand)]
 enum ClientAction {
     /// Start the proxy client (optional SOCKS5 + HTTP proxy listeners, plus the
-    /// port forwards declared in the config). Needs at least one flag: `-c`/other options load a config (the
-    /// default ~/.config/flextunnel/client.toml when no -c is given), or
-    /// `--quick` prompts for the connection details without persisting them. Run
-    /// with no arguments to print this help.
+    /// port forwards declared in the config). The servers it reaches are the
+    /// config's `[[destinations]]`; each is connected on first use. Needs at
+    /// least one flag: `-c`/other options load a config (the default
+    /// ~/.config/flextunnel/client.toml when no -c is given), or `--quick`
+    /// prompts for the connection details without persisting them. Run with no
+    /// arguments to print this help.
     #[command(arg_required_else_help = true)]
     Start {
         /// Config file path (TOML). CLI flags override file values. Without
@@ -152,32 +153,26 @@ enum ClientAction {
         /// unless set.
         #[arg(long)]
         http_port: Option<u16>,
-        /// EndpointId of the server to connect to.
-        #[arg(short = 'n', long)]
-        server_node_id: Option<String>,
-        /// Inline client secret key (`ed25519-sec:...`) used to
-        /// authenticate to the server.
+        /// Inline client secret key (`ed25519-sec:...`) used to authenticate
+        /// to every destination that does not name its own key file.
         #[arg(long, conflicts_with = "auth_key_file")]
         auth_key: Option<String>,
         /// File containing the client secret key (from `flexaccess-keys
-        /// generate-auth-key`).
+        /// generate-auth-key`), for every destination that does not name its
+        /// own.
         #[arg(long)]
         auth_key_file: Option<PathBuf>,
-        /// Custom relay server URL(s) for failover (repeatable).
+        /// Custom relay server URL(s) for failover (repeatable; at least two),
+        /// for every destination that does not name its own.
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
         /// Shared bearer token sent to every custom relay (custom relays only).
         #[arg(long)]
         relay_auth_token: Option<String>,
-        /// Force auto-reconnect on (overrides `auto_reconnect = false` in the config).
-        #[arg(long, conflicts_with = "no_auto_reconnect")]
-        auto_reconnect: bool,
-        /// Disable auto-reconnect (exit on the first failed connection attempt or drop).
-        #[arg(long, conflicts_with = "auto_reconnect")]
-        no_auto_reconnect: bool,
-        /// Cap on consecutive retries before giving up (unlimited if unset).
-        #[arg(long)]
-        max_reconnect_attempts: Option<NonZeroU32>,
+        /// Seconds a destination's connection is kept with nothing using it
+        /// (default 300; 0 never closes an idle connection).
+        #[arg(long, value_name = "SECS", conflicts_with = "quick")]
+        idle_timeout: Option<u64>,
         /// Ignore any saved config, print this client's EndpointId (enter it on
         /// the quick server, which allowlists it — no auth keypair), and
         /// prompt for the server EndpointId (pairs with `server start
@@ -185,36 +180,37 @@ enum ClientAction {
         #[arg(long, conflicts_with_all = ["config", "auth_key", "auth_key_file"])]
         quick: bool,
     },
-    /// Attach the read-only control panel to the running client for a profile:
-    /// live status and the state of its config-declared port forwards (in this
-    /// terminal). The client is
-    /// identified by the profile's server node id; with no flags, the default
-    /// config (~/.config/flextunnel/client.toml) selects it.
+    /// Attach the read-only control panel to a running client: live status of
+    /// its destinations and of its config-declared port forwards (in this
+    /// terminal). The client is identified by its name; with no flags, the
+    /// default config (~/.config/flextunnel/client.toml) gives it, else the
+    /// name `default`.
     Control {
-        /// Config file path (TOML) of the profile to attach to. With no flags,
-        /// ~/.config/flextunnel/client.toml selects the profile.
+        /// Config file path (TOML) of the client to attach to. With no flags,
+        /// ~/.config/flextunnel/client.toml selects it.
         #[arg(short = 'c', long)]
         config: Option<PathBuf>,
-        /// Attach by server EndpointId directly (overrides the config file).
+        /// Attach by client name directly (overrides the config file).
         #[arg(short = 'n', long)]
-        server_node_id: Option<String>,
+        name: Option<String>,
     },
-    /// Relay stdin/stdout through the running client to HOST:PORT on the
-    /// server side, for SSH's `ProxyCommand`:
-    /// `ProxyCommand flextunnel client nc -c <profile.toml> %h %p`. Like a port
-    /// forward, the server enforces its routed set and resolves HOST. The
-    /// client is picked the same way as for `client control`.
+    /// Relay stdin/stdout through the running client to HOST:PORT behind one
+    /// of its destinations, for SSH's `ProxyCommand`:
+    /// `ProxyCommand flextunnel client nc %h %p`. HOST is routed like a port
+    /// forward: a destination's own name reaches that server's loopback, and
+    /// the destination connects if it is not connected. The client is picked
+    /// the same way as for `client control`.
     #[command(arg_required_else_help = true)]
     Nc {
-        /// Config file path (TOML) of the profile whose client to use. With
-        /// no flags, ~/.config/flextunnel/client.toml selects the profile.
+        /// Config file path (TOML) of the client to use. With no flags,
+        /// ~/.config/flextunnel/client.toml selects it.
         #[arg(short = 'c', long)]
         config: Option<PathBuf>,
-        /// Use the client for this server EndpointId directly (overrides the
-        /// config file).
+        /// Use the client with this name directly (overrides the config
+        /// file).
         #[arg(short = 'n', long)]
-        server_node_id: Option<String>,
-        /// Target host, resolved by the server.
+        name: Option<String>,
+        /// Target host: a destination's host, or one a destination routes.
         host: String,
         /// Target port.
         port: u16,
@@ -250,22 +246,18 @@ fn main() -> Result<()> {
         // loop (and a small runtime for the IPC calls), so it never enters the
         // shared multi-thread runtime below.
         Command::Client {
-            action:
-                ClientAction::Control {
-                    config,
-                    server_node_id,
-                },
-        } => tui::run(config, server_node_id),
+            action: ClientAction::Control { config, name },
+        } => tui::run(config, name),
         // Runs its own small runtime, like `client control`.
         Command::Client {
             action:
                 ClientAction::Nc {
                     config,
-                    server_node_id,
+                    name,
                     host,
                     port,
                 },
-        } => nc::run(config, server_node_id, host, port),
+        } => nc::run(config, name, host, port),
         Command::GenerateIrohKey { output, force, json } => {
             secret::generate_iroh_key(output, force, json)
         }
@@ -364,41 +356,15 @@ async fn run_async(command: Command) -> Result<()> {
                     config: config_path,
                     socks_port,
                     http_port,
-                    server_node_id,
                     auth_key,
                     auth_key_file,
                     relay_urls,
                     relay_auth_token,
-                    auto_reconnect,
-                    no_auto_reconnect,
-                    max_reconnect_attempts,
+                    idle_timeout,
                     quick,
                 },
         } => {
             log_version();
-            // CLI precedence: --auto-reconnect → Some(true), --no-auto-reconnect →
-            // Some(false), neither → None (defer to config file, then default).
-            // The two flags are mutually exclusive (clap `conflicts_with`).
-            let auto_reconnect = if auto_reconnect {
-                Some(true)
-            } else if no_auto_reconnect {
-                Some(false)
-            } else {
-                None
-            };
-            let mut cli = config::ClientConfig {
-                server_node_id,
-                name: None, // display name is config-file only; no CLI flag
-                socks_port,
-                http_port,
-                auth_key,
-                auth_key_file,
-                relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
-                relay_auth_token,
-                auto_reconnect,
-                max_reconnect_attempts,
-                forwards: None, // config-file only; no CLI flag
-            };
             // `--quick` is a self-contained ephemeral session: it ignores any
             // saved config, mints a session identity whose EndpointId is the
             // credential (printed here for the user to allowlist on the quick
@@ -423,13 +389,34 @@ async fn run_async(command: Command) -> Result<()> {
                     "Enter it at the `flextunnel server start --quick` prompt — it is this \
                      client's credential (no auth keypair)."
                 );
-                cli = tokio::task::spawn_blocking(move || {
-                    prompt::fill_client_config(&mut cli).map(|()| cli)
+                let details = tokio::task::spawn_blocking(move || {
+                    prompt::quick_client(socks_port, http_port)
                 })
                 .await??;
-                return client_session::run_quick(config::resolve_client(cli, None), client_secret)
-                    .await;
+                return client_session::run_quick(
+                    client_session::QuickSession {
+                        server_id: details.server_id,
+                        socks_port: details.socks_port,
+                        http_port: details.http_port,
+                        relay_urls,
+                        relay_auth_token,
+                    },
+                    client_secret,
+                )
+                .await;
             }
+            let cli = config::ClientConfig {
+                name: None, // config-file only; no CLI flag
+                socks_port,
+                http_port,
+                auth_key,
+                auth_key_file,
+                relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
+                relay_auth_token,
+                idle_timeout_secs: idle_timeout,
+                destinations: None, // config-file only; no CLI flag
+                forwards: None,     // config-file only; no CLI flag
+            };
             let file = config::load_client_config(config_path.as_deref())?;
             client_session::run(config::resolve_client(cli, file)).await
         }
@@ -543,7 +530,8 @@ async fn run_server(
             running.endpoint().id()
         ),
         None => log::info!(
-            "Clients connect with: flextunnel client start --server-node-id {} --auth-key-file <KEY FILE>",
+            "Clients reach this server with a [[destinations]] entry in their config: \
+             host = \"<a name for this machine>\", server_node_id = \"{}\"",
             running.endpoint().id()
         ),
     }
@@ -579,21 +567,23 @@ async fn run_server(
         }
     };
 
-    close_endpoint_or_exit(running.endpoint()).await;
+    close_or_exit(running.endpoint().close()).await;
     res
 }
 
-/// Close `endpoint` gracefully before it is dropped — skipping the close makes
-/// iroh tear down its relay tasks via an ungraceful abort, which panics
-/// (`JoinSet::join_all` on a cancelled task), fatal under panic=abort. But never
-/// let a slow teardown make the process unkillable: once we are already shutting
-/// down, a second shutdown signal (e.g. another Ctrl-C) or `SHUTDOWN_CLOSE_TIMEOUT`
-/// forces an immediate clean exit. `std::process::exit` skips destructors, so it
-/// avoids the very ungraceful-drop panic the graceful close exists to prevent.
-/// Shared by the server ([`run_server`]) and the client (`client_session`).
-pub(crate) async fn close_endpoint_or_exit(endpoint: &flextunnel_core::iroh::Endpoint) {
+/// Run `close` — a graceful close of one or more iroh endpoints — to
+/// completion before they are dropped: skipping the close makes iroh tear down
+/// its relay tasks via an ungraceful abort, which panics (`JoinSet::join_all`
+/// on a cancelled task), fatal under panic=abort. But never let a slow teardown
+/// make the process unkillable: once we are already shutting down, a second
+/// shutdown signal (e.g. another Ctrl-C) or `SHUTDOWN_CLOSE_TIMEOUT` forces an
+/// immediate clean exit. `std::process::exit` skips destructors, so it avoids
+/// the very ungraceful-drop panic the graceful close exists to prevent. Shared
+/// by the server ([`run_server`], its one endpoint) and the client
+/// (`client_session`, the endpoints of the destinations in use).
+pub(crate) async fn close_or_exit(close: impl Future<Output = ()>) {
     tokio::select! {
-        _ = endpoint.close() => {}
+        _ = close => {}
         _ = app::shutdown_signal() => {
             log::warn!("Second shutdown signal — exiting now");
             std::process::exit(0);
@@ -627,8 +617,10 @@ mod cli_tests {
             "flextunnel",
             "client",
             "start",
-            "--server-node-id",
-            "server-id",
+            "--socks-port",
+            "1080",
+            "--idle-timeout",
+            "0",
             "--auth-key",
             "ed25519-sec:XXXX",
         ])
@@ -683,16 +675,53 @@ mod cli_tests {
     }
 
     #[test]
-    fn client_rejects_legacy_startup_flags() {
-        let Err(error) = Args::try_parse_from([
-            "flextunnel",
-            "client",
-            "--server-node-id",
-            "server-id",
-        ]) else {
-            panic!("startup flags without the start action must be rejected");
-        };
-        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    fn client_start_takes_no_server_or_reconnect_flags() {
+        // Destinations are config-file only, and there is no session-wide
+        // reconnect policy to switch off or cap.
+        for flag in [
+            vec!["--server-node-id", "server-id"],
+            vec!["-n", "server-id"],
+            vec!["--auto-reconnect"],
+            vec!["--no-auto-reconnect"],
+            vec!["--max-reconnect-attempts", "3"],
+        ] {
+            let mut args = vec!["flextunnel", "client", "start", "--socks-port", "1080"];
+            args.extend(&flag);
+            let Err(error) = Args::try_parse_from(&args) else {
+                panic!("{flag:?} must be rejected for client start");
+            };
+            assert_eq!(error.kind(), ErrorKind::UnknownArgument, "{flag:?}");
+        }
+    }
+
+    #[test]
+    fn attaching_commands_select_a_client_by_name_or_config() {
+        let args = Args::try_parse_from(["flextunnel", "client", "control", "-n", "work"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Command::Client {
+                action: ClientAction::Control { name: Some(name), config: None }
+            } if name == "work"
+        ));
+        // `nc` with no selector uses the default client; HOST and PORT follow.
+        let args =
+            Args::try_parse_from(["flextunnel", "client", "nc", "machine1.internal", "22"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Command::Client {
+                action: ClientAction::Nc { name: None, config: None, host, port: 22 }
+            } if host == "machine1.internal"
+        ));
+        let args = Args::try_parse_from([
+            "flextunnel", "client", "nc", "-c", "work.toml", "machine1.internal", "22",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Command::Client {
+                action: ClientAction::Nc { config: Some(_), .. }
+            }
+        ));
     }
 
     #[test]
@@ -732,6 +761,8 @@ mod cli_tests {
             // client's endpoint id), so key flags are rejected too.
             vec!["flextunnel", "client", "start", "--quick", "--auth-key", "ed25519-sec:X"],
             vec!["flextunnel", "client", "start", "--quick", "--auth-key-file", "c.key"],
+            // A quick session is kept connected; there is no idle timeout to set.
+            vec!["flextunnel", "client", "start", "--quick", "--idle-timeout", "60"],
         ];
         for case in cases {
             let Err(error) = Args::try_parse_from(&case) else {

@@ -1,10 +1,12 @@
-//! The ratatui control panel — status (connection, routing, connection paths)
-//! and the config-declared port forwards. Read-only: nothing about the client
-//! can be changed from here. Reachable two ways over the same UI:
+//! The ratatui control panel — the client's destinations with their live
+//! connection state, the selected destination's details (routes, connection
+//! paths), and the config-declared port forwards. Read-only: nothing about the
+//! client can be changed from here, and looking never makes a destination
+//! connect. Reachable two ways over the same UI:
 //!
 //! - `flextunnel client control`: attaches to a *running* client over its
 //!   control socket (see `ipc.rs`), as a separate process. Detaching (q) never
-//!   affects the tunnel; the panel can re-attach any time, and several panels
+//!   affects the client; the panel can re-attach any time, and several panels
 //!   can attach at once. This is the [`IpcBackend`] path.
 //! - `flextunnel client start --quick`: a *self-contained* session in this same
 //!   process, driven over an in-process channel with no socket. Quitting (q)
@@ -26,7 +28,9 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 use tokio::sync::mpsc;
 
 use crate::instance;
-use crate::ipc::{IpcClient, IpcCmd, Request, Response, StatusSnapshot, WireConnSnapshot};
+use crate::ipc::{
+    DestinationRow, IpcClient, IpcCmd, Request, Response, StatusSnapshot, WireConnSnapshot,
+};
 
 /// The panel's transport to a client session: one request → one response,
 /// blocking the UI thread. Implemented over the control socket (a separate
@@ -68,31 +72,36 @@ const REFRESH: Duration = Duration::from_secs(1);
 
 enum Mode {
     Normal,
-    /// On-demand connection-path overlay: a point-in-time snapshot (paths +
-    /// custom-relay health) captured when opened, refreshable, not polled —
-    /// mirrors the desktop modal / iOS sheet.
-    ConnPath(WireConnSnapshot),
+    /// On-demand connection-path overlay for one destination: a point-in-time
+    /// snapshot (paths + custom-relay health) captured when opened,
+    /// refreshable, not polled — mirrors the desktop modal / iOS sheet.
+    ConnPath {
+        host: String,
+        snapshot: WireConnSnapshot,
+    },
 }
 
 struct App {
     snapshot: StatusSnapshot,
-    routing_scroll: u16,
+    /// Index of the highlighted destination, whose details the middle pane
+    /// shows. Clamped against the destination count wherever it is read.
+    selected: usize,
+    details_scroll: u16,
     forwards_scroll: u16,
     mode: Mode,
     /// Transient error line (e.g. a failed path probe), cleared on next input.
     notice: Option<String>,
 }
 
-pub fn run(config_path: Option<PathBuf>, server_node_id: Option<String>) -> Result<()> {
-    let instance::Located { key, profile } =
-        instance::locate(config_path, server_node_id, "client control")?;
+pub fn run(config_path: Option<PathBuf>, name: Option<String>) -> Result<()> {
+    let located = instance::locate(config_path, name)?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
 
-    let Some(client) = rt.block_on(IpcClient::connect(&key))? else {
-        eprintln!("The flextunnel client for {profile} is not running.");
+    let Some(client) = rt.block_on(IpcClient::connect(&located.name))? else {
+        eprintln!("{}", located.not_running());
         std::process::exit(1);
     };
     let mut backend = IpcBackend { rt, client };
@@ -136,10 +145,28 @@ impl App {
     fn new(snapshot: StatusSnapshot) -> Self {
         App {
             snapshot,
-            routing_scroll: 0,
+            selected: 0,
+            details_scroll: 0,
             forwards_scroll: 0,
             mode: Mode::Normal,
             notice: None,
+        }
+    }
+
+    /// The highlighted destination, if the client has any.
+    fn selected_destination(&self) -> Option<&DestinationRow> {
+        let destinations = &self.snapshot.destinations;
+        destinations.get(self.selected.min(destinations.len().saturating_sub(1)))
+    }
+
+    /// Move the highlight by `delta` rows, stopping at either end.
+    fn select(&mut self, delta: isize) {
+        let last = self.snapshot.destinations.len().saturating_sub(1);
+        let selected = self.selected.min(last).saturating_add_signed(delta).min(last);
+        if selected != self.selected {
+            self.selected = selected;
+            // Another destination's details: start at their top.
+            self.details_scroll = 0;
         }
     }
 
@@ -165,9 +192,9 @@ impl App {
                 {
                     return Ok(());
                 }
-                let quit = match &mut self.mode {
+                let quit = match &self.mode {
                     Mode::Normal => self.handle_normal_key(key.code, backend)?,
-                    Mode::ConnPath(_) => {
+                    Mode::ConnPath { .. } => {
                         self.handle_conn_path_key(key.code, backend)?;
                         false
                     }
@@ -192,38 +219,49 @@ impl App {
     ) -> Result<bool> {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
-            // Both panes clamp against their content height at render time.
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up | KeyCode::Char('k') => self.select(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.select(1),
+            // The scrolling panes clamp against their content height at
+            // render time.
+            KeyCode::Char('[') => {
+                self.details_scroll = self.details_scroll.saturating_sub(3);
+            }
+            KeyCode::Char(']') => {
+                self.details_scroll = self.details_scroll.saturating_add(3);
+            }
+            KeyCode::PageUp => {
                 self.forwards_scroll = self.forwards_scroll.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::PageDown => {
                 self.forwards_scroll = self.forwards_scroll.saturating_add(1);
             }
-            KeyCode::Char('[') | KeyCode::PageUp => {
-                self.routing_scroll = self.routing_scroll.saturating_sub(3);
+            // On-demand connection-path + custom-relay-health overlay for the
+            // highlighted destination (not polled).
+            KeyCode::Char('p') => {
+                if let Some(host) = self.selected_destination().map(|d| d.host.clone()) {
+                    match self.request_conn_path(&host, backend)? {
+                        Ok(snapshot) => self.mode = Mode::ConnPath { host, snapshot },
+                        Err(message) => self.notice = Some(message),
+                    }
+                }
             }
-            KeyCode::Char(']') | KeyCode::PageDown => {
-                // Clamped against the content height at render time.
-                self.routing_scroll = self.routing_scroll.saturating_add(3);
-            }
-            // On-demand connection-path + custom-relay-health overlay (not polled).
-            KeyCode::Char('p') => match self.request_conn_path(backend)? {
-                Ok(snapshot) => self.mode = Mode::ConnPath(snapshot),
-                Err(message) => self.notice = Some(message),
-            },
             _ => {}
         }
         Ok(false)
     }
 
-    /// Fetch an on-demand connection snapshot. The outer `Result` is a transport
-    /// failure (ends the loop); the inner is a session-reported error to surface
-    /// as a footer notice.
+    /// Fetch an on-demand connection snapshot for the destination `host`. The
+    /// outer `Result` is a transport failure (ends the loop); the inner is a
+    /// session-reported error to surface as a footer notice.
     fn request_conn_path(
         &mut self,
+        host: &str,
         backend: &mut dyn ControlBackend,
     ) -> Result<std::result::Result<WireConnSnapshot, String>> {
-        Ok(match backend.request(Request::ConnPath)? {
+        let request = Request::ConnPath {
+            host: host.to_string(),
+        };
+        Ok(match backend.request(request)? {
             Response::ConnPath(snapshot) => Ok(snapshot),
             Response::Error { message } => Err(message),
             other => Err(format!("unexpected response to a conn-path request: {other:?}")),
@@ -235,18 +273,90 @@ impl App {
         code: KeyCode,
         backend: &mut dyn ControlBackend,
     ) -> Result<()> {
+        let Mode::ConnPath { host, .. } = &self.mode else {
+            return Ok(());
+        };
         match code {
             // Re-probe in place (paths + relay /healthz).
-            KeyCode::Char('r') => match self.request_conn_path(backend)? {
-                Ok(snapshot) => self.mode = Mode::ConnPath(snapshot),
-                Err(message) => {
-                    self.notice = Some(message);
-                    self.mode = Mode::Normal;
+            KeyCode::Char('r') => {
+                let host = host.clone();
+                match self.request_conn_path(&host, backend)? {
+                    Ok(snapshot) => self.mode = Mode::ConnPath { host, snapshot },
+                    Err(message) => {
+                        self.notice = Some(message);
+                        self.mode = Mode::Normal;
+                    }
                 }
-            },
+            }
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.mode = Mode::Normal,
             _ => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::DestState;
+
+    fn destination(host: &str) -> DestinationRow {
+        DestinationRow {
+            host: host.to_string(),
+            server_node_id: "server".into(),
+            state: DestState::Idle,
+            connected_secs: None,
+            open_streams: 0,
+            waiting: 0,
+            client_node_id: None,
+            failed_attempts: 0,
+            next_attempt_secs: None,
+            last_error: None,
+            routed_domains: Vec::new(),
+            routed_cidrs: Vec::new(),
+            relay_urls: Vec::new(),
+        }
+    }
+
+    fn app(hosts: &[&str]) -> App {
+        App::new(StatusSnapshot {
+            name: "work".into(),
+            socks_addr: None,
+            http_addr: None,
+            status_page_host: "flextunnel.internal".into(),
+            idle_timeout_secs: Some(300),
+            destinations: hosts.iter().map(|h| destination(h)).collect(),
+            forwards: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn selection_stops_at_both_ends_and_resets_the_details_scroll() {
+        let mut app = app(&["m1.internal", "m2.internal", "m3.internal"]);
+        assert_eq!(app.selected_destination().unwrap().host, "m1.internal");
+        app.select(-1);
+        assert_eq!(app.selected, 0, "already at the top");
+
+        app.details_scroll = 6;
+        app.select(1);
+        assert_eq!(app.selected_destination().unwrap().host, "m2.internal");
+        assert_eq!(app.details_scroll, 0);
+        app.select(5);
+        assert_eq!(app.selected_destination().unwrap().host, "m3.internal");
+
+        // A stale index (the destination list never shrinks in practice, but
+        // the panel must not panic if it did) reads as the last row.
+        app.selected = 9;
+        assert_eq!(app.selected_destination().unwrap().host, "m3.internal");
+        app.select(-1);
+        assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn no_destinations_selects_nothing() {
+        let mut app = app(&[]);
+        assert!(app.selected_destination().is_none());
+        app.select(1);
+        assert_eq!(app.selected, 0);
     }
 }

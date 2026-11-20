@@ -32,6 +32,7 @@
 //! the account's keychain and `profiles.json` are never read or written.
 
 use flextunnel_core::forwards::PortForward;
+use flextunnel_core::proxy::{RouteSpec, RouteTable};
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit};
 use anyhow::{Context, Result};
@@ -135,14 +136,28 @@ pub fn is_valid_name(name: &str) -> bool {
         && !name.chars().any(|c| c.is_whitespace() && c != ' ')
 }
 
-/// One connection profile — the desktop equivalent of a `client.toml`. Each
-/// active profile runs its own tunnel session with optional local proxy
-/// front-ends and its own server-direct port forwards.
+/// One connection profile — the desktop equivalent of a `client.toml` with a
+/// single destination. Each active profile runs its own client session with
+/// optional local proxy front-ends and its own port forwards; the session
+/// connects to the profile's server when something is first sent to it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
     pub id: String,
     pub name: String,
     pub server_node_id: String,
+    /// The destination name for this profile's server: `<host>:<port>` through
+    /// the profile's proxy or a forward reaches that port on the server's own
+    /// loopback. Empty until set — a profile without one cannot connect.
+    #[serde(default)]
+    pub host: String,
+    /// Further domains sent through the server (exact, `*.suffix`, or `*`).
+    /// The server must route them too.
+    #[serde(default)]
+    pub routed_domains: Vec<String>,
+    /// Further networks or bare IPs sent through the server. The server must
+    /// route them too.
+    #[serde(default)]
+    pub routed_cidrs: Vec<String>,
     /// Which shared [`AuthKey`] this profile authenticates with; empty when
     /// none is picked yet (fresh import). A plain reference, not a secret —
     /// it serializes with the rest of the profile.
@@ -171,12 +186,25 @@ impl Profile {
         random_id()
     }
 
-    /// Whether the profile can be connected: it must reference a key whose
+    /// Whether the profile can be connected: it must name its server, give it
+    /// a valid host with routes the core accepts, and reference a key whose
     /// secret is present. The secret goes missing when the key's keychain
     /// entry was lost (re-entered in the Keys pane).
     pub fn is_ready(&self, keys: &[AuthKey]) -> bool {
         !self.server_node_id.is_empty()
+            && self.route_table().is_ok()
             && find_key(keys, &self.auth_key_id).is_some_and(|k| !k.secret.is_empty())
+    }
+
+    /// The profile's routing as the core will see it: its one destination's
+    /// host and routes, validated. The error says what to fix.
+    pub fn route_table(&self) -> Result<RouteTable, String> {
+        RouteTable::new(&[RouteSpec {
+            host: &self.host,
+            routed_domains: &self.routed_domains,
+            routed_cidrs: &self.routed_cidrs,
+        }])
+        .map_err(|e| format!("{e:#}"))
     }
 }
 
@@ -227,8 +255,8 @@ pub struct ServerConfig {
     /// but cannot start until one is added.
     #[serde(default)]
     pub authorized_clients: Vec<AuthorizedClient>,
-    /// The tunnel set; may be empty (the reserved `flextunnel.internal`
-    /// namespace is always routed).
+    /// The tunnel set; may be empty (clients reach this machine's own
+    /// loopback and the server's status page regardless).
     #[serde(default)]
     pub routed_domains: Vec<String>,
     #[serde(default)]
@@ -1030,6 +1058,9 @@ mod tests {
             id: "00000000deadbeef".into(),
             name: "prod".into(),
             server_node_id: "node".into(),
+            host: "prod.internal".into(),
+            routed_domains: vec!["*.corp.example".into()],
+            routed_cidrs: vec!["10.0.0.0/8".into()],
             auth_key_id: "key1".into(),
             socks_port: Some(1085),
             http_port: Some(8081),
@@ -1179,6 +1210,30 @@ mod tests {
         let mut unpicked = profile();
         unpicked.auth_key_id = String::new();
         assert!(!unpicked.is_ready(&keys), "no key picked");
+
+        // A profile needs a host the core accepts, and routes that validate.
+        let mut hostless = profile();
+        hostless.host = String::new();
+        assert!(!hostless.is_ready(&keys), "no host");
+        assert!(hostless.route_table().is_err());
+        let mut bad_route = profile();
+        bad_route.routed_cidrs = vec!["not-a-cidr".into()];
+        assert!(!bad_route.is_ready(&keys), "invalid route");
+        let mut bare = profile();
+        bare.routed_domains.clear();
+        bare.routed_cidrs.clear();
+        assert!(bare.is_ready(&keys), "a host alone is enough");
+    }
+
+    #[test]
+    fn a_profile_without_host_or_routes_still_loads() {
+        // Host and routes default to empty when absent: such a profile loads
+        // and shows, but cannot connect until it is given a host.
+        let json = r#"{"id":"p1","name":"prod","server_node_id":"node"}"#;
+        let profile: Profile = serde_json::from_str(json).unwrap();
+        assert!(profile.host.is_empty());
+        assert!(profile.routed_domains.is_empty() && profile.routed_cidrs.is_empty());
+        assert!(!profile.is_ready(&[key()]));
     }
 
     #[test]

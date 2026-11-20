@@ -15,7 +15,7 @@ use flextunnel_core::forwards::{ForwardState, ForwardStatus, PortForward};
 use crate::style::{self, AMBER, GRAY, GREEN, RED};
 use crate::tunnel::{Phase, Snapshot};
 use flextunnel_core::proxy::signaling::Target;
-use flextunnel_core::proxy::{reserved, RoutedSet, TunnelRoutes};
+use flextunnel_core::proxy::{Route, RouteTable, reserved};
 use flextunnel_core::transport::paths::{ConnPathKind, ConnectionSnapshot, CustomRelayStatus};
 use iced::widget::{
     button, center, checkbox, column, container, mouse_area, opaque, pick_list, row, scrollable,
@@ -24,50 +24,46 @@ use iced::widget::{
 use iced::{Center, Color, Element, Fill, Font};
 use std::net::SocketAddr;
 
-/// Advisory-badge cache: the `RoutedSet` rebuilt only when the pushed
-/// domains/CIDRs change (`None` inside means the set failed to parse).
-pub type RoutedCache = Option<(Vec<String>, Vec<String>, Option<RoutedSet>)>;
+/// Advisory-badge cache: the profile's routing table, rebuilt only when its
+/// host or routes change (`None` inside means they do not validate — the
+/// profile then cannot connect, and no badge is shown).
+pub type RoutedCache = Option<(String, Vec<String>, Vec<String>, Option<RouteTable>)>;
 
-/// Rebuild the advisory-badge `RoutedSet` only when the pushed routes change.
-pub fn refresh_routed_cache(cache: &mut RoutedCache, routes: &TunnelRoutes) {
+/// Rebuild the advisory-badge routing table only when the profile's host or
+/// routes change.
+pub fn refresh_routed_cache(cache: &mut RoutedCache, profile: &Profile) {
     let fresh = matches!(cache,
-        Some((domains, cidrs, _)) if *domains == routes.domains && *cidrs == routes.cidrs);
+        Some((host, domains, cidrs, _)) if *host == profile.host
+            && *domains == profile.routed_domains
+            && *cidrs == profile.routed_cidrs);
     if !fresh {
-        let set = RoutedSet::new(&routes.domains, &routes.cidrs)
-            .inspect_err(|e| log::debug!("Routed set unusable for the badge: {e:#}"))
+        let table = profile
+            .route_table()
+            .inspect_err(|e| log::debug!("Routes unusable for the badge: {e}"))
             .ok();
-        *cache = Some((routes.domains.clone(), routes.cidrs.clone(), set));
+        *cache = Some((
+            profile.host.clone(),
+            profile.routed_domains.clone(),
+            profile.routed_cidrs.clone(),
+            table,
+        ));
     }
 }
 
-/// Everything is tunneled when the server pushes a wildcard domain or an
-/// all-covering CIDR. An empty set tunnels nothing but the reserved hosts.
-fn is_full_tunnel(routes: &TunnelRoutes) -> bool {
-    routes.domains.iter().any(|d| d == "*")
-        || routes.cidrs.iter().any(|c| c == "0.0.0.0/0" || c == "::/0")
+/// Everything is tunneled when the profile routes every hostname or an
+/// all-covering network.
+fn is_full_tunnel(domains: &[String], cidrs: &[String]) -> bool {
+    domains.iter().any(|d| d == "*") || cidrs.iter().any(|c| c == "0.0.0.0/0" || c == "::/0")
 }
 
-/// Advisory tunneled/direct badge for a forward (`None` = hidden). Mirrors the
-/// core's routing decision — reserved hosts always tunnel, everything else per
-/// the routed set — but never gates traffic; the core decides for real per
-/// connection (like the iOS badge).
-fn forward_badge(
-    phase: Phase,
-    routes: &TunnelRoutes,
-    routed_set: Option<&RoutedSet>,
-    forward: &PortForward,
-) -> Option<bool> {
-    if phase != Phase::Connected {
-        return None;
-    }
-    if is_full_tunnel(routes) || reserved::is_reserved_host(&forward.remote_host) {
-        return Some(true);
-    }
-    let set = routed_set?;
-    Some(set.allows(&Target::Domain(
-        forward.remote_host.clone(),
-        forward.remote_port,
-    )))
+/// Whether the profile's routing carries a forward to its server (`None` =
+/// unknown, no badge). Mirrors the core's routing decision — the profile's
+/// own host, or a host on its routed lists — and matters more for a forward
+/// than for the proxy: a forward never connects directly, so one whose host
+/// nothing routes can only fail.
+fn forward_routed(table: Option<&RouteTable>, forward: &PortForward) -> Option<bool> {
+    let target = Target::Domain(forward.remote_host.clone(), forward.remote_port);
+    Some(matches!(table?.route(&target), Route::Tunnel { .. }))
 }
 
 /// Live state pill for a forward row: gray "stopped", amber "starting…",
@@ -102,7 +98,9 @@ fn phase_color(phase: Phase) -> Color {
     match phase {
         Phase::Idle => GRAY,
         Phase::Connecting | Phase::Reconnecting => AMBER,
-        Phase::Connected => GREEN,
+        // Standby is a healthy state: everything is listening and the server
+        // is one use away.
+        Phase::Connected | Phase::Standby => GREEN,
         Phase::Failed => RED,
     }
 }
@@ -137,6 +135,7 @@ fn phase_label(phase: Phase) -> &'static str {
         Phase::Idle => "disconnected",
         Phase::Connecting => "connecting…",
         Phase::Connected => "connected",
+        Phase::Standby => "standby",
         Phase::Reconnecting => "reconnecting…",
         Phase::Failed => "failed",
     }
@@ -634,13 +633,28 @@ fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message
     if let Some(error) = &snapshot.last_error {
         col = col.push(text(error.as_str()).size(12).color(RED));
     }
+    if snapshot.phase == Phase::Standby {
+        col = col.push(
+            text("Not connected right now — it connects again when something is sent to it.")
+                .size(12)
+                .style(style::dim_text),
+        );
+    }
     if !ready {
         let fix = match config::find_key(&app.keys, &profile.auth_key_id) {
             // The key exists but its secret was lost from the keychain.
-            Some(key) => format!(
+            Some(key) if key.secret.is_empty() => format!(
                 "The secret of key \"{}\" is missing — re-enter it in the Keys pane.",
                 key.name
             ),
+            // The key is fine: the host (or a route) is what is missing.
+            Some(_) if profile.host.trim().is_empty() => {
+                "No host set — edit the profile to give this server a host name.".into()
+            }
+            Some(_) => match profile.route_table() {
+                Err(e) => format!("Edit the profile to fix its host and routes: {e}"),
+                Ok(_) => "Edit the profile to complete it.".into(),
+            },
             None => "No auth key picked — edit the profile to pick one.".into(),
         };
         col = col.push(text(fix).size(12).color(AMBER));
@@ -664,6 +678,9 @@ fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message
         info_row("Server node id", truncate_middle(&node_id, 22), copy_node),
     ]
     .spacing(8);
+    if !profile.host.is_empty() {
+        info = info.push(info_row("Host", profile.host.clone(), Some(profile.host.clone())));
+    }
     // The key's public half is not a secret — always shown unmasked so it can
     // be copied onto the server's authorized-keys file. (The secret never
     // appears anywhere in the UI.)
@@ -703,10 +720,12 @@ fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message
     col = col.push(header);
     col = col.push(container(info).padding([12, 14]).width(Fill).style(style::card));
 
-    if snapshot.phase == Phase::Connected {
+    // The routing is the profile's own configuration, so it shows whatever
+    // the connection is doing.
+    if !profile.host.is_empty() {
         col = col.push(section_label("ROUTING"));
         col = col.push(
-            container(routes_section(snapshot))
+            container(routes_section(profile))
                 .padding([12, 14])
                 .width(Fill)
                 .style(style::card),
@@ -754,18 +773,20 @@ fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message
             .style(style::card),
         );
     } else {
-        let routed_set = app
+        let table = app
             .routed_caches
             .get(&profile.id)
             .and_then(|c| c.as_ref())
-            .and_then(|(_, _, set)| set.as_ref());
+            .and_then(|(_, _, _, table)| table.as_ref());
         for forward in &profile.forwards {
-            col = col.push(forward_card(app, profile, forward, snapshot, routed_set));
+            col = col.push(forward_card(app, profile, forward, snapshot, table));
         }
         col = col.push(
             text(
-                "Forwards listen on localhost only (127.0.0.1 and ::1) and open \
-                 server-direct tunnel streams. The server rejects targets outside its tunnel set.",
+                "Forwards listen on localhost only (127.0.0.1 and ::1) and always go \
+                 through the server, never directly — so the remote host must be this \
+                 profile's host or one of its routes. The server rejects targets outside \
+                 its tunnel set.",
             )
             .size(11)
             .style(style::faint_text),
@@ -801,7 +822,8 @@ fn connection_banner<'a>(
     snapshot: &'a Snapshot,
 ) -> Option<Element<'a, Message>> {
     let (color, message, show_connect) = match snapshot.phase {
-        Phase::Connected => return None,
+        // In standby the forwards are listening; using one connects.
+        Phase::Connected | Phase::Standby => return None,
         Phase::Idle => (
             AMBER,
             "Not connected — forwards are inactive until you connect.",
@@ -812,7 +834,7 @@ fn connection_banner<'a>(
             "Connection failed — forwards are inactive until you reconnect.",
             true,
         ),
-        Phase::Connecting => (AMBER, "Connecting — forwards start automatically.", false),
+        Phase::Connecting => (AMBER, "Connecting — forwards work as soon as it is up.", false),
         Phase::Reconnecting => (AMBER, "Reconnecting — forwards resume automatically.", false),
     };
     let mut r = row![dot(color, 8.0), text(message).size(12)]
@@ -905,7 +927,7 @@ fn forward_card<'a>(
     profile: &'a Profile,
     forward: &'a PortForward,
     snapshot: &'a Snapshot,
-    routed_set: Option<&RoutedSet>,
+    table: Option<&RouteTable>,
 ) -> Element<'a, Message> {
     let status = snapshot.forwards.iter().find(|s| s.id == forward.id);
     let (pill_text, pill_color) = forward_pill(forward, status, snapshot.phase);
@@ -917,13 +939,10 @@ fn forward_card<'a>(
     let mut title = row![name, pill(pill_text, pill_color)]
         .spacing(8)
         .align_y(Center);
-    if let Some(tunneled) = forward_badge(snapshot.phase, &snapshot.routes, routed_set, forward) {
-        let (badge, color) = if tunneled {
-            ("server-direct", GREEN)
-        } else {
-            ("not routed", AMBER)
-        };
-        title = title.push(pill(badge.to_string(), color));
+    // Only the problem is worth a badge: a forward the profile routes is the
+    // normal case.
+    if forward_routed(table, forward) == Some(false) {
+        title = title.push(pill("no route".to_string(), AMBER));
     }
 
     let route = arrow_copy_row(forward.local_endpoint(), forward.remote_endpoint(), true);
@@ -974,101 +993,48 @@ fn forward_card<'a>(
         .into()
 }
 
-fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
-    let routes = &snapshot.routes;
+fn routes_section(profile: &Profile) -> Element<'_, Message> {
     let mut col = column![].spacing(3);
-    if is_full_tunnel(routes) {
-        col = col.push(text("Everything through the tunnel").size(12));
+    // The profile's own name is always the server itself.
+    col = col.push(text("This server's own loopback, on any port:").size(12));
+    col = col.push(route_row(profile.host.clone(), None));
+
+    col = col.push(space().height(8));
+    if is_full_tunnel(&profile.routed_domains, &profile.routed_cidrs) {
+        col = col.push(text("Everything else through the tunnel").size(12));
+    } else if profile.routed_domains.is_empty() && profile.routed_cidrs.is_empty() {
+        col = col.push(
+            text("Nothing else is routed — every other target connects directly.").size(12),
+        );
     } else {
         col = col.push(
             text(format!(
-                "Split tunnel — {} domain(s), {} CIDR(s) routed through the server:",
-                routes.domains.len(),
-                routes.cidrs.len()
+                "Split tunnel — {} domain(s), {} CIDR(s) routed through the server; \
+                 everything else connects directly:",
+                profile.routed_domains.len(),
+                profile.routed_cidrs.len()
             ))
             .size(12),
         );
-        for domain in &routes.domains {
+        for domain in &profile.routed_domains {
             col = col.push(route_row(domain.clone(), None));
         }
-        for cidr in &routes.cidrs {
+        for cidr in &profile.routed_cidrs {
             col = col.push(route_row(cidr.clone(), None));
         }
     }
-    if !routes.host_aliases.is_empty() {
-        col = col.push(space().height(8));
-        col = col.push(
-            text(format!(
-                "Host aliases — {} resolved server-side:",
-                routes.host_aliases.len()
-            ))
-            .size(12),
-        );
-        for (alias, target) in &routes.host_aliases {
-            col = col.push(arrow_copy_row(alias.clone(), target.clone(), false));
-        }
-    }
-    if !routes.dns_forwards.is_empty() {
-        col = col.push(space().height(8));
-        col = col.push(
-            text(format!(
-                "DNS forwards — {} resolved via upstream server(s):",
-                routes.dns_forwards.len()
-            ))
-            .size(12),
-        );
-        for (suffix, servers) in &routes.dns_forwards {
-            col = col.push(arrow_copy_row(
-                format!("{suffix} (+ subdomains)"),
-                servers.join(", "),
-                false,
-            ));
-        }
-    }
-    if !routes.bridges.is_empty() {
-        col = col.push(space().height(8));
-        col = col.push(
-            text(format!(
-                "Bridge routes — {} forwarded via another server:",
-                routes.bridges.len()
-            ))
-            .size(12),
-        );
-        for bridge in &routes.bridges {
-            col = col.push(space().height(4));
-            col = col.push(mono(format!("{}:", bridge.name)));
-            col = col.push(
-                row![
-                    space().width(16),
-                    text("endpoint id:").size(12).style(style::dim_text),
-                    mono(bridge.endpoint_id.clone()),
-                    copy_button(bridge.endpoint_id.clone()),
-                ]
-                .spacing(6)
-                .align_y(Center),
-            );
-            if !bridge.domains.is_empty() {
-                col = col.push(indented_label("routed domains:"));
-                for d in &bridge.domains {
-                    col = col.push(indented_item(d));
-                }
-            }
-            if !bridge.cidrs.is_empty() {
-                col = col.push(indented_label("routed CIDRs:"));
-                for c in &bridge.cidrs {
-                    col = col.push(indented_item(c));
-                }
-            }
-        }
-    }
-    // The reserved hosts are always tunneled to the server, regardless of the
-    // routed set — surface them so they're discoverable (and copyable).
+
+    // The status pages live under the reserved name, answered by this
+    // profile's own proxy — surface them so they're discoverable (and
+    // copyable). The server's page is where its routed set, host aliases, DNS
+    // forwards and bridges are shown.
     col = col.push(space().height(8));
-    col = col.push(text("Server status page — always tunneled:").size(12));
-    col = col.push(route_row(reserved::STATUS_HOST.to_string(), None));
-    col = col.push(space().height(8));
-    col = col.push(text("Server loopback — always tunneled:").size(12));
-    col = col.push(route_row(reserved::LOCALHOST_HOST.to_string(), None));
+    col = col.push(text("Status pages, through this profile's proxy:").size(12));
+    col = col.push(route_row(format!("http://{}/", reserved::STATUS_HOST), None));
+    col = col.push(route_row(
+        format!("http://{}/servers/{}/", reserved::STATUS_HOST, profile.host),
+        None,
+    ));
     col.into()
 }
 
@@ -1106,6 +1072,28 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
         form_row(
             "Server node id",
             input("", &form.server_node_id, Message::ServerNodeIdChanged),
+        ),
+        // The name this server goes by: `<host>:<port>` reaches the server's
+        // own loopback.
+        form_row(
+            "Host",
+            input("e.g. nas.internal", &form.host, Message::ProfileHostChanged),
+        ),
+        form_row(
+            "Routed domains",
+            input(
+                "comma-separated, optional — e.g. *.corp.example",
+                &form.routed_domains,
+                Message::ProfileRoutedDomainsChanged,
+            ),
+        ),
+        form_row(
+            "Routed CIDRs",
+            input(
+                "comma-separated, optional — e.g. 10.0.0.0/8",
+                &form.routed_cidrs,
+                Message::ProfileRoutedCidrsChanged,
+            ),
         ),
     ]
     .spacing(10);
@@ -1473,14 +1461,14 @@ fn server_detail<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
             tunnel = tunnel.push(indented_item(cidr));
         }
     }
-    tunnel = tunnel.push(indented_label("always routed:"));
+    tunnel = tunnel.push(indented_label("always reachable by clients:"));
     tunnel = tunnel.push(indented_note_item(
-        reserved::STATUS_HOST,
-        "this server's status page",
+        "<the client's name for this server>",
+        "this machine's localhost, on any port",
     ));
     tunnel = tunnel.push(indented_note_item(
-        reserved::LOCALHOST_HOST,
-        "this machine's localhost, on any port",
+        "the server status page",
+        "through the client's flextunnel.internal",
     ));
     let relays = if server.relay_urls.is_empty() {
         "default".to_string()
@@ -1493,7 +1481,8 @@ fn server_detail<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
 
     col = col.push(
         text(
-            "The tunnel set is pushed to clients and enforced here.",
+            "The tunnel set is enforced here. Clients route by their own lists, so a \
+             client must list a route itself to send it to this server.",
         )
         .size(11)
         .style(style::faint_text),
@@ -1884,9 +1873,10 @@ fn server_form_view<'a>(app: &'a App, form: &'a ServerForm) -> Element<'a, Messa
             "TUNNEL SET & RELAYS",
             server_settings_card(app, form),
             "The tunnel set decides what else clients may reach through this server; \
-             both lists are optional, since flextunnel.internal (the status page) and \
-             localhost.flextunnel.internal (this machine's localhost) are always \
-             routed. Clients are authorized on the server pane.",
+             both lists are optional, since this machine's localhost (under the name \
+             a client gives this server) and the server's status page are always \
+             reachable. A client must list a route itself to send it here. Clients \
+             are authorized on the server pane.",
         ),
     };
     scrollable(
@@ -2429,14 +2419,36 @@ mod tests {
 
     #[test]
     fn full_tunnel_derivation() {
-        let mut routes = TunnelRoutes::default();
-        assert!(!is_full_tunnel(&routes), "an empty set tunnels only the reserved hosts");
-        routes.domains = vec!["example.com".into()];
-        assert!(!is_full_tunnel(&routes));
-        routes.domains.push("*".into());
-        assert!(is_full_tunnel(&routes));
-        routes.domains = vec!["example.com".into()];
-        routes.cidrs = vec!["0.0.0.0/0".into()];
-        assert!(is_full_tunnel(&routes));
+        let strings = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(!is_full_tunnel(&[], &[]), "no routes: only the host is tunneled");
+        assert!(!is_full_tunnel(&strings(&["example.com"]), &[]));
+        assert!(is_full_tunnel(&strings(&["example.com", "*"]), &[]));
+        assert!(is_full_tunnel(&strings(&["example.com"]), &strings(&["0.0.0.0/0"])));
+    }
+
+    #[test]
+    fn forward_badge_follows_the_profiles_routes() {
+        let table = RouteTable::new(&[flextunnel_core::proxy::RouteSpec {
+            host: "nas.internal",
+            routed_domains: &["*.corp.example".to_string()],
+            routed_cidrs: &["10.0.0.0/8".to_string()],
+        }])
+        .unwrap();
+        let forward = |host: &str| PortForward {
+            id: "f".into(),
+            label: String::new(),
+            local_port: 5432,
+            remote_host: host.into(),
+            remote_port: 5432,
+            enabled: true,
+        };
+        for routed in ["nas.internal", "db.corp.example", "10.1.2.3"] {
+            assert_eq!(forward_routed(Some(&table), &forward(routed)), Some(true), "{routed}");
+        }
+        for unrouted in ["example.org", "192.168.1.1", "localhost"] {
+            assert_eq!(forward_routed(Some(&table), &forward(unrouted)), Some(false), "{unrouted}");
+        }
+        // Routes that do not validate: no verdict, no badge.
+        assert_eq!(forward_routed(None, &forward("nas.internal")), None);
     }
 }

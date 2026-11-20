@@ -42,20 +42,24 @@ authorized_keys_file = "./authorized_keys"
 # detects it is a duplicate server; on the next start it refuses to run if its
 # id is listed. Delete the offending entry after resolving the conflict.
 
-# Routed set (the "tunnel set") — optional. This is a VPN-style split-tunnel
-# "included routes" list and the single source of truth: it is pushed to every
-# client during the handshake (clients tunnel on-list targets and direct-connect
-# off-list ones) AND enforced here as a defense-in-depth whitelist — the server
-# REJECTS any tunnel request whose target is not on the list (SOCKS5 reply 0x02,
-# "connection not allowed by ruleset"). Note the asymmetry: clients fall back to
-# a direct connection for off-list targets, whereas the server rejects them
-# outright. Clients configure no routed set of their own.
+# Routed set (the "tunnel set") — optional. This is what clients may reach
+# through this server, beyond the machine it runs on. It is enforced here as a
+# whitelist — the server REJECTS any tunnel request whose target is not on the
+# list (SOCKS5 reply 0x02, "connection not allowed by ruleset").
 #
-# Both lists are optional: `flextunnel.internal` (the status page) and
-# `localhost.flextunnel.internal` (this server's own `localhost`) are ALWAYS
-# routed, independent of the set. With both lists omitted, clients reach just
-# those two names through the tunnel and direct-connect everything else (an
-# empty set never means "tunnel everything").
+# Routing is configured on both sides and nothing is exchanged between them: a
+# client sends this server only the targets its own config routes here (the
+# `routed_domains` / `routed_cidrs` of the destination it gives this server —
+# see client.toml.example), and this server accepts only what is listed below.
+# So a route must be on both lists to work: one that only the client lists is
+# rejected here, and one that only this server lists is never sent — the
+# client connects it directly.
+#
+# Both lists are optional. Two things are ALWAYS reachable by an authorized
+# client, independent of the set: this machine's own `localhost` on any port
+# (under the host name the client gives this server as a destination), and
+# this server's status page. With both lists omitted, clients reach just those
+# through this server (an empty set never means "tunnel everything").
 #
 # Domain entries are exact (`example.com`), wildcard (`*.example.com`, subdomains
 # only — not the bare apex), or `*` to match every hostname; case-insensitive.
@@ -66,13 +70,13 @@ authorized_keys_file = "./authorized_keys"
 # hostname form, so `*` never lets a raw IP through.
 #
 # Either list may be set alone. The two never cross: an omitted/empty list means
-# that whole category is off-list and always direct-connected. So `routed_domains` alone (no `routed_cidrs`)
-# tunnels those hostnames but direct-connects every bare-IP target, and
-# `routed_cidrs` alone tunnels those IPs but direct-connects every hostname.
+# that whole category is rejected. So `routed_domains` alone (no `routed_cidrs`)
+# accepts those hostnames but no bare-IP target, and `routed_cidrs` alone
+# accepts those IPs but no hostname.
 # If you use `host_aliases`, add the alias name itself to the routed set here:
 # filtering happens on the requested hostname before the server rewrites it.
 #
-# For a FULL tunnel (route all traffic through the tunnel), use the catch-alls:
+# To allow everything (clients then decide what to send), use the catch-alls:
 #   routed_domains = ["*"]
 #   routed_cidrs = ["0.0.0.0/0", "::/0"]
 #
@@ -83,13 +87,13 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 
 # RESERVED namespace: `flextunnel.internal` and any `*.flextunnel.internal`
 # subdomain are reserved by flextunnel and cannot be used as [host_aliases]
-# names (the server rejects such configs at startup). Clients
-# always tunnel these names regardless of the routed set. Browse to
-# `http://flextunnel.internal/` through the tunnel for the HTML server status
-# page, or query the plain-text form from a client with:
-#   curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.txt
-# HTTP-only. Other `*.flextunnel.internal` names are reserved for future use and
-# return a 404.
+# names (the server rejects such configs at startup). A client answers these
+# names itself and never sends them to a server. This server's status page is
+# reached through a client at
+# `http://flextunnel.internal/servers/<the client's host for this server>/`,
+# or in plain text with:
+#   curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/servers/machine1.internal/status.txt
+# HTTP-only.
 
 # Optional host aliases, resolved server-side. A requested hostname matching a
 # key (case-insensitive) is rewritten to its value — an IP or another hostname

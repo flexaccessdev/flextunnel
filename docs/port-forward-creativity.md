@@ -5,8 +5,8 @@ and `::1`. An external TCP adapter can expose a forward on another local
 address, for example to give two remote databases the same local port or to
 share one service with another machine.
 
-Start with built-in forwards, whose targets must be in the server's routed
-set:
+Start with built-in forwards, whose targets must be routed by one of the
+client's destinations and be in that server's routed set:
 
 ```toml
 [[forwards]]
@@ -21,7 +21,7 @@ remote_port = 5432
 ```
 
 Adapters below connect to these local ports. They do not perform SOCKS5
-handshakes or change the forwards' server-direct routing.
+handshakes or change how the forwards are routed.
 
 ## Multiple local addresses on Unix
 

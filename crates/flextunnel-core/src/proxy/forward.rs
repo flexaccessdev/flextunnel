@@ -1,15 +1,17 @@
-//! Server-direct local TCP port forwarding.
+//! Local TCP port forwarding.
 //!
-//! Each configured loopback listener opens a data bi-stream on the client's
-//! authenticated iroh connection and sends the target directly to the server.
-//! No local SOCKS5 listener or handshake is involved. The server remains the
-//! authority: it enforces its routed set before resolving or dialing the target.
+//! Each configured loopback listener hands an accepted connection to the
+//! client's [`TunnelDialer`], which opens a data bi-stream on the destination
+//! that routes the forward's target — connecting that destination first if it
+//! is idle — and sends the target to its server. No local SOCKS5 listener or
+//! handshake is involved. The server remains the authority: it enforces its
+//! routed set before resolving or dialing the target.
 //!
 //! A forward binds both loopback stacks (`127.0.0.1` and `[::1]`). Each stack
 //! binds and recovers independently — one stack stuck reclaiming its port never
 //! blocks accepts on the other — and concurrent relays are capped per forward.
 
-use super::client::{AcceptOutcome, AcceptRetry, ServerForwarder};
+use super::client::{AcceptOutcome, AcceptRetry, TunnelDialer};
 use super::signaling::Target;
 use std::collections::HashMap;
 use std::io;
@@ -22,7 +24,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
-/// One server-direct local forward.
+/// One local forward.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForwardSpec {
     pub id: String,
@@ -145,18 +147,18 @@ struct ForwardTask {
     shared: Arc<ForwardShared>,
 }
 
-/// Owns and reconciles server-direct listener tasks.
+/// Owns and reconciles forward listener tasks.
 ///
 /// The runtime handle makes [`apply`](Self::apply) safe to call from a foreign
 /// thread (the iOS FFI does this from Swift's main actor).
 pub struct ForwardManager {
     runtime: Handle,
-    forwarder: ServerForwarder,
+    forwarder: TunnelDialer,
     tasks: HashMap<String, ForwardTask>,
 }
 
 impl ForwardManager {
-    pub fn new(runtime: Handle, forwarder: ServerForwarder, forwards: &[ForwardSpec]) -> Self {
+    pub fn new(runtime: Handle, forwarder: TunnelDialer, forwards: &[ForwardSpec]) -> Self {
         let mut manager = Self {
             runtime,
             forwarder,
@@ -307,10 +309,10 @@ async fn run_stack(
     }
 }
 
-async fn run_forward(spec: ForwardSpec, forwarder: ServerForwarder, shared: Arc<ForwardShared>) {
+async fn run_forward(spec: ForwardSpec, forwarder: TunnelDialer, shared: Arc<ForwardShared>) {
     let port = spec.local_port;
     log::info!(
-        "Forwarding localhost:{port} → {:?} directly through the server",
+        "Forwarding localhost:{port} → {:?} through its destination",
         spec.target
     );
     // Capacity 1: once the relay cap pauses this loop, at most one accepted

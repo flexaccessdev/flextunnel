@@ -1,16 +1,19 @@
 //! The headless `flextunnel client start` session: proxy front-ends (both
-//! optional), server-direct port forwards, and the control channel that
-//! `flextunnel client control` attaches to.
+//! optional), port forwards, and the control channel that `flextunnel client
+//! control` and `flextunnel client nc` attach to.
 //!
 //! Mirrors the desktop client's per-profile session (`flextunnel-desktop`'s
-//! `tunnel.rs`): bind the enabled listeners, run the reconnecting client, poll
-//! routes/forward state on a ticker, and serve status snapshots — here over the
-//! IPC socket instead of a GUI channel. Unlike the desktop, nothing is mutable
-//! from the panel: the forward set is the config's.
+//! `tunnel.rs`): bind the enabled listeners, run the client, poll forward
+//! state on a ticker, and serve status snapshots — here over the IPC socket
+//! instead of a GUI channel. Starting the session connects nothing: each
+//! destination connects when something is first sent to it. Unlike the
+//! desktop, nothing is mutable from the panel: the forward set is the
+//! config's.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -19,91 +22,88 @@ use flextunnel_core::forwards::{
     validate_label, validate_remote_host,
 };
 use flextunnel_core::config::ForwardConfig;
-use flextunnel_core::iroh::SecretKey;
-use flextunnel_core::proxy::{ClientAuth, ClientConfig, ProxyClient, ReconnectStatus, reserved};
-use flextunnel_core::transport::endpoint::{
-    ClientEndpoint, RelayConfig, create_client_endpoint, create_quick_client_endpoint,
+use flextunnel_core::iroh::{EndpointId, SecretKey};
+use flextunnel_core::proxy::signaling::Target;
+use flextunnel_core::proxy::{
+    ClientAuth, ClientConfig, ClientStatus, DestinationConfig, DestinationStatus, LocalListeners,
+    ProxyClient, TunnelDialer, reserved,
 };
+use flextunnel_core::transport::endpoint::RelayConfig;
 use flextunnel_core::transport::paths::{ConnPath, ConnPathKind};
-use flextunnel_core::{app, auth, config};
+use flextunnel_core::{app, config};
 
 use crate::ipc::{
-    self, ForwardRow, ForwardRowState, IpcCmd, Phase, StatusSnapshot, WireBridge, WireConnPath,
-    WireConnSnapshot, WireCustomRelay, WireForward, WireRoutes,
+    self, DestinationRow, ForwardRow, ForwardRowState, IpcCmd, StatusSnapshot, WireConnPath,
+    WireConnSnapshot, WireCustomRelay, WireForward,
 };
 use crate::{instance, lock};
 
 pub async fn run(r: config::ResolvedClient) -> Result<()> {
-    let server_node_id = r.server_node_id.clone().context(
-        "The client requires a server node id (--server-node-id or server_node_id in the config).",
-    )?;
-    // A profile's server id never changes, so its prefix is the client's
-    // on-disk identity: lock and control socket.
-    let key = instance::instance_key(&server_node_id)?;
-    let client_key = resolve_client_key(&r)?;
-    // The public half is what the server operator needs on their
-    // authorized-keys file — never a secret, so log it plainly.
-    log::info!("Client auth public key: {}", client_key.public_str());
+    // The instance name is the client's on-disk identity: lock and control
+    // socket.
+    let name = instance::instance_name(r.name.as_deref())?;
+    let proxy_config = r.proxy_config()?;
+    // The public halves are what the server operators need on their
+    // authorized-keys files — never a secret, so log them plainly.
+    let mut logged = Vec::new();
+    for destination in &proxy_config.destinations {
+        if let ClientAuth::Key(key) = &destination.auth {
+            let public = key.public_str();
+            if !logged.contains(&public) {
+                log::info!("Client auth public key: {public}");
+                logged.push(public);
+            }
+        }
+    }
 
     // Held for the process lifetime; also what makes removing a stale control
     // socket safe (see ipc.rs).
-    let _lock = lock::acquire_client(&key)?;
+    let _lock = lock::acquire_client(&name)?;
+
+    // Validates the destinations (hosts, routes, one entry per server).
+    // Nothing is bound or dialed by this.
+    let client = Arc::new(
+        ProxyClient::new(proxy_config).map_err(|e| anyhow::anyhow!("Invalid client config: {e}"))?,
+    );
 
     // The forward set is the config's `[[forwards]]` tables, fixed for the
     // session (the panel only observes it). Validated here like the rest of
-    // the config, before the endpoint exists. All start enabled; one whose
+    // the config, before anything is bound. All start enabled; one whose
     // listener fails to bind is switched off by the ticker below.
-    let forwards = forwards_from_config(&r.forwards)
+    let dialer = client.dialer();
+    let forwards = forwards_from_config(&r.forwards, &dialer)
         .map_err(|e| anyhow::anyhow!("Invalid [[forwards]] in the client config: {e}"))?;
     if !forwards.is_empty() {
         log::info!("Loaded {} port forward(s) from the config", forwards.len());
     }
 
-    // The routed set (tunnel set) is configured on the server and pushed
-    // during the handshake (see ProxyClient::handshake).
-    let runtime = build_session(
-        r,
-        server_node_id,
-        SessionAuth::Key(client_key),
-        key.clone(),
-        forwards,
-    )
-    .await?;
+    let runtime = build_session(client, r.socks_port, r.http_port, name.clone(), forwards).await?;
     if runtime.state.socks_addr.is_none() && runtime.state.http_addr.is_none() {
         log::info!("No local proxy listeners configured; running in port-forward-only mode");
     }
 
     // Serve the control socket others attach to; a detaching panel never stops
-    // the tunnel, and the loop keeps running when the channel closes. `client
-    // nc` tunnels share the session's connection, like the port forwards.
-    let forwarder = runtime.client.server_forwarder();
+    // the client, and the loop keeps running when the channel closes. `client
+    // nc` tunnels go through the session's dialer, like the port forwards.
     drive_session(runtime, move |tx, _initial| {
-        ipc::spawn_ipc_server(&key, tx, forwarder).map(IpcSink::Socket)
+        ipc::spawn_ipc_server(&name, tx, dialer).map(IpcSink::Socket)
     })
     .await
 }
 
-/// Resolve the client auth keypair: exactly one of the inline secret or the
-/// key file. Normal sessions only — quick mode has no keypair (its credential
-/// is the client's endpoint id, allowlisted on the quick server).
-fn resolve_client_key(r: &config::ResolvedClient) -> Result<auth::ClientKey> {
-    if r.auth_key.is_some() && r.auth_key_file.is_some() {
-        anyhow::bail!("Provide only one of auth_key or auth_key_file, not both");
-    }
-    if let Some(secret) = &r.auth_key {
-        auth::ClientKey::from_secret_str(secret.trim()).context("Invalid client secret key")
-    } else if let Some(path) = &r.auth_key_file {
-        auth::load_client_key_from_file(path).context("Failed to load the client key file")
-    } else {
-        anyhow::bail!(
-            "The client requires an authentication keypair.\n\
-             Generate one with: flexaccess-keys generate-auth-key -o <FILE>\n\
-             Then pass --auth-key-file <FILE> (or --auth-key <SECRET>), or set \
-             auth_key_file/auth_key in the config, and put the key's public half \
-             (`flexaccess-keys show-auth-key --private-key-file <FILE>`) on the \
-             server's authorized_keys_file."
-        )
-    }
+/// The one destination of a quick session. Its name is fixed — there is no
+/// config to choose one in — and reaches the quick server's own loopback like
+/// any destination's.
+pub const QUICK_HOST: &str = "quick.internal";
+
+/// What a `client start --quick` session connects to and serves.
+pub struct QuickSession {
+    /// The quick server's EndpointId.
+    pub server_id: EndpointId,
+    pub socks_port: Option<u16>,
+    pub http_port: Option<u16>,
+    pub relay_urls: Vec<String>,
+    pub relay_auth_token: Option<String>,
 }
 
 /// The self-contained `flextunnel client start --quick` session: an ephemeral
@@ -115,24 +115,41 @@ fn resolve_client_key(r: &config::ResolvedClient) -> Result<auth::ClientKey> {
 /// the channel, which shuts the session down — so the tunnel disconnects rather
 /// than detaching.
 ///
+/// A quick session is the one that is **not** lazy: its single destination
+/// ([`QUICK_HOST`]) routes everything — the quick server is a full tunnel —
+/// and is dialed at once and kept connected, because the quick server exits
+/// unless its client shows up soon after it starts.
+///
 /// `client_secret` is the session's pre-generated identity, whose endpoint id
 /// the caller already printed for the user to allowlist on the quick server —
 /// that id (not a keypair) is the quick client's credential, so the endpoint must
 /// bind with exactly this secret.
-pub async fn run_quick(r: config::ResolvedClient, client_secret: SecretKey) -> Result<()> {
-    let server_node_id = r.server_node_id.clone().context(
-        "The client requires a server node id (--server-node-id or server_node_id in the config).",
-    )?;
-    // Display-only in quick mode (no lock/socket paths are derived from it);
-    // computing it also validates the id shape up front.
-    let key = instance::instance_key(&server_node_id)?;
+pub async fn run_quick(quick: QuickSession, client_secret: SecretKey) -> Result<()> {
+    let relay = RelayConfig::from_urls_with_token(&quick.relay_urls, quick.relay_auth_token)
+        .context("Invalid relay configuration")?;
+    let client = Arc::new(
+        ProxyClient::new(ClientConfig {
+            destinations: vec![DestinationConfig {
+                host: QUICK_HOST.to_string(),
+                server_id: quick.server_id,
+                auth: ClientAuth::Quick(Box::new(client_secret)),
+                relay,
+                routed_domains: vec!["*".to_string()],
+                routed_cidrs: vec!["0.0.0.0/0".to_string(), "::/0".to_string()],
+                keep_connected: true,
+            }],
+            idle_timeout: None,
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
 
-    // No config, so no forwards (the panel cannot declare any).
+    // No config, so no forwards (the panel cannot declare any). The name is
+    // display-only: no lock or socket is derived from it.
     let runtime = build_session(
-        r,
-        server_node_id,
-        SessionAuth::Quick(client_secret),
-        key,
+        client,
+        quick.socks_port,
+        quick.http_port,
+        "quick".to_string(),
         Vec::new(),
     )
     .await?;
@@ -150,13 +167,11 @@ pub async fn run_quick(r: config::ResolvedClient, client_secret: SecretKey) -> R
     .await
 }
 
-/// The assembled per-session runtime that [`drive_session`] consumes: the iroh
-/// endpoint, the proxy client and its live routes, the bound proxy listeners,
-/// the forward manager + set, and the status state.
+/// The assembled per-session runtime that [`drive_session`] consumes: the
+/// proxy client, the bound proxy listeners, the forward manager + set, and the
+/// status state.
 struct SessionRuntime {
-    endpoint: ClientEndpoint,
-    client: std::sync::Arc<ProxyClient>,
-    routes: std::sync::Arc<std::sync::Mutex<flextunnel_core::proxy::TunnelRoutes>>,
+    client: Arc<ProxyClient>,
     socks_listener: Option<tokio::net::TcpListener>,
     http_listener: Option<tokio::net::TcpListener>,
     fwd_mgr: ForwardManager,
@@ -164,111 +179,46 @@ struct SessionRuntime {
     state: SessionState,
 }
 
-/// How a session authenticates, coupling the credential to the endpoint
-/// identity it requires so the two cannot be mixed and matched: a keypair
-/// session dials from an anonymous ephemeral endpoint, while a quick session
-/// must bind its endpoint to the fixed secret whose id the quick server
-/// allowlisted — the id *is* the credential.
-enum SessionAuth {
-    /// Normal session: signed keypair credential over the client ALPN.
-    Key(auth::ClientKey),
-    /// Quick session: no keypair; the endpoint binds to this secret and its
-    /// endpoint id is checked against the quick server's allowlist.
-    Quick(SecretKey),
-}
-
-/// Create the iroh endpoint, bind the enabled proxy front-ends (127.0.0.1 only,
-/// like the desktop client — unauthenticated, never exposed off-machine), and
-/// assemble the [`SessionRuntime`]. Shared by [`run`] and [`run_quick`]; the
-/// caller supplies the [`SessionAuth`] (which also determines the endpoint's
-/// identity), the instance `key` (status display), and the session's fixed
-/// `forwards`. On any failure past endpoint creation the endpoint is closed
-/// gracefully before returning.
+/// Bind the enabled proxy front-ends (127.0.0.1 only, like the desktop client
+/// — unauthenticated, never exposed off-machine) and assemble the
+/// [`SessionRuntime`]. Shared by [`run`] and [`run_quick`]; the caller supplies
+/// the built client, the instance `name` (status display), and the session's
+/// fixed `forwards`. No endpoint exists yet, so a failure here leaves nothing
+/// to close.
 async fn build_session(
-    r: config::ResolvedClient,
-    server_node_id: String,
-    auth: SessionAuth,
-    key: String,
+    client: Arc<ProxyClient>,
+    socks_port: Option<u16>,
+    http_port: Option<u16>,
+    name: String,
     forwards: Vec<PortForward>,
 ) -> Result<SessionRuntime> {
-    let relay_config = RelayConfig::from_urls_with_token(&r.relay_urls, r.relay_auth_token.clone())
-        .context("Invalid relay configuration")?;
-    let (endpoint, auth) = match auth {
-        SessionAuth::Key(client_key) => (
-            create_client_endpoint(&relay_config).await,
-            ClientAuth::Key(Box::new(client_key)),
-        ),
-        SessionAuth::Quick(secret) => (
-            create_quick_client_endpoint(&relay_config, secret).await,
-            ClientAuth::QuickAllowlisted,
-        ),
-    };
-    let endpoint = endpoint.context("Failed to create iroh endpoint")?;
-    log::info!("flextunnel client Node ID: {}", endpoint.id());
-
-    let socks_bind = r.socks_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p)));
-    let http_bind = r.http_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p)));
-
-    let client = std::sync::Arc::new(ProxyClient::new(ClientConfig {
-        server_node_id: server_node_id.clone(),
-        auth,
-        socks_listen: socks_bind,
-        http_listen: http_bind,
-        relay_urls: r.relay_urls,
-        relay_auth_token: r.relay_auth_token,
-        auto_reconnect: r.auto_reconnect,
-        max_reconnect_attempts: r.max_reconnect_attempts,
-    }));
-    let routes = client.routes();
-
     // Bind the enabled proxy front-ends before anything else can take the
     // ports; a taken port fails startup with a clear message.
-    let listeners = async {
-        let socks = match socks_bind {
-            Some(addr) => Some(bind_local(addr, "SOCKS").await?),
-            None => None,
-        };
-        let http = match http_bind {
-            Some(addr) => Some(bind_local(addr, "HTTP").await?),
-            None => None,
-        };
-        anyhow::Ok((socks, http))
+    let socks_listener = match socks_port {
+        Some(port) => Some(bind_local(SocketAddr::from(([127, 0, 0, 1], port)), "SOCKS").await?),
+        None => None,
     };
-    let (socks_listener, http_listener) = match listeners.await {
-        Ok(listeners) => listeners,
-        Err(e) => {
-            endpoint.close().await;
-            return Err(e);
-        }
+    let http_listener = match http_port {
+        Some(port) => Some(bind_local(SocketAddr::from(([127, 0, 0, 1], port)), "HTTP").await?),
+        None => None,
     };
     let socks_addr = local_addr(&socks_listener);
     let http_addr = local_addr(&http_listener);
 
-    // Forwards run for the whole session (including reconnect gaps); they die
-    // with the manager when the session ends.
-    let fwd_mgr = ForwardManager::new(
-        tokio::runtime::Handle::current(),
-        client.server_forwarder(),
-        &forwards,
-    );
+    // Forwards listen for the whole session; a forwarded connection connects
+    // its destination on demand. They die with the manager when the session
+    // ends.
+    let fwd_mgr = ForwardManager::new(tokio::runtime::Handle::current(), client.dialer(), &forwards);
 
     let state = SessionState {
-        instance: key,
-        name: r.name,
-        server_node_id,
-        client_node_id: endpoint.id().to_string(),
+        name,
         socks_addr,
         http_addr,
-        ever_connected: false,
-        connected_since: None,
-        reconnect: ReconnectStatus::default(),
         disabled_reasons: HashMap::new(),
     };
 
     Ok(SessionRuntime {
-        endpoint,
         client,
-        routes,
         socks_listener,
         http_listener,
         fwd_mgr,
@@ -291,44 +241,35 @@ enum IpcSink {
 
 /// Run the session's `tokio::select!` loop until the client future ends, a
 /// shutdown signal arrives, or (panel only) the control channel closes; then
-/// tear everything down and close the endpoint gracefully. `make_sink` wires the
-/// freshly-created command channel to its consumer — the control socket server,
-/// or the quick panel seeded with `initial` — keeping the differing IPC/panel
-/// setup in the wrappers.
+/// tear everything down and close the client's endpoints gracefully.
+/// `make_sink` wires the freshly-created command channel to its consumer — the
+/// control socket server, or the quick panel seeded with `initial` — keeping
+/// the differing IPC/panel setup in the wrappers.
 async fn drive_session(
     runtime: SessionRuntime,
     make_sink: impl FnOnce(mpsc::Sender<IpcCmd>, StatusSnapshot) -> Result<IpcSink>,
 ) -> Result<()> {
     let SessionRuntime {
-        endpoint,
         client,
-        routes,
         socks_listener,
         http_listener,
         mut fwd_mgr,
         mut forwards,
         mut state,
     } = runtime;
+    let dialer = client.dialer();
 
     let (ipc_tx, mut ipc_rx) = mpsc::channel(8);
-    let initial = state.snapshot(&routes, &forwards, &fwd_mgr);
-    // Any failure past endpoint creation must still close the endpoint
-    // gracefully (fatal under panic=abort otherwise).
-    let sink = match make_sink(ipc_tx, initial) {
-        Ok(sink) => sink,
-        Err(e) => {
-            drop(fwd_mgr);
-            endpoint.close().await;
-            return Err(e);
-        }
-    };
+    let initial = state.snapshot(&client.status(), &forwards, &fwd_mgr, &dialer);
+    // Nothing has been dialed yet, so a failure here has no endpoint to close.
+    let sink = make_sink(ipc_tx, initial)?;
     // A closed control channel means the quick panel quit → disconnect. A normal
     // session's IPC accept task holds its sender while the guard lives, so the
     // channel never closes there and the `None` arm stays a no-op.
     let quit_on_ipc_close = matches!(sink, IpcSink::Panel(_));
 
-    let run = client.run_with_optional_listeners(&endpoint, socks_listener, http_listener);
-    tokio::pin!(run);
+    // Boxed so it can be dropped before the endpoints are closed below.
+    let mut run = Box::pin(client.run(LocalListeners::tcp(socks_listener, http_listener)));
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
 
     let res = loop {
@@ -347,26 +288,20 @@ async fn drive_session(
                     }
                     fwd_mgr.apply(&forwards);
                 }
-                state.observe_connection(routes.lock().map(|r| r.connected).unwrap_or(false));
-                state.reconnect = client.reconnect_status();
-                // The reconnect loop rebuilds the endpoint after repeated
-                // failures, which changes the (ephemeral) node id — keep the
-                // status display current.
-                state.client_node_id = endpoint.id().to_string();
             }
             cmd = ipc_rx.recv() => match cmd {
                 Some(IpcCmd::Status(reply)) => {
-                    let _ = reply.send(state.snapshot(&routes, &forwards, &fwd_mgr));
+                    let _ = reply.send(state.snapshot(&client.status(), &forwards, &fwd_mgr, &dialer));
                 }
                 // On-demand connection snapshot: paths + custom-relay /healthz.
                 // Off-loaded to a task (never on the polled Status path, and
                 // never awaited in-loop) because the health probe does on-demand
                 // HTTP; ~3s worst case would otherwise stall the client run,
                 // ticker, and shutdown futures this select is also driving.
-                Some(IpcCmd::ConnPath(reply)) => {
-                    let client = std::sync::Arc::clone(&client);
+                Some(IpcCmd::ConnPath(host, reply)) => {
+                    let client = Arc::clone(&client);
                     tokio::spawn(async move {
-                        let snap = client.connection_snapshot().await;
+                        let snap = client.connection_snapshot(&host).await;
                         let _ = reply.send(WireConnSnapshot {
                             paths: snap.paths.iter().map(wire_conn_path).collect(),
                             custom_relays: snap
@@ -400,11 +335,12 @@ async fn drive_session(
 
     // Close the channel so a quick panel still waiting on a reply (or issuing
     // its next request) unblocks and exits, tear down forwards and the control
-    // socket, then close the endpoint gracefully — bounded so a slow teardown
-    // can't leave the client hung (a second signal or timeout forces exit, just
-    // like the server). Finally join the panel (if any) so the terminal is
-    // restored; a graceful close completes well before that, so the normal path
-    // reaches it.
+    // socket, stop the client, then close the endpoints of the destinations
+    // that were in use gracefully — bounded so a slow teardown can't leave the
+    // client hung (a second signal or timeout forces exit, just like the
+    // server). Finally join the panel (if any) so the terminal is restored; a
+    // graceful close completes well before that, so the normal path reaches
+    // it.
     drop(ipc_rx);
     drop(fwd_mgr);
     let panel = match sink {
@@ -414,7 +350,8 @@ async fn drive_session(
         }
         IpcSink::Panel(panel) => Some(panel),
     };
-    crate::close_endpoint_or_exit(&endpoint.endpoint()).await;
+    drop(run);
+    crate::close_or_exit(client.close()).await;
     if let Some(panel) = panel {
         let _ = panel.await;
     }
@@ -441,80 +378,49 @@ fn local_addr(listener: &Option<tokio::net::TcpListener>) -> Option<SocketAddr> 
 
 /// Session-scoped status state shared by the ticker and the IPC arms.
 struct SessionState {
-    /// The server-id-prefix instance key (see `instance.rs`).
-    instance: String,
-    /// Friendly profile name from the config, display-only.
-    name: Option<String>,
-    server_node_id: String,
-    client_node_id: String,
+    /// The client's instance name (see `instance.rs`).
+    name: String,
     socks_addr: Option<SocketAddr>,
     http_addr: Option<SocketAddr>,
-    ever_connected: bool,
-    connected_since: Option<Instant>,
-    /// The core's reconnect progress (failed attempts, last error, next
-    /// attempt), polled by the ticker; all defaults while connected.
-    reconnect: ReconnectStatus,
     /// Bind-failure reasons of forwards switched off by the ticker, keyed by
     /// forward id, shown next to their rows for the rest of the session.
     disabled_reasons: HashMap<String, String>,
 }
 
 impl SessionState {
-    fn observe_connection(&mut self, connected: bool) {
-        if connected {
-            self.ever_connected = true;
-            if self.connected_since.is_none() {
-                self.connected_since = Some(Instant::now());
-            }
-        } else {
-            self.connected_since = None;
-        }
-    }
-
-    fn phase(&self, connected: bool) -> Phase {
-        if connected {
-            Phase::Connected
-        } else if self.ever_connected {
-            Phase::Reconnecting
-        } else {
-            Phase::Connecting
-        }
-    }
-
     fn snapshot(
         &self,
-        routes: &std::sync::Arc<std::sync::Mutex<flextunnel_core::proxy::TunnelRoutes>>,
+        status: &ClientStatus,
         forwards: &[PortForward],
         fwd_mgr: &ForwardManager,
+        dialer: &TunnelDialer,
     ) -> StatusSnapshot {
-        let routes = routes.lock().map(|r| r.clone()).unwrap_or_default();
         let statuses = fwd_mgr.statuses();
+        let now = Instant::now();
         StatusSnapshot {
-            instance: self.instance.clone(),
             name: self.name.clone(),
-            phase: self.phase(routes.connected),
-            connected_secs: self.connected_since.map(|t| t.elapsed().as_secs()),
-            server_node_id: self.server_node_id.clone(),
-            client_node_id: self.client_node_id.clone(),
             socks_addr: self.socks_addr,
             http_addr: self.http_addr,
             status_page_host: reserved::STATUS_HOST.to_string(),
-            localhost_host: reserved::LOCALHOST_HOST.to_string(),
-            failed_attempts: self.reconnect.failed_attempts,
-            next_attempt_secs: self
-                .reconnect
-                .next_attempt_at
-                .map(|at| at.saturating_duration_since(Instant::now()).as_secs()),
-            last_error: self.reconnect.last_error.clone(),
-            routes: wire_routes(routes),
+            idle_timeout_secs: status.idle_timeout.map(|idle| idle.as_secs()),
+            destinations: status
+                .destinations
+                .iter()
+                .map(|d| destination_row(d, now))
+                .collect(),
             forwards: forwards
                 .iter()
-                .map(|f| self.forward_row(f, &statuses))
+                .map(|f| self.forward_row(f, &statuses, dialer))
                 .collect(),
         }
     }
 
-    fn forward_row(&self, forward: &PortForward, statuses: &[ForwardStatus]) -> ForwardRow {
+    fn forward_row(
+        &self,
+        forward: &PortForward,
+        statuses: &[ForwardStatus],
+        dialer: &TunnelDialer,
+    ) -> ForwardRow {
         let status = statuses.iter().find(|s| s.id == forward.id);
         let (state, error, active, last_conn_error) = if !forward.enabled {
             (
@@ -545,6 +451,11 @@ impl SessionState {
         };
         ForwardRow {
             forward: wire_forward(forward),
+            // Every forward was checked to have one at startup.
+            destination: dialer
+                .destination_for(&forward_target(forward))
+                .unwrap_or_default()
+                .to_string(),
             state,
             error,
             active,
@@ -553,13 +464,46 @@ impl SessionState {
     }
 }
 
+fn destination_row(d: &DestinationStatus, now: Instant) -> DestinationRow {
+    DestinationRow {
+        host: d.host.clone(),
+        server_node_id: d.server_node_id.clone(),
+        state: d.state.into(),
+        connected_secs: d
+            .connected_since
+            .map(|at| now.saturating_duration_since(at).as_secs()),
+        open_streams: d.open_streams,
+        waiting: d.waiting,
+        client_node_id: d.client_node_id.clone(),
+        failed_attempts: d.failed_attempts,
+        next_attempt_secs: d
+            .next_attempt_at
+            .map(|at| at.saturating_duration_since(now).as_secs()),
+        last_error: d.last_error.clone(),
+        routed_domains: d.routed_domains.clone(),
+        routed_cidrs: d.routed_cidrs.clone(),
+        relay_urls: d.relay_urls.clone(),
+    }
+}
+
+/// The wire target of a forward — a domain-form target, like the forward
+/// listener itself sends.
+fn forward_target(forward: &PortForward) -> Target {
+    Target::Domain(forward.remote_host.clone(), forward.remote_port)
+}
+
 /// Build the session's forward set from the config's `[[forwards]]` tables,
 /// enforcing the invariants the running client and the panel rely on: valid
-/// labels and remote hosts, nonzero ports, and unique local ports (the local
-/// port identifies a forward on the control channel). Hosts and labels are
+/// labels and remote hosts, nonzero ports, unique local ports (the local
+/// port identifies a forward on the control channel), and a destination that
+/// routes each remote host — a forward never connects directly, so one
+/// pointing at a host nobody routes could only ever fail. Hosts and labels are
 /// stored normalized (trimmed, IPv6 brackets stripped). Every forward starts
 /// enabled. Errors name the offending entry by its 1-based position.
-fn forwards_from_config(entries: &[ForwardConfig]) -> Result<Vec<PortForward>, String> {
+fn forwards_from_config(
+    entries: &[ForwardConfig],
+    dialer: &TunnelDialer,
+) -> Result<Vec<PortForward>, String> {
     let mut forwards: Vec<PortForward> = Vec::with_capacity(entries.len());
     for (i, entry) in entries.iter().enumerate() {
         let n = i + 1;
@@ -579,7 +523,7 @@ fn forwards_from_config(entries: &[ForwardConfig]) -> Result<Vec<PortForward>, S
                 owner.display_name()
             ));
         }
-        forwards.push(PortForward {
+        let forward = PortForward {
             // The core manager keys listeners by id; the local port is the
             // natural unique key here (there is no persisted identity).
             id: entry.local_port.to_string(),
@@ -588,7 +532,15 @@ fn forwards_from_config(entries: &[ForwardConfig]) -> Result<Vec<PortForward>, S
             remote_host,
             remote_port: entry.remote_port,
             enabled: true,
-        });
+        };
+        if dialer.destination_for(&forward_target(&forward)).is_none() {
+            return Err(format!(
+                "forward #{n}: no destination routes {} — use a destination's host, or add \
+                 the host to a destination's routed_domains / routed_cidrs",
+                forward.remote_host
+            ));
+        }
+        forwards.push(forward);
     }
     Ok(forwards)
 }
@@ -615,28 +567,33 @@ fn wire_conn_path(p: &ConnPath) -> WireConnPath {
     }
 }
 
-fn wire_routes(routes: flextunnel_core::proxy::TunnelRoutes) -> WireRoutes {
-    WireRoutes {
-        domains: routes.domains,
-        cidrs: routes.cidrs,
-        host_aliases: routes.host_aliases,
-        dns_forwards: routes.dns_forwards,
-        bridges: routes
-            .bridges
-            .into_iter()
-            .map(|b| WireBridge {
-                name: b.name,
-                endpoint_id: b.endpoint_id,
-                domains: b.domains,
-                cidrs: b.cidrs,
-            })
-            .collect(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dialer over two destinations: `m1.internal` routing `*.internal` and
+    /// `2001:db8::/32`, `m2.internal` routing `10.0.0.0/8`. Building it
+    /// connects nothing.
+    fn dialer() -> TunnelDialer {
+        let destination = |host: &str, seed: u8, domains: &[&str], cidrs: &[&str]| DestinationConfig {
+            host: host.to_string(),
+            server_id: SecretKey::from_bytes(&[seed; 32]).public(),
+            auth: ClientAuth::Quick(Box::new(SecretKey::from_bytes(&[seed + 100; 32]))),
+            relay: RelayConfig::default(),
+            routed_domains: domains.iter().map(|s| s.to_string()).collect(),
+            routed_cidrs: cidrs.iter().map(|s| s.to_string()).collect(),
+            keep_connected: false,
+        };
+        ProxyClient::new(ClientConfig {
+            destinations: vec![
+                destination("m1.internal", 1, &["*.internal"], &["2001:db8::/32"]),
+                destination("m2.internal", 2, &[], &["10.0.0.0/8"]),
+            ],
+            idle_timeout: None,
+        })
+        .unwrap()
+        .dialer()
+    }
 
     fn entry(local_port: u16, remote_host: &str) -> ForwardConfig {
         ForwardConfig {
@@ -647,36 +604,105 @@ mod tests {
         }
     }
 
-    #[test]
-    fn config_forwards_are_validated_and_start_enabled() {
-        let forwards =
-            forwards_from_config(&[entry(5000, "db.internal"), entry(5001, "other.internal")])
-                .expect("valid");
+    #[tokio::test]
+    async fn config_forwards_are_validated_and_start_enabled() {
+        let dialer = dialer();
+        let forwards = forwards_from_config(
+            &[entry(5000, "db.internal"), entry(5001, "other.internal")],
+            &dialer,
+        )
+        .expect("valid");
         assert_eq!(forwards.len(), 2);
         assert!(forwards.iter().all(|f| f.enabled));
         assert_eq!(forwards[0].id, "5000");
         assert_eq!(forwards[1].local_port, 5001);
 
-        let err = forwards_from_config(&[entry(5000, "a"), entry(5000, "b")]).unwrap_err();
+        let err = forwards_from_config(&[entry(5000, "a.internal"), entry(5000, "b.internal")], &dialer)
+            .unwrap_err();
         assert!(err.contains("forward #2") && err.contains("5000"), "{err}");
-        assert!(forwards_from_config(&[entry(0, "db.internal")]).is_err(), "zero local port");
-        assert!(forwards_from_config(&[entry(5000, "bad..host")]).is_err(), "bad host");
+        assert!(forwards_from_config(&[entry(0, "db.internal")], &dialer).is_err(), "zero local port");
+        assert!(forwards_from_config(&[entry(5000, "bad..host")], &dialer).is_err(), "bad host");
 
         let mut zero_remote = entry(5000, "db.internal");
         zero_remote.remote_port = 0;
-        assert!(forwards_from_config(&[zero_remote]).is_err(), "zero remote port");
+        assert!(forwards_from_config(&[zero_remote], &dialer).is_err(), "zero remote port");
 
         let mut long_label = entry(5000, "db.internal");
         long_label.label = "x".repeat(65);
-        assert!(forwards_from_config(&[long_label]).is_err(), "oversized label");
+        assert!(forwards_from_config(&[long_label], &dialer).is_err(), "oversized label");
     }
 
-    #[test]
-    fn host_and_label_are_normalized() {
+    #[tokio::test]
+    async fn host_and_label_are_normalized() {
         let mut e = entry(5001, " [2001:db8::1] ");
         e.label = "  db  ".into();
-        let f = forwards_from_config(&[e]).unwrap().remove(0);
+        let f = forwards_from_config(&[e], &dialer()).unwrap().remove(0);
         assert_eq!(f.label, "db");
         assert_eq!(f.remote_host, "2001:db8::1");
+    }
+
+    /// A forward is carried by the destination that routes its host: a
+    /// destination's own name (the server's loopback), a routed domain, or a
+    /// routed network. A host nobody routes is refused at startup.
+    #[tokio::test]
+    async fn a_forward_needs_a_destination_that_routes_it() {
+        let dialer = dialer();
+        let state = SessionState {
+            name: "test".into(),
+            socks_addr: None,
+            http_addr: None,
+            disabled_reasons: HashMap::new(),
+        };
+        for (host, destination) in [
+            ("m2.internal", "m2.internal"),
+            ("db.internal", "m1.internal"),
+            ("10.1.2.3", "m2.internal"),
+            ("2001:db8::7", "m1.internal"),
+        ] {
+            let forward = forwards_from_config(&[entry(5000, host)], &dialer)
+                .unwrap_or_else(|e| panic!("{host}: {e}"))
+                .remove(0);
+            assert_eq!(state.forward_row(&forward, &[], &dialer).destination, destination, "{host}");
+        }
+        for unrouted in ["example.org", "192.168.1.1", "localhost", "flextunnel.internal"] {
+            let err = forwards_from_config(&[entry(5000, unrouted)], &dialer).unwrap_err();
+            assert!(err.contains("forward #1") && err.contains("no destination routes"), "{err}");
+        }
+    }
+
+    /// The status snapshot reports every destination, idle before any use.
+    #[tokio::test]
+    async fn snapshot_lists_the_destinations() {
+        let client = ProxyClient::new(ClientConfig {
+            destinations: vec![DestinationConfig {
+                host: "m1.internal".to_string(),
+                server_id: SecretKey::from_bytes(&[1; 32]).public(),
+                auth: ClientAuth::Quick(Box::new(SecretKey::from_bytes(&[9; 32]))),
+                relay: RelayConfig::default(),
+                routed_domains: vec!["*.corp.example".to_string()],
+                routed_cidrs: Vec::new(),
+                keep_connected: false,
+            }],
+            idle_timeout: Some(Duration::from_secs(300)),
+        })
+        .unwrap();
+        let runtime = build_session(Arc::new(client), None, None, "work".to_string(), Vec::new())
+            .await
+            .unwrap();
+        let snapshot = runtime.state.snapshot(
+            &runtime.client.status(),
+            &runtime.forwards,
+            &runtime.fwd_mgr,
+            &runtime.client.dialer(),
+        );
+        assert_eq!(snapshot.name, "work");
+        assert_eq!(snapshot.status_page_host, "flextunnel.internal");
+        assert_eq!(snapshot.idle_timeout_secs, Some(300));
+        assert!(snapshot.socks_addr.is_none() && snapshot.forwards.is_empty());
+        let row = &snapshot.destinations[0];
+        assert_eq!(row.host, "m1.internal");
+        assert_eq!(row.state, crate::ipc::DestState::Idle);
+        assert_eq!(row.routed_domains, ["*.corp.example"]);
+        assert!(row.client_node_id.is_none() && row.connected_secs.is_none());
     }
 }

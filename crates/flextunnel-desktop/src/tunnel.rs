@@ -3,18 +3,24 @@
 //! own Tokio runtime whose threads are named `tunnel-<profile>` — so every
 //! log line a session emits (core internals included) is attributed to its
 //! profile by thread name (see `logging`). Status is published as per-profile
-//! snapshots the UI polls each frame. Each session owns its `ProxyClient`
-//! future, so dropping it (disconnect/shutdown) tears down the accept loops
-//! and the connection manager together, followed by a graceful endpoint
-//! close. The app's server ([`crate::server_session`]) is routed through the
+//! snapshots the UI polls each frame. Each session is one client with one
+//! destination — the profile's server — which it connects to on demand: once
+//! when the session starts, so pressing Connect shows whether the server is
+//! reachable, and from then on whenever something is sent to it after the
+//! connection idled out. Each session owns its `ProxyClient` future, so
+//! dropping it (disconnect/shutdown) tears down the accept loops and the
+//! destination's manager together, followed by a graceful endpoint close. The app's server ([`crate::server_session`]) is routed through the
 //! same supervisor, so one controller owns every session and one shutdown
 //! stops them all.
 
 use crate::config::{Profile, ServerConfig};
 use crate::server_session::{self, ServerCmd, ServerHandle, ServerSnapshot, SharedServerSnapshot};
 use flextunnel_core::forwards::{ForwardManager, ForwardStatus, PortForward};
-use flextunnel_core::proxy::{ClientAuth, ClientConfig, ProxyClient, TunnelRoutes};
-use flextunnel_core::transport::endpoint::{RelayConfig, create_client_endpoint};
+use flextunnel_core::config::DEFAULT_IDLE_TIMEOUT;
+use flextunnel_core::proxy::{
+    ClientAuth, ClientConfig, DestinationConfig, DestinationState, LocalListeners, ProxyClient,
+};
+use flextunnel_core::transport::endpoint::RelayConfig;
 use flextunnel_core::transport::paths::ConnectionSnapshot;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -31,11 +37,24 @@ pub type ProfileId = String;
 /// hang if a session stalls.
 const CONN_PATH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bound on a session's graceful endpoint close at teardown. The close waits
+/// out an endpoint still being built (see `ProxyClient::close`), which a
+/// Disconnect or a quit during a slow dial must not hang behind; an ordinary
+/// close finishes well inside it.
+const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
+    /// No session: the profile is not connected and nothing is listening.
     Idle,
     Connecting,
     Connected,
+    /// The session is up — proxy and forwards are listening — and the
+    /// server connection is closed for now: it idled out, or dropped with
+    /// nothing using it. The next use connects it again.
+    Standby,
+    /// A connection attempt failed and is being retried for requests that
+    /// are still waiting.
     Reconnecting,
     Failed,
 }
@@ -46,7 +65,6 @@ pub struct Snapshot {
     pub connected_since: Option<Instant>,
     pub socks_addr: Option<SocketAddr>,
     pub http_addr: Option<SocketAddr>,
-    pub routes: TunnelRoutes,
     pub last_error: Option<String>,
     /// Live status per running forward; empty while no session runs, which the
     /// UI renders as "stopped".
@@ -60,7 +78,6 @@ impl Default for Snapshot {
             connected_since: None,
             socks_addr: None,
             http_addr: None,
-            routes: TunnelRoutes::default(),
             last_error: None,
             forwards: Vec::new(),
         }
@@ -548,115 +565,51 @@ async fn run_session(
         };
     });
 
-    // Endpoint creation can block for up to ~10s (the relay online-wait), so
-    // it races the command channel — otherwise a Disconnect or app quit issued
-    // during it would stall until it finished. It runs as a spawned task
-    // rather than a raced future because cancelling it by drop could drop a
-    // bound endpoint without `close()`, which is fatal under panic=abort (see
-    // the CLI's run_client); on a stop the task finishes on its own and the
-    // endpoint is closed gracefully.
-    let relay_config = match RelayConfig::from_urls_with_token(
+    // Everything the session needs is validated before anything is bound.
+    // The profile form checks all of it on save, but a hand-edited file or a
+    // corrupted keychain entry can still surface here — fail the session
+    // cleanly rather than panic.
+    let fail = |message: String| {
+        log::error!("{message}");
+        slot.update(|s| {
+            s.phase = Phase::Failed;
+            s.last_error = Some(message);
+        });
+    };
+    let relay = match RelayConfig::from_urls_with_token(
         &profile.relay_urls,
         profile.relay_auth_token.clone(),
     ) {
-        Ok(relay_config) => relay_config,
-        Err(e) => {
-            log::error!("Invalid relay configuration: {e:#}");
-            slot.update(|s| {
-                s.phase = Phase::Failed;
-                s.last_error = Some(format!("{e:#}"));
-            });
-            return;
-        }
+        Ok(relay) => relay,
+        Err(e) => return fail(format!("Invalid relay configuration: {e:#}")),
     };
-    // The key form validated the secret on save, but a corrupted keychain
-    // entry can still surface here — fail the session cleanly rather than
-    // panic.
     let client_key = match flextunnel_core::auth::ClientKey::from_secret_str(auth_key.trim()) {
         Ok(key) => key,
-        Err(e) => {
-            log::error!("Invalid client auth key: {e:#}");
-            slot.update(|s| {
-                s.phase = Phase::Failed;
-                s.last_error = Some(format!("Invalid client auth key: {e:#}"));
-            });
-            return;
-        }
+        Err(e) => return fail(format!("Invalid client auth key: {e:#}")),
     };
-    let mut create = tokio::spawn({
-        let relay_config = relay_config.clone();
-        async move { create_client_endpoint(&relay_config).await }
-    });
-    let endpoint = loop {
-        tokio::select! {
-            created = &mut create => match created.map_err(anyhow::Error::from) {
-                Ok(Ok(endpoint)) => break endpoint,
-                Ok(Err(e)) | Err(e) => {
-                    log::error!("Failed to create the iroh endpoint: {e:#}");
-                    slot.update(|s| {
-                        s.phase = Phase::Failed;
-                        s.last_error = Some(format!("{e:#}"));
-                    });
-                    return;
-                }
-            },
-            cmd = rx.recv() => match cmd {
-                Some(SessionCmd::Disconnect) => {
-                    log::info!("Disconnecting \"{}\"", profile.name);
-                    slot.update(|s| s.phase = Phase::Idle);
-                    // The UI already shows Idle and this session makes no
-                    // further snapshot writes, so release the command channel
-                    // now — an immediate reconnect may start a fresh session
-                    // while this thread lingers briefly (bounded — the
-                    // session runtime dies with the thread, so a detached
-                    // close task would be cut off) to close the endpoint
-                    // gracefully when creation finishes quickly.
-                    drop(rx);
-                    let _ = tokio::time::timeout(Duration::from_secs(2), async {
-                        if let Ok(Ok(endpoint)) = create.await {
-                            endpoint.close().await;
-                        }
-                    })
-                    .await;
-                    return;
-                }
-                Some(SessionCmd::SetForwards(f)) => forwards = f,
-                // No connection yet during endpoint creation — report none.
-                Some(SessionCmd::QueryConnPath(reply)) => {
-                    let _ = reply.send(ConnectionSnapshot::default());
-                }
-                Some(SessionCmd::Shutdown) | None => {
-                    // Bounded grace so quitting stays responsive: close
-                    // cleanly when creation finishes quickly, otherwise just
-                    // exit — the process is going away anyway.
-                    let _ = tokio::time::timeout(Duration::from_secs(2), async {
-                        if let Ok(Ok(endpoint)) = create.await {
-                            endpoint.close().await;
-                        }
-                    })
-                    .await;
-                    return;
-                }
-            }
-        }
+    let server_id = match profile.server_node_id.trim().parse() {
+        Ok(id) => id,
+        Err(e) => return fail(format!("Invalid server node id: {e}")),
     };
-    log::info!(
-        "flextunnel client node id for \"{}\": {}",
-        profile.name,
-        endpoint.id()
-    );
-
-    let client = ProxyClient::new(ClientConfig {
-        server_node_id: profile.server_node_id.clone(),
-        auth: ClientAuth::Key(Box::new(client_key)),
-        socks_listen: socks_addr,
-        http_listen: http_addr,
-        relay_urls: profile.relay_urls.clone(),
-        relay_auth_token: profile.relay_auth_token.clone(),
-        auto_reconnect: true,
-        max_reconnect_attempts: None,
-    });
-    let routes = client.routes();
+    // One destination: the profile's server, under the profile's host.
+    // Building the client validates the host and routes and dials nothing.
+    let client = match ProxyClient::new(ClientConfig {
+        destinations: vec![DestinationConfig {
+            host: profile.host.clone(),
+            server_id,
+            auth: ClientAuth::Key(Box::new(client_key)),
+            relay,
+            routed_domains: profile.routed_domains.clone(),
+            routed_cidrs: profile.routed_cidrs.clone(),
+            keep_connected: false,
+        }],
+        idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
+    }) {
+        Ok(client) => client,
+        Err(e) => return fail(e.to_string()),
+    };
+    // The core stores the host normalized; status lookups use that form.
+    let host = client.status().destinations[0].host.clone();
 
     // Bind enabled proxy front-ends before any forward listener exists. A
     // taken proxy port fails the session before forwards come up.
@@ -673,30 +626,27 @@ async fn run_session(
     };
     let (socks_listener, http_listener) = match listeners.await {
         Ok(listeners) => listeners,
-        Err(reason) => {
-            log::error!("{reason}");
-            slot.update(|s| {
-                s.phase = Phase::Failed;
-                s.last_error = Some(reason);
-            });
-            endpoint.close().await;
-            return;
-        }
+        // No endpoint exists yet, so there is nothing to close.
+        Err(reason) => return fail(reason),
     };
 
-    // Forwards run for the whole session (including reconnect gaps — the SOCKS
-    // listener above stays bound); they die with the manager when the session
-    // ends.
+    // Forwards listen for the whole session, whatever the connection is doing
+    // (a forwarded connection connects the server on demand); they die with
+    // the manager when the session ends.
     let mut fwd_mgr = ForwardManager::new(
         tokio::runtime::Handle::current(),
-        client.server_forwarder(),
+        client.dialer(),
         &forwards,
     );
 
-    let run = client.run_with_optional_listeners(&endpoint, socks_listener, http_listener);
-    tokio::pin!(run);
+    // Pressing Connect should say whether the server is reachable, so ask for
+    // one connection attempt up front instead of waiting for the first use.
+    // After that the connection lives, idles out and returns on demand.
+    client.dialer().warm(&host);
+
+    // Boxed so it can be dropped before the endpoint is closed below.
+    let mut run = Box::pin(client.run(LocalListeners::tcp(socks_listener, http_listener)));
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
-    let mut ever_connected = false;
 
     loop {
         tokio::select! {
@@ -714,26 +664,33 @@ async fn run_session(
                 break;
             }
             _ = ticker.tick() => {
-                let routes = routes
-                    .lock()
-                    .map(|r| r.clone())
-                    .unwrap_or_default();
-                ever_connected |= routes.connected;
-                slot.update(|s| {
-                    if routes.connected {
-                        if s.phase != Phase::Connected {
-                            s.connected_since = Some(Instant::now());
-                        }
-                        s.phase = Phase::Connected;
-                    } else {
+                let status = client.status().destinations.swap_remove(0);
+                // A server that refuses this client ends the session, as a
+                // rejected key always has here: the fix is on the server or
+                // in the profile, and Connect tries again.
+                if status.state == DestinationState::Failed {
+                    let reason = status
+                        .last_error
+                        .unwrap_or_else(|| "the server refused this client".into());
+                    log::error!("Client error: {reason}");
+                    slot.update(|s| {
+                        s.phase = Phase::Failed;
                         s.connected_since = None;
-                        s.phase = if ever_connected {
-                            Phase::Reconnecting
-                        } else {
-                            Phase::Connecting
-                        };
-                    }
-                    s.routes = routes;
+                        s.last_error = Some(reason);
+                    });
+                    break;
+                }
+                slot.update(|s| {
+                    s.phase = match status.state {
+                        DestinationState::Connected => Phase::Connected,
+                        DestinationState::Connecting => Phase::Connecting,
+                        DestinationState::Backoff => Phase::Reconnecting,
+                        DestinationState::Idle | DestinationState::Failed => Phase::Standby,
+                    };
+                    s.connected_since = status.connected_since;
+                    // What the last attempt failed with, until one succeeds —
+                    // also while in standby after a drop.
+                    s.last_error = status.last_error;
                 });
                 refresh_forward_statuses(&slot, &fwd_mgr);
             }
@@ -749,7 +706,7 @@ async fn run_session(
                     refresh_forward_statuses(&slot, &fwd_mgr);
                 }
                 Some(SessionCmd::QueryConnPath(reply)) => {
-                    let _ = reply.send(client.connection_snapshot().await);
+                    let _ = reply.send(client.connection_snapshot(&host).await);
                 }
                 Some(SessionCmd::Shutdown) | None => {
                     slot.update(|s| s.phase = Phase::Idle);
@@ -761,13 +718,22 @@ async fn run_session(
 
     // The select loop is done with `run`; dropping it cancels the client.
     // Tear the forward listeners down with the session so their rows read
-    // "stopped" immediately, then close the endpoint gracefully before it is
-    // dropped (see the CLI's run_client for why an ungraceful drop is fatal
-    // under panic=abort).
+    // "stopped" immediately, then close the endpoint (if the server was in
+    // use) gracefully before it is dropped (see the CLI's close_or_exit for
+    // why an ungraceful drop is fatal under panic=abort). The UI already shows
+    // the final phase and this session makes no further command reads, so
+    // release the command channel first: an immediate reconnect may start a
+    // fresh session while this thread finishes closing.
     drop(fwd_mgr);
-    endpoint.close().await;
+    drop(run);
+    drop(rx);
+    if tokio::time::timeout(SESSION_CLOSE_TIMEOUT, client.close())
+        .await
+        .is_err()
+    {
+        log::warn!("Closing the endpoint of \"{}\" is taking too long; giving up", profile.name);
+    }
     slot.update(|s| {
-        s.routes.connected = false;
         s.connected_since = None;
         s.forwards.clear();
     });

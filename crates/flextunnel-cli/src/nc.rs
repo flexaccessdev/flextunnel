@@ -1,9 +1,12 @@
 //! `flextunnel client nc`: relay stdin/stdout through one tunnel to a
-//! server-side `host:port` — an SSH `ProxyCommand` without a SOCKS listener or
-//! an external netcat. The tunnel is opened by the *running* client for the
-//! profile over its control socket (see `ipc.rs`), so it rides that client's
-//! live connection, and like a port forward the server enforces its routed set
-//! and resolves the host.
+//! `host:port` behind one of the client's destinations — an SSH `ProxyCommand`
+//! without a SOCKS listener or an external netcat. The tunnel is opened by the
+//! *running* client over its control socket (see `ipc.rs`), which routes HOST
+//! like a port forward: the destination that routes it connects if it is idle
+//! (this command waits while it does), and its server enforces its routed set
+//! and resolves the host. A destination's own name is its server's loopback,
+//! so `ProxyCommand flextunnel client nc %h %p` under `Host machine1.internal`
+//! reaches that machine's sshd.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -14,19 +17,18 @@ use crate::ipc::{self, IpcClient};
 
 pub fn run(
     config_path: Option<PathBuf>,
-    server_node_id: Option<String>,
+    name: Option<String>,
     host: String,
     port: u16,
 ) -> Result<()> {
-    let instance::Located { key, profile } =
-        instance::locate(config_path, server_node_id, "client nc")?;
+    let located = instance::locate(config_path, name)?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     let res = rt.block_on(async {
-        let Some(client) = IpcClient::connect(&key).await? else {
-            anyhow::bail!("The flextunnel client for {profile} is not running.");
+        let Some(client) = IpcClient::connect(&located.name).await? else {
+            return Err(located.not_running());
         };
         let tunnel = client.open_tunnel(&host, port).await?;
         relay(tunnel).await

@@ -4,9 +4,10 @@
 //! `flextunnel-core` directly — no FFI layer — and drives a sidebar window
 //! (connections, then the server) plus a system tray icon that shows the
 //! server's state. Each client profile is its
-//! own client config and can run its own concurrent tunnel session with its own
-//! optional local SOCKS5 and HTTP proxies plus server-direct port forwards;
-//! connect is always manual.
+//! own client config and can run its own concurrent session with its own
+//! optional local SOCKS5 and HTTP proxies plus port forwards; starting a
+//! session is always manual, and a running session connects to its server on
+//! demand.
 //!
 //! Built on iced's daemon runtime: the process keeps running with no window
 //! open (the tray owns the lifecycle), the window is opened at launch and

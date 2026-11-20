@@ -5,9 +5,7 @@
 use crate::blocklist::{self, BlockList};
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::bridge::BridgeUpstream;
-use crate::proxy::signaling::{
-    self, AcceptedRoutes, BridgeSummary, ControlMsg, HelloResponse, Target,
-};
+use crate::proxy::signaling::{self, ControlMsg, HelloResponse, StreamRequest, Target};
 use crate::proxy::status_page::{
     self, BridgeInboundStatus, BridgeUpstreamStatus, ServerStatusTemplate,
 };
@@ -35,14 +33,6 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// SOCKS5 streams are separately bounded by the QUIC transport's bidi-stream
 /// limit, so this single cap is enough to bound overall task growth.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
-
-/// Deadline for draining a reserved-namespace request after the server has
-/// already written its HTTP response. We drain (rather than drop `recv`) only to
-/// avoid a STOP_SENDING that could truncate the relayed response; a peer that
-/// then neither sends nor closes must not pin the task, so cap the wait.
-const RESERVED_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-/// Cap on the HTTP request head read from a reserved-namespace stream.
-const RESERVED_REQUEST_HEAD_LIMIT: usize = 64 * 1024;
 
 /// QUIC close code used when the server tears a connection down for a
 /// duplicate-id conflict (distinct from the auth-failure code `1`).
@@ -149,11 +139,10 @@ pub struct ProxyServer {
     /// exact host or a `*.suffix` wildcard; see [`resolve_alias`]/[`apply_alias`].
     host_aliases: HashMap<String, String>,
     /// Destinations routed through the tunnel, enforced here as a whitelist: a
-    /// request for a target not on the set is rejected (defense in depth — the
-    /// client should already have split it off; see [`RoutedSet`]).
+    /// request for a target not on the set is rejected (the client routes by
+    /// its own lists; this is the server's say — see [`RoutedSet`]).
     routed_set: RoutedSet,
-    /// Raw routed-set rules, pushed verbatim to clients in the handshake so they
-    /// learn the tunnel set from the server (the single source of truth).
+    /// Raw routed-set rules, shown verbatim on the status page.
     routed_domains: Vec<String>,
     routed_cidrs: Vec<String>,
     /// Conditional DNS forwarding (split-DNS): names under a configured suffix
@@ -221,8 +210,7 @@ impl ProxyServer {
     }
 
     /// The configured host aliases as `(alias, target)` pairs, sorted for
-    /// stable output. Shown on the status page and pushed to clients in the
-    /// `HelloResponse` for their status UIs.
+    /// stable output. Shown on the status page.
     fn sorted_host_aliases(&self) -> Vec<(String, String)> {
         let mut host_aliases: Vec<(String, String)> = self
             .host_aliases
@@ -235,29 +223,12 @@ impl ProxyServer {
 
     /// The configured conditional DNS forwards as `(suffix, servers)` pairs,
     /// sorted by suffix. Empty when no `[dns_forwards]` are configured. Shown on
-    /// the status page and pushed to clients in the `HelloResponse` for their
-    /// status UIs (the resolution itself stays server-side).
+    /// the status page.
     fn dns_forwards(&self) -> Vec<(String, Vec<String>)> {
         self.dns_forwarder
             .as_ref()
             .map(DnsForwarder::forwards)
             .unwrap_or_default()
-    }
-
-    /// The outbound bridge routes as config-only summaries, in name order.
-    /// Pushed to clients in the `HelloResponse` for their status UIs (no live
-    /// state — the handshake snapshot would go stale; the server status page
-    /// shows liveness instead).
-    fn bridge_summaries(&self) -> Vec<BridgeSummary> {
-        self.bridges
-            .iter()
-            .map(|b| BridgeSummary {
-                name: b.config.name.clone(),
-                endpoint_id: b.config.endpoint_id.to_string(),
-                domains: b.config.domains.clone(),
-                cidrs: b.config.cidrs.clone(),
-            })
-            .collect()
     }
 
     /// The outbound bridges with their live connected state, in name order.
@@ -663,18 +634,9 @@ impl ProxyServer {
             }
         };
 
-        // Accept: push the routed set and our server nonce. The control stream is
-        // NOT finished — it stays open for heartbeats.
-        let resp = HelloResponse::accepted(
-            self.server_instance_nonce,
-            AcceptedRoutes {
-                routed_domains: self.routed_domains.clone(),
-                routed_cidrs: self.routed_cidrs.clone(),
-                host_aliases: self.sorted_host_aliases(),
-                dns_forwards: self.dns_forwards(),
-                bridges: self.bridge_summaries(),
-            },
-        );
+        // Accept, with our server nonce. The control stream is NOT finished —
+        // it stays open for heartbeats.
+        let resp = HelloResponse::accepted(self.server_instance_nonce);
         signaling::write_message(&mut send, &signaling::encode_hello_response(&resp)?).await?;
         send.flush().await?;
         log::info!("Client {remote_id} authenticated");
@@ -732,10 +694,10 @@ impl ProxyServer {
             conn_seq,
         };
 
-        // Accept: bridges get no routed set (the bridging server enforces its
-        // own set before forwarding, and this server re-enforces per stream).
-        // The control stream stays open for heartbeats.
-        let resp = HelloResponse::accepted(self.server_instance_nonce, AcceptedRoutes::default());
+        // Accept. The bridging server enforces its own routed set before
+        // forwarding, and this server re-enforces per stream. The control
+        // stream stays open for heartbeats.
+        let resp = HelloResponse::accepted(self.server_instance_nonce);
         signaling::write_message(&mut send, &signaling::encode_hello_response(&resp)?).await?;
         send.flush().await?;
         log::info!("Bridge server {remote_id} authenticated");
@@ -895,48 +857,60 @@ fn resolve_alias<'a>(map: &'a HashMap<String, String>, host: &str) -> Option<&'a
         .map(|(_, value)| value)
 }
 
-/// Handle one SOCKS5 stream from a client (or an inbound bridge): read the
-/// target, then forward it over an outbound **bridge** to another server, or —
-/// for everything else — resolve + connect from the server's own network and
-/// pipe bytes. `from_bridge` streams skip the bridge step (single hop, no
-/// forwarding loops).
+/// Handle one stream from a client (or an inbound bridge): read the request,
+/// then serve it — the server's own loopback or status page, a target
+/// forwarded over an outbound **bridge** to another server, or, for everything
+/// else, resolve + connect from the server's own network and pipe bytes.
+/// `from_bridge` streams skip the bridge step (single hop, no forwarding
+/// loops) and may only ask for a routed target.
 async fn handle_socks_stream(
-    mut send: SendStream,
+    send: SendStream,
     mut recv: RecvStream,
     server: &Arc<ProxyServer>,
     from_bridge: bool,
 ) -> io::Result<()> {
-    let requested = signaling::read_request(&mut recv).await?;
-
-    // Reserved `flextunnel.internal` namespace: handled by the server itself,
-    // bypassing the routed-set whitelist, bridges and host aliases. The client
-    // always tunnels these names, so no operator config is needed to reach
-    // them. `localhost.flextunnel.internal` is the server's own loopback (dialed
-    // exactly like `localhost`, dual-stack); the rest is a status page or a
-    // reserved 404.
-    if let Target::Domain(host, port) = &requested
-        && reserved::is_reserved_host(host)
-    {
-        if reserved::is_localhost_host(host) {
-            let target = Target::Domain("localhost".to_string(), *port);
-            log::debug!("Reserved loopback host {host} -> {target:?}");
+    let requested = match signaling::read_request(&mut recv).await? {
+        StreamRequest::Connect(target) => target,
+        // The server's own loopback and status page are for its admitted
+        // clients — a destination's own name on the client side. Another
+        // server bridging in is not one: it forwards its clients' routed
+        // targets, nothing else.
+        StreamRequest::Loopback(_) | StreamRequest::Status if from_bridge => {
+            log::warn!("Bridge asked for this server's loopback or status page; rejecting");
+            return reject_not_allowed(send).await;
+        }
+        // Dialed exactly like `localhost` (dual-stack), outside the routed-set
+        // whitelist, bridges and host aliases: no operator config is needed
+        // to reach the machine the server runs on.
+        StreamRequest::Loopback(port) => {
+            let target = Target::Domain("localhost".to_string(), port);
+            log::debug!("Loopback request -> {target:?}");
             return dial::connect_and_pipe(send, recv, &target, server.dns_forwarder.as_ref())
                 .await;
         }
-        return serve_reserved(send, recv, server, reserved::is_status_host(host)).await;
+        StreamRequest::Status => return serve_status(send, recv, server).await,
+    };
+
+    // The reserved `flextunnel.internal` namespace belongs to the client, which
+    // answers it locally and never sends it. Refuse it here before the routed
+    // set, so no `routed_domains = ["*"]` can capture it and hand a name
+    // flextunnel owns to the server's resolver.
+    if let Target::Domain(host, _) = &requested
+        && reserved::is_reserved_host(host)
+    {
+        log::warn!("Tunnel request for reserved name {host} rejected");
+        return reject_not_allowed(send).await;
     }
 
     // Enforce the routed set as a whitelist on the requested target (before
-    // aliasing/routing), as a defense-in-depth boundary: a well-behaved client
-    // only tunnels on-list targets, so a request for anything off-list means a
-    // misconfigured or untrusted client. Reject with the SOCKS5 "not allowed by
-    // ruleset" code.
+    // aliasing/routing). The client routes by its own configured lists, which
+    // this server never sees, so a request for anything off-list means the two
+    // sides disagree (or an untrusted client). Reject with the SOCKS5 "not
+    // allowed by ruleset" code.
     if !server.routed_set.allows(&requested) {
         log::warn!("Tunnel request rejected by routed-set whitelist");
         log::debug!("Rejected {requested:?}: not in routed-set whitelist");
-        signaling::write_reply(&mut send, signaling::REP_NOT_ALLOWED).await?;
-        send.flush().await?;
-        return Ok(());
+        return reject_not_allowed(send).await;
     }
 
     // Bridge routes: a matching target is forwarded verbatim (no aliasing —
@@ -952,130 +926,45 @@ async fn handle_socks_stream(
     dial::connect_and_pipe(send, recv, &target, server.dns_forwarder.as_ref()).await
 }
 
-/// Serve a reserved `flextunnel.internal` request: the status page for the exact
-/// host, or a "reserved for future use" 404 for a `*.flextunnel.internal`
-/// subdomain. Both are HTTP responses written over the tunnel stream.
-async fn serve_reserved(
+/// Answer a stream with "connection not allowed by ruleset".
+async fn reject_not_allowed(mut send: SendStream) -> io::Result<()> {
+    signaling::write_reply(&mut send, signaling::REP_NOT_ALLOWED).await?;
+    send.flush().await
+}
+
+/// Serve the status page: the success reply byte, then an HTTP response to the
+/// HTTP request the client wrote after its [`StreamRequest::Status`] header
+/// (its path and `Accept` pick HTML, text or JSON).
+async fn serve_status(
     mut send: SendStream,
     mut recv: RecvStream,
     server: &Arc<ProxyServer>,
-    is_status: bool,
 ) -> io::Result<()> {
-    if is_status {
-        log::debug!("Serving flextunnel.internal status page");
-        status_page::write_tunnel_success(&mut send).await?;
-        let request_head = read_reserved_request_head(&mut recv).await;
-        let format = status_format_for_reserved_request(&request_head);
-        let (status_line, content_type, body) =
-            status_page::render_status(&server.build_status_template(), format);
-        status_page::write_http_payload(&mut send, status_line, content_type, &body).await?;
-    } else {
-        log::debug!("Serving reserved flextunnel.internal subdomain 404");
-        let (status_line, content_type, body) = status_page::render_reserved_404();
-        status_page::write_http_response(&mut send, status_line, content_type, &body).await?;
-    }
+    log::debug!("Serving the server status page");
+    status_page::write_tunnel_success(&mut send).await?;
+    let head = status_page::read_request_head(&mut recv).await;
+    let request = status_page::parse_status_request(&head);
+    let format = status_page::status_format_for(&request.path, request.accept);
+    let (status_line, content_type, body) =
+        status_page::render_status(&server.build_status_template(), format);
+    status_page::write_http_payload(&mut send, status_line, content_type, &body).await?;
+    let _ = send.finish();
 
-    drain_reserved_request(&mut recv).await;
-    Ok(())
-}
-
-async fn read_reserved_request_head(recv: &mut RecvStream) -> Vec<u8> {
-    let mut head = Vec::with_capacity(512);
-    let mut buf = [0u8; 1024];
-    while head.len() < RESERVED_REQUEST_HEAD_LIMIT {
-        let read_len = buf.len().min(RESERVED_REQUEST_HEAD_LIMIT - head.len());
-        match tokio::time::timeout(RESERVED_DRAIN_TIMEOUT, recv.read(&mut buf[..read_len])).await {
-            Ok(Ok(Some(n))) => {
-                head.extend_from_slice(&buf[..n]);
-                if head.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
-        }
-    }
-    head
-}
-
-fn status_format_for_reserved_request(head: &[u8]) -> status_page::StatusFormat {
-    let Ok(head) = std::str::from_utf8(head) else {
-        return status_page::StatusFormat::Html;
-    };
-    let mut lines = head.split("\r\n");
-    if let Some(request_line) = lines.next() {
-        let mut parts = request_line.split_ascii_whitespace();
-        let _method = parts.next();
-        if let Some(target) = parts.next()
-            && let Some(format) = request_target_status_format(target)
-        {
-            return format;
-        }
-    }
-
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        if name.eq_ignore_ascii_case("accept")
-            && let Some(format) = status_format_for_accept(value)
-        {
-            return format;
-        }
-    }
-
-    status_page::StatusFormat::Html
-}
-
-fn request_target_status_format(target: &str) -> Option<status_page::StatusFormat> {
-    let path = if let Some(rest) = strip_http_scheme(target) {
-        match rest.find(['/', '?']) {
-            Some(i) => &rest[i..],
-            None => "/",
-        }
-    } else {
-        target
-    };
-    let path = path.split_once('?').map_or(path, |(path, _)| path);
-    match path {
-        status_page::STATUS_TEXT_PATH => Some(status_page::StatusFormat::Text),
-        status_page::STATUS_JSON_PATH => Some(status_page::StatusFormat::Json),
-        _ => None,
-    }
-}
-
-fn status_format_for_accept(value: &str) -> Option<status_page::StatusFormat> {
-    value.split(',').find_map(|part| {
-        let media_type = part.trim().split(';').next()?.trim();
-        if media_type.eq_ignore_ascii_case("application/json") {
-            Some(status_page::StatusFormat::Json)
-        } else if media_type.eq_ignore_ascii_case("text/plain") {
-            Some(status_page::StatusFormat::Text)
-        } else {
-            None
-        }
-    })
-}
-
-fn strip_http_scheme(target: &str) -> Option<&str> {
-    let (prefix, rest) = target.split_at_checked("http://".len())?;
-    prefix.eq_ignore_ascii_case("http://").then_some(rest)
-}
-
-async fn drain_reserved_request(recv: &mut RecvStream) {
-    // Drain the peer's HTTP request instead of dropping `recv` immediately: an
+    // Drain the peer's request instead of dropping `recv` immediately: an
     // abrupt drop sends STOP_SENDING, which can truncate the response as the
     // client relays it. We sent `Connection: close`, so the peer closes after
     // reading the response, giving us EOF. Bounded by both a byte cap and a
     // per-read timeout so a peer that never sends nor closes can't pin the task.
     let mut buf = [0u8; 4096];
     let mut drained = 0usize;
-    while drained < RESERVED_REQUEST_HEAD_LIMIT {
-        match tokio::time::timeout(RESERVED_DRAIN_TIMEOUT, recv.read(&mut buf)).await {
+    while drained < status_page::REQUEST_HEAD_LIMIT {
+        match tokio::time::timeout(status_page::REQUEST_READ_TIMEOUT, recv.read(&mut buf)).await {
             Ok(Ok(Some(n))) => drained += n,
             // EOF, read error, or drain timeout: stop draining.
             Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
         }
     }
+    Ok(())
 }
 
 /// Forward a client stream over an outbound bridge: open a stream on the
@@ -1113,7 +1002,7 @@ async fn route_to_bridge(
     // The target server replies and pipes using the same wire format the client
     // expects, so we splice raw.
     log::debug!("Routing over bridge '{name}' -> {target:?}");
-    signaling::write_request(&mut bridge_send, target).await?;
+    signaling::write_request(&mut bridge_send, &StreamRequest::Connect(target.clone())).await?;
     bridge_send.flush().await?;
 
     let mut client_side = tokio::io::join(client_recv, client_send);

@@ -214,8 +214,6 @@ impl BridgeUpstream {
             let reason = response.reject_reason.unwrap_or_else(|| "unknown".to_string());
             return Err(ProxyError::AuthenticationFailed(reason));
         }
-        // The target server pushes no routed set to a bridge (it re-enforces its
-        // own set per stream); ignore any list fields.
         Ok((send, recv))
     }
 }

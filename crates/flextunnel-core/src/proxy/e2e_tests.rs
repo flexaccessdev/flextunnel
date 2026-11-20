@@ -1,11 +1,16 @@
-//! End-to-end duplicate-id detection tests over real (loopback) iroh endpoints.
+//! End-to-end tests over real (loopback) iroh endpoints.
 //!
-//! These exercise the *actual* [`ProxyServer`] accept/handshake path — not just
-//! the codecs — by binding endpoints to `127.0.0.1:0` with relay + discovery
-//! disabled and connecting via a direct address, so they are fully hermetic (no
-//! network, no relay, deterministic).
+//! These exercise the *actual* [`ProxyServer`] accept/handshake path and the
+//! full [`ProxyClient`] session — not just the codecs — by binding endpoints to
+//! `127.0.0.1:0` with relay + discovery disabled and connecting via a direct
+//! address, so they are fully hermetic (no network, no relay, deterministic).
 //!
-//! They cover both misconfiguration guard rails:
+//! The client tests cover the lazy model: nothing connects before first use,
+//! each destination reaches its own server, routes pick the destination,
+//! requests are held while a destination connects, an idle connection is
+//! closed and redialed, and one destination's failure leaves the others alone.
+//!
+//! The server tests cover both misconfiguration guard rails:
 //!
 //! * **Duplicate server** — a client advisory makes the server self-block (record
 //!   its own id + shut down), and a server refuses to start once its id is
@@ -16,13 +21,16 @@
 //!   duplicate client id, exactly as the design intends.
 
 use crate::blocklist::BlockList;
-use crate::proxy::signaling::{self, BridgeHello, Hello, HelloResponse, Target};
+use crate::proxy::signaling::{self, BridgeHello, Hello, HelloResponse, StreamRequest, Target};
 use crate::proxy::dns_forward::DnsForwarder;
 use crate::proxy::{
-    BridgeUpstream, BridgeUpstreamConfig, ClientAuth, ClientConfig, ForwardManager, ForwardSpec,
-    ProxyClient, ProxyServer, ProxyServerParams, RoutedSet, ServerForwarder, reserved,
+    BridgeUpstream, BridgeUpstreamConfig, ClientAuth, ClientConfig, DestinationConfig,
+    DestinationState, DestinationStatus, EndpointProvider, ForwardManager, ForwardSpec,
+    LocalListeners, ProxyClient, ProxyServer, ProxyServerParams, RoutedSet,
 };
-use crate::transport::endpoint::{AllowlistHook, ClientEndpoint, EndpointAllowlists};
+use crate::transport::endpoint::{
+    AllowlistHook, ClientEndpoint, EndpointAllowlists, RelayConfig,
+};
 use crate::transport::{ALPN, BRIDGE_ALPN, QUICK_ALPN, build_quic_transport_config};
 use iroh::address_lookup::MemoryLookup;
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
@@ -32,7 +40,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 /// The one authorized client keypair shared by the tests: servers authorize
 /// its public half, clients sign their handshakes with it.
@@ -214,6 +222,21 @@ fn spawn_server_params(endpoint: Endpoint, params: ProxyServerParams) {
     });
 }
 
+/// [`spawn_server_params`], keeping a handle to the server so a test can ask
+/// which clients are connected to it.
+fn spawn_server_handle(endpoint: Endpoint, params: ProxyServerParams) -> Arc<ProxyServer> {
+    let server = ProxyServer::new(params);
+    tokio::spawn({
+        let server = server.clone();
+        async move {
+            if let Err(e) = server.run(&endpoint).await {
+                eprintln!("e2e test server task ended: {e}");
+            }
+        }
+    });
+    server
+}
+
 /// A routed set (and its raw rules) for all of loopback — what the bridge tests
 /// tunnel and bridge.
 fn loopback_cidr_set() -> (RoutedSet, Vec<String>) {
@@ -385,7 +408,7 @@ async fn assert_rejected_by_allowlist(
 async fn assert_echo_roundtrip(conn: &Connection, port: u16) {
     let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
     let target = Target::Ip(format!("127.0.0.1:{port}").parse().unwrap());
-    signaling::write_request(&mut send, &target).await.unwrap();
+    signaling::write_request(&mut send, &StreamRequest::Connect(target)).await.unwrap();
     send.flush().await.unwrap();
     let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
     assert_eq!(rep, signaling::REP_SUCCESS, "tunnel stream should connect");
@@ -396,36 +419,855 @@ async fn assert_echo_roundtrip(conn: &Connection, port: u16) {
     assert_eq!(&buf, b"HELLOping");
 }
 
-/// Port forwards bypass the local proxy front-ends: the listener hands an
-/// accepted TCP stream straight to a QUIC data stream. The same server rejects
-/// a target outside its routed-set whitelist before attempting to dial it.
+/// Every endpoint a client under test has built, in build order.
+type Built = Arc<std::sync::Mutex<Vec<Endpoint>>>;
+
+/// A hermetic [`EndpointProvider`]: each destination endpoint — and each
+/// rebuild of one — is a fresh loopback endpoint resolving servers through
+/// `lookup`, recorded in the returned [`Built`] list so a test can count the
+/// builds and inspect the endpoints.
+fn loopback_provider(lookup: MemoryLookup) -> (EndpointProvider, Built) {
+    let built: Built = Default::default();
+    let provider: EndpointProvider = {
+        let built = built.clone();
+        Arc::new(move |cfg: &DestinationConfig| {
+            // A quick destination's endpoint must present its session identity.
+            let secret = match &cfg.auth {
+                ClientAuth::Quick(secret) => Some((**secret).clone()),
+                ClientAuth::Key(_) => None,
+            };
+            let (lookup, built) = (lookup.clone(), built.clone());
+            let build = move || {
+                let (lookup, built, secret) = (lookup.clone(), built.clone(), secret.clone());
+                async move {
+                    let endpoint = loopback_endpoint_full(
+                        secret.unwrap_or_else(SecretKey::generate),
+                        false,
+                        lookup,
+                        EndpointAllowlists::default(),
+                    )
+                    .await;
+                    built.lock().unwrap().push(endpoint.clone());
+                    endpoint
+                }
+            };
+            Box::pin(async move {
+                let first = build().await;
+                Ok(ClientEndpoint::from_parts(
+                    first,
+                    Arc::new(move || {
+                        let next = build();
+                        Box::pin(async move { Ok(next.await) })
+                    }),
+                ))
+            })
+        })
+    };
+    (provider, built)
+}
+
+/// A destination named `host` for the server `server_id`, authenticating with
+/// [`test_client_key`] and routing nothing beyond its own name.
+fn destination(host: &str, server_id: EndpointId) -> DestinationConfig {
+    DestinationConfig {
+        host: host.to_string(),
+        server_id,
+        auth: ClientAuth::Key(Box::new(test_client_key().clone())),
+        relay: RelayConfig::default(),
+        routed_domains: Vec::new(),
+        routed_cidrs: Vec::new(),
+        keep_connected: false,
+    }
+}
+
+fn strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| s.to_string()).collect()
+}
+
+/// A full [`ProxyClient`] session with real SOCKS5 and HTTP front-ends.
+struct TestClient {
+    client: Arc<ProxyClient>,
+    socks: SocketAddr,
+    http: SocketAddr,
+    built: Built,
+    session: tokio::task::JoinHandle<()>,
+}
+
+impl TestClient {
+    fn status(&self, host: &str) -> DestinationStatus {
+        self.client
+            .status()
+            .destinations
+            .into_iter()
+            .find(|d| d.host == host)
+            .unwrap_or_else(|| panic!("no destination {host}"))
+    }
+
+    fn state(&self, host: &str) -> DestinationState {
+        self.status(host).state
+    }
+
+    /// How many endpoints the client has built so far.
+    fn built(&self) -> usize {
+        self.built.lock().unwrap().len()
+    }
+
+    fn endpoint(&self, index: usize) -> Endpoint {
+        self.built.lock().unwrap()[index].clone()
+    }
+}
+
+impl Drop for TestClient {
+    fn drop(&mut self) {
+        self.session.abort();
+    }
+}
+
+/// Start a client session over `destinations`, whose endpoints resolve servers
+/// through `lookup`.
+async fn start_client(
+    destinations: Vec<DestinationConfig>,
+    idle_timeout: Option<Duration>,
+    lookup: MemoryLookup,
+) -> TestClient {
+    let (provider, built) = loopback_provider(lookup);
+    let client = Arc::new(
+        ProxyClient::with_endpoint_provider(
+            ClientConfig {
+                destinations,
+                idle_timeout,
+            },
+            provider,
+        )
+        .unwrap(),
+    );
+    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (socks, http) = (
+        socks_listener.local_addr().unwrap(),
+        http_listener.local_addr().unwrap(),
+    );
+    let session = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let listeners = LocalListeners::tcp(Some(socks_listener), Some(http_listener));
+            if let Err(e) = client.run(listeners).await {
+                eprintln!("e2e test client session ended: {e}");
+            }
+        }
+    });
+    TestClient {
+        client,
+        socks,
+        http,
+        built,
+        session,
+    }
+}
+
+/// Greet the SOCKS5 proxy at `socks` and send a CONNECT for `host:port`
+/// (domain form), without waiting for the reply.
+async fn socks_request(socks: SocketAddr, host: &str, port: u16) -> TcpStream {
+    let mut app = TcpStream::connect(socks).await.unwrap();
+    app.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut method = [0u8; 2];
+    with_timeout(app.read_exact(&mut method)).await.unwrap();
+    assert_eq!(method, [0x05, 0x00], "no-auth method selected");
+    let mut request = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+    request.extend_from_slice(host.as_bytes());
+    request.extend_from_slice(&port.to_be_bytes());
+    app.write_all(&request).await.unwrap();
+    app
+}
+
+/// Read the SOCKS5 CONNECT reply and return its reply code.
+async fn socks_reply(app: &mut TcpStream) -> u8 {
+    let mut reply = [0u8; 10];
+    with_timeout(app.read_exact(&mut reply)).await.unwrap();
+    reply[1]
+}
+
+/// SOCKS5 CONNECT to `host:port` through the proxy at `socks`.
+async fn socks_connect(socks: SocketAddr, host: &str, port: u16) -> (TcpStream, u8) {
+    let mut app = socks_request(socks, host, port).await;
+    let rep = socks_reply(&mut app).await;
+    (app, rep)
+}
+
+/// Complete the [`spawn_echo`] exchange on a connected stream: the "HELLO"
+/// greeting, then our bytes echoed back.
+async fn expect_echo<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(app: &mut S) {
+    let mut greeting = [0u8; 5];
+    with_timeout(app.read_exact(&mut greeting)).await.unwrap();
+    assert_eq!(&greeting, b"HELLO");
+    app.write_all(b"ping").await.unwrap();
+    let mut echoed = [0u8; 4];
+    with_timeout(app.read_exact(&mut echoed)).await.unwrap();
+    assert_eq!(&echoed, b"ping");
+}
+
+/// SOCKS5 CONNECT to `host:port` and run the echo exchange, returning the
+/// still-open stream.
+async fn socks_echo(socks: SocketAddr, host: &str, port: u16) -> TcpStream {
+    let (mut app, rep) = socks_connect(socks, host, port).await;
+    assert_eq!(rep, signaling::REP_SUCCESS, "CONNECT {host}:{port} should succeed");
+    expect_echo(&mut app).await;
+    app
+}
+
+/// `GET path` on `http://flextunnel.internal` through the SOCKS5 proxy,
+/// returning the whole HTTP response.
+async fn status_get(socks: SocketAddr, path: &str) -> String {
+    let (mut app, rep) = socks_connect(socks, "flextunnel.internal", 80).await;
+    assert_eq!(rep, signaling::REP_SUCCESS, "the status host always answers");
+    app.write_all(format!("GET {path} HTTP/1.1\r\nHost: flextunnel.internal\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    with_timeout(app.read_to_end(&mut response)).await.unwrap();
+    String::from_utf8(response).unwrap()
+}
+
+/// A loopback server endpoint plus the address a client reaches it at.
+async fn server_endpoint(secret: SecretKey) -> (Endpoint, EndpointAddr) {
+    let endpoint = loopback_endpoint(secret, true).await;
+    let addr = EndpointAddr::new(endpoint.id()).with_ip_addr(endpoint.bound_sockets()[0]);
+    (endpoint, addr)
+}
+
+/// Nothing happens until a destination is used: no endpoint is built, the
+/// server sees no client. The first request for the destination's own name
+/// connects it and reaches the server's loopback; the connection then stays
+/// for the next request.
 #[tokio::test]
-async fn server_direct_forward_relays_and_server_rejects_off_list_target() {
-    let bl_path = temp_blocklist("server-direct-forward");
-    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
-    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
+async fn nothing_connects_before_first_use() {
+    let echo_port = spawn_echo().await;
+    let (server_ep, server_addr) = server_endpoint(SecretKey::generate()).await;
+    let server_id = server_ep.id();
+    let bl_path = temp_blocklist("lazy-first-use");
+    // An empty routed set: the destination's own name needs no server config.
+    let server = spawn_server_handle(server_ep, base_params(server_id, bl_path.clone()));
+
+    let client = start_client(
+        vec![destination("m1.internal", server_id)],
+        Some(Duration::from_secs(300)),
+        MemoryLookup::from_endpoint_info(vec![server_addr]),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(client.built(), 0, "no endpoint before first use");
+    assert_eq!(client.state("m1.internal"), DestinationState::Idle);
+    assert!(server.connected_client_keys().is_empty(), "the server saw nobody");
+    // Looking at the client's status is not a use.
+    let page = status_get(client.socks, "/status.json").await;
+    assert!(page.contains("\"state\": \"idle\""), "{page}");
+    assert_eq!(client.built(), 0, "the status page connects nothing");
+
+    let app = socks_echo(client.socks, "m1.internal", echo_port).await;
+    assert_eq!(client.built(), 1);
+    let status = client.status("m1.internal");
+    assert_eq!(status.state, DestinationState::Connected);
+    assert_eq!(status.open_streams, 1);
+    assert!(status.connected_since.is_some() && status.client_node_id.is_some());
+    assert_eq!(server.connected_client_keys(), [test_client_key().public_str()]);
+
+    // The stream ends; the connection stays for the next request.
+    drop(app);
+    wait_until("the stream to be released", || {
+        client.status("m1.internal").open_streams == 0
+    })
+    .await;
+    assert_eq!(client.state("m1.internal"), DestinationState::Connected);
+    let _app = socks_echo(client.socks, "m1.internal", echo_port).await;
+    assert_eq!(client.built(), 1, "the second request reused the connection");
+
+    let _ = std::fs::remove_file(bl_path);
+}
+
+/// Each destination name reaches its own server, and using one leaves the
+/// other untouched.
+#[tokio::test]
+async fn each_destination_reaches_its_own_server() {
+    let echo_port = spawn_echo().await;
+    let (ep1, addr1) = server_endpoint(SecretKey::generate()).await;
+    let (ep2, addr2) = server_endpoint(SecretKey::generate()).await;
+    let (id1, id2) = (ep1.id(), ep2.id());
+    let server1 = spawn_server_handle(ep1, base_params(id1, temp_blocklist("two-dest-1")));
+    let server2 = spawn_server_handle(ep2, base_params(id2, temp_blocklist("two-dest-2")));
+
+    let client = start_client(
+        vec![destination("m1.internal", id1), destination("m2.internal", id2)],
+        None,
+        MemoryLookup::from_endpoint_info(vec![addr1, addr2]),
+    )
+    .await;
+
+    let _app2 = socks_echo(client.socks, "m2.internal", echo_port).await;
+    assert_eq!(client.state("m2.internal"), DestinationState::Connected);
+    assert_eq!(client.state("m1.internal"), DestinationState::Idle);
+    assert_eq!(client.built(), 1);
+    assert_eq!(server2.connected_client_keys().len(), 1);
+    assert!(server1.connected_client_keys().is_empty(), "server 1 was never dialed");
+
+    let _app1 = socks_echo(client.socks, "M1.Internal", echo_port).await;
+    assert_eq!(client.state("m1.internal"), DestinationState::Connected);
+    assert_eq!(client.built(), 2, "each destination has its own endpoint");
+    assert_eq!(server1.connected_client_keys().len(), 1);
+    assert_ne!(
+        client.status("m1.internal").client_node_id,
+        client.status("m2.internal").client_node_id
+    );
+}
+
+/// The client's routes pick the destination — the most specific rule across
+/// destinations wins — and a target on nobody's list is dialed directly,
+/// connecting nothing.
+#[tokio::test]
+async fn routes_pick_the_destination_and_the_rest_goes_direct() {
+    let echo_port = spawn_echo().await;
+    let (ep1, addr1) = server_endpoint(SecretKey::generate()).await;
+    let (ep2, addr2) = server_endpoint(SecretKey::generate()).await;
+    let (id1, id2) = (ep1.id(), ep2.id());
+    // Each server routes what its destination sends it, aliased to loopback
+    // so the echo server answers.
+    let server_params = |id, tag: &str, domains: &[&str], cidrs: &[&str]| {
+        let (domains, cidrs) = (strings(domains), strings(cidrs));
+        ProxyServerParams {
+            host_aliases: domains
+                .iter()
+                .map(|d| (d.clone(), "127.0.0.1".to_string()))
+                .collect(),
+            routed_set: RoutedSet::new(&domains, &cidrs).unwrap(),
+            routed_domains: domains,
+            routed_cidrs: cidrs,
+            ..base_params(id, temp_blocklist(tag))
+        }
+    };
+    spawn_server_params(ep1, server_params(id1, "routes-1", &["*.corp.test"], &[]));
+    spawn_server_params(
+        ep2,
+        server_params(id2, "routes-2", &["db.corp.test"], &["127.0.0.0/8"]),
+    );
+
+    let mut m1 = destination("m1.internal", id1);
+    m1.routed_domains = strings(&["*.corp.test"]);
+    let mut m2 = destination("m2.internal", id2);
+    m2.routed_domains = strings(&["db.corp.test"]);
+    m2.routed_cidrs = strings(&["127.0.0.1"]);
+    let client = start_client(
+        vec![m1, m2],
+        None,
+        MemoryLookup::from_endpoint_info(vec![addr1, addr2]),
+    )
+    .await;
+    let streams = |host: &str| client.status(host).open_streams;
+
+    // `localhost` is on no list: dialed from here, nothing connects.
+    let direct = socks_echo(client.socks, "localhost", echo_port).await;
+    assert_eq!(client.built(), 0, "a direct target builds no endpoint");
+    assert_eq!((streams("m1.internal"), streams("m2.internal")), (0, 0));
+    drop(direct);
+
+    // A wildcard route → its destination.
+    let api = socks_echo(client.socks, "api.corp.test", echo_port).await;
+    assert_eq!((streams("m1.internal"), streams("m2.internal")), (1, 0));
+    assert_eq!(client.state("m2.internal"), DestinationState::Idle);
+
+    // An exact route on the other destination beats that wildcard.
+    let db = socks_echo(client.socks, "db.corp.test", echo_port).await;
+    assert_eq!((streams("m1.internal"), streams("m2.internal")), (1, 1));
+
+    // An IP (here in domain form) is routed by network.
+    let ip = socks_echo(client.socks, "127.0.0.1", echo_port).await;
+    assert_eq!((streams("m1.internal"), streams("m2.internal")), (1, 2));
+
+    drop((api, db, ip));
+}
+
+/// A client route its server does not also list is refused by that server:
+/// the server's routed set stays the authority.
+#[tokio::test]
+async fn a_route_the_server_does_not_list_is_refused() {
+    let (server_ep, server_addr) = server_endpoint(SecretKey::generate()).await;
+    let server_id = server_ep.id();
+    spawn_server_params(server_ep, base_params(server_id, temp_blocklist("route-refused")));
+
+    let mut m1 = destination("m1.internal", server_id);
+    m1.routed_domains = strings(&["*.corp.test"]);
+    let client = start_client(
+        vec![m1],
+        None,
+        MemoryLookup::from_endpoint_info(vec![server_addr]),
+    )
+    .await;
+    let (_app, rep) = socks_connect(client.socks, "api.corp.test", 443).await;
+    assert_eq!(rep, signaling::REP_NOT_ALLOWED);
+    // The destination did connect — the refusal is the server's answer.
+    assert_eq!(client.state("m1.internal"), DestinationState::Connected);
+}
+
+/// Port forwards and `nc` go through the dialer, which holds a request while
+/// its destination connects — here across a server that is not up yet, then
+/// comes up: a failed first attempt is retried for the request still waiting.
+///
+/// The stand-in for "not up yet" is the server's own endpoint with nothing
+/// serving on it: every accepted connection is closed on the spot, so an
+/// attempt fails fast (the alternative, a dead address, would sit out the
+/// full connect timeout per attempt). The server then comes up on that same
+/// endpoint — same identity, same address — exactly as a late-starting
+/// service would.
+#[tokio::test]
+async fn dialer_holds_while_the_server_comes_up() {
+    let echo_port = spawn_echo().await;
+    let (server_ep, server_addr) = server_endpoint(SecretKey::generate()).await;
+    let server_id = server_ep.id();
+    let bl_path = temp_blocklist("dialer-hold");
+    let params = base_params(server_id, bl_path.clone());
+
+    let (up_tx, mut up_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn({
+        let server_ep = server_ep.clone();
+        async move {
+            loop {
+                // Only the accept wait is cancellable: an accepted connection
+                // is always answered (closed), never dropped on the floor.
+                let incoming = tokio::select! {
+                    incoming = server_ep.accept() => incoming,
+                    _ = up_rx.wait_for(|up| *up) => break,
+                };
+                let Some(incoming) = incoming else { return };
+                if let Ok(conn) = incoming.await {
+                    conn.close(0u32.into(), b"not up yet");
+                }
+            }
+            let server = ProxyServer::new(params);
+            if let Err(e) = server.run(&server_ep).await {
+                eprintln!("e2e dialer-hold test server task ended: {e}");
+            }
+        }
+    });
+
+    let client = start_client(
+        vec![destination("m1.internal", server_id)],
+        None,
+        MemoryLookup::from_endpoint_info(vec![server_addr]),
+    )
+    .await;
+    let dialer = client.client.dialer();
+
+    // A forward to a host no destination routes is refused outright.
+    let unrouted = dialer
+        .connect(&Target::Domain("off-list.invalid".into(), 443))
+        .await
+        .err()
+        .expect("unrouted target refused");
+    assert!(unrouted.to_string().contains("no destination routes"), "{unrouted:#}");
+    assert_eq!(client.built(), 0);
+
+    // The request makes the destination dial; the attempt fails; the request
+    // stays held and the destination reports the failure.
+    let pending = tokio::spawn({
+        let dialer = dialer.clone();
+        async move {
+            dialer
+                .connect(&Target::Domain("m1.internal".into(), echo_port))
+                .await
+        }
+    });
+    wait_until("the first attempt to fail", || {
+        client.status("m1.internal").failed_attempts >= 1
+    })
+    .await;
+    assert!(!pending.is_finished(), "the request is held, not failed");
+    let status = client.status("m1.internal");
+    assert_eq!(status.waiting, 1);
+    assert!(status.last_error.is_some() && status.next_attempt_at.is_some());
+
+    // The server comes up; the retry (1s backoff) lands and the held request
+    // proceeds as if nothing had happened.
+    up_tx.send_replace(true);
+    let mut stream = with_timeout(pending).await.unwrap().expect("held request connects");
+    expect_echo(&mut stream).await;
+    let status = client.status("m1.internal");
+    assert_eq!(status.state, DestinationState::Connected);
+    assert_eq!(status.failed_attempts, 0, "a connection clears the outage");
+    assert!(status.last_error.is_none());
+    assert_eq!((status.open_streams, status.waiting), (1, 0));
+
+    let _ = std::fs::remove_file(bl_path);
+}
+
+/// A connection with no stream open for the idle timeout is closed, endpoint
+/// and all, and the server sees the client leave; an open stream keeps it up
+/// however long it lasts. The next request redials on a fresh endpoint.
+#[tokio::test]
+async fn idle_connection_is_closed_and_redialed_on_demand() {
+    let echo_port = spawn_echo().await;
+    let (server_ep, server_addr) = server_endpoint(SecretKey::generate()).await;
+    let server_id = server_ep.id();
+    let bl_path = temp_blocklist("idle-timeout");
+    let server = spawn_server_handle(server_ep, base_params(server_id, bl_path.clone()));
+
+    let idle_timeout = Duration::from_millis(300);
+    let client = start_client(
+        vec![destination("m1.internal", server_id)],
+        Some(idle_timeout),
+        MemoryLookup::from_endpoint_info(vec![server_addr]),
+    )
+    .await;
+
+    // In use: well past the idle timeout, the connection is still there.
+    let mut app = socks_echo(client.socks, "m1.internal", echo_port).await;
+    tokio::time::sleep(idle_timeout * 3).await;
+    assert_eq!(client.state("m1.internal"), DestinationState::Connected);
+    app.write_all(b"more").await.unwrap();
+    let mut echoed = [0u8; 4];
+    with_timeout(app.read_exact(&mut echoed)).await.unwrap();
+    assert_eq!(&echoed, b"more");
+
+    // Unused: it closes, and so does its endpoint.
+    drop(app);
+    wait_until("the idle connection to close", || {
+        client.state("m1.internal") == DestinationState::Idle
+    })
+    .await;
+    let first = client.endpoint(0);
+    wait_until("the idle endpoint to close", || first.is_closed()).await;
+    wait_until("the server to see the client leave", || {
+        server.connected_client_keys().is_empty()
+    })
+    .await;
+    wait_until("the endpoint to be forgotten", || {
+        client.status("m1.internal").client_node_id.is_none()
+    })
+    .await;
+    assert_eq!(client.status("m1.internal").failed_attempts, 0, "idling is not a failure");
+
+    // The next request redials, on a new endpoint.
+    let _app = socks_echo(client.socks, "m1.internal", echo_port).await;
+    assert_eq!(client.built(), 2);
+    assert_eq!(client.state("m1.internal"), DestinationState::Connected);
+
+    let _ = std::fs::remove_file(bl_path);
+}
+
+/// A connection that drops with nobody using it is not redialed: the
+/// destination goes idle and stays idle — no background reconnect loop —
+/// until a request wants it, which is then held for the redial.
+#[tokio::test]
+async fn a_dropped_connection_is_redialed_only_on_demand() {
+    let echo_port = spawn_echo().await;
+
+    // First server incarnation, on a secret the test keeps to resurrect it.
+    let server_secret = SecretKey::generate();
+    let (server_ep, server_addr) = server_endpoint(server_secret.clone()).await;
+    let server_id = server_ep.id();
+    let bl_path = temp_blocklist("drop-no-redial");
+    spawn_server_params(server_ep.clone(), base_params(server_id, bl_path.clone()));
+
+    // The lookup is held externally so the resurrected server's fresh address
+    // can be published mid-test.
+    let lookup = MemoryLookup::from_endpoint_info(vec![server_addr]);
+    let client = start_client(vec![destination("m1.internal", server_id)], None, lookup.clone()).await;
+    drop(socks_echo(client.socks, "m1.internal", echo_port).await);
+    wait_until("the stream to be released", || {
+        client.status("m1.internal").open_streams == 0
+    })
+    .await;
+
+    // Drop the connection out from under the session.
+    server_ep.close().await;
+    wait_until("the destination to go idle after the drop", || {
+        let status = client.status("m1.internal");
+        status.state == DestinationState::Idle && status.client_node_id.is_none()
+    })
+    .await;
+    let status = client.status("m1.internal");
+    assert_eq!(status.failed_attempts, 1, "the drop is recorded");
+    assert!(status.last_error.is_some());
+    let built = client.built();
+
+    // Well past the first backoff step, still nothing has been tried.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let status = client.status("m1.internal");
+    assert_eq!(status.state, DestinationState::Idle);
+    assert_eq!(status.failed_attempts, 1, "no attempt without a request");
+    assert_eq!(client.built(), built, "no endpoint without a request");
+
+    // Resurrect the server on the same identity (a fresh nonce — a restart,
+    // not a duplicate) and publish its new address.
+    let (server_ep2, server_addr2) = server_endpoint(server_secret).await;
+    lookup.set_endpoint_info(server_addr2);
+    spawn_server_params(server_ep2, base_params(server_id, bl_path.clone()));
+
+    // A request brings the destination back.
+    let _app = socks_echo(client.socks, "m1.internal", echo_port).await;
+    let status = client.status("m1.internal");
+    assert_eq!(status.state, DestinationState::Connected);
+    assert_eq!(status.failed_attempts, 0);
+    assert_eq!(client.built(), built + 1);
+
+    let _ = std::fs::remove_file(bl_path);
+}
+
+/// Connection holding: a SOCKS request arriving while its destination's
+/// server is unreachable is *held* while the destination redials, and then
+/// proceeds transparently on the fresh connection instead of being refused
+/// with network-unreachable. The request is issued during the outage, the
+/// server is resurrected on the same identity, and the held request completes
+/// end-to-end.
+#[tokio::test]
+async fn a_request_is_held_until_the_server_is_back() {
+    let echo_port = spawn_echo().await;
+
+    let server_secret = SecretKey::generate();
+    let (server_ep, server_addr) = server_endpoint(server_secret.clone()).await;
+    let server_id = server_ep.id();
+    let bl_path = temp_blocklist("hold-reconnect");
+    spawn_server_params(server_ep.clone(), base_params(server_id, bl_path.clone()));
+
+    let lookup = MemoryLookup::from_endpoint_info(vec![server_addr]);
+    let client = start_client(vec![destination("m1.internal", server_id)], None, lookup.clone()).await;
+    drop(socks_echo(client.socks, "m1.internal", echo_port).await);
+
+    // Drop the connection out from under the session and wait for it to notice.
+    server_ep.close().await;
+    wait_until("the client to notice the drop", || {
+        client.state("m1.internal") != DestinationState::Connected
+    })
+    .await;
+
+    // Issue the request during the outage: the SOCKS handshake completes (the
+    // listener is up), but the CONNECT reply is held while the destination
+    // waits out its backoff and redials.
+    let mut app = socks_request(client.socks, "m1.internal", echo_port).await;
+    let mut reply = [0u8; 10];
+    let held = tokio::time::timeout(Duration::from_millis(500), app.read_exact(&mut reply)).await;
+    assert!(held.is_err(), "the request was answered instead of held");
+    assert_eq!(client.status("m1.internal").waiting, 1);
+
+    // Resurrect the server on the same identity and publish its new address.
+    let (server_ep2, server_addr2) = server_endpoint(server_secret).await;
+    lookup.set_endpoint_info(server_addr2);
+    spawn_server_params(server_ep2, base_params(server_id, bl_path.clone()));
+
+    // The redial (backoff ~1s) wakes the held request, which then proceeds:
+    // the echo greeting arriving through the SOCKS stream proves it.
+    with_timeout(app.read_exact(&mut reply)).await.unwrap();
+    assert_eq!(
+        reply[1],
+        signaling::REP_SUCCESS,
+        "held request should succeed once the server is back"
+    );
+    expect_echo(&mut app).await;
+
+    let _ = std::fs::remove_file(bl_path);
+}
+
+/// Endpoint-rebuild escalation: when attempts keep failing on an endpoint that
+/// is broken beyond repair (here: closed out from under the session — the
+/// loopback stand-in for a wedged endpoint whose relay link or path state
+/// never recovers), the destination must escalate to rebuilding the endpoint
+/// via its factory and reconnect on the fresh one. The old endpoint can never
+/// connect again, so recovery itself proves the rebuild ran; the changed node
+/// id confirms it.
+///
+/// A kept-connected destination supplies the standing demand that drives the
+/// retries, and shows it connecting unasked at start.
+#[tokio::test]
+async fn a_kept_destination_reconnects_by_rebuilding_a_dead_endpoint() {
+    let (server_ep, server_addr) = server_endpoint(SecretKey::generate()).await;
+    let server_id = server_ep.id();
+    let bl_path = temp_blocklist("rebuild-endpoint");
+    spawn_server_params(server_ep, base_params(server_id, bl_path.clone()));
+
+    let mut kept = destination("m1.internal", server_id);
+    kept.keep_connected = true;
+    let client = start_client(
+        vec![kept],
+        // Never closed for idleness either way: it is kept connected.
+        Some(Duration::from_millis(200)),
+        MemoryLookup::from_endpoint_info(vec![server_addr]),
+    )
+    .await;
+    let connected = || client.state("m1.internal") == DestinationState::Connected;
+    wait_until("the kept destination to connect unasked", connected).await;
+    let first_id = client.status("m1.internal").client_node_id;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(connected(), "a kept destination is not closed as idle");
+
+    // Kill the client's own endpoint. Every attempt on it fails immediately,
+    // so the backoff series reaches the rebuild escalation well inside the
+    // wait window.
+    client.endpoint(0).close().await;
+    wait_until("the client to notice the drop", || !connected()).await;
+    // Own, longer bound: reaching the rebuild takes the full early backoff
+    // series (1s + 2s + 4s plus jitter), which crowds `wait_until`'s 10s.
+    let start = Instant::now();
+    while !connected() {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "timed out waiting for the destination to reconnect on a rebuilt endpoint"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_ne!(
+        client.status("m1.internal").client_node_id,
+        first_id,
+        "recovery must have swapped in a freshly built endpoint"
+    );
+    assert!(client.built() >= 2);
+
+    let _ = std::fs::remove_file(bl_path);
+}
+
+/// A server that refuses this client's key fails that destination's requests
+/// at once — the first as soon as the rejection arrives, later ones without
+/// dialing at all — and the other destination is unaffected.
+#[tokio::test]
+async fn a_rejected_key_fails_fast_and_spares_the_other_destination() {
+    let echo_port = spawn_echo().await;
+    let (ep1, addr1) = server_endpoint(SecretKey::generate()).await;
+    let (ep2, addr2) = server_endpoint(SecretKey::generate()).await;
+    let (id1, id2) = (ep1.id(), ep2.id());
+    // Server 1 authorizes somebody else's key.
+    let stranger = crate::auth::ClientKey::generate().unwrap();
+    spawn_server_params(
+        ep1,
+        ProxyServerParams {
+            authorized_keys: flexaccess_keys::parse_authorized_key_entries(
+                &[stranger.public_str()],
+                "e2e_tests",
+            )
+            .unwrap(),
+            ..base_params(id1, temp_blocklist("rejected-1"))
+        },
+    );
+    spawn_server_params(ep2, base_params(id2, temp_blocklist("rejected-2")));
+
+    let client = start_client(
+        vec![destination("m1.internal", id1), destination("m2.internal", id2)],
+        None,
+        MemoryLookup::from_endpoint_info(vec![addr1, addr2]),
+    )
+    .await;
+
+    let started = Instant::now();
+    let (_app, rep) = socks_connect(client.socks, "m1.internal", echo_port).await;
+    assert_eq!(rep, signaling::REP_NOT_ALLOWED);
+    assert!(started.elapsed() < Duration::from_secs(5), "not held for the full window");
+    let status = client.status("m1.internal");
+    assert_eq!(status.state, DestinationState::Failed);
+    assert!(
+        status.last_error.as_deref().unwrap_or_default().contains("Authentication failed"),
+        "{:?}",
+        status.last_error
+    );
+
+    // Asked again right away: refused without another dial.
+    let started = Instant::now();
+    let (_app, rep) = socks_connect(client.socks, "m1.internal", echo_port).await;
+    assert_eq!(rep, signaling::REP_NOT_ALLOWED);
+    assert!(started.elapsed() < Duration::from_millis(500), "failed fast");
+    assert_eq!(client.status("m1.internal").failed_attempts, 1, "no second dial");
+
+    // The other destination works as if nothing happened.
+    let _app = socks_echo(client.socks, "m2.internal", echo_port).await;
+    assert_eq!(client.state("m2.internal"), DestinationState::Connected);
+}
+
+/// `http://flextunnel.internal/servers/<destination>/…` is that server's own
+/// status page, fetched on demand — which connects the destination like any
+/// other use — and relayed verbatim, from the SOCKS and HTTP front-ends alike.
+#[tokio::test]
+async fn a_servers_status_page_is_fetched_through_the_client() {
+    let (server_ep, server_addr) = server_endpoint(SecretKey::generate()).await;
+    let server_id = server_ep.id();
+    let params = ProxyServerParams {
+        routed_set: RoutedSet::new(&strings(&["marker.example.com"]), &[]).unwrap(),
+        routed_domains: strings(&["marker.example.com"]),
+        ..base_params(server_id, temp_blocklist("status-proxy"))
+    };
+    spawn_server_params(server_ep, params);
+
+    let client = start_client(
+        vec![destination("m1.internal", server_id)],
+        None,
+        MemoryLookup::from_endpoint_info(vec![server_addr]),
+    )
+    .await;
+
+    // An unknown destination is a local 404 and connects nothing.
+    let missing = status_get(client.socks, "/servers/nope.internal/status.json").await;
+    assert!(missing.starts_with("HTTP/1.1 404"), "{missing:.60}");
+    assert_eq!(client.built(), 0);
+
+    // JSON through SOCKS: the server's own view, node id and routed set.
+    let response = status_get(client.socks, "/servers/m1.internal/status.json").await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response:.60}");
+    let body = response.split_once("\r\n\r\n").expect("headers").1;
+    let status: serde_json::Value = serde_json::from_str(body).expect("server JSON status");
+    assert_eq!(status["server_node_id"], server_id.to_string());
+    assert_eq!(status["routed_domains"], serde_json::json!(["marker.example.com"]));
+    assert_eq!(client.built(), 1, "fetching it connected the destination");
+    assert_eq!(client.state("m1.internal"), DestinationState::Connected);
+
+    // HTML at the bare path.
+    let response = status_get(client.socks, "/servers/m1.internal/").await;
+    assert!(response.contains("Content-Type: text/html"), "{response:.200}");
+    assert!(response.contains("flextunnel server status"));
+    assert!(response.contains("marker.example.com"));
+
+    // Through the HTTP proxy as a plain GET, with `Accept` picking text.
+    let mut app = TcpStream::connect(client.http).await.unwrap();
+    app.write_all(
+        b"GET http://flextunnel.internal/servers/m1.internal HTTP/1.1\r\n\
+          Host: flextunnel.internal\r\nAccept: text/plain\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut response = Vec::new();
+    with_timeout(app.read_to_end(&mut response)).await.unwrap();
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response:.60}");
+    assert!(response.contains("Content-Type: text/plain"), "{response:.200}");
+    assert!(response.contains("flextunnel server status"));
+
+    // The client's own page now shows the destination connected.
+    let page = status_get(client.socks, "/status.json").await;
+    assert!(page.contains("\"state\": \"connected\""), "{page}");
+}
+
+/// Port forwards bypass the local proxy front-ends: the listener hands an
+/// accepted TCP stream straight to a QUIC data stream on the destination that
+/// routes the forward's target — here an idle one, which the first forwarded
+/// connection brings up. The server still rejects a target outside its
+/// routed-set whitelist.
+#[tokio::test]
+async fn a_forward_connects_its_destination_and_relays() {
+    let bl_path = temp_blocklist("forward");
+    let (server_ep, server_addr) = server_endpoint(SecretKey::generate()).await;
+    let server_id = server_ep.id();
     let (routed_set, routed_cidrs) = loopback_cidr_set();
     let params = ProxyServerParams {
         routed_set,
         routed_cidrs,
-        ..base_params(server_ep.id(), bl_path.clone())
+        ..base_params(server_id, bl_path.clone())
     };
     spawn_server_params(server_ep, params);
 
-    let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
-    let (conn, _ctrl_send, _ctrl_recv, response) =
-        client_handshake(&client_ep, server_addr, 41, false).await;
-    assert!(response.accepted);
-    let forwarder = ServerForwarder::connected(conn);
-
-    let rejected = forwarder
-        .connect(&Target::Domain("off-list.invalid".into(), 443))
-        .await
-        .unwrap_err();
-    assert!(
-        rejected.to_string().contains("not allowed"),
-        "unexpected rejection: {rejected:#}"
-    );
+    // The client routes more than the server allows: loopback (allowed) and a
+    // domain the server does not list.
+    let mut m1 = destination("m1.internal", server_id);
+    m1.routed_cidrs = strings(&["127.0.0.0/8"]);
+    m1.routed_domains = strings(&["off-list.invalid"]);
+    let client = start_client(
+        vec![m1],
+        None,
+        MemoryLookup::from_endpoint_info(vec![server_addr]),
+    )
+    .await;
+    let dialer = client.client.dialer();
 
     let echo_port = spawn_echo().await;
     let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -433,7 +1275,7 @@ async fn server_direct_forward_relays_and_server_rejects_off_list_target() {
     drop(probe);
     let manager = ForwardManager::new(
         tokio::runtime::Handle::current(),
-        forwarder,
+        dialer.clone(),
         &[ForwardSpec {
             id: "echo".into(),
             local_port,
@@ -441,9 +1283,14 @@ async fn server_direct_forward_relays_and_server_rejects_off_list_target() {
         }],
     );
 
+    // A forward that is merely listening connects nothing.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(client.built(), 0);
+    assert_eq!(client.state("m1.internal"), DestinationState::Idle);
+
     let mut local = None;
     for _ in 0..50 {
-        match tokio::net::TcpStream::connect(("127.0.0.1", local_port)).await {
+        match TcpStream::connect(("127.0.0.1", local_port)).await {
             Ok(stream) => {
                 local = Some(stream);
                 break;
@@ -451,15 +1298,23 @@ async fn server_direct_forward_relays_and_server_rejects_off_list_target() {
             Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
         }
     }
-    let mut local = local.expect("direct forward listener reachable");
-    let mut greeting = [0u8; 5];
-    with_timeout(local.read_exact(&mut greeting)).await.unwrap();
-    assert_eq!(&greeting, b"HELLO");
-    local.write_all(b"ping").await.unwrap();
-    let mut echoed = [0u8; 4];
-    with_timeout(local.read_exact(&mut echoed)).await.unwrap();
-    assert_eq!(&echoed, b"ping");
+    let mut local = local.expect("forward listener reachable");
+    // The first forwarded connection brings the destination up.
+    expect_echo(&mut local).await;
     assert_eq!(manager.statuses()[0].active, 1);
+    assert_eq!(client.state("m1.internal"), DestinationState::Connected);
+    assert_eq!(client.status("m1.internal").open_streams, 1);
+
+    // Routed by the client but not by the server: the server says no.
+    let rejected = dialer
+        .connect(&Target::Domain("off-list.invalid".into(), 443))
+        .await
+        .err()
+        .expect("server rejects the target");
+    assert!(
+        rejected.to_string().contains("not allowed"),
+        "unexpected rejection: {rejected:#}"
+    );
 
     drop(manager);
     let _ = std::fs::remove_file(bl_path);
@@ -521,325 +1376,6 @@ async fn prepared_server_serves_an_authorized_client() {
     let stopped = with_timeout(served).await.unwrap().unwrap();
     assert!(stopped, "serve ran until stopped");
     running.endpoint().close().await;
-    let _ = std::fs::remove_file(bl_path);
-}
-
-/// Endpoint-rebuild escalation: when reconnect attempts keep failing on an
-/// endpoint that is broken beyond repair (here: closed out from under the
-/// session — the loopback stand-in for a wedged endpoint whose relay link or
-/// path state never recovers), the reconnect loop must escalate to rebuilding
-/// the endpoint via its factory and reconnect on the fresh one. The old
-/// endpoint can never connect again, so recovery itself proves the rebuild
-/// ran; the changed node id confirms it.
-#[tokio::test]
-async fn reconnect_rebuilds_a_dead_endpoint() {
-    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
-    let server_id = server_ep.id();
-    let server_addr = EndpointAddr::new(server_id).with_ip_addr(server_ep.bound_sockets()[0]);
-    let bl_path = temp_blocklist("rebuild-endpoint");
-    let (routed_set, routed_cidrs) = loopback_cidr_set();
-    spawn_server_params(
-        server_ep.clone(),
-        ProxyServerParams {
-            routed_set,
-            routed_cidrs,
-            ..base_params(server_id, bl_path.clone())
-        },
-    );
-
-    let lookup = MemoryLookup::from_endpoint_info(vec![server_addr]);
-    let first_ep = loopback_endpoint_full(
-        SecretKey::generate(),
-        false,
-        lookup.clone(),
-        EndpointAllowlists::default(),
-    )
-    .await;
-    let client_ep = ClientEndpoint::from_parts(first_ep.clone(), {
-        let lookup = lookup.clone();
-        Arc::new(move || {
-            let lookup = lookup.clone();
-            Box::pin(async move {
-                Ok(loopback_endpoint_full(
-                    SecretKey::generate(),
-                    false,
-                    lookup,
-                    EndpointAllowlists::default(),
-                )
-                .await)
-            })
-        })
-    });
-    let first_id = client_ep.id();
-
-    let client = Arc::new(ProxyClient::new(ClientConfig {
-        server_node_id: server_id.to_string(),
-        auth: ClientAuth::Key(Box::new(test_client_key().clone())),
-        socks_listen: None,
-        http_listen: None,
-        relay_urls: Vec::new(),
-        relay_auth_token: None,
-        auto_reconnect: true,
-        max_reconnect_attempts: None,
-    }));
-    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    {
-        let (client, ep) = (client.clone(), client_ep.clone());
-        tokio::spawn(async move {
-            if let Err(e) = client.run_with_listener(&ep, socks_listener).await {
-                eprintln!("e2e rebuild test client session ended: {e}");
-            }
-        });
-    }
-    let connected = || client.routes().lock().unwrap().connected;
-    wait_until("client to connect", connected).await;
-
-    // Kill the client's own endpoint. Every reconnect attempt on it fails
-    // immediately, so the backoff series reaches the rebuild escalation well
-    // inside the wait window.
-    first_ep.close().await;
-    wait_until("client to notice the drop", || !connected()).await;
-    // Own, longer bound: reaching the rebuild takes the full early backoff
-    // series (1s + 2s + 4s plus jitter), which crowds `wait_until`'s 10s.
-    let start = Instant::now();
-    while !connected() {
-        assert!(
-            start.elapsed() < Duration::from_secs(20),
-            "timed out waiting for client to reconnect on a rebuilt endpoint"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    assert_ne!(
-        client_ep.id(),
-        first_id,
-        "recovery must have swapped in a freshly built endpoint"
-    );
-
-    let _ = std::fs::remove_file(bl_path);
-}
-
-/// A client started before its server is up keeps trying until the server
-/// appears: a failed first connection is retried like any later drop instead
-/// of ending the session (the boot-order case — a unit starting ahead of the
-/// server, or a server down for maintenance when the client comes up).
-///
-/// The stand-in for "not up yet" is the server's own endpoint with nothing
-/// serving on it: every accepted connection is closed on the spot, so an
-/// attempt fails fast (the alternative, a dead address, would sit out the
-/// full connect timeout per attempt). The server then comes up on that same
-/// endpoint — same identity, same address — exactly as a late-starting
-/// service would.
-#[tokio::test]
-async fn client_retries_first_connect_until_server_is_up() {
-    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
-    let server_id = server_ep.id();
-    let server_addr = EndpointAddr::new(server_id).with_ip_addr(server_ep.bound_sockets()[0]);
-    let bl_path = temp_blocklist("retry-first-connect");
-    let (routed_set, routed_cidrs) = loopback_cidr_set();
-    let params = ProxyServerParams {
-        routed_set,
-        routed_cidrs,
-        ..base_params(server_id, bl_path.clone())
-    };
-
-    let (up_tx, mut up_rx) = tokio::sync::watch::channel(false);
-    tokio::spawn({
-        let server_ep = server_ep.clone();
-        async move {
-            loop {
-                // Only the accept wait is cancellable: an accepted connection
-                // is always answered (closed), never dropped on the floor.
-                let incoming = tokio::select! {
-                    incoming = server_ep.accept() => incoming,
-                    _ = up_rx.wait_for(|up| *up) => break,
-                };
-                let Some(incoming) = incoming else { return };
-                if let Ok(conn) = incoming.await {
-                    conn.close(0u32.into(), b"not up yet");
-                }
-            }
-            let server = ProxyServer::new(params);
-            if let Err(e) = server.run(&server_ep).await {
-                eprintln!("e2e retry test server task ended: {e}");
-            }
-        }
-    });
-
-    let client_ep = ClientEndpoint::from_parts(
-        loopback_endpoint_seeded(SecretKey::generate(), false, vec![server_addr]).await,
-        Arc::new(|| Box::pin(async { anyhow::bail!("no rebuild expected in this test") })),
-    );
-    let client = Arc::new(ProxyClient::new(ClientConfig {
-        server_node_id: server_id.to_string(),
-        auth: ClientAuth::Key(Box::new(test_client_key().clone())),
-        socks_listen: None,
-        http_listen: None,
-        relay_urls: Vec::new(),
-        relay_auth_token: None,
-        auto_reconnect: true,
-        max_reconnect_attempts: None,
-    }));
-    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let session = tokio::spawn({
-        let (client, ep) = (client.clone(), client_ep.clone());
-        async move { client.run_with_listener(&ep, socks_listener).await }
-    });
-
-    // The session survives its first failure and reports it, rather than
-    // ending with an error.
-    wait_until("the first attempt to fail", || {
-        client.reconnect_status().failed_attempts >= 1
-    })
-    .await;
-    assert!(!session.is_finished(), "the session ended on a failed first connect");
-    let status = client.reconnect_status();
-    assert!(status.last_error.is_some());
-    assert!(status.next_attempt_at.is_some());
-
-    // The server comes up; the next attempt (1s backoff) lands.
-    up_tx.send_replace(true);
-    let connected = || client.routes().lock().unwrap().connected;
-    wait_until("the client to connect once the server is up", connected).await;
-    let status = client.reconnect_status();
-    assert_eq!(status.failed_attempts, 0, "a connection clears the outage");
-    assert!(status.last_error.is_none());
-
-    session.abort();
-    let _ = std::fs::remove_file(bl_path);
-}
-
-/// Deploy-style connection holding: a SOCKS request for an on-list target
-/// arriving while the tunnel link is down is *held* for the client's own
-/// reconnect and then proceeds transparently on the fresh connection, instead
-/// of being refused with network-unreachable. Runs the full [`ProxyClient`]
-/// session, kills the server endpoint mid-session, issues the request during
-/// the outage, resurrects the server on the same identity, and asserts the
-/// held request completes end-to-end.
-#[tokio::test]
-async fn on_list_request_is_held_across_reconnect() {
-    let echo_port = spawn_echo().await;
-
-    // First server incarnation, on a secret the test keeps to resurrect it.
-    let server_secret = SecretKey::generate();
-    let server_ep = loopback_endpoint(server_secret.clone(), true).await;
-    let server_id = server_ep.id();
-    let server_addr = EndpointAddr::new(server_id).with_ip_addr(server_ep.bound_sockets()[0]);
-    let bl_path = temp_blocklist("hold-reconnect");
-    let (routed_set, routed_cidrs) = loopback_cidr_set();
-    spawn_server_params(
-        server_ep.clone(),
-        ProxyServerParams {
-            routed_set,
-            routed_cidrs,
-            ..base_params(server_id, bl_path.clone())
-        },
-    );
-
-    // The client endpoint's lookup is held externally so the resurrected
-    // server's fresh address can be published mid-test.
-    let lookup = MemoryLookup::from_endpoint_info(vec![server_addr]);
-    let client_ep = loopback_endpoint_full(
-        SecretKey::generate(),
-        false,
-        lookup.clone(),
-        EndpointAllowlists::default(),
-    )
-    .await;
-    // Hermetic rebuild recipe: should the session escalate to an endpoint
-    // rebuild mid-test, the replacement is another loopback endpoint sharing
-    // the same externally-held lookup.
-    let client_ep = ClientEndpoint::from_parts(client_ep, {
-        let lookup = lookup.clone();
-        Arc::new(move || {
-            let lookup = lookup.clone();
-            Box::pin(async move {
-                Ok(loopback_endpoint_full(
-                    SecretKey::generate(),
-                    false,
-                    lookup,
-                    EndpointAllowlists::default(),
-                )
-                .await)
-            })
-        })
-    });
-
-    // The full reconnecting client session with a real SOCKS front-end.
-    let client = Arc::new(ProxyClient::new(ClientConfig {
-        server_node_id: server_id.to_string(),
-        auth: ClientAuth::Key(Box::new(test_client_key().clone())),
-        socks_listen: None,
-        http_listen: None,
-        relay_urls: Vec::new(),
-        relay_auth_token: None,
-        auto_reconnect: true,
-        max_reconnect_attempts: None,
-    }));
-    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let socks_addr = socks_listener.local_addr().unwrap();
-    {
-        let (client, ep) = (client.clone(), client_ep.clone());
-        tokio::spawn(async move {
-            if let Err(e) = client.run_with_listener(&ep, socks_listener).await {
-                eprintln!("e2e hold test client session ended: {e}");
-            }
-        });
-    }
-    let connected = || client.routes().lock().unwrap().connected;
-    wait_until("client to connect", connected).await;
-
-    // Drop the tunnel out from under the session and wait for it to notice.
-    server_ep.close().await;
-    wait_until("client to notice the drop", || !connected()).await;
-
-    // Issue the on-list request during the outage: handshake completes (the
-    // listener is up), but the CONNECT reply is held for the reconnect.
-    let mut app = tokio::net::TcpStream::connect(socks_addr).await.unwrap();
-    app.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut method = [0u8; 2];
-    with_timeout(app.read_exact(&mut method)).await.unwrap();
-    assert_eq!(method, [0x05, 0x00], "no-auth method selected");
-    let p = echo_port.to_be_bytes();
-    app.write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, p[0], p[1]])
-        .await
-        .unwrap();
-    let mut reply = [0u8; 10];
-    let held = tokio::time::timeout(Duration::from_millis(500), app.read_exact(&mut reply)).await;
-    assert!(held.is_err(), "on-list request was answered instead of held");
-
-    // Resurrect the server on the same identity (a fresh nonce — a restart,
-    // not a duplicate) and publish its new address to the client's lookup.
-    let server_ep2 = loopback_endpoint(server_secret, true).await;
-    lookup.set_endpoint_info(
-        EndpointAddr::new(server_id).with_ip_addr(server_ep2.bound_sockets()[0]),
-    );
-    let (routed_set, routed_cidrs) = loopback_cidr_set();
-    spawn_server_params(
-        server_ep2,
-        ProxyServerParams {
-            routed_set,
-            routed_cidrs,
-            ..base_params(server_id, bl_path.clone())
-        },
-    );
-
-    // The reconnect (backoff ~1s) wakes the held request, which then proceeds:
-    // the echo greeting arriving through the SOCKS stream proves it.
-    with_timeout(app.read_exact(&mut reply)).await.unwrap();
-    assert_eq!(
-        reply[1],
-        signaling::REP_SUCCESS,
-        "held request should succeed once the tunnel is back"
-    );
-    let mut greeting = [0u8; 5];
-    with_timeout(app.read_exact(&mut greeting)).await.unwrap();
-    assert_eq!(&greeting, b"HELLO");
-    app.write_all(b"ping").await.unwrap();
-    let mut echoed = [0u8; 4];
-    with_timeout(app.read_exact(&mut echoed)).await.unwrap();
-    assert_eq!(&echoed, b"ping");
-
     let _ = std::fs::remove_file(bl_path);
 }
 
@@ -961,9 +1497,12 @@ async fn wildcard_host_alias_still_requires_routed_set_coverage() {
     assert!(resp.accepted, "client should be accepted");
 
     let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
-    signaling::write_request(&mut send, &Target::Domain("db.web.internal".to_string(), echo_port))
-        .await
-        .unwrap();
+    signaling::write_request(
+        &mut send,
+        &StreamRequest::Connect(Target::Domain("db.web.internal".to_string(), echo_port)),
+    )
+    .await
+    .unwrap();
     send.flush().await.unwrap();
     let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
     assert_eq!(
@@ -990,7 +1529,7 @@ async fn wildcard_host_alias_still_requires_routed_set_coverage() {
     let (mut send2, mut recv2) = with_timeout(conn2.open_bi()).await.unwrap();
     signaling::write_request(
         &mut send2,
-        &Target::Domain("db.web.internal".to_string(), echo_port),
+        &StreamRequest::Connect(Target::Domain("db.web.internal".to_string(), echo_port)),
     )
     .await
     .unwrap();
@@ -1009,24 +1548,22 @@ async fn wildcard_host_alias_still_requires_routed_set_coverage() {
     assert_eq!(&buf, b"HELLOping");
 }
 
-/// End-to-end reserved namespace: a request for `flextunnel.internal` is served
-/// by the server itself as an HTTP status page (bypassing the routed-set
-/// whitelist — note the routed set here does NOT contain it), and a
-/// `*.flextunnel.internal` subdomain returns an HTTP 404.
+/// End-to-end status request: a [`StreamRequest::Status`] stream is served by
+/// the server itself as an HTTP status page, in the format the request's path
+/// or `Accept` header asks for.
 #[tokio::test]
-async fn reserved_internal_serves_status_page_and_subdomain_404() {
+async fn status_request_serves_the_server_status_page() {
     let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
     let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
     // A distinctive routed domain we expect to see rendered on the status page.
-    // `flextunnel.internal` is deliberately NOT on the routed set.
     let host_aliases =
         HashMap::from([("nas.internal".to_string(), "192.168.1.9".to_string())]);
-    // Two conditional DNS forwards we expect rendered on the status page and
-    // pushed to the client (each suffix must be reachable through the routed
-    // set). `corp.example.com` carries two servers in a deliberate, non-sorted
-    // order; the server must emit the suffixes sorted (`corp` before `marker`)
-    // while preserving each suffix's server order verbatim — exercised through
-    // every serialization path below.
+    // Two conditional DNS forwards we expect rendered on the status page (each
+    // suffix must be reachable through the routed set). `corp.example.com`
+    // carries two servers in a deliberate, non-sorted order; the server must
+    // emit the suffixes sorted (`corp` before `marker`) while preserving each
+    // suffix's server order verbatim — exercised through every serialization
+    // path below.
     let dns_forwards = HashMap::from([
         (
             "marker.example.com".to_string(),
@@ -1039,7 +1576,7 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
     ]);
     spawn_server_dns(
         server_ep,
-        temp_blocklist("reserved"),
+        temp_blocklist("status-page"),
         host_aliases,
         vec!["marker.example.com".to_string(), "corp.example.com".to_string()],
         dns_forwards,
@@ -1049,28 +1586,8 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
     let (client_conn, _cs, _cr, cresp) =
         client_handshake(&client_ep, server_addr, 1, false).await;
     assert!(cresp.accepted, "client should be accepted");
-    assert_eq!(
-        cresp.host_aliases,
-        vec![("nas.internal".to_string(), "192.168.1.9".to_string())],
-        "handshake should push the configured host aliases for client status UIs"
-    );
-    assert_eq!(
-        cresp.dns_forwards,
-        vec![
-            (
-                "corp.example.com".to_string(),
-                vec!["10.1.0.11".to_string(), "10.1.0.10:5353".to_string()]
-            ),
-            (
-                "marker.example.com".to_string(),
-                vec!["10.9.9.9:5353".to_string()]
-            ),
-        ],
-        "handshake should push DNS forwards sorted by suffix, each suffix's servers verbatim"
-    );
-
-    // The status host: expect an HTTP 200 whose body contains the routed domain.
-    let body = fetch_reserved(&client_conn, "flextunnel.internal").await;
+    // The bare path: expect an HTTP 200 whose body contains the routed domain.
+    let body = fetch_status(&client_conn, "/", None).await;
     assert!(body.starts_with("HTTP/1.1 200"), "status page should be 200: {body:.40}");
     assert!(
         body.contains("marker.example.com"),
@@ -1089,7 +1606,7 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
         "status page should render DNS forwards sorted by suffix (corp before marker)"
     );
 
-    let body = fetch_reserved_path(&client_conn, "flextunnel.internal", "/status.txt").await;
+    let body = fetch_status(&client_conn, "/status.txt", None).await;
     assert!(body.starts_with("HTTP/1.1 200"), "text status should be 200: {body:.40}");
     assert!(
         body.contains("Content-Type: text/plain; charset=utf-8"),
@@ -1117,7 +1634,7 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
         "text status should render DNS forwards sorted by suffix (corp before marker)"
     );
 
-    let body = fetch_reserved_path(&client_conn, "flextunnel.internal", "/status.json").await;
+    let body = fetch_status(&client_conn, "/status.json", None).await;
     assert!(body.starts_with("HTTP/1.1 200"), "json status should be 200: {body:.40}");
     assert!(
         body.contains("Content-Type: application/json; charset=utf-8"),
@@ -1150,7 +1667,7 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
 
     // Accept-header negotiation: a `/` request with `Accept: text/plain` should
     // also return the plain-text status response (not the HTML page).
-    let body = fetch_reserved_accept(&client_conn, "flextunnel.internal", "/", "text/plain").await;
+    let body = fetch_status(&client_conn, "/", Some("text/plain")).await;
     assert!(body.starts_with("HTTP/1.1 200"), "accept-text status should be 200: {body:.40}");
     assert!(
         body.contains("Content-Type: text/plain; charset=utf-8"),
@@ -1161,99 +1678,140 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
         "accept-text status should include a plain heading"
     );
 
-    // A reserved subdomain: expect an HTTP 404 "reserved" page.
-    let body = fetch_reserved(&client_conn, "sub.flextunnel.internal").await;
-    assert!(body.starts_with("HTTP/1.1 404"), "reserved subdomain should be 404: {body:.40}");
-
     drop(client_conn);
 }
 
-/// Open a tunnel stream for `host:80`, send a minimal HTTP request, and return
-/// the full response after consuming the per-stream success reply byte.
-/// End-to-end reserved loopback host: `localhost.flextunnel.internal:<port>`
-/// reaches `localhost:<port>` on the server with an empty routed set (deny-all)
-/// and no host alias — the built-in way to a server-side loopback service.
+/// Open a stream with `request` on `conn` and return the server's reply code
+/// along with the stream halves.
+async fn open_stream(conn: &Connection, request: StreamRequest) -> (SendStream, RecvStream, u8) {
+    let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
+    signaling::write_request(&mut send, &request).await.unwrap();
+    send.flush().await.unwrap();
+    let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
+    (send, recv, rep)
+}
+
+/// End-to-end loopback request: [`StreamRequest::Loopback`] reaches
+/// `localhost:<port>` on the server with an empty routed set (deny-all) and no
+/// host alias — what a client destination's own name asks for.
 #[tokio::test]
-async fn reserved_localhost_host_dials_server_loopback() {
+async fn loopback_request_dials_the_servers_own_loopback() {
     let echo_port = spawn_echo().await;
     let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
     let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
-    spawn_server(server_ep, temp_blocklist("reserved-localhost"));
+    spawn_server(server_ep, temp_blocklist("loopback-request"));
 
     let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
     let (conn, _cs, _cr, resp) = client_handshake(&client_ep, server_addr, 63, false).await;
     assert!(resp.accepted, "client should be accepted");
 
     // Plain `localhost` is off the (empty) routed set and must be refused...
-    let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
-    signaling::write_request(&mut send, &Target::Domain("localhost".to_string(), echo_port))
-        .await
-        .unwrap();
-    send.flush().await.unwrap();
-    let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
+    let localhost = StreamRequest::Connect(Target::Domain("localhost".to_string(), echo_port));
+    let (_send, _recv, rep) = open_stream(&conn, localhost).await;
     assert_eq!(rep, signaling::REP_NOT_ALLOWED, "bare localhost is subject to the routed set");
 
-    // ...while the reserved loopback host bypasses it (case-insensitively).
-    let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
-    signaling::write_request(
-        &mut send,
-        &Target::Domain("LocalHost.FlexTunnel.Internal".to_string(), echo_port),
-    )
-    .await
-    .unwrap();
-    send.flush().await.unwrap();
-    let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
-    assert_eq!(rep, signaling::REP_SUCCESS, "reserved loopback host should bypass the routed set");
+    // ...while the loopback request bypasses it.
+    let (mut send, mut recv, rep) = open_stream(&conn, StreamRequest::Loopback(echo_port)).await;
+    assert_eq!(rep, signaling::REP_SUCCESS, "a loopback request bypasses the routed set");
     send.write_all(b"ping").await.unwrap();
     send.flush().await.unwrap();
     let mut buf = [0u8; 9]; // "HELLO" + "ping"
     with_timeout(recv.read_exact(&mut buf)).await.unwrap();
     assert_eq!(&buf, b"HELLOping");
 
-    // A connect failure surfaces as a failure reply, not a 404 page. Port 0 is
-    // unconnectable on every platform (nothing can listen on it), so this
-    // never depends on which loopback ports happen to be in use.
-    let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
-    signaling::write_request(&mut send, &Target::Domain(reserved::LOCALHOST_HOST.to_string(), 0))
-        .await
-        .unwrap();
-    send.flush().await.unwrap();
-    let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
+    // A connect failure surfaces as a failure reply. Port 0 is unconnectable
+    // on every platform (nothing can listen on it), so this never depends on
+    // which loopback ports happen to be in use.
+    let (_send, _recv, rep) = open_stream(&conn, StreamRequest::Loopback(0)).await;
     assert_ne!(rep, signaling::REP_SUCCESS, "closed loopback port must not reply success");
 }
 
-async fn fetch_reserved(conn: &Connection, host: &str) -> String {
-    fetch_reserved_path(conn, host, "/").await
+/// The reserved `flextunnel.internal` namespace belongs to the client, which
+/// answers it locally. A server refuses it as a target outright — even one
+/// that routes every hostname.
+#[tokio::test]
+async fn reserved_names_are_refused_as_targets() {
+    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
+    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
+    spawn_server_full(
+        server_ep,
+        temp_blocklist("reserved-target"),
+        HashMap::new(),
+        vec!["*".to_string()],
+    );
+
+    let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
+    let (conn, _cs, _cr, resp) = client_handshake(&client_ep, server_addr, 64, false).await;
+    assert!(resp.accepted, "client should be accepted");
+    for host in [
+        "flextunnel.internal",
+        "FlexTunnel.Internal",
+        "sub.flextunnel.internal",
+        "localhost.flextunnel.internal",
+    ] {
+        let request = StreamRequest::Connect(Target::Domain(host.to_string(), 80));
+        let (_send, _recv, rep) = open_stream(&conn, request).await;
+        assert_eq!(rep, signaling::REP_NOT_ALLOWED, "{host} must be refused");
+    }
 }
 
-async fn fetch_reserved_path(conn: &Connection, host: &str, path: &str) -> String {
-    fetch_reserved_request(conn, host, path, None).await
+/// A server bridging in forwards its clients' routed targets and nothing
+/// else: it may not ask for this server's own loopback or status page.
+#[tokio::test]
+async fn a_bridge_may_only_ask_for_routed_targets() {
+    let echo_port = spawn_echo().await;
+    let (routed_set, cidrs) = loopback_cidr_set();
+
+    // The "bridging server" is a bare endpoint speaking the bridge handshake.
+    let bridge_secret = SecretKey::generate();
+    let bridge_id = bridge_secret.public();
+    let server_ep = loopback_endpoint_full(
+        SecretKey::generate(),
+        true,
+        MemoryLookup::new(),
+        bridge_allowlist([bridge_id]),
+    )
+    .await;
+    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
+    let mut params = base_params(server_ep.id(), temp_blocklist("bridge-requests"));
+    params.routed_set = routed_set;
+    params.routed_cidrs = cidrs;
+    params.allowed_bridge_servers = HashSet::from([bridge_id]);
+    spawn_server_params(server_ep, params);
+
+    let bridge_ep = loopback_endpoint(bridge_secret, false).await;
+    let conn = with_timeout(bridge_ep.connect(server_addr, BRIDGE_ALPN)).await.unwrap();
+    let (mut ctrl_send, mut ctrl_recv) = with_timeout(conn.open_bi()).await.unwrap();
+    let hello = signaling::encode_bridge_hello(&BridgeHello::new()).unwrap();
+    signaling::write_message(&mut ctrl_send, &hello).await.unwrap();
+    ctrl_send.flush().await.unwrap();
+    let data = with_timeout(signaling::read_message(
+        &mut ctrl_recv,
+        signaling::MAX_HANDSHAKE_SIZE,
+    ))
+    .await
+    .unwrap();
+    assert!(signaling::decode_hello_response(&data).unwrap().accepted, "bridge accepted");
+
+    let (_send, _recv, rep) = open_stream(&conn, StreamRequest::Loopback(echo_port)).await;
+    assert_eq!(rep, signaling::REP_NOT_ALLOWED, "no loopback for a bridge");
+    let (_send, _recv, rep) = open_stream(&conn, StreamRequest::Status).await;
+    assert_eq!(rep, signaling::REP_NOT_ALLOWED, "no status page for a bridge");
+    // A routed target is what a bridge is for.
+    assert_echo_roundtrip(&conn, echo_port).await;
 }
 
-/// Like [`fetch_reserved_path`] but with an optional `Accept` header, so the
-/// Accept-based text negotiation path can be exercised (a `/` request with
-/// `Accept: text/plain` should return the plain-text status response).
-async fn fetch_reserved_accept(conn: &Connection, host: &str, path: &str, accept: &str) -> String {
-    fetch_reserved_request(conn, host, path, Some(accept)).await
-}
-
-async fn fetch_reserved_request(
-    conn: &Connection,
-    host: &str,
-    path: &str,
-    accept: Option<&str>,
-) -> String {
-    let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
-    signaling::write_request(&mut send, &Target::Domain(host.to_string(), 80))
-        .await
-        .unwrap();
-    send.flush().await.unwrap();
-    let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
-    assert_eq!(rep, signaling::REP_SUCCESS, "reserved host should reply success");
+/// Ask the server for its status page over a [`StreamRequest::Status`] stream
+/// — `path` and the optional `Accept` header pick the format — and return the
+/// full HTTP response after consuming the per-stream success reply byte.
+async fn fetch_status(conn: &Connection, path: &str, accept: Option<&str>) -> String {
+    let (mut send, mut recv, rep) = open_stream(conn, StreamRequest::Status).await;
+    assert_eq!(rep, signaling::REP_SUCCESS, "a status request should reply success");
     let accept_header = accept.map(|a| format!("Accept: {a}\r\n")).unwrap_or_default();
     let _ = send
         .write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{accept_header}\r\n").as_bytes(),
+            format!("GET {path} HTTP/1.1\r\nHost: flextunnel.internal\r\n{accept_header}\r\n")
+                .as_bytes(),
         )
         .await;
     let _ = send.finish();
@@ -1264,8 +1822,8 @@ async fn fetch_reserved_request(
 /// End-to-end bridge routing: a client stream whose target matches server A's
 /// bridge rules is spliced over A's persistent upstream connection to server B,
 /// which dials the target from its own network; bytes round-trip. Also asserts
-/// the informational surfaces: the handshake's bridge summaries, A's outbound
-/// bridge status (connected), and B's inbound allowlist status (connected).
+/// the informational surfaces: A's outbound bridge status (connected) and B's
+/// inbound allowlist status (connected).
 #[tokio::test]
 async fn bridge_routes_pipe_through_target_server() {
     let echo_port = spawn_echo().await;
@@ -1311,16 +1869,11 @@ async fn bridge_routes_pipe_through_target_server() {
     let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
     let (client_conn, _cs, _cr, cresp) = client_handshake(&client_ep, a_addr, 1, false).await;
     assert!(cresp.accepted, "client should be accepted");
-    let summaries = cresp.bridges;
-    assert_eq!(summaries.len(), 1, "handshake should push the bridge summary");
-    assert_eq!(summaries[0].name, "lab");
-    assert_eq!(summaries[0].endpoint_id, b_id.to_string());
-    assert_eq!(summaries[0].cidrs, vec!["127.0.0.0/8".to_string()]);
 
     assert_echo_roundtrip(&client_conn, echo_port).await;
 
     // A's status page shows the outbound bridge as connected.
-    let body = fetch_reserved_path(&client_conn, "flextunnel.internal", "/status.json").await;
+    let body = fetch_status(&client_conn, "/status.json", None).await;
     let json_body = body.split_once("\r\n\r\n").expect("headers").1;
     let status: serde_json::Value = serde_json::from_str(json_body).expect("json status parses");
     assert_eq!(
@@ -1334,7 +1887,7 @@ async fn bridge_routes_pipe_through_target_server() {
         }]),
         "A's json status should show the connected outbound bridge"
     );
-    let html = fetch_reserved(&client_conn, "flextunnel.internal").await;
+    let html = fetch_status(&client_conn, "/", None).await;
     assert!(html.contains("lab"), "A's status page should name the bridge");
     assert!(
         html.contains(&b_id.to_string()),
@@ -1345,7 +1898,7 @@ async fn bridge_routes_pipe_through_target_server() {
     let b_client_ep = loopback_endpoint(SecretKey::generate(), false).await;
     let (b_client_conn, _bs, _br, bresp) = client_handshake(&b_client_ep, b_addr, 2, false).await;
     assert!(bresp.accepted, "client should be accepted by B");
-    let body = fetch_reserved_path(&b_client_conn, "flextunnel.internal", "/status.json").await;
+    let body = fetch_status(&b_client_conn, "/status.json", None).await;
     let json_body = body.split_once("\r\n\r\n").expect("headers").1;
     let status: serde_json::Value = serde_json::from_str(json_body).expect("json status parses");
     assert_eq!(
@@ -1392,8 +1945,8 @@ async fn bridge_rejected_by_native_allowlist() {
 /// Quick mode end to end: a client whose endpoint id is on the server's quick
 /// allowlist connects over the quick ALPN with **no keypair** (the server runs
 /// with an empty authorized-keys set, like a quick server), is served exactly
-/// like a keypair client (routed set pushed, tunnel streams pipe), and its heartbeat
-/// refreshes liveness through the same accepted path.
+/// like a keypair client (tunnel streams pipe), and its heartbeat refreshes
+/// liveness through the same accepted path.
 #[tokio::test]
 async fn quick_client_authenticates_by_endpoint_id() {
     let echo_port = spawn_echo().await;
@@ -1425,11 +1978,6 @@ async fn quick_client_authenticates_by_endpoint_id() {
     let (conn, _cs, _cr, resp) =
         handshake_on_alpn(&client_ep, server_addr, QUICK_ALPN, 1, false).await;
     assert!(resp.accepted, "allowlisted quick client must be accepted: {:?}", resp.reject_reason);
-    assert_eq!(
-        resp.routed_cidrs,
-        vec!["127.0.0.0/8".to_string()],
-        "a quick client gets the routed set pushed like any client"
-    );
     assert_echo_roundtrip(&conn, echo_port).await;
 }
 
@@ -1632,12 +2180,8 @@ async fn bridge_down_returns_host_unreachable() {
     let (client_conn, _cs, _cr, cresp) = client_handshake(&client_ep, a_addr, 1, false).await;
     assert!(cresp.accepted, "client should be accepted");
 
-    let (mut send, mut recv) = with_timeout(client_conn.open_bi()).await.unwrap();
-    signaling::write_request(&mut send, &Target::Ip("127.0.0.1:9999".parse().unwrap()))
-        .await
-        .unwrap();
-    send.flush().await.unwrap();
-    let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
+    let request = StreamRequest::Connect(Target::Ip("127.0.0.1:9999".parse().unwrap()));
+    let (_send, _recv, rep) = open_stream(&client_conn, request).await;
     assert_eq!(
         rep,
         signaling::REP_HOST_UNREACHABLE,

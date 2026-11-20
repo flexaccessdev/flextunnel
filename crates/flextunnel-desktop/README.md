@@ -31,27 +31,48 @@ welcome first.
 
 ## Client connections
 
-Each **connection profile** is the desktop equivalent of a `client.toml` — a
-server `EndpointId`, an auth key, and the local front-ends you want. Profiles are
-independent: any number can be connected at once, and each runs its own tunnel
-session with its own optional local **SOCKS5** and **HTTP** proxy listeners plus
-its own **server-direct port forwards**. Connecting is always manual.
+Each **connection profile** is the desktop equivalent of a `client.toml` with
+one destination — a server `EndpointId`, a **host** name for it, an auth key,
+and the local front-ends you want. Profiles are independent: any number can be
+connected at once, and each runs its own session with its own optional local
+**SOCKS5** and **HTTP** proxy listeners plus its own **port forwards**.
+Starting a session (*Connect*) is always manual.
 
+- **Host and routes** — the profile's **host** is your name for its server:
+  `<host>:<port>` through the profile's proxy, or as a forward's remote host,
+  reaches that port on the server machine itself. *Routed domains* and *Routed
+  CIDRs* are optional further targets to send through the server (which must
+  allow them in its own tunnel set). Everything else connects directly. A
+  profile needs a host to connect; one saved without it shows a prompt to edit
+  it.
+- **Connects on demand** — *Connect* starts the session and makes one
+  connection attempt, so you see whether the server is reachable. After that
+  the connection follows use: it closes once nothing has used it for five
+  minutes and the profile shows **standby** — still listening, proxy and
+  forwards included — and the next request connects it again, waiting while it
+  does. A dropped connection is likewise re-established when something next
+  needs it, not before.
 - **Shared auth keys** — the Keys pane holds this computer's client keypairs;
   any number of profiles can use the same one. Each server a key connects to
   must authorize its public half.
 - **Local SOCKS5 / HTTP proxies** — enable either or both per profile; point any
-  proxy-aware app at `127.0.0.1:<port>` and its traffic to routed targets rides
-  the tunnel.
-- **Port forwards** — bind a local port to any `host:port` on the server's
-  network so tools that can't use a proxy reach private services as if local.
+  proxy-aware app at `127.0.0.1:<port>` and its traffic to the profile's host
+  and routes rides the tunnel.
+- **Port forwards** — bind a local port to a `host:port` reached through the
+  server, so tools that can't use a proxy reach private services as if local.
+  A forward always goes through the server, so its remote host must be the
+  profile's host or one of its routes; one that isn't shows a **no route**
+  badge.
+- **Status pages** — `http://flextunnel.internal/` through the profile's proxy
+  is the session's own status; `http://flextunnel.internal/servers/<host>/` is
+  the server's, with its tunnel set, host aliases, DNS forwards and bridges.
+  Both are listed on the profile pane.
 - **Connection path** — a modal that reports whether a connected profile is
   reaching the server directly (hole-punched) or via relay.
 - **Export / import** — move profiles between machines via native save/open
   dialogs. (Secrets are re-entered on import: neither the auth token nor the
   custom-relay auth token is written to the export file. Importing over an
   existing profile — matched by server id — keeps that profile's secrets.)
-- **Auto-reconnect** — sessions re-establish the tunnel when the path drops.
 
 ## The server
 
@@ -89,8 +110,11 @@ showing the endpoint id it gives — and *Create server* goes straight on to aut
   offers both ways on: *Import key…* to restore it and keep the endpoint id,
   or *Generate new identity…* when it is gone for good (clients then switch to
   the new endpoint id).
-- **Tunnel set & relays** — the routed domains/CIDRs pushed to clients and
-  enforced here, plus custom relays; optional, and edited any time.
+- **Tunnel set & relays** — the routed domains/CIDRs clients may reach through
+  this server, enforced here, plus custom relays; optional, and edited any
+  time. Clients route by their own lists, so a client must also list a route
+  to send it here. This computer's own `localhost` is always reachable by its
+  clients, under the host name each gives this server.
 - **Restart to apply** — the server runs with the settings it started with;
   after a change (a client authorized, the tunnel set edited, a new identity)
   its pane offers *Restart now*. Removing a client applies at once: the server
@@ -108,6 +132,7 @@ and the server pane); client connections don't change it then. Without a
 server, or with a disabled one, the app is client-only: the icon is at full
 strength (dark on macOS) while a connection is up and dimmed otherwise, with no
 badge — except an **empty circle** for a disabled server while no connection is up.
+A profile in standby counts as up, in the icon and in the menu's count.
 
 - **Live logs** — an in-app Logs pane; every session's log lines (core
   internals included) are attributed to the server or their profile.

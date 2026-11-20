@@ -1,17 +1,18 @@
 //! Persisted port-forward definitions shared by the desktop and CLI clients,
-//! plus the thin adapter to the core's server-direct listener manager and the
+//! plus the thin adapter to the core's forward listener manager and the
 //! validation rules both UIs apply to user input.
 
 use crate::proxy::signaling::Target;
-use crate::proxy::{ForwardManager as CoreForwardManager, ForwardSpec, ServerForwarder};
+use crate::proxy::{ForwardManager as CoreForwardManager, ForwardSpec, TunnelDialer};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
 pub use crate::proxy::{ForwardState, ForwardStatus};
 
 /// One configured forward: `localhost:local_port` →
-/// `remote_host:remote_port`, opened directly on the authenticated server
-/// connection. The server enforces its routed-set whitelist and resolves names.
+/// `remote_host:remote_port`, opened through the destination that routes
+/// `remote_host`. That server enforces its routed-set whitelist and resolves
+/// names.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortForward {
     pub id: String,
@@ -51,7 +52,7 @@ impl PortForward {
         ForwardSpec {
             id: self.id.clone(),
             local_port: self.local_port,
-            // Keep the host as a name end-to-end. RoutedSet recognizes
+            // Keep the host as a name end-to-end. The routing table recognizes
             // IP-looking domain strings, while the server remains responsible
             // for aliases and DNS resolution.
             target: Target::Domain(self.remote_host.clone(), self.remote_port),
@@ -66,7 +67,7 @@ pub struct ForwardManager {
 }
 
 impl ForwardManager {
-    pub fn new(runtime: Handle, forwarder: ServerForwarder, forwards: &[PortForward]) -> Self {
+    pub fn new(runtime: Handle, forwarder: TunnelDialer, forwards: &[PortForward]) -> Self {
         Self {
             inner: CoreForwardManager::new(runtime, forwarder, &enabled_specs(forwards)),
         }

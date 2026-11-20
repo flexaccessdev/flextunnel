@@ -72,7 +72,12 @@ fn connections_line(phases: &[Phase]) -> Option<String> {
     if phases.is_empty() {
         return None;
     }
-    let connected = phases.iter().filter(|p| **p == Phase::Connected).count();
+    // A profile in standby is up — listening, one use away from its server —
+    // so it counts with the connected ones.
+    let connected = phases
+        .iter()
+        .filter(|p| matches!(p, Phase::Connected | Phase::Standby))
+        .count();
     Some(if connected > 0 {
         format!("Connections: {connected} of {} connected", phases.len())
     } else if phases.contains(&Phase::Failed) {
@@ -96,7 +101,9 @@ fn tray_state(
     server: Option<(&ServerConfig, &ServerSnapshot)>,
     client_phases: &[Phase],
 ) -> TrayState {
-    let connected = client_phases.contains(&Phase::Connected);
+    let connected = client_phases
+        .iter()
+        .any(|p| matches!(p, Phase::Connected | Phase::Standby));
     match server {
         // Just disabled: shown as stopping until it has.
         Some((_, snapshot)) if snapshot.phase == ServerPhase::Stopping => TrayState::Changing,
@@ -394,6 +401,8 @@ mod tests {
         assert_eq!(tray_state(None, &[]), TrayState::Off);
         assert_eq!(tray_state(None, &[Phase::Idle, Phase::Failed]), TrayState::Off);
         assert_eq!(tray_state(None, &[Phase::Reconnecting]), TrayState::Busy);
+        // Standby is up: listening, one use away from its server.
+        assert_eq!(tray_state(None, &[Phase::Standby, Phase::Idle]), TrayState::Active);
         assert_eq!(tray_state(None, &[Phase::Connected, Phase::Connecting]), TrayState::Active);
     }
 
@@ -417,6 +426,11 @@ mod tests {
         assert_eq!(server_toggle(&off, ServerPhase::Stopped), ("Enable Server", true));
 
         assert_eq!(connections_line(&[]), None);
+        assert_eq!(
+            connections_line(&[Phase::Standby, Phase::Connected, Phase::Idle]).as_deref(),
+            Some("Connections: 2 of 3 connected"),
+            "a profile in standby counts as connected"
+        );
         assert_eq!(
             connections_line(&[Phase::Connected, Phase::Idle]).as_deref(),
             Some("Connections: 1 of 2 connected")

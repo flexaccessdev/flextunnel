@@ -4,11 +4,7 @@
 //! local listener. No-auth only; CONNECT command only (TCP — no BIND, no UDP
 //! ASSOCIATE).
 //!
-//! There is no authentication (everything is loopback and trusted). The port
-//! forwarder guards against accidentally reaching some *other* SOCKS5 server
-//! on the port (another flextunnel instance, an `ssh -D`) by fetching
-//! `http://flextunnel.internal/status.json` through the proxy and checking the
-//! reported server node id — see the desktop forwarder module.
+//! There is no authentication (everything is loopback and trusted).
 
 use crate::proxy::signaling::{self, Target};
 use std::io;
