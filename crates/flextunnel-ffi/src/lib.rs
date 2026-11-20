@@ -1,36 +1,39 @@
 //! C FFI surface for the iOS app (`aarch64-apple-ios`).
 //!
 //! The app links `libflextunnel.xcframework` (containing `libflextunnel.a`
-//! slices) and drives the in-process tunnel primarily with these calls:
+//! slices) and drives the in-process client primarily with these calls:
 //!
-//! 1. [`flextunnel_start`] — parse the JSON config, create an iroh endpoint,
-//!    optionally bind a loopback SOCKS5 listener, and spawn the
-//!    connect/auth/serve loop on an embedded runtime. Returns an opaque handle
-//!    and writes `{"socks_port": N|null}` to the caller's buffer so the app can point
-//!    `WKWebsiteDataStore.proxyConfigurations` at `127.0.0.1:N`. At most **one**
+//! 1. [`flextunnel_start`] — parse the JSON config, optionally bind a loopback
+//!    SOCKS5 listener, and spawn the client on an embedded runtime. Returns an
+//!    opaque handle and writes `{"socks_port": N|null}` to the caller's buffer
+//!    so the app can point `WKWebsiteDataStore.proxyConfigurations` at
+//!    `127.0.0.1:N`. **Nothing is connected by starting**: each destination's
+//!    server is dialed when something is first sent to it. At most **one**
 //!    instance may run at a time (a process-global guard rejects a second).
-//! 2. [`flextunnel_set_forwards`] — reconcile server-direct local forwards.
-//! 3. [`flextunnel_health`] — cheap liveness probe: is the serve loop still
-//!    running, or did it give up (a rejected key, a malformed config)?
-//! 4. [`flextunnel_routes`] — snapshot the server-pushed split-tunnel set for UI.
-//! 5. [`flextunnel_conn_path`] — snapshot the live iroh path(s) (relay/direct)
-//!    for an on-demand "connection path" status readout.
+//! 2. [`flextunnel_set_forwards`] — reconcile local port forwards.
+//! 3. [`flextunnel_health`] — cheap liveness probe: is the client still
+//!    serving, or did it lose a local listener for good?
+//! 4. [`flextunnel_status`] — snapshot every destination's connection state
+//!    and routes for UI.
+//! 5. [`flextunnel_conn_path`] — snapshot one destination's live iroh path(s)
+//!    (relay/direct) for an on-demand "connection path" status readout.
 //! 6. [`flextunnel_close_listeners`] — one-way suspend-side close of every
 //!    local listener, so backlogged clients get refused instead of hanging.
 //! 7. [`flextunnel_set_background`] — scene-lifecycle hint: backgrounded, the
-//!    core's heartbeat slows from 10s to 60s so an idle session wakes the
+//!    core's heartbeat slows from 10s to 60s so a connected session wakes the
 //!    cellular radio once a minute instead of six times.
 //! 8. [`flextunnel_set_network_available`] — path hint (`NWPathMonitor`): while
-//!    no path is usable the reconnect loop parks with no timers instead of
-//!    burning backoff retries into a dead network, and reconnects immediately
-//!    when a path returns.
-//! 9. [`flextunnel_stop`] — abort the loop, close the endpoint, free the handle.
+//!    no path is usable nothing is dialed, instead of burning retries into a
+//!    dead network, and waiting destinations dial immediately when a path
+//!    returns.
+//! 9. [`flextunnel_stop`] — stop the client, close its endpoints, free the
+//!    handle.
 //!
 //! Unlike the ezvpn FFI there is **no VPN / Network Extension and no `utun` fd**:
-//! flextunnel is pure-userspace proxying and server-direct forwarding over QUIC,
-//! so its optional proxy and forwarding listeners run entirely inside the app
+//! flextunnel is pure-userspace proxying and forwarding over QUIC, so its
+//! optional proxy and forwarding listeners run entirely inside the app
 //! process. The app is expected to work only in the foreground —
-//! when iOS suspends it the runtime freezes and the QUIC connection idle-times
+//! when iOS suspends it the runtime freezes and the QUIC connections idle-time
 //! out. The app calls [`flextunnel_close_listeners`] just before an unavoidable
 //! suspension (so local clients get refused instead of hanging on a frozen
 //! backlog) and relaunches the session on return to the foreground.
@@ -41,19 +44,32 @@
 //!
 //! ## Config JSON (input to `flextunnel_start`)
 //!
-//! `auth_key` (the client's `ed25519-sec:...` secret key, whose public
-//! half must be on the server's authorized-keys file) and `server_node_id` are
-//! required; the rest are optional. The routed set (the *tunnel set* that
-//! decides split-tunneling) is configured on the server and pushed to the
-//! client during the handshake, so the app sends no routed set of its own.
+//! `auth_key` (the client's `ed25519-sec:...` secret key, whose public half
+//! must be on each server's authorized-keys file) and at least one entry in
+//! `destinations` are required; the rest is optional.
+//!
+//! A destination gives a server a `host` name: `<host>:<port>` through the
+//! client reaches that port on the server's own loopback. Its optional
+//! `routed_domains` / `routed_cidrs` are further targets sent through that
+//! server (which must route them too — its own routed set is the allowlist).
+//! Routing is entirely this config's: nothing is learned from a server, and a
+//! target on no destination's list is connected directly from the device.
+//!
+//! `idle_timeout_secs` is how long a destination's connection is kept with no
+//! stream open on it: absent means the default (300), `0` means never close
+//! one for idleness.
 //!
 //! ```json
 //! {
-//!   "server_node_id": "<iroh endpoint id>",
 //!   "auth_key": "ed25519-sec:...",
 //!   "socks_port": null,
-//!   "relay_urls": ["https://relay.example/"],
-//!   "relay_auth_token": null
+//!   "relay_urls": ["https://relay-a.example/", "https://relay-b.example/"],
+//!   "relay_auth_token": null,
+//!   "idle_timeout_secs": 300,
+//!   "destinations": [
+//!     { "host": "machine1.internal", "server_node_id": "<iroh endpoint id>",
+//!       "routed_domains": ["*.corp.example"], "routed_cidrs": ["10.0.0.0/8"] }
+//!   ]
 //! }
 //! ```
 //!
@@ -65,21 +81,30 @@
 
 use std::ffi::{CStr, c_char, c_int};
 use std::collections::HashSet;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
 use flextunnel_core::error::ProxyResult;
 use flextunnel_core::proxy::signaling::Target;
+use flextunnel_core::config::DEFAULT_IDLE_TIMEOUT;
 use flextunnel_core::proxy::{
-    ClientAuth, ClientConfig, ForwardManager, ForwardSpec, ForwardState, ProxyClient, TunnelRoutes,
+    ClientAuth, ClientConfig, DestinationConfig, ForwardManager, ForwardSpec, ForwardState,
+    LocalListeners, ProxyClient,
 };
-use flextunnel_core::transport::endpoint::{ClientEndpoint, RelayConfig, create_client_endpoint};
+use flextunnel_core::transport::endpoint::RelayConfig;
 use flextunnel_core::transport::paths::ConnPathKind;
+
+/// Bound on [`flextunnel_stop`]'s graceful close of the client's endpoints.
+/// Closing waits out an endpoint still being built (see
+/// `ProxyClient::close`), which in the worst case takes as long as a relay
+/// probe plus the online wait; the app's calling thread must not hang on that.
+const STOP_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Process-global guard enforcing **at most one** running proxy instance. A
 /// second [`flextunnel_start`] while one is live is rejected rather than racing.
@@ -91,24 +116,18 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 /// by [`flextunnel_stop`].
 pub struct FlextunnelHandle {
     runtime: tokio::runtime::Runtime,
-    /// Kept so [`flextunnel_stop`] can close it gracefully before drop.
-    endpoint: ClientEndpoint,
-    /// The client driving the serve loop. Shared with the spawned `task` (which
-    /// holds a clone) so status callers can snapshot its live iroh paths on
-    /// demand via [`flextunnel_conn_path`].
+    /// The client. Shared with the spawned `task` (which holds a clone) so
+    /// status callers can snapshot it, and kept so [`flextunnel_stop`] can
+    /// close its endpoints gracefully before drop.
     client: Arc<ProxyClient>,
-    /// The running connect/serve loop.
+    /// The running client session (listeners + destination managers).
     task: tokio::task::JoinHandle<ProxyResult<()>>,
-    /// Live tunnel set (split-tunnel domains/CIDRs the server pushed), refreshed
-    /// by the serve loop on each (re)connect. Read by [`flextunnel_routes`].
-    routes: Arc<Mutex<TunnelRoutes>>,
-    /// Server-direct local forward listeners, reconciled from Swift.
+    /// Local forward listeners, reconciled from Swift.
     forwards: Mutex<ForwardManager>,
 }
 
 #[derive(Deserialize)]
 struct FfiConfig {
-    server_node_id: String,
     /// The client's secret key (`ed25519-sec:...`); the app stores it
     /// in the iOS keychain and passes it here at start.
     auth_key: String,
@@ -124,6 +143,25 @@ struct FfiConfig {
     /// valid with custom `relay_urls`; rejected with the default iroh relays.
     #[serde(default)]
     relay_auth_token: Option<String>,
+    /// Seconds a destination's connection is kept with no stream open on it.
+    /// Absent: the default; `0`: never closed for idleness.
+    #[serde(default)]
+    idle_timeout_secs: Option<u64>,
+    /// The servers this client reaches. At least one.
+    destinations: Vec<FfiDestination>,
+}
+
+#[derive(Deserialize)]
+struct FfiDestination {
+    /// The destination's name; `<host>:<port>` is the server's own loopback.
+    host: String,
+    server_node_id: String,
+    /// Further domains sent through this server.
+    #[serde(default)]
+    routed_domains: Vec<String>,
+    /// Further networks or bare IPs sent through this server.
+    #[serde(default)]
+    routed_cidrs: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -217,7 +255,10 @@ pub unsafe extern "C" fn flextunnel_client_public_key(
     }
 }
 
-/// Start the in-process tunnel, optionally with a SOCKS5 front-end.
+/// Start the in-process client, optionally with a SOCKS5 front-end. Validates
+/// the config (key, relays, destinations and their routes) and binds the
+/// listener; it does not connect to any server — a destination connects on
+/// first use.
 ///
 /// Returns a non-null handle on success and writes `{"socks_port": N|null}` to
 /// `out_buf`. On failure returns null and writes an error message to `out_buf`.
@@ -319,68 +360,76 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
         None => (None, None),
     };
 
-    let relay_config = RelayConfig::from_urls_with_token(&cfg.relay_urls, cfg.relay_auth_token.clone())
+    let relay = RelayConfig::from_urls_with_token(&cfg.relay_urls, cfg.relay_auth_token)
         .map_err(|e| format!("invalid relay configuration: {e}"))?;
     let client_key = flextunnel_core::auth::ClientKey::from_secret_str(cfg.auth_key.trim())
         .map_err(|e| format!("invalid auth key: {e:#}"))?;
-    let endpoint = runtime
-        .block_on(create_client_endpoint(&relay_config))
-        .map_err(|e| format!("failed to create iroh endpoint: {e}"))?;
+    let idle_timeout = match cfg.idle_timeout_secs {
+        None => Some(DEFAULT_IDLE_TIMEOUT),
+        Some(0) => None,
+        Some(secs) => Some(Duration::from_secs(secs)),
+    };
+    let mut destinations = Vec::with_capacity(cfg.destinations.len());
+    for destination in cfg.destinations {
+        let server_id = destination.server_node_id.trim().parse().map_err(|e| {
+            format!("destination {:?}: invalid server_node_id: {e}", destination.host)
+        })?;
+        destinations.push(DestinationConfig {
+            host: destination.host,
+            server_id,
+            auth: ClientAuth::Key(Box::new(client_key.clone())),
+            relay: relay.clone(),
+            routed_domains: destination.routed_domains,
+            routed_cidrs: destination.routed_cidrs,
+            keep_connected: false,
+        });
+    }
+    // Validates the destinations (hosts, routes, one entry per server).
+    // Nothing is dialed: a destination connects on first use.
+    let client = Arc::new(
+        ProxyClient::new(ClientConfig {
+            destinations,
+            idle_timeout,
+        })
+        .map_err(|e| e.to_string())?,
+    );
 
-    let client = Arc::new(ProxyClient::new(ClientConfig {
-        server_node_id: cfg.server_node_id,
-        auth: ClientAuth::Key(Box::new(client_key)),
-        // Unused: any listener is already bound above and passed in directly.
-        socks_listen: port.map(|p| SocketAddr::from((Ipv4Addr::LOCALHOST, p))),
-        // iOS exposes no HTTP front-end.
-        http_listen: None,
-        relay_urls: cfg.relay_urls,
-        relay_auth_token: cfg.relay_auth_token,
-        auto_reconnect: true,
-        max_reconnect_attempts: None,
-    }));
-
-    // Share the live tunnel set out of the client, so `flextunnel_routes` can
-    // read what the server pushes on connect.
-    let routes = client.routes();
     let forwards = Mutex::new(ForwardManager::new(
         runtime.handle().clone(),
-        client.server_forwarder(),
+        client.dialer(),
         &[],
     ));
 
-    // Clone the endpoint into the task; the original stays in the handle so
-    // `flextunnel_stop` can close it after aborting the task. The client is
-    // shared (Arc) so the handle keeps a clone for `flextunnel_conn_path` while
-    // the task drives the serve loop.
-    let ep = endpoint.clone();
+    // The client is shared (Arc) so the handle keeps a clone for the status
+    // calls — and to close its endpoints at stop — while the task serves.
     let client_task = client.clone();
     let task = runtime.spawn(async move {
-        client_task
-            .run_with_optional_listeners(&ep, listener, None)
-            .await
+        // iOS exposes no HTTP front-end.
+        client_task.run(LocalListeners::tcp(listener, None)).await
     });
 
     let result_json = serde_json::json!({ "socks_port": port }).to_string();
     Ok((
         FlextunnelHandle {
             runtime,
-            endpoint,
             client,
             task,
-            routes,
             forwards,
         },
         result_json,
     ))
 }
 
-/// Replace the complete desired server-direct forward set.
+/// Replace the complete desired forward set.
 ///
 /// `forwards_json` is a JSON array of
 /// `{id,local_port,remote_host,remote_port,enabled}` objects. Enabled forwards
-/// bind `127.0.0.1` and `::1`; every accepted connection is sent directly over
-/// the authenticated server connection. The server rejects off-list targets.
+/// bind `127.0.0.1` and `::1`; every accepted connection is sent through the
+/// destination that routes `remote_host` (connecting it first if it is idle),
+/// whose server rejects targets off its own list. `remote_host` is routed like
+/// a proxy request — a destination's own host is that server's loopback —
+/// except that a forward never connects directly: an enabled forward whose
+/// host no destination routes is invalid input.
 ///
 /// Returns 1 on success, 0 for invalid input, and -1 for a null handle.
 ///
@@ -442,6 +491,16 @@ pub unsafe extern "C" fn flextunnel_set_forwards(
         });
     }
     let handle = unsafe { &*handle };
+    let dialer = handle.client.dialer();
+    for spec in &specs {
+        if dialer.destination_for(&spec.target).is_none() {
+            let Target::Domain(host, _) = &spec.target else {
+                unreachable!("forward targets are built in domain form above");
+            };
+            write_cstr(out_buf, out_len, &format!("no destination routes {host}"));
+            return 0;
+        }
+    }
     match handle.forwards.lock() {
         Ok(mut manager) => manager.apply(&specs),
         Err(_) => {
@@ -453,7 +512,7 @@ pub unsafe extern "C" fn flextunnel_set_forwards(
     1
 }
 
-/// Snapshot server-direct forward states as JSON.
+/// Snapshot forward states as JSON.
 ///
 /// Returns the number of bytes the JSON needs **including the trailing NUL**,
 /// or -1 for a null handle or internal lock failure. The buffer holds the
@@ -504,8 +563,8 @@ pub unsafe extern "C" fn flextunnel_forward_statuses(
     (json.len() + 1) as isize
 }
 
-/// Close every local listener — the SOCKS5/HTTP front-ends and all
-/// server-direct forward listeners — while keeping the session handle alive.
+/// Close every local listener — the SOCKS5 front-end and all forward
+/// listeners — while keeping the session handle alive.
 ///
 /// One-way, for the moment iOS is about to suspend the app: a frozen process's
 /// listeners keep accepting into the kernel backlog and then serve nothing, so
@@ -543,10 +602,10 @@ pub unsafe extern "C" fn flextunnel_close_listeners(handle: *const FlextunnelHan
 /// is backgrounded, `0` when foregrounded. Backgrounded, the app-level
 /// heartbeat — the connection's only periodic traffic — slows from 10s to 60s,
 /// keeping the cellular radio in its low-power state almost the whole time; the
-/// foreground flip snaps it back and sends any overdue beat immediately, and if
-/// the core is sitting out a reconnect backoff (up to 60s once a long outage
-/// has pushed it to the cap) it ends that wait and attempts at once with a
-/// fresh backoff series. Idempotent; safe to call with the same value
+/// foreground flip snaps it back and sends any overdue beat immediately, and a
+/// destination sitting out a retry backoff (up to 60s once a long outage has
+/// pushed it to the cap) ends that wait and attempts at once with a fresh
+/// backoff series. Idempotent; safe to call with the same value
 /// repeatedly.
 ///
 /// Returns 1 on success and -1 for a null handle.
@@ -568,10 +627,10 @@ pub unsafe extern "C" fn flextunnel_set_background(
 }
 
 /// Report whether the device currently has a usable network path (`1`/`0`),
-/// e.g. from `NWPathMonitor`. While unavailable the core's reconnect loop parks
-/// with no timers at all — instead of waking the radio for backoff retries that
-/// cannot succeed — and a flip back to available reconnects immediately with a
-/// fresh backoff series. Defaults to available if never called.
+/// e.g. from `NWPathMonitor`. While unavailable no destination dials — instead
+/// of waking the radio for attempts that cannot succeed — and a flip back to
+/// available gives every destination with requests waiting an immediate
+/// attempt with a fresh backoff series. Defaults to available if never called.
 ///
 /// Returns 1 on success and -1 for a null handle.
 ///
@@ -609,10 +668,12 @@ pub unsafe extern "C" fn flextunnel_stop(handle: *mut FlextunnelHandle) {
 
 /// Liveness probe for the running proxy.
 ///
-/// Returns `1` while the connect/serve loop is still running, `0` once it has
-/// ended (it gives up only on a permanent error — a bad node id, a rejected
-/// key; an unreachable server, on the first attempt or after a drop, keeps
-/// retrying with backoff and stays `1`), and `-1` for a null handle.
+/// Returns `1` while the client is still serving, `0` once it has ended, and
+/// `-1` for a null handle. The client ends only when a local listener is lost
+/// for good (its port taken by another process after the OS invalidated the
+/// socket). No destination's trouble ends it: an unreachable server, a dropped
+/// connection or a rejected key is that destination's state — see
+/// [`flextunnel_status`] — and the client keeps serving the rest.
 ///
 /// # Safety
 /// `handle` must be a valid pointer returned by [`flextunnel_start`] and not yet
@@ -626,130 +687,47 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
     if handle.task.is_finished() { 0 } else { 1 }
 }
 
-/// Snapshot the tunnel's current forwarding set as JSON into `out_buf`:
+/// Snapshot the client's destinations as JSON into `out_buf`:
 ///
 /// ```json
-/// { "connected": true, "domains": ["*.example.com"], "cidrs": ["10.0.0.0/8"],
-///   "host_aliases": [["nas.internal", "192.168.1.9"]],
-///   "dns_forwards": [{"suffix": "corp.example.com", "servers": ["10.1.0.10:5353"]}],
-///   "bridges": [{"name": "lab", "endpoint_id": "…", "domains": ["*.svc"], "cidrs": ["fd34::/64"]}] }
+/// { "idle_timeout_secs": 300,
+///   "destinations": [
+///     { "host": "machine1.internal", "server_node_id": "…",
+///       "state": "connected", "connected_secs": 42,
+///       "open_streams": 1, "waiting": 0, "client_node_id": "…",
+///       "failed_attempts": 0, "next_attempt_secs": null, "last_error": null,
+///       "routed_domains": ["*.corp.example"], "routed_cidrs": ["10.0.0.0/8"],
+///       "relay_urls": [] } ] }
 /// ```
 ///
-/// This is the split-tunnel set the server pushes during the handshake — the
-/// domains/CIDRs routed through the tunnel. The local SOCKS proxy owns the split:
-/// matching targets use the tunnel, while off-list targets connect directly from
-/// the client device. The server independently rejects any off-list request that
-/// reaches it. The caller may use the lists for OS routing or display, but does
-/// not need to enforce the split itself. Before the first successful handshake,
-/// `connected` is false and the lists are empty. The set becomes available shortly
-/// after start, once the handshake completes, so the caller should poll it.
+/// One entry per configured destination, in config order. `state` is one of:
 ///
-/// `host_aliases` (`[alias, target]` pairs) is informational, for display in
-/// status UIs only — the server resolves the aliases itself, so there is
-/// nothing to enforce caller-side.
+/// - `"idle"` — not connected and nothing is asking for it. The resting state:
+///   a destination connects when something is first sent to it and goes back
+///   to idle after `idle_timeout_secs` without an open stream (`null`: never).
+/// - `"connecting"` — building its endpoint, connecting or authenticating.
+/// - `"connected"` — `connected_secs` is the connection's age.
+/// - `"backoff"` — the last attempt failed and requests are still waiting;
+///   `next_attempt_secs` is when it retries.
+/// - `"failed"` — the server refused this client (e.g. an unauthorized key);
+///   requests fail at once until `next_attempt_secs`.
 ///
-/// `dns_forwards` is the server's conditional DNS-forwarding table (split-DNS),
-/// also informational: each entry is `{"suffix", "servers"}` where names under
-/// `suffix` are resolved via `servers` (`IP` or `IP:port`) instead of the
-/// server's system resolver. Empty when the server configures none.
+/// `open_streams` / `waiting` count the streams open on the connection and the
+/// requests held while it connects. `client_node_id` is this client's endpoint
+/// id toward that server, `null` while idle (the endpoint exists only while
+/// the destination is in use). `failed_attempts` and `last_error` describe the
+/// current outage and are cleared by a successful connection; an idle
+/// destination with `failed_attempts > 0` retries on its next use, not before.
 ///
-/// `bridges` is the server's outbound bridge-route table (targets it forwards
-/// to another flextunnel server), also informational: each entry is
-/// `{"name", "endpoint_id", "domains", "cidrs"}`. The bridged rules are already
-/// part of the routed set, so there is nothing to enforce caller-side. Empty
-/// when the server configures none.
+/// `routed_domains` / `routed_cidrs` echo the destination's configured routes,
+/// for display: the local SOCKS proxy owns the split — a target a destination
+/// routes uses that destination's tunnel, everything else connects directly
+/// from the device — so the caller has nothing to enforce. A server's own view
+/// (its routed set, host aliases, DNS forwards, bridges) is its status page,
+/// reachable through the SOCKS proxy at
+/// `http://flextunnel.internal/servers/<host>/status.json`.
 ///
-/// Returns `1` on success (full JSON written), `0` if `out_buf` was too small
-/// (the JSON is truncated; retry with a larger buffer), and `-1` for a null
-/// handle or if the route snapshot could not be read (internal lock error).
-/// `out_buf` is always NUL-terminated when usable (non-null, `out_len > 0`):
-/// the error returns write an empty string.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by [`flextunnel_start`] and not yet
-/// passed to [`flextunnel_stop`]. `out_buf` must point to at least `out_len`
-/// writable bytes (may be null only if `out_len` is 0).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn flextunnel_routes(
-    handle: *const FlextunnelHandle,
-    out_buf: *mut c_char,
-    out_len: usize,
-) -> c_int {
-    if handle.is_null() {
-        write_cstr(out_buf, out_len, "");
-        return -1;
-    }
-    let handle = unsafe { &*handle };
-    let json = match handle.routes.lock() {
-        Ok(routes) => {
-            let dns_forwards: Vec<_> = routes
-                .dns_forwards
-                .iter()
-                .map(|(suffix, servers)| {
-                    serde_json::json!({ "suffix": suffix, "servers": servers })
-                })
-                .collect();
-            let bridges: Vec<_> = routes
-                .bridges
-                .iter()
-                .map(|b| {
-                    serde_json::json!({
-                        "name": b.name,
-                        "endpoint_id": b.endpoint_id,
-                        "domains": b.domains,
-                        "cidrs": b.cidrs,
-                    })
-                })
-                .collect();
-            serde_json::json!({
-                "connected": routes.connected,
-                "domains": routes.domains,
-                "cidrs": routes.cidrs,
-                "host_aliases": routes.host_aliases,
-                "dns_forwards": dns_forwards,
-                "bridges": bridges,
-            })
-            .to_string()
-        }
-        Err(_) => {
-            write_cstr(out_buf, out_len, "");
-            return -1;
-        }
-    };
-    if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
-}
-
-/// Snapshot the live connection's iroh path(s) as JSON into `out_buf`, mirroring
-/// `ezvpn client status` / the desktop's "connection path" readout:
-///
-/// ```json
-/// { "paths": [
-///     {"kind":"direct","display":"Direct 1.2.3.4:52186 (rtt 1ms)","selected":true},
-///     {"kind":"relay","display":"Relay https://relay.example/ (rtt 42ms)","selected":false}
-///   ],
-///   "udp_tx_datagrams": 1234, "udp_rx_datagrams": 1201 }
-/// ```
-///
-/// `udp_tx_datagrams`/`udp_rx_datagrams` count the UDP datagrams the live
-/// connection has sent/received since it was established (0 while
-/// disconnected). On cellular, energy is per-wakeup rather than per-byte, so
-/// sampling the tx count across an interval — e.g. across a backgrounded stint
-/// — is the cheap proxy for the tunnel's radio cost.
-///
-/// This is a **point-in-time** snapshot of how the client currently reaches the
-/// server, showing *all* discovered paths (not just the selected one); `kind` is
-/// `"direct"`, `"relay"`, or `"other"` (a forward-compatible catch-all) and
-/// `selected` marks the path iroh routes over right now. The `paths` array is
-/// **empty** while disconnected (during a drop/backoff or before the first
-/// connect), so callers should only offer this once the tunnel link is up.
-///
-/// `custom_relays` reports each configured custom relay's health from an
-/// on-demand GET of its `/healthz` endpoint (checked in parallel, only when this
-/// snapshot is requested). `working` is `true` on a 2xx, `false` when
-/// unreachable/timed-out/non-2xx, and `null` if the check could not run; `error`
-/// carries the failure detail. The array is empty when the default relays are
-/// used. `/healthz` is unauthenticated: it confirms the relay is up, not that a
-/// `relay_auth_token` is accepted.
+/// Reading this never causes a connection.
 ///
 /// Returns `1` on success (full JSON written), `0` if `out_buf` was too small
 /// (the JSON is truncated; retry with a larger buffer), and `-1` for a null
@@ -761,7 +739,7 @@ pub unsafe extern "C" fn flextunnel_routes(
 /// passed to [`flextunnel_stop`]. `out_buf` must point to at least `out_len`
 /// writable bytes (may be null only if `out_len` is 0).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn flextunnel_conn_path(
+pub unsafe extern "C" fn flextunnel_status(
     handle: *const FlextunnelHandle,
     out_buf: *mut c_char,
     out_len: usize,
@@ -771,10 +749,110 @@ pub unsafe extern "C" fn flextunnel_conn_path(
         return -1;
     }
     let handle = unsafe { &*handle };
+    let json = status_json(&handle.client.status(), Instant::now());
+    if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
+}
+
+/// The [`flextunnel_status`] JSON for `status` as of `now`.
+fn status_json(status: &flextunnel_core::proxy::ClientStatus, now: Instant) -> String {
+    let destinations: Vec<_> = status
+        .destinations
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "host": d.host,
+                "server_node_id": d.server_node_id,
+                "state": d.state.as_str(),
+                "connected_secs": d
+                    .connected_since
+                    .map(|at| now.saturating_duration_since(at).as_secs()),
+                "open_streams": d.open_streams,
+                "waiting": d.waiting,
+                "client_node_id": d.client_node_id,
+                "failed_attempts": d.failed_attempts,
+                "next_attempt_secs": d
+                    .next_attempt_at
+                    .map(|at| at.saturating_duration_since(now).as_secs()),
+                "last_error": d.last_error,
+                "routed_domains": d.routed_domains,
+                "routed_cidrs": d.routed_cidrs,
+                "relay_urls": d.relay_urls,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "idle_timeout_secs": status.idle_timeout.map(|idle| idle.as_secs()),
+        "destinations": destinations,
+    })
+    .to_string()
+}
+
+/// Snapshot the iroh path(s) of the connection to the destination named `host`
+/// as JSON into `out_buf`, mirroring `ezvpn client status` / the desktop's
+/// "connection path" readout:
+///
+/// ```json
+/// { "paths": [
+///     {"kind":"direct","display":"Direct 1.2.3.4:52186 (rtt 1ms)","selected":true},
+///     {"kind":"relay","display":"Relay https://relay.example/ (rtt 42ms)","selected":false}
+///   ],
+///   "udp_tx_datagrams": 1234, "udp_rx_datagrams": 1201 }
+/// ```
+///
+/// `udp_tx_datagrams`/`udp_rx_datagrams` count the UDP datagrams the live
+/// connection has sent/received since it was established (0 while not
+/// connected). On cellular, energy is per-wakeup rather than per-byte, so
+/// sampling the tx count across an interval — e.g. across a backgrounded stint
+/// — is the cheap proxy for the tunnel's radio cost.
+///
+/// This is a **point-in-time** snapshot of how the client currently reaches that
+/// server, showing *all* discovered paths (not just the selected one); `kind` is
+/// `"direct"`, `"relay"`, or `"other"` (a forward-compatible catch-all) and
+/// `selected` marks the path iroh routes over right now. The whole snapshot is
+/// **empty** while the destination is not connected — idle, connecting, or
+/// backing off — or when `host` names no destination, so callers should only
+/// offer this for a destination [`flextunnel_status`] reports `"connected"`.
+/// Asking never connects it.
+///
+/// `custom_relays` reports each configured custom relay's health from an
+/// on-demand GET of its `/healthz` endpoint (checked in parallel, only when this
+/// snapshot is requested). `working` is `true` on a 2xx, `false` when
+/// unreachable/timed-out/non-2xx, and `null` if the check could not run; `error`
+/// carries the failure detail. The array is empty when the default relays are
+/// used. `/healthz` is unauthenticated: it confirms the relay is up, not that a
+/// `relay_auth_token` is accepted.
+///
+/// Returns `1` on success (full JSON written), `0` if `out_buf` was too small
+/// (the JSON is truncated; retry with a larger buffer), and `-1` for a null
+/// handle or an unusable `host` (null or not UTF-8). `out_buf` is always
+/// NUL-terminated when usable (non-null, `out_len > 0`): the `-1` returns
+/// write an empty string.
+///
+/// # Safety
+/// `handle` must be a valid pointer returned by [`flextunnel_start`] and not yet
+/// passed to [`flextunnel_stop`]. `host` must be a valid, NUL-terminated C
+/// string (or null). `out_buf` must point to at least `out_len` writable bytes
+/// (may be null only if `out_len` is 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flextunnel_conn_path(
+    handle: *const FlextunnelHandle,
+    host: *const c_char,
+    out_buf: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    if handle.is_null() || host.is_null() {
+        write_cstr(out_buf, out_len, "");
+        return -1;
+    }
+    let Ok(host) = unsafe { CStr::from_ptr(host) }.to_str() else {
+        write_cstr(out_buf, out_len, "");
+        return -1;
+    };
+    let handle = unsafe { &*handle };
     // The relay health check performs on-demand HTTP, so drive the async snapshot
     // on the embedded runtime. Called from the app's own thread (never a runtime
     // worker), so `block_on` is safe and does not stall the running tunnel task.
-    let snapshot = handle.runtime.block_on(handle.client.connection_snapshot());
+    let snapshot = handle.runtime.block_on(handle.client.connection_snapshot(host.trim()));
     let paths: Vec<_> = snapshot
         .paths
         .into_iter()
@@ -802,24 +880,33 @@ pub unsafe extern "C" fn flextunnel_conn_path(
     if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
 }
 
-/// Abort the serve loop, close the endpoint gracefully, and shut the runtime
-/// down. Factored out so [`flextunnel_start`] can also use it on the
+/// Stop the client session, close its endpoints gracefully, and shut the
+/// runtime down. Factored out so [`flextunnel_start`] can also use it on the
 /// buffer-too-small path without going through a raw pointer.
 fn stop_handle(handle: FlextunnelHandle) {
     let FlextunnelHandle {
         runtime,
-        endpoint,
-        client: _,
+        client,
         task,
-        routes: _,
         forwards,
     } = handle;
     drop(forwards);
     task.abort();
-    // Close the endpoint before it drops. Skipping this makes iroh tear down its
-    // relay tasks ungracefully (a JoinSet abort that panics — fatal under
-    // panic=abort). `block_on` is safe here: the task is already aborted.
-    runtime.block_on(endpoint.close());
+    // Close the endpoints of the destinations in use before they drop.
+    // Skipping this makes iroh tear down its relay tasks ungracefully (a
+    // JoinSet abort that panics — fatal under panic=abort). The session task is
+    // awaited first so nothing is still using them; `block_on` is safe here,
+    // on the app's own thread. Bounded: the close waits out an endpoint build
+    // in flight, and stopping must not hang the caller on a slow one.
+    runtime.block_on(async {
+        let _ = task.await;
+        if tokio::time::timeout(STOP_CLOSE_TIMEOUT, client.close())
+            .await
+            .is_err()
+        {
+            log::warn!("Closing the client's endpoints is taking too long; stopping anyway");
+        }
+    });
     runtime.shutdown_background();
 }
 
@@ -859,5 +946,93 @@ mod tests {
         drop(probe);
         let listener = bind_socks_listener(port).await.unwrap();
         assert_eq!(listener.local_addr().unwrap().port(), port);
+    }
+
+    fn start_error(json: &str) -> String {
+        match start_inner(json) {
+            Ok((handle, _)) => {
+                stop_handle(handle);
+                panic!("expected the start to fail");
+            }
+            Err(message) => message,
+        }
+    }
+
+    fn config(destinations: serde_json::Value) -> String {
+        let key = flextunnel_core::auth::ClientKey::generate().unwrap();
+        serde_json::json!({ "auth_key": key.secret_str(), "destinations": destinations }).to_string()
+    }
+
+    fn node_id(seed: u8) -> String {
+        flextunnel_core::iroh::SecretKey::from_bytes(&[seed; 32])
+            .public()
+            .to_string()
+    }
+
+    /// Starting validates the config and connects nothing: every destination
+    /// reports idle, and stopping right away has no endpoint to close.
+    #[test]
+    fn start_is_lazy_and_reports_idle_destinations() {
+        let json = config(serde_json::json!([
+            { "host": "Machine1.Internal", "server_node_id": node_id(1),
+              "routed_domains": ["*.corp.example"], "routed_cidrs": ["10.0.0.0/8"] },
+            { "host": "m2.internal", "server_node_id": node_id(2) },
+        ]));
+        let (handle, result) = start_inner(&json).expect("starts");
+        assert_eq!(result, r#"{"socks_port":null}"#);
+
+        let status: serde_json::Value =
+            serde_json::from_str(&status_json(&handle.client.status(), Instant::now())).unwrap();
+        assert_eq!(status["idle_timeout_secs"], DEFAULT_IDLE_TIMEOUT.as_secs());
+        let destinations = status["destinations"].as_array().unwrap();
+        assert_eq!(destinations.len(), 2);
+        assert_eq!(destinations[0]["host"], "machine1.internal");
+        assert_eq!(destinations[0]["server_node_id"], node_id(1));
+        assert_eq!(destinations[0]["routed_domains"][0], "*.corp.example");
+        assert_eq!(destinations[0]["routed_cidrs"][0], "10.0.0.0/8");
+        for destination in destinations {
+            assert_eq!(destination["state"], "idle");
+            assert!(destination["client_node_id"].is_null());
+            assert!(destination["connected_secs"].is_null());
+            assert_eq!(destination["open_streams"], 0);
+        }
+        assert!(!handle.task.is_finished(), "the session keeps serving");
+        stop_handle(handle);
+    }
+
+    #[test]
+    fn idle_timeout_zero_means_never() {
+        let key = flextunnel_core::auth::ClientKey::generate().unwrap();
+        let json = serde_json::json!({
+            "auth_key": key.secret_str(),
+            "idle_timeout_secs": 0,
+            "destinations": [{ "host": "m1.internal", "server_node_id": node_id(1) }],
+        })
+        .to_string();
+        let (handle, _) = start_inner(&json).expect("starts");
+        let status: serde_json::Value =
+            serde_json::from_str(&status_json(&handle.client.status(), Instant::now())).unwrap();
+        assert!(status["idle_timeout_secs"].is_null());
+        stop_handle(handle);
+    }
+
+    #[test]
+    fn invalid_configs_are_rejected_at_start() {
+        // The single-server schema is gone: `destinations` is required.
+        let key = flextunnel_core::auth::ClientKey::generate().unwrap();
+        let old = serde_json::json!({ "auth_key": key.secret_str(), "server_node_id": node_id(1) });
+        assert!(start_error(&old.to_string()).contains("destinations"));
+
+        assert!(start_error(&config(serde_json::json!([]))).contains("no destinations"));
+        let bad_id = config(serde_json::json!([{ "host": "m1.internal", "server_node_id": "nope" }]));
+        let message = start_error(&bad_id);
+        assert!(message.contains("m1.internal") && message.contains("server_node_id"), "{message}");
+        let bad_host = config(serde_json::json!([{ "host": "10.0.0.1", "server_node_id": node_id(1) }]));
+        assert!(start_error(&bad_host).contains("IP address"));
+        let same_server = config(serde_json::json!([
+            { "host": "m1.internal", "server_node_id": node_id(1) },
+            { "host": "m2.internal", "server_node_id": node_id(1) },
+        ]));
+        assert!(start_error(&same_server).contains("same server"));
     }
 }

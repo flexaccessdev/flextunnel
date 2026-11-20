@@ -1,0 +1,23 @@
+flextunnel client status
+version: {{ version }}
+socks5: {{ socks_listen }}
+http: {{ http_listen }}
+idle timeout: {{ idle_timeout }}
+
+destinations:
+{% if rows.is_empty() %}  none
+{% else %}{% for row in rows %}  {{ row.status.host }}:
+    state: {{ row.state }}{% if !row.detail.is_empty() %} ({{ row.detail }}){% endif %}
+    server node id: {{ row.status.server_node_id }}
+    open streams: {{ row.status.open_streams }}
+    waiting: {{ row.status.waiting }}
+{% if let Some(id) = row.status.client_node_id %}    client node id: {{ id }}
+{% endif %}{% if let Some(error) = row.status.last_error %}    last error: {{ error }}
+{% endif %}{% if !row.status.routed_domains.is_empty() %}    routed domains:
+{% for d in row.status.routed_domains %}      - {{ d }}
+{% endfor %}{% endif %}{% if !row.status.routed_cidrs.is_empty() %}    routed cidrs:
+{% for c in row.status.routed_cidrs %}      - {{ c }}
+{% endfor %}{% endif %}{% if !row.status.relay_urls.is_empty() %}    relays:
+{% for r in row.status.relay_urls %}      - {{ r }}
+{% endfor %}{% endif %}    server status: http://flextunnel.internal{{ row.server_status_path }}
+{% endfor %}{% endif %}

@@ -1,32 +1,48 @@
 //! Client instance identity.
 //!
 //! A client *instance* is one running `flextunnel client start` process,
-//! identified by the server it connects to: since a profile's `server_node_id` never
-//! changes, its prefix keys every per-instance artifact — the single-instance
-//! lock (`client-<key>.lock`) and the control socket (`client-<key>.sock` /
-//! `\\.\pipe\flextunnel-client-<key>`). There is deliberately no way to
-//! override the key:
-//! one client per server per user, and `flextunnel client control` finds the
-//! right socket from the same config. The optional `name` in the config
-//! ("aws", "home network") is display-only.
+//! identified by its **name**: the `name` in its config, or `default`. The name
+//! keys every per-instance artifact — the single-instance lock
+//! (`client-<name>.lock`) and the control socket (a `client-….sock` file or a
+//! per-user `\\.\pipe\flextunnel-client-…` pipe, both named from it — see
+//! `ipc.rs`) — so `flextunnel client control` and `flextunnel client nc` find
+//! the right running client from the same config, or from `-n <name>` alone.
+//!
+//! One client reaches any number of servers (its destinations), so a single
+//! unnamed client is the common case. Names exist for running several at once
+//! — say, two configs with different proxy ports — which each need their own.
 
 use anyhow::{Context, Result, anyhow, bail};
 use flextunnel_core::config;
 use std::path::{Path, PathBuf};
 
-/// How much of the server node id keys the on-disk artifacts. 16 hex chars
-/// (64 bits) cannot collide by accident between distinct servers.
-const KEY_LEN: usize = 16;
+/// The instance name of a client whose config sets none.
+pub const DEFAULT_INSTANCE: &str = "default";
 
-/// Derive the instance key from a profile's server node id: its first
-/// [`KEY_LEN`] characters, lowercased. Errors on anything that cannot be a
-/// node id (full validation happens when the id is parsed for dialing).
-pub fn instance_key(server_node_id: &str) -> Result<String> {
-    let id = server_node_id.trim();
-    if id.len() < KEY_LEN || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
-        bail!("server_node_id {id:?} does not look like a server EndpointId");
+/// Longest instance name: short enough to read in a lock file's name and a
+/// panel title. The control socket's file name is bounded separately (see
+/// `ipc.rs`), so a long name never costs the socket path its length limit.
+const MAX_NAME_LEN: usize = 32;
+
+/// Resolve and validate an instance name: `name` when given, else
+/// [`DEFAULT_INSTANCE`]. It becomes part of a file name and a Windows pipe
+/// name, so only lowercase letters, digits, `-` and `_` are allowed.
+pub fn instance_name(name: Option<&str>) -> Result<String> {
+    let Some(name) = name else {
+        return Ok(DEFAULT_INSTANCE.to_string());
+    };
+    let valid = !name.is_empty()
+        && name.len() <= MAX_NAME_LEN
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+    if !valid {
+        bail!(
+            "client name {name:?} is not usable: it names the lock and the control socket, so \
+             it must be 1-{MAX_NAME_LEN} characters of a-z, 0-9, '-' or '_'"
+        );
     }
-    Ok(id[..KEY_LEN].to_ascii_lowercase())
+    Ok(name.to_string())
 }
 
 /// The per-user directory holding all per-instance artifacts
@@ -38,89 +54,93 @@ pub fn instance_dir() -> Result<PathBuf> {
     Ok(home.join(".config").join("flextunnel"))
 }
 
+/// How an attaching command came by its instance name.
+enum Source {
+    /// `-n <name>`.
+    Flag,
+    /// `-c <file>`.
+    Config(PathBuf),
+    /// The default config file, which exists.
+    DefaultConfig(PathBuf),
+    /// Neither flag, and no default config: assumed [`DEFAULT_INSTANCE`].
+    Assumed,
+}
+
 /// A running client as named on the command line of a command that attaches
 /// to it (`client control`, `client nc`).
 pub struct Located {
-    /// The instance key its control socket is named by.
-    pub key: String,
-    /// The profile's display name, or `server <key>…` when it has none.
-    pub profile: String,
+    /// The instance name its control socket is named by.
+    pub name: String,
+    source: Source,
 }
 
-/// Identify the running client to attach to: `-n` wins over the config file,
-/// and with neither a bare `command` reads the default config, deriving the
-/// same instance key as the client's. With `-n` and no `-c`, identify purely
-/// by server id (no config load).
-pub fn locate(
-    config_path: Option<PathBuf>,
-    server_node_id: Option<String>,
-    command: &str,
-) -> Result<Located> {
-    let file = if server_node_id.is_some() && config_path.is_none() {
-        None
-    } else {
-        config::load_client_config(config_path.as_deref())?
+/// Identify the running client to attach to: `-n` wins; otherwise the config
+/// (`-c`, or the default `~/.config/flextunnel/client.toml` when it exists)
+/// gives the name, exactly as it does for the client that was started from it;
+/// with neither, the default name.
+pub fn locate(config_path: Option<PathBuf>, name: Option<String>) -> Result<Located> {
+    if let Some(name) = name {
+        return Ok(Located {
+            name: instance_name(Some(&name))?,
+            source: Source::Flag,
+        });
+    }
+    let default_path = config::default_client_config_path();
+    let source = match (&config_path, &default_path) {
+        (Some(path), _) => Source::Config(path.clone()),
+        (None, Some(path)) if path.exists() => Source::DefaultConfig(path.clone()),
+        (None, _) => Source::Assumed,
     };
-    let cli = config::ClientConfig {
-        server_node_id,
-        ..Default::default()
-    };
-    let r = config::resolve_client(cli, file);
-    let Some(server_id) = r.server_node_id else {
-        return Err(no_profile_error(config_path.as_deref(), command));
-    };
-    let key = instance_key(&server_id)?;
-    let profile = r.name.unwrap_or_else(|| format!("server {key}…"));
-    Ok(Located { key, profile })
+    let file = config::load_client_config(config_path.as_deref())?;
+    let name = instance_name(file.and_then(|f| f.name).as_deref())?;
+    Ok(Located { name, source })
 }
 
-/// The error for an attaching `command` that has nothing to identify a client
-/// by. The two cases read very differently and want different fixes: a config
-/// file that exists but carries no `server_node_id`, versus no config file at
-/// all — the usual shape under the systemd template (see `docs/systemd.md`),
-/// where every profile lives in its own `<instance>.toml` and there is no
-/// `client.toml` for a bare command to find. In that case name the profiles
-/// that *are* there, so the fix is a copy-paste away.
-fn no_profile_error(config_path: Option<&Path>, command: &str) -> anyhow::Error {
-    if let Some(path) = config_path {
-        return anyhow!(
-            "The client config {} has no server_node_id, so it does not say which client to \
-             attach to. Set server_node_id in it, or pass -n <server EndpointId>.",
-            path.display()
-        );
+impl Located {
+    /// The error for "nothing is listening for this instance", saying where
+    /// the name came from. When it was only assumed — no flag, no default
+    /// config, the usual shape where each client's config lives in its own
+    /// file — name the configs that *are* there, so the fix is a copy-paste
+    /// away.
+    pub fn not_running(&self) -> anyhow::Error {
+        let name = &self.name;
+        match &self.source {
+            Source::Flag => anyhow!("The flextunnel client named '{name}' is not running."),
+            Source::Config(path) | Source::DefaultConfig(path) => anyhow!(
+                "The flextunnel client named '{name}' (from {}) is not running.",
+                path.display()
+            ),
+            Source::Assumed => {
+                let mut msg = format!(
+                    "The flextunnel client named '{name}' is not running. No -c <file> or \
+                     -n <name> was given and there is no default client config, so the \
+                     default name was assumed."
+                );
+                if let Some(path) = config::default_client_config_path()
+                    && let Some(dir) = path.parent()
+                    && let Some(found) = client_configs(dir)
+                {
+                    // Whole paths: one copied from here works with `-c` from
+                    // any directory.
+                    let paths: Vec<String> = found
+                        .iter()
+                        .map(|name| dir.join(name).display().to_string())
+                        .collect();
+                    msg.push_str(&format!(
+                        "\nConfigs found: {} — pass one with -c.",
+                        paths.join(", ")
+                    ));
+                }
+                anyhow!(msg)
+            }
+        }
     }
-    let Some(default_path) = config::default_client_config_path() else {
-        return anyhow!(
-            "Could not determine the default config directory. Pass -c <file> or \
-             -n <server EndpointId>."
-        );
-    };
-    if default_path.exists() {
-        return anyhow!(
-            "The default client config {} has no server_node_id, so it does not say which \
-             client to attach to. Set server_node_id in it, pass -c <file> for another \
-             profile, or pass -n <server EndpointId>.",
-            default_path.display()
-        );
-    }
-    let mut msg = format!(
-        "There is no client config at {}, so `{command}` has no profile to attach to. \
-         Pass the profile's config with -c <file>, or attach by server id with \
-         -n <server EndpointId>.",
-        default_path.display()
-    );
-    if let Some(dir) = default_path.parent()
-        && let Some(found) = profile_configs(dir)
-    {
-        msg.push_str(&format!("\nProfiles in {}: {}", dir.display(), found.join(", ")));
-    }
-    anyhow!(msg)
 }
 
-/// Config files in the flextunnel config dir that could be a client profile,
-/// as bare file names, sorted. `None` when there are none (or the directory is
+/// Config files in the flextunnel config dir that could be a client's, as bare
+/// file names, sorted. `None` when there are none (or the directory is
 /// unreadable) — the caller then says nothing rather than an empty list.
-fn profile_configs(dir: &Path) -> Option<Vec<String>> {
+fn client_configs(dir: &Path) -> Option<Vec<String>> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .ok()?
         .flatten()
@@ -136,49 +156,82 @@ mod tests {
     use super::*;
 
     #[test]
-    fn profile_configs_lists_candidate_client_configs() {
+    fn client_configs_lists_candidate_configs() {
         let dir = tempfile::tempdir().unwrap();
         for name in [
             "macintel.toml",
             "aws.toml",
             "server.toml",
-            "client-abc.lock",
+            "client-default.lock",
             "client.key",
         ] {
             std::fs::write(dir.path().join(name), "").unwrap();
         }
         assert_eq!(
-            profile_configs(dir.path()).unwrap(),
+            client_configs(dir.path()).unwrap(),
             ["aws.toml", "macintel.toml"]
         );
     }
 
     #[test]
-    fn no_profiles_reports_nothing_to_list() {
+    fn no_configs_reports_nothing_to_list() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(profile_configs(dir.path()).is_none());
-        assert!(profile_configs(&dir.path().join("missing")).is_none());
+        assert!(client_configs(dir.path()).is_none());
+        assert!(client_configs(&dir.path().join("missing")).is_none());
     }
 
     #[test]
-    fn a_named_config_without_a_server_id_names_that_file() {
-        let msg = no_profile_error(Some(Path::new("/tmp/aws.toml")), "client nc").to_string();
-        assert!(msg.contains("/tmp/aws.toml"), "{msg}");
-        assert!(msg.contains("server_node_id"), "{msg}");
+    fn names_default_and_are_validated() {
+        assert_eq!(instance_name(None).unwrap(), "default");
+        for good in ["default", "work", "home-2", "a_b", "0", &"x".repeat(32)] {
+            assert_eq!(instance_name(Some(good)).unwrap(), good);
+        }
+        for bad in [
+            "",
+            "Work",
+            "has space",
+            "dot.ted",
+            "../escape",
+            "slash/y",
+            "pipe\\y",
+            "ünï",
+            &"x".repeat(33),
+        ] {
+            assert!(instance_name(Some(bad)).is_err(), "{bad:?} should be rejected");
+        }
     }
 
     #[test]
-    fn key_is_a_lowercased_prefix() {
-        let id = "62E463A6D67FDEACc65e97464b2b51d7362e00436a8b81477a9cea46b11228ca";
-        assert_eq!(instance_key(id).unwrap(), "62e463a6d67fdeac");
-        assert_eq!(instance_key(&format!("  {id} ")).unwrap(), "62e463a6d67fdeac");
+    fn the_flag_names_the_instance_without_reading_a_config() {
+        // The config path does not exist; `-n` must not try to load it.
+        let located = locate(
+            Some(PathBuf::from("/nonexistent/flextunnel-test.toml")),
+            Some("work".to_string()),
+        )
+        .unwrap();
+        assert_eq!(located.name, "work");
+        assert!(located.not_running().to_string().contains("'work'"));
+        assert!(locate(None, Some("Not Valid".to_string())).is_err());
     }
 
     #[test]
-    fn malformed_ids_are_rejected() {
-        assert!(instance_key("").is_err());
-        assert!(instance_key("short").is_err());
-        assert!(instance_key("../escape/../../etc/passwd0000000").is_err());
-        assert!(instance_key("62e463a6 67fdeacc65e97464b2b51d7").is_err());
+    fn a_config_names_the_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let named = dir.path().join("named.toml");
+        std::fs::write(&named, "name = \"home\"\n").unwrap();
+        let located = locate(Some(named.clone()), None).unwrap();
+        assert_eq!(located.name, "home");
+        let msg = located.not_running().to_string();
+        assert!(msg.contains("'home'") && msg.contains("named.toml"), "{msg}");
+
+        // No name in the config: the default instance.
+        let unnamed = dir.path().join("unnamed.toml");
+        std::fs::write(&unnamed, "socks_port = 1080\n").unwrap();
+        assert_eq!(locate(Some(unnamed), None).unwrap().name, "default");
+
+        // A config that does not parse is an error, not a silent default.
+        let broken = dir.path().join("broken.toml");
+        std::fs::write(&broken, "server_node_id = \"abc\"\n").unwrap();
+        assert!(locate(Some(broken), None).is_err());
     }
 }

@@ -14,14 +14,15 @@ use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// flextunnel protocol version. v13: `Hello.auth.public_key` switched from the
-/// `flxtpubv1:` format to the shared flexaccess-keys `ed25519-pub:` tokens, so
-/// a pre-migration peer is turned away at the version check, before
-/// authentication, instead of failing key parsing.
-pub const PROTOCOL_VERSION: u16 = 13;
+/// flextunnel protocol version. v14: routing moved to the client — the
+/// `HelloResponse` no longer carries the server's routed set, and a stream
+/// request can ask for the server's own loopback or status page explicitly
+/// ([`StreamRequest`]) instead of through a reserved hostname. A peer on
+/// another version is turned away at the version check, before authentication.
+pub const PROTOCOL_VERSION: u16 = 14;
 
-/// Maximum auth-handshake message size (64 KiB). The server's routed set rides
-/// the `HelloResponse`, so this is generous enough for a large operator list.
+/// Maximum auth-handshake message size (64 KiB) — far above what a `Hello` or
+/// `HelloResponse` needs, while still bounding a misbehaving peer.
 pub const MAX_HANDSHAKE_SIZE: usize = 64 * 1024;
 
 /// Maximum size of a control-stream frame ([`ControlMsg`]). Generous for the
@@ -35,6 +36,11 @@ const STREAM_VERSION: u8 = 1;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
+// flextunnel's own request kinds, outside the SOCKS5 ATYP range.
+/// `[port:u16 BE]` follows: dial that port on the server's own loopback.
+const REQ_LOOPBACK: u8 = 0x10;
+/// Nothing follows: serve the server's status page.
+const REQ_STATUS: u8 = 0x11;
 
 // Reply codes — deliberately equal to RFC 1928 SOCKS5 reply codes so the client
 // forwards the server's reply byte straight into its SOCKS5 reply to the app.
@@ -97,11 +103,8 @@ pub struct Hello {
 
 /// Server → client auth handshake response.
 ///
-/// On acceptance the server pushes its resolved routed set (the *tunnel set*) so
-/// the client can make the split-tunnel decision without configuring its own
-/// list — the server is the single source of truth. Clients reject an empty
-/// routed set; bridges receive empty informational route lists because they do
-/// not make local split-tunnel decisions.
+/// Carries no routing: each side configures its own routed set (see
+/// [`crate::proxy::routed_set`]), so there is nothing for the server to push.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloResponse {
     pub version: u16,
@@ -112,31 +115,9 @@ pub struct HelloResponse {
     /// lifetime. A restarting server emits a fresh random nonce each start (never
     /// reappearing); a client bouncing between two servers that share this
     /// identity sees nonces flip-flop. That reappearance is how a client detects
-    /// a duplicate server id (see `proxy::client`). Sent on acceptance and
+    /// a duplicate server id (see `proxy::destination`). Sent on acceptance and
     /// rejection alike so the client can always record it.
     pub server_instance_nonce: u128,
-    /// Domain rules the client should tunnel (exact or `*.` wildcard).
-    #[serde(default)]
-    pub routed_domains: Vec<String>,
-    /// CIDR / bare-IP rules the client should tunnel.
-    #[serde(default)]
-    pub routed_cidrs: Vec<String>,
-    /// Server-side host aliases as `(alias, target)` pairs, sorted by alias.
-    /// Purely informational for client UIs (the server status page shows the
-    /// same list); alias resolution itself stays server-side.
-    #[serde(default)]
-    pub host_aliases: Vec<(String, String)>,
-    /// Server-side conditional DNS forwards as `(suffix, upstream servers)`
-    /// pairs, sorted by suffix. Purely informational for client UIs (the server
-    /// status page shows the same list); the resolution itself stays
-    /// server-side. Empty when no `[dns_forwards]` are configured.
-    #[serde(default)]
-    pub dns_forwards: Vec<(String, Vec<String>)>,
-    /// Outbound bridge routes (targets forwarded to another server), sorted by
-    /// name. Purely informational for client UIs — the routing decision stays
-    /// server-side and the bridged rules are already part of the routed set.
-    #[serde(default)]
-    pub bridges: Vec<BridgeSummary>,
 }
 
 impl Hello {
@@ -197,54 +178,13 @@ pub fn decode_bridge_hello(data: &[u8]) -> io::Result<BridgeHello> {
     Ok(hello)
 }
 
-/// One outbound bridge route, pushed to clients on acceptance. Config only —
-/// no live connected-state, which would go stale the moment the handshake
-/// snapshot is taken (the server status page shows live state instead).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BridgeSummary {
-    /// The friendly `[bridges.<name>]` config key.
-    pub name: String,
-    /// The target server's iroh endpoint id.
-    pub endpoint_id: String,
-    /// Domain rules forwarded to the target server (routed-set syntax).
-    pub domains: Vec<String>,
-    /// CIDR / bare-IP rules forwarded to the target server.
-    pub cidrs: Vec<String>,
-}
-
-/// The routing/status payload the server pushes to a peer on acceptance,
-/// grouped so the several same-typed lists can't be swapped positionally. Only
-/// the routed set (`routed_domains`/`routed_cidrs`) is enforced client-side; the
-/// rest is informational for status UIs. `Default` (all empty) is the bridge
-/// case — a bridge gets no routed set.
-#[derive(Debug, Clone, Default)]
-pub struct AcceptedRoutes {
-    /// Domain rules the client should tunnel (exact or `*.` wildcard).
-    pub routed_domains: Vec<String>,
-    /// CIDR / bare-IP rules the client should tunnel.
-    pub routed_cidrs: Vec<String>,
-    /// Server-side host aliases as `(alias, target)` pairs, sorted by alias.
-    pub host_aliases: Vec<(String, String)>,
-    /// Conditional DNS forwards as `(suffix, upstream servers)` pairs.
-    pub dns_forwards: Vec<(String, Vec<String>)>,
-    /// Outbound bridge routes, sorted by name.
-    pub bridges: Vec<BridgeSummary>,
-}
-
 impl HelloResponse {
-    /// Accept the peer and push its [`AcceptedRoutes`] (the *tunnel set* plus the
-    /// informational host-alias and DNS-forward lists).
-    pub fn accepted(server_instance_nonce: u128, routes: AcceptedRoutes) -> Self {
+    pub fn accepted(server_instance_nonce: u128) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             accepted: true,
             reject_reason: None,
             server_instance_nonce,
-            routed_domains: routes.routed_domains,
-            routed_cidrs: routes.routed_cidrs,
-            host_aliases: routes.host_aliases,
-            dns_forwards: routes.dns_forwards,
-            bridges: routes.bridges,
         }
     }
 
@@ -254,11 +194,6 @@ impl HelloResponse {
             accepted: false,
             reject_reason: Some(reason.into()),
             server_instance_nonce,
-            routed_domains: Vec::new(),
-            routed_cidrs: Vec::new(),
-            host_aliases: Vec::new(),
-            dns_forwards: Vec::new(),
-            bridges: Vec::new(),
         }
     }
 }
@@ -297,6 +232,21 @@ pub enum Target {
     Ip(SocketAddr),
     /// A domain name + port; resolved on the server side (SOCKS5 ATYP DOMAIN).
     Domain(String, u16),
+}
+
+/// What a client asks the server for on one per-connection stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamRequest {
+    /// Connect to `Target` from the server's network. The server enforces its
+    /// routed set, then applies bridges, host aliases and DNS forwards.
+    Connect(Target),
+    /// Connect to this port on the server's own loopback — what a client
+    /// destination's own name means. Outside the routed set, bridges and
+    /// aliases: every admitted client can reach the server's loopback.
+    Loopback(u16),
+    /// Serve the server's status page: an HTTP response to the HTTP request
+    /// the client writes next.
+    Status,
 }
 
 /// Write a length-prefixed message (4-byte big-endian length + payload).
@@ -360,21 +310,27 @@ pub fn decode_hello_response(data: &[u8]) -> io::Result<HelloResponse> {
     Ok(resp)
 }
 
-/// Write the per-stream request header: `[ver][atyp][addr][port:u16 BE]`.
-pub async fn write_request<W: AsyncWriteExt + Unpin>(w: &mut W, t: &Target) -> io::Result<()> {
+/// Write the per-stream request header. A [`StreamRequest::Connect`] is
+/// `[ver][atyp][addr][port:u16 BE]` with the SOCKS5 address types; a
+/// [`StreamRequest::Loopback`] is `[ver][0x10][port:u16 BE]`; a
+/// [`StreamRequest::Status`] is `[ver][0x11]`.
+pub async fn write_request<W: AsyncWriteExt + Unpin>(
+    w: &mut W,
+    request: &StreamRequest,
+) -> io::Result<()> {
     let mut buf = vec![STREAM_VERSION];
-    match t {
-        Target::Ip(SocketAddr::V4(sa)) => {
+    match request {
+        StreamRequest::Connect(Target::Ip(SocketAddr::V4(sa))) => {
             buf.push(ATYP_IPV4);
             buf.extend_from_slice(&sa.ip().octets());
             buf.extend_from_slice(&sa.port().to_be_bytes());
         }
-        Target::Ip(SocketAddr::V6(sa)) => {
+        StreamRequest::Connect(Target::Ip(SocketAddr::V6(sa))) => {
             buf.push(ATYP_IPV6);
             buf.extend_from_slice(&sa.ip().octets());
             buf.extend_from_slice(&sa.port().to_be_bytes());
         }
-        Target::Domain(host, port) => {
+        StreamRequest::Connect(Target::Domain(host, port)) => {
             let bytes = host.as_bytes();
             let len = u8::try_from(bytes.len())
                 .map_err(|_| io::Error::other("domain name longer than 255 bytes"))?;
@@ -383,38 +339,39 @@ pub async fn write_request<W: AsyncWriteExt + Unpin>(w: &mut W, t: &Target) -> i
             buf.extend_from_slice(bytes);
             buf.extend_from_slice(&port.to_be_bytes());
         }
+        StreamRequest::Loopback(port) => {
+            buf.push(REQ_LOOPBACK);
+            buf.extend_from_slice(&port.to_be_bytes());
+        }
+        StreamRequest::Status => buf.push(REQ_STATUS),
     }
     w.write_all(&buf).await
 }
 
 /// Read the per-stream request header written by [`write_request`].
-pub async fn read_request<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Target> {
+pub async fn read_request<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<StreamRequest> {
     let ver = r.read_u8().await?;
     if ver != STREAM_VERSION {
         return Err(io::Error::other(format!(
             "Unsupported stream version: {ver} (expected {STREAM_VERSION})"
         )));
     }
-    let atyp = r.read_u8().await?;
-    match atyp {
+    let kind = r.read_u8().await?;
+    match kind {
         ATYP_IPV4 => {
             let mut octets = [0u8; 4];
             r.read_exact(&mut octets).await?;
             let port = r.read_u16().await?;
-            Ok(Target::Ip(SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::from(octets),
-                port,
+            Ok(StreamRequest::Connect(Target::Ip(SocketAddr::V4(
+                SocketAddrV4::new(Ipv4Addr::from(octets), port),
             ))))
         }
         ATYP_IPV6 => {
             let mut octets = [0u8; 16];
             r.read_exact(&mut octets).await?;
             let port = r.read_u16().await?;
-            Ok(Target::Ip(SocketAddr::V6(SocketAddrV6::new(
-                Ipv6Addr::from(octets),
-                port,
-                0,
-                0,
+            Ok(StreamRequest::Connect(Target::Ip(SocketAddr::V6(
+                SocketAddrV6::new(Ipv6Addr::from(octets), port, 0, 0),
             ))))
         }
         ATYP_DOMAIN => {
@@ -424,9 +381,11 @@ pub async fn read_request<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Targ
             let port = r.read_u16().await?;
             let host = String::from_utf8(host)
                 .map_err(|_| io::Error::other("domain name is not valid UTF-8"))?;
-            Ok(Target::Domain(host, port))
+            Ok(StreamRequest::Connect(Target::Domain(host, port)))
         }
-        other => Err(io::Error::other(format!("invalid address type: 0x{other:02x}"))),
+        REQ_LOOPBACK => Ok(StreamRequest::Loopback(r.read_u16().await?)),
+        REQ_STATUS => Ok(StreamRequest::Status),
+        other => Err(io::Error::other(format!("invalid request kind: 0x{other:02x}"))),
     }
 }
 
@@ -462,30 +421,27 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn request_roundtrip_ipv4() {
-        let t = Target::Ip("93.184.216.34:443".parse().unwrap());
-        let mut buf = Vec::new();
-        write_request(&mut buf, &t).await.unwrap();
-        let got = read_request(&mut buf.as_slice()).await.unwrap();
-        assert_eq!(got, t);
+    async fn request_roundtrips_every_kind() {
+        for request in [
+            StreamRequest::Connect(Target::Ip("93.184.216.34:443".parse().unwrap())),
+            StreamRequest::Connect(Target::Ip(
+                "[2606:2800:220:1:248:1893:25c8:1946]:80".parse().unwrap(),
+            )),
+            StreamRequest::Connect(Target::Domain("example.com".to_string(), 443)),
+            StreamRequest::Loopback(22),
+            StreamRequest::Status,
+        ] {
+            let mut buf = Vec::new();
+            write_request(&mut buf, &request).await.unwrap();
+            let got = read_request(&mut buf.as_slice()).await.unwrap();
+            assert_eq!(got, request);
+        }
     }
 
     #[tokio::test]
-    async fn request_roundtrip_ipv6() {
-        let t = Target::Ip("[2606:2800:220:1:248:1893:25c8:1946]:80".parse().unwrap());
-        let mut buf = Vec::new();
-        write_request(&mut buf, &t).await.unwrap();
-        let got = read_request(&mut buf.as_slice()).await.unwrap();
-        assert_eq!(got, t);
-    }
-
-    #[tokio::test]
-    async fn request_roundtrip_domain() {
-        let t = Target::Domain("example.com".to_string(), 443);
-        let mut buf = Vec::new();
-        write_request(&mut buf, &t).await.unwrap();
-        let got = read_request(&mut buf.as_slice()).await.unwrap();
-        assert_eq!(got, t);
+    async fn unknown_request_kind_is_rejected() {
+        let buf = [STREAM_VERSION, 0x7f];
+        assert!(read_request(&mut buf.as_slice()).await.is_err());
     }
 
     #[tokio::test]
@@ -529,80 +485,40 @@ mod tests {
 
     #[test]
     fn hello_response_roundtrip() {
-        let resp = HelloResponse::accepted(
-            42,
-            AcceptedRoutes {
-                routed_domains: vec!["*.example.com".to_string(), "httpbin.org".to_string()],
-                routed_cidrs: vec!["10.0.0.0/8".to_string()],
-                host_aliases: vec![("nas.internal".to_string(), "192.168.1.9".to_string())],
-                dns_forwards: vec![(
-                    "corp.example.com".to_string(),
-                    vec!["10.1.0.10:5353".to_string()],
-                )],
-                bridges: vec![BridgeSummary {
-                    name: "lab".to_string(),
-                    endpoint_id: "endpointid".to_string(),
-                    domains: vec!["*.svc".to_string()],
-                    cidrs: vec!["fd34::/64".to_string()],
-                }],
-            },
-        );
+        let resp = HelloResponse::accepted(42);
         let decoded = decode_hello_response(&encode_hello_response(&resp).unwrap()).unwrap();
         assert!(decoded.accepted);
         assert_eq!(decoded.version, PROTOCOL_VERSION);
         assert_eq!(decoded.server_instance_nonce, 42);
-        assert_eq!(decoded.routed_domains, vec!["*.example.com", "httpbin.org"]);
-        assert_eq!(decoded.routed_cidrs, vec!["10.0.0.0/8"]);
-        assert_eq!(
-            decoded.host_aliases,
-            vec![("nas.internal".to_string(), "192.168.1.9".to_string())]
-        );
-        assert_eq!(
-            decoded.dns_forwards,
-            vec![("corp.example.com".to_string(), vec!["10.1.0.10:5353".to_string()])]
-        );
-        assert_eq!(
-            decoded.bridges,
-            vec![BridgeSummary {
-                name: "lab".to_string(),
-                endpoint_id: "endpointid".to_string(),
-                domains: vec!["*.svc".to_string()],
-                cidrs: vec!["fd34::/64".to_string()],
-            }]
-        );
+        assert!(decoded.reject_reason.is_none());
 
-        // A rejection carries no routed set but still carries the server nonce.
+        // A rejection still carries the server nonce.
         let rej = HelloResponse::rejected(7, "nope");
         let decoded = decode_hello_response(&encode_hello_response(&rej).unwrap()).unwrap();
         assert!(!decoded.accepted);
         assert_eq!(decoded.reject_reason.as_deref(), Some("nope"));
         assert_eq!(decoded.server_instance_nonce, 7);
-        assert!(decoded.routed_domains.is_empty());
-        assert!(decoded.routed_cidrs.is_empty());
-        assert!(decoded.host_aliases.is_empty());
-        assert!(decoded.dns_forwards.is_empty());
-        assert!(decoded.bridges.is_empty());
     }
 
     #[test]
     fn version_mismatch_is_rejected_before_auth() {
-        // A pre-migration (v12, `flxtpubv1:` keys) peer must be rejected at the
-        // version check — decode fails before any credential is even looked at,
-        // on both directions of the handshake.
+        // A peer on another protocol version must be rejected at the version
+        // check — decode fails before any credential is even looked at, on
+        // both directions of the handshake.
         let mut old = Hello::new(
             Some(ClientAuthPayload {
-                public_key: "flxtpubv1:abc".to_string(),
+                public_key: "ed25519-pub:abc".to_string(),
                 endpoint_id: "endpointid".to_string(),
                 signature: "sig".to_string(),
             }),
             7,
         );
-        old.version = 12;
+        old.version = PROTOCOL_VERSION - 1;
         let err = decode_hello(&serde_json::to_vec(&old).unwrap()).unwrap_err();
-        assert!(err.to_string().contains("Unsupported protocol version: 12"));
+        assert!(err.to_string().contains("Unsupported protocol version"));
 
         let mut resp = HelloResponse::rejected(7, "nope");
-        resp.version = 12;
+        resp.version = PROTOCOL_VERSION - 1;
         assert!(decode_hello_response(&serde_json::to_vec(&resp).unwrap()).is_err());
     }
 

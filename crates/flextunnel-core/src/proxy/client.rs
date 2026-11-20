@@ -1,25 +1,32 @@
-//! flextunnel client: local SOCKS5 and optional HTTP proxy listeners whose
-//! routed requests are tunneled over a single iroh QUIC connection to the
-//! server, one bi-stream per proxied connection.
+//! flextunnel client: local SOCKS5 and optional HTTP proxy listeners, port
+//! forwards and `nc`, whose requests are routed by a static table
+//! ([`RouteTable`]) to one of several *destinations* — each a server reached
+//! over its own iroh QUIC connection, opened on first use and closed when idle
+//! (see [`super::destination`]). One bi-stream per proxied connection.
 
 use crate::error::{ProxyError, ProxyResult};
-use crate::proxy::signaling::{self, ControlMsg, Hello, Target};
-use crate::proxy::{dial, http, reserved, socks5, RoutedSet};
-use crate::transport::endpoint::{ClientEndpoint, RelayConfig};
-use crate::transport::paths::{connection_paths, ConnPath, ConnectionSnapshot};
+use crate::proxy::destination::{
+    AcquireError, Destination, DestinationConfig, DestinationStatus, EndpointProvider, Holds,
+    Shared, StreamGuard, default_endpoint_provider,
+};
+use crate::proxy::route_table::{Route, RouteSpec, RouteTable};
+use crate::proxy::signaling::{self, ControlMsg, StreamRequest, Target};
+use crate::proxy::{client_status, dial, http, socks5};
+use crate::transport::paths::ConnectionSnapshot;
 use crate::transport::{HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL_IDLE, liveness_window};
 use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
+use iroh::{Endpoint, EndpointAddr};
 use rand::RngExt;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::num::NonZeroU32;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -28,13 +35,12 @@ use tokio::sync::{Semaphore, watch};
 /// Reconnect backoff: base 1s, doubling per consecutive failed attempt, capped
 /// here. The early steps (1s, 2s, 4s, …) catch a server restart within a
 /// minute or two; past them the doubling settles at the cap, so a server that
-/// stays down for hours or days is probed once a minute for as long as it
-/// takes. Each probe is one bounded connect ([`CONNECT_TIMEOUT`]) on the
-/// endpoint the client already holds, so an outage of any length is cheap to
-/// sit through while still noticing the server's return within a minute — a
-/// wait of several minutes saves little and reads as a hang to anyone
-/// watching. Events that make an earlier attempt worthwhile cut the wait
-/// short (see [`ProxyClient::wait_backoff`]).
+/// stays down is probed at most once a minute — and only while a request is
+/// actually waiting for it (see [`super::destination`]). Each probe is one
+/// bounded connect ([`CONNECT_TIMEOUT`]), so an outage of any length is cheap
+/// to sit through while still noticing the server's return within a minute.
+/// Events that make an earlier attempt worthwhile — a restored network path,
+/// a foregrounded app — cut the wait short.
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Escalate to a full endpoint rebuild once this many consecutive attempts of
 /// an outage have failed. The attempts before it get the cheap
@@ -62,15 +68,15 @@ const RECONNECT_JITTER_MAX_MS: u64 = 500;
 /// the handshake, so without this a server that accepts the connection but
 /// never replies on the stream would stall the client until the QUIC idle
 /// timeout, or indefinitely if the server keeps the connection alive.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Deadline for `Endpoint::connect` (address discovery + QUIC handshake). The
 /// discovery phase awaits DNS/pkarr/mDNS lookups with no deadline of its own,
 /// and on a wedged endpoint (seen on iOS after the OS suspends the process and
 /// invalidates the socket state underneath it) that future can pend forever —
 /// which would stall the reconnect loop permanently instead of retrying. The
 /// retry then nudges `Endpoint::network_change()` to rebind the dead
-/// transports (see `manage_connection`), so the wedge is repaired rather than
-/// merely timed out again.
+/// transports (see `Destination::connect_once`), so the wedge is repaired
+/// rather than merely timed out again.
 /// Generous: a healthy connect through discovery + relay completes well within.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -97,18 +103,19 @@ pub(crate) async fn connect_with_timeout(
 /// dialing the target, up to ~10s), so a legitimately slow target isn't cut
 /// off; without it a server that stalls after accepting the stream would hang
 /// the local SOCKS5 connection forever.
-const TUNNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long an on-list request arriving while the tunnel link is down is held
-/// waiting for the core's own reconnect before being refused with a
-/// network-unreachable reply — connection holding in the style of a deploy
-/// router: a routed page load racing a transient drop waits out the reconnect
-/// and then proceeds as if nothing happened, instead of surfacing an error the
-/// user must retry by hand. Sized to cover a silent drop end-to-end in the
-/// foreground: detection takes up to [`liveness_window`] of
+pub const TUNNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a request for a destination that is not connected is held while
+/// the destination connects — the first use of an idle destination, or a
+/// reconnect after a drop — before being refused with a network-unreachable
+/// reply. The request that finds the destination idle is what makes it dial,
+/// so holding is what lets a lazy connection be invisible: the page load (or
+/// the ssh, or the forwarded connection) waits out the dial and then proceeds
+/// as if the tunnel had been up all along. Sized to cover a silent drop
+/// end-to-end in the foreground: detection takes up to [`liveness_window`] of
 /// [`HEARTBEAT_INTERVAL`] (33s), then the early backoff steps plus the
-/// connect+handshake; a reconnect that hasn't landed by then is genuinely
+/// connect+handshake; a connection that hasn't landed by then is genuinely
 /// stuck, and the bound keeps the failure inside a browser's own patience.
-const TUNNEL_RECOVERY_HOLD: Duration = Duration::from_secs(45);
+pub const TUNNEL_RECOVERY_HOLD: Duration = Duration::from_secs(45);
 /// Deadline for the local app to complete its SOCKS5 handshake (method
 /// negotiation + CONNECT request). A peer that connects to the loopback
 /// listener but sends nothing would otherwise pin the spawned task and socket
@@ -139,103 +146,252 @@ const REBIND_AFTER_CONSECUTIVE_ABORTS: u64 = 4;
 /// connection holds a socket plus a QUIC stream). Generous for the real
 /// client: a browser's worst case is a few dozen parallel fetches.
 const MAX_ACTIVE_LOCAL_CONNS: usize = 256;
-/// Cap on requests concurrently *held* for a tunnel reconnect per local
-/// front-end listener (see [`wait_for_tunnel`]). A held request parks with its
-/// [`MAX_ACTIVE_LOCAL_CONNS`] permit for up to [`TUNNEL_RECOVERY_HOLD`], so
-/// without a separate bound a burst of on-list retries during an outage could
-/// pin every permit and starve the off-list/direct traffic a drop is supposed
-/// to leave working. At this cap further on-list requests fall back to the
-/// pre-hold behavior: an immediate network-unreachable reply.
+/// Cap on requests concurrently *held* for a connecting destination per local
+/// front-end listener (see `Destination::acquire`). A held request parks with
+/// its [`MAX_ACTIVE_LOCAL_CONNS`] permit for up to [`TUNNEL_RECOVERY_HOLD`], so
+/// without a separate bound a burst of retries toward a server that is down
+/// could pin every permit and starve the direct traffic and the other
+/// destinations. At this cap further tunneled requests are not held: they get
+/// an immediate network-unreachable reply (the destination is still asked to
+/// connect).
 const MAX_HELD_CONNS: usize = 64;
+/// Longest idle timeout a client accepts. The timeout is added to the time a
+/// connection was last used, and a value near the limits of the clock would
+/// overflow that sum — a panic, long after start, the first time a connection
+/// falls unused. Nothing sensible is lost: a connection that should never be
+/// closed for idleness has no timeout at all.
+pub const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+/// How many of a listener's [`MAX_HELD_CONNS`] holds are set aside for each
+/// destination (fewer when there are too many destinations to give each this
+/// many). Every first use of an idle destination needs a hold while it
+/// connects, so without a share of its own a destination whose server is up
+/// would be refused for as long as a burst of retries toward one that is
+/// down fills the budget.
+const HOLDS_RESERVED_PER_DESTINATION: usize = 8;
 
-/// The live QUIC connection shared with the always-on accept loop; `None` while
-/// disconnected (during a drop/backoff), so off-list targets still connect
-/// directly. Published over a watch channel so on-list requests arriving during
-/// the gap can subscribe and hold for the reconnect (see [`wait_for_tunnel`]).
-type SharedConn = Arc<watch::Sender<Option<Connection>>>;
-/// The route policy (tunnel set) shared with the accept loop. `None` until the
-/// first handshake learns it, then `Some` for the rest of the process — retained
-/// across drops so split-tunnel routing keeps working while the connection is
-/// down. While it is `None` the client **fails closed**: no connection is routed
-/// (directly or tunneled) before the policy is known, so nothing leaks out —
-/// requests arriving in that window hold for the first handshake rather than
-/// being refused outright (see [`wait_for_route_policy`]).
-type SharedRoutedSet = Arc<Mutex<Option<Arc<RoutedSet>>>>;
+/// One listener's budget of held requests: [`MAX_HELD_CONNS`] in all, split
+/// into a small share reserved for each destination and a pool they all draw
+/// on once their own share is used.
+pub(crate) struct HoldBudget {
+    /// Indexed like the client's destinations.
+    reserved: Vec<Semaphore>,
+    shared: Semaphore,
+}
 
-/// How the client authenticates to the server.
-pub enum ClientAuth {
-    /// Regular client: dial the client [`ALPN`](crate::transport::ALPN) and
-    /// present this keypair's public key plus a signature over the client's
-    /// own (ephemeral) endpoint id in the `Hello` (see [`crate::auth`]).
-    /// Boxed to keep the variants close in size (clippy: large_enum_variant).
-    Key(Box<crate::auth::ClientKey>),
-    /// Quick-mode client: dial [`QUICK_ALPN`](crate::transport::QUICK_ALPN)
-    /// with no keypair. The sole credential is this endpoint's
-    /// TLS-authenticated id, which the quick server has allowlisted — the
-    /// endpoint must be bound to the session's fixed secret (see
-    /// `create_quick_client_endpoint`).
-    QuickAllowlisted,
+impl HoldBudget {
+    pub(crate) fn new(destinations: usize) -> Self {
+        let each = (MAX_HELD_CONNS / destinations.max(1)).min(HOLDS_RESERVED_PER_DESTINATION);
+        Self {
+            reserved: (0..destinations).map(|_| Semaphore::new(each)).collect(),
+            shared: Semaphore::new(MAX_HELD_CONNS - each * destinations),
+        }
+    }
+
+    /// The claim of the destination at index `dest` on this budget.
+    pub(crate) fn for_destination(&self, dest: usize) -> Holds<'_> {
+        Holds {
+            reserved: &self.reserved[dest],
+            shared: &self.shared,
+        }
+    }
 }
 
 /// Configuration for the proxy client.
 pub struct ClientConfig {
-    /// Server's iroh EndpointId (as a string).
-    pub server_node_id: String,
-    /// How to authenticate: signed keypair credential, or quick-mode endpoint-id allowlist.
-    pub auth: ClientAuth,
-    /// Local address the optional SOCKS5 listener binds to. CLI clients always
-    /// set this; GUI forwarding-only sessions may leave it disabled.
-    pub socks_listen: Option<SocketAddr>,
-    /// Local address for the optional HTTP proxy listener (CONNECT tunneling +
-    /// absolute-URI plain-HTTP forwarding). `None` leaves the HTTP front-end
-    /// disabled.
-    pub http_listen: Option<SocketAddr>,
-    /// Relay URL hints (optional). Empty selects the default iroh relays.
-    pub relay_urls: Vec<String>,
-    /// Shared bearer token sent to every custom relay's WebSocket upgrade.
-    /// Only valid alongside custom `relay_urls`; ignored with the default relays.
-    pub relay_auth_token: Option<String>,
-    /// Retry a failed connection attempt or a lost connection with backoff
-    /// instead of ending the session (`false`: the first failure of either
-    /// kind ends it — including a server that is merely not up yet).
-    pub auto_reconnect: bool,
-    /// Cap on consecutive retries — attempts after a failure, before the next
-    /// success — after which the session ends (unlimited if `None`).
-    pub max_reconnect_attempts: Option<NonZeroU32>,
+    /// The servers this client can reach, each under its own host name. At
+    /// least one; hosts and server ids must be unique and the routing rules
+    /// unambiguous (see [`RouteTable`]).
+    pub destinations: Vec<DestinationConfig>,
+    /// Close a destination's connection after this long with no stream open
+    /// on it. `None` never closes one for idleness: once a destination has
+    /// connected it stays up until the link drops.
+    pub idle_timeout: Option<Duration>,
 }
 
-/// Cloneable handle for opening a target directly on the client's live,
-/// authenticated server connection. It deliberately bypasses all local proxy
-/// front-ends and always asks the server to connect; the server's routed-set
-/// whitelist remains authoritative and rejects off-list targets.
-#[derive(Clone)]
-pub struct ServerForwarder {
-    current: SharedConn,
+/// The local proxy front-ends a client serves. All optional: a client with
+/// none still serves port forwards and `nc` through its [`TunnelDialer`].
+#[derive(Default)]
+pub struct LocalListeners {
+    /// SOCKS5 (TCP CONNECT only).
+    pub socks: Option<TcpListener>,
+    /// HTTP proxy: `CONNECT` tunneling + absolute-URI plain-HTTP forwarding.
+    pub http: Option<TcpListener>,
+    /// SOCKS5 on a Unix-domain socket — for an embedder that wants the proxy
+    /// reachable only through a socket file in its own sandbox instead of a
+    /// loopback TCP port any process on the device can connect to. Unix only;
+    /// there is no Windows equivalent.
+    #[cfg(unix)]
+    pub unix_socks: Option<UnixListener>,
 }
 
-impl ServerForwarder {
-    /// Open one server-side target and return its raw bidirectional byte stream.
-    pub async fn connect(
-        &self,
-        target: &signaling::Target,
-    ) -> Result<tokio::io::Join<RecvStream, SendStream>> {
-        let conn = self
-            .current
-            .borrow()
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("tunnel is not connected"))?;
-        let opened = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, open_tunnel(&conn, target))
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out opening server-direct forward"))??;
-        let (send, recv, rep) = opened;
-        if rep != signaling::REP_SUCCESS {
-            anyhow::bail!("server rejected target: {}", socks5::describe_reply(rep));
+impl LocalListeners {
+    /// The TCP front-ends alone — the only ones there are off Unix, which is
+    /// why callers use this rather than `..Default::default()`.
+    pub fn tcp(socks: Option<TcpListener>, http: Option<TcpListener>) -> Self {
+        Self {
+            socks,
+            http,
+            #[cfg(unix)]
+            unix_socks: None,
         }
-        Ok(tokio::io::join(recv, send))
+    }
+}
+
+/// A point-in-time view of the client, for status displays.
+#[derive(Clone, Debug)]
+pub struct ClientStatus {
+    /// Where the SOCKS5 front-end listens; `None` when it is off.
+    pub socks_listen: Option<SocketAddr>,
+    /// Where the HTTP front-end listens; `None` when it is off.
+    pub http_listen: Option<SocketAddr>,
+    pub idle_timeout: Option<Duration>,
+    /// One entry per destination, in configuration order.
+    pub destinations: Vec<DestinationStatus>,
+}
+
+/// The TCP front-end addresses a running client serves.
+#[derive(Clone, Copy, Default)]
+struct ListenAddrs {
+    socks: Option<SocketAddr>,
+    http: Option<SocketAddr>,
+}
+
+/// The client's routing state, shared by every request path: the static
+/// table, and the destinations it indexes.
+pub(crate) struct Router {
+    pub(crate) table: RouteTable,
+    /// Indexed by [`Route::Tunnel::dest`].
+    pub(crate) destinations: Vec<Arc<Destination>>,
+    shared: Arc<Shared>,
+    listen: Mutex<ListenAddrs>,
+}
+
+impl Router {
+    pub(crate) fn status(&self) -> ClientStatus {
+        let listen = *self.listen.lock().expect("listen addrs lock");
+        ClientStatus {
+            socks_listen: listen.socks,
+            http_listen: listen.http,
+            idle_timeout: self.shared.idle_timeout,
+            destinations: self.destinations.iter().map(|d| d.status()).collect(),
+        }
+    }
+
+    fn destination(&self, host: &str) -> Option<&Arc<Destination>> {
+        self.table.index_of(host).map(|dest| &self.destinations[dest])
+    }
+
+    /// Stop reporting the front-end addresses: nothing listens on them now.
+    fn withdraw_listen_addrs(&self) {
+        *self.listen.lock().expect("listen addrs lock") = ListenAddrs::default();
+    }
+}
+
+/// Withdraws the advertised front-end addresses when a [`ProxyClient::run`]
+/// ends, however it ends — returned, or dropped mid-flight — since its
+/// listeners end with it.
+struct AdvertisedAddrs<'a>(&'a Router);
+
+impl Drop for AdvertisedAddrs<'_> {
+    fn drop(&mut self) {
+        self.0.withdraw_listen_addrs();
+    }
+}
+
+/// One stream to a server, opened by a [`TunnelDialer`]. Reads and writes go
+/// straight to the QUIC stream; holding it keeps its destination's connection
+/// from being closed as idle.
+pub struct TunnelStream {
+    inner: tokio::io::Join<RecvStream, SendStream>,
+    _stream: StreamGuard,
+}
+
+impl AsyncRead for TunnelStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for TunnelStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Cloneable handle for opening targets through the client's destinations,
+/// bypassing the local proxy front-ends — what port forwards and `nc` use.
+///
+/// It routes exactly like a proxy request, with one difference: a target that
+/// no destination routes is an **error**, never a direct connection. A forward
+/// or an `nc` exists to reach something through a server; quietly dialing it
+/// from this machine instead would be the wrong answer. Like a proxy request,
+/// a call connects its destination on demand and is held while it does.
+#[derive(Clone)]
+pub struct TunnelDialer {
+    router: Arc<Router>,
+}
+
+impl TunnelDialer {
+    /// The host of the destination that would carry `target`, or `None` when
+    /// no destination routes it (including the reserved `flextunnel.internal`
+    /// names, which the client answers itself).
+    pub fn destination_for(&self, target: &Target) -> Option<&str> {
+        match self.router.table.route(target) {
+            Route::Tunnel { dest, .. } => Some(self.router.destinations[dest].host()),
+            Route::ClientStatus | Route::Reserved | Route::Direct => None,
+        }
+    }
+
+    /// Open `target` through the destination that routes it and return its raw
+    /// bidirectional byte stream.
+    pub async fn connect(&self, target: &Target) -> Result<TunnelStream> {
+        let (destination, request) = match self.router.table.route(target) {
+            Route::Tunnel { dest, request } => (&self.router.destinations[dest], request),
+            Route::ClientStatus | Route::Reserved => anyhow::bail!(
+                "{} is the client's own status endpoint; reach it through a proxy listener",
+                target_host(target)
+            ),
+            Route::Direct => anyhow::bail!("no destination routes {}", target_host(target)),
+        };
+        let lease = destination
+            .acquire(None)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}: {e}", destination.host()))?;
+        let (conn, stream) = lease.into_parts();
+        let (send, recv, rep) = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, open_tunnel(&conn, &request))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out opening a stream to {}", destination.host()))??;
+        if rep != signaling::REP_SUCCESS {
+            anyhow::bail!(
+                "{} rejected target: {}",
+                destination.host(),
+                socks5::describe_reply(rep)
+            );
+        }
+        Ok(TunnelStream {
+            inner: tokio::io::join(recv, send),
+            _stream: stream,
+        })
     }
 
     /// Open `target` and splice it with one accepted local connection.
-    pub async fn relay<S>(&self, mut local: S, target: &signaling::Target) -> Result<()>
+    pub async fn relay<S>(&self, mut local: S, target: &Target) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -244,18 +400,32 @@ impl ServerForwarder {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn connected(connection: Connection) -> Self {
-        Self {
-            current: Arc::new(watch::Sender::new(Some(connection))),
+    /// Ask the destination named `host` to connect now, without waiting for
+    /// it: one attempt in the background, after which the connection lives or
+    /// idles out like any other. Returns whether there is such a destination.
+    pub fn warm(&self, host: &str) -> bool {
+        match self.router.destination(host) {
+            Some(destination) => {
+                destination.kick();
+                true
+            }
+            None => false,
         }
+    }
+}
+
+/// A target's host, for messages.
+fn target_host(target: &Target) -> String {
+    match target {
+        Target::Domain(host, _) => host.clone(),
+        Target::Ip(addr) => addr.ip().to_string(),
     }
 }
 
 /// Exponential backoff with jitter for the Nth (1-based) reconnect attempt.
 ///
-/// Shared with [`crate::proxy::bridge`], whose reconnect policy mirrors the
-/// client's.
+/// Shared by every client destination and by [`crate::proxy::bridge`], whose
+/// reconnect policy mirrors the client's.
 pub(crate) fn calculate_backoff(attempt: u32) -> Duration {
     // 2^(attempt-1) seconds; the shift is bounded well past where the cap
     // takes over, so it can never overflow.
@@ -265,156 +435,131 @@ pub(crate) fn calculate_backoff(attempt: u32) -> Duration {
     Duration::from_secs(secs) + Duration::from_millis(jitter)
 }
 
-/// Whether the reconnect loop should rebuild the endpoint before its next
+/// Whether a destination should rebuild its endpoint before its next
 /// attempt: the outage has reached [`REBUILD_ENDPOINT_ATTEMPTS`] consecutive
 /// failures, and it either has not rebuilt yet or last did so at least
 /// [`REBUILD_ENDPOINT_MIN_INTERVAL`] ago.
-fn rebuild_due(attempt: u32, last_rebuild: Option<Instant>) -> bool {
+pub(crate) fn rebuild_due(attempt: u32, last_rebuild: Option<Instant>) -> bool {
     attempt >= REBUILD_ENDPOINT_ATTEMPTS
         && last_rebuild.is_none_or(|at| at.elapsed() >= REBUILD_ENDPOINT_MIN_INTERVAL)
 }
 
-/// An event that cuts a reconnect backoff short (see
-/// [`ProxyClient::wait_backoff`]).
-enum BackoffWake {
-    /// The device lost its network path mid-sleep: park until it returns.
-    PathLost,
-    /// The embedding app came to the foreground: attempt right away.
-    Foregrounded,
-}
-
-/// What the reconnect loop is doing while the tunnel is down, for status
-/// displays (the CLI panel). All fields are at their defaults while connected.
-#[derive(Clone, Debug, Default)]
-pub struct ReconnectStatus {
-    /// Consecutive failed connection attempts in the current outage: 0 while
-    /// connected, or before the first attempt has failed.
-    pub failed_attempts: u32,
-    /// What the most recent attempt failed with.
-    pub last_error: Option<String>,
-    /// When the next attempt is due. Already in the past while an attempt is
-    /// in progress (bounded by [`CONNECT_TIMEOUT`] + [`HANDSHAKE_TIMEOUT`]);
-    /// `None` when there is no attempt to wait for.
-    pub next_attempt_at: Option<Instant>,
-}
-
-/// Snapshot of what the tunnel currently forwards: the split-tunnel set the
-/// server pushed on the last successful handshake, plus whether a connection is
-/// live right now. Shared with the FFI so the app can display the routed
-/// domains/CIDRs. An empty set while `connected` is true means the server routes
-/// nothing but the reserved `flextunnel.internal` namespace, which is always
-/// tunneled.
-#[derive(Clone, Default)]
-pub struct TunnelRoutes {
-    pub connected: bool,
-    pub domains: Vec<String>,
-    pub cidrs: Vec<String>,
-    /// Server-side host aliases (`alias -> target`), informational only — the
-    /// server resolves them; shown in client status UIs like the server status
-    /// page shows them.
-    pub host_aliases: Vec<(String, String)>,
-    /// Server-side conditional DNS forwards as `(suffix, upstream servers)`
-    /// pairs, sorted by suffix. Informational only — the server does the
-    /// resolution; shown in client status UIs like the server status page shows
-    /// them. Empty when the server configures no `[dns_forwards]`.
-    pub dns_forwards: Vec<(String, Vec<String>)>,
-    /// Server-side outbound bridge routes (targets forwarded to another
-    /// server), sorted by name. Informational only — the server does the
-    /// forwarding; shown in client status UIs like the server status page shows
-    /// them. Empty when the server configures no `[bridges]`.
-    pub bridges: Vec<signaling::BridgeSummary>,
-}
-
-/// Client-side history of server instance nonces observed for the configured
-/// server id, used to detect a *duplicate server*.
-///
-/// A single server that merely restarts emits a strictly-growing sequence of
-/// fresh random nonces (a previous one never reappears, 2⁻¹²⁸). A client
-/// bouncing between two servers that share one identity sees a previously-seen
-/// nonce **reappear** after a different one — that flip-flop is the signal.
-#[derive(Default)]
-struct ServerNonceTracker {
-    /// Distinct nonces seen, in first-seen order.
-    history: Vec<u128>,
-    /// The most recently observed nonce.
-    last: Option<u128>,
-}
-
+/// The client: a routing table over lazily connected destinations, served to
+/// local apps through proxy listeners ([`Self::run`]) and a [`TunnelDialer`].
 pub struct ProxyClient {
-    config: ClientConfig,
-    routes: Arc<Mutex<TunnelRoutes>>,
-    /// The live server connection, published by the connection manager while
-    /// up and `None` during a drop/backoff. Also the accept loops' routing
-    /// handle; held as a field so status callers (the desktop's connection-path
-    /// CTA) can snapshot its iroh paths on demand via [`Self::conn_paths`].
-    current: SharedConn,
-    /// Random per-process identity of this client, sent in every `Hello` so the
-    /// server can tell a benign reconnect (same nonce) from two distinct client
-    /// processes sharing a node id (different nonces → a duplicate-client bug).
-    instance_nonce: u128,
-    /// Observed server-nonce history for duplicate-server detection.
-    nonce_tracker: Mutex<ServerNonceTracker>,
-    /// Latches once a duplicate server has been observed; thereafter every
-    /// `Hello` carries the advisory so the server can self-block.
-    duplicate_server: AtomicBool,
+    router: Arc<Router>,
     /// One-way close signal for the local front-end listeners, latched by
     /// [`Self::close_local_listeners`]. The accept loops watch the receiving
     /// side and drop their listener when it flips.
     local_close: watch::Sender<bool>,
-    /// Whether the embedding app is backgrounded (mobile embedders flip this
-    /// from their scene lifecycle via [`Self::set_background`]). Drives the
-    /// heartbeat cadence: [`HEARTBEAT_INTERVAL`] in the foreground,
-    /// [`HEARTBEAT_INTERVAL_IDLE`] in the background, switching mid-wait.
-    background: watch::Sender<bool>,
-    /// Whether the device reports a usable network path
-    /// ([`Self::set_network_available`]; defaults to available for embedders
-    /// that never report). While unavailable the reconnect loop parks with no
-    /// timers at all — retrying into a dead path is pure battery burn — and a
-    /// flip back to available reconnects immediately with a fresh backoff.
-    network_available: watch::Sender<bool>,
-    /// The reconnect loop's progress through the current outage, for status
-    /// displays ([`Self::reconnect_status`]).
-    reconnect: Mutex<ReconnectStatus>,
 }
 
 impl ProxyClient {
-    pub fn new(config: ClientConfig) -> Self {
-        Self {
-            config,
-            routes: Arc::new(Mutex::new(TunnelRoutes::default())),
-            current: Arc::new(watch::Sender::new(None)),
+    /// Build a client, validating the destinations: at least one, each host a
+    /// valid and unique destination name, each server configured once, and no
+    /// routing rule shared between two destinations (see [`RouteTable::new`]).
+    /// Nothing is bound or dialed here — or at all, until a request arrives.
+    pub fn new(config: ClientConfig) -> ProxyResult<Self> {
+        Self::with_endpoint_provider(config, default_endpoint_provider())
+    }
+
+    /// [`Self::new`] with a custom recipe for building a destination's
+    /// endpoint. The seam for tests, which run on loopback-only endpoints.
+    pub fn with_endpoint_provider(
+        config: ClientConfig,
+        provider: EndpointProvider,
+    ) -> ProxyResult<Self> {
+        let ClientConfig {
+            mut destinations,
+            idle_timeout,
+        } = config;
+        if destinations.is_empty() {
+            return Err(ProxyError::config("the client has no destinations configured"));
+        }
+        if let Some(idle_timeout) = idle_timeout
+            && idle_timeout > MAX_IDLE_TIMEOUT
+        {
+            return Err(ProxyError::config(format!(
+                "the idle timeout of {}s is longer than the {}s (one year) allowed; to never \
+                 close an idle connection, set it to 0",
+                idle_timeout.as_secs(),
+                MAX_IDLE_TIMEOUT.as_secs()
+            )));
+        }
+        let specs: Vec<RouteSpec<'_>> = destinations
+            .iter()
+            .map(|d| RouteSpec {
+                host: &d.host,
+                routed_domains: &d.routed_domains,
+                routed_cidrs: &d.routed_cidrs,
+            })
+            .collect();
+        let table = RouteTable::new(&specs).map_err(|e| ProxyError::config(format!("{e:#}")))?;
+        // Store each host the way the table spells it (trimmed, lowercased).
+        let hosts: Vec<String> = table.hosts().map(str::to_owned).collect();
+        for (destination, host) in destinations.iter_mut().zip(hosts) {
+            destination.host = host;
+        }
+        // Two names for one server would be two connections to it from one
+        // process, each with its own endpoint and no reason to exist.
+        for (i, destination) in destinations.iter().enumerate() {
+            if let Some(earlier) = destinations[..i]
+                .iter()
+                .find(|d| d.server_id == destination.server_id)
+            {
+                return Err(ProxyError::config(format!(
+                    "destinations {:?} and {:?} name the same server ({})",
+                    earlier.host, destination.host, destination.server_id
+                )));
+            }
+        }
+
+        let shared = Arc::new(Shared {
             instance_nonce: rand::rng().random(),
-            nonce_tracker: Mutex::new(ServerNonceTracker::default()),
-            duplicate_server: AtomicBool::new(false),
-            local_close: watch::Sender::new(false),
+            idle_timeout,
+            provider,
             background: watch::Sender::new(false),
             network_available: watch::Sender::new(true),
-            reconnect: Mutex::new(ReconnectStatus::default()),
-        }
+            closed: AtomicBool::new(false),
+        });
+        let destinations = destinations
+            .into_iter()
+            .map(|cfg| Destination::new(cfg, shared.clone()))
+            .collect();
+        Ok(Self {
+            router: Arc::new(Router {
+                table,
+                destinations,
+                shared,
+                listen: Mutex::new(ListenAddrs::default()),
+            }),
+            local_close: watch::Sender::new(false),
+        })
     }
 
     /// Report the embedding app's scene state. Backgrounded, the heartbeat
     /// slows to [`HEARTBEAT_INTERVAL_IDLE`] (one radio wake a minute instead of
     /// six); foregrounded, it snaps back to [`HEARTBEAT_INTERVAL`] — a beat
     /// already overdue at the faster cadence is sent immediately — and a
-    /// reconnect backoff in progress ends early: the next attempt runs at
-    /// once, with a fresh backoff series (the user is looking, and a long
-    /// backoff step sized for an unattended outage should not keep them
-    /// waiting). Safe to call repeatedly with the same value.
+    /// retry backoff in progress ends early: the next attempt runs at once,
+    /// with a fresh backoff series (the user is looking, and a long backoff
+    /// step sized for an unattended outage should not keep them waiting). Safe
+    /// to call repeatedly with the same value.
     pub fn set_background(&self, background: bool) {
-        self.background.send_replace(background);
+        self.router.shared.background.send_replace(background);
     }
 
     /// Report whether the device has a usable network path (e.g. from
-    /// `NWPathMonitor`). While unavailable the reconnect loop parks instead of
-    /// burning backoff retries into a dead path; the flip back to available
-    /// triggers an immediate reconnect with a fresh backoff series.
+    /// `NWPathMonitor`). While unavailable no destination dials — retrying
+    /// into a dead path is pure battery burn; the flip back to available gives
+    /// every waiting destination an immediate attempt with a fresh backoff
+    /// series.
     pub fn set_network_available(&self, available: bool) {
-        self.network_available.send_replace(available);
+        self.router.shared.network_available.send_replace(available);
     }
 
     /// Close the local proxy front-end listeners (SOCKS5/HTTP/Unix) while
-    /// leaving the session — the connection manager and established relays —
+    /// leaving the session — the destinations and established relays —
     /// running. One-way: there is no reopen for this client; the embedder
     /// relaunches the session when it wants listeners back.
     ///
@@ -426,656 +571,137 @@ impl ProxyClient {
         self.local_close.send_replace(true);
     }
 
-    /// Record a server instance nonce observed in a `HelloResponse` and apply the
-    /// reappearance rule. Latches [`Self::duplicate_server`] on a confirmed
-    /// duplicate; a plain change (restart or first sight of a second instance) is
-    /// only logged. Returns `true` only when this call *newly* latched the flag,
-    /// so the caller can force an immediate reconnect to get the advisory out.
-    fn observe_server_nonce(&self, nonce: u128) -> bool {
-        let mut t = self.nonce_tracker.lock().expect("nonce tracker lock");
-        let mut newly_flagged = false;
-        match t.last {
-            Some(last) if last == nonce => return false, // same server as last time
-            Some(_) => {
-                if t.history.contains(&nonce) {
-                    // A previously-seen nonce reappeared after a different one:
-                    // two concurrent servers share this identity.
-                    newly_flagged = !self.duplicate_server.swap(true, Ordering::Relaxed);
-                    if newly_flagged {
-                        log::error!(
-                            "Duplicate server id detected: server instance nonce {nonce} \
-                             reappeared after a different one — two servers appear to share \
-                             this identity. Advising the server to self-block."
-                        );
-                    }
-                } else {
-                    log::warn!(
-                        "Server identity nonce changed ({nonce}) — a restart, or possibly \
-                         a second server sharing this id; watching for a reappearance."
-                    );
-                    t.history.push(nonce);
-                }
-            }
-            None => t.history.push(nonce), // first observation this process
-        }
-        t.last = Some(nonce);
-        newly_flagged
+    /// A point-in-time view of the client and every destination. Cheap and
+    /// synchronous; never causes a connection.
+    pub fn status(&self) -> ClientStatus {
+        self.router.status()
     }
 
-    /// Shared handle to the live tunnel set, for callers (the FFI) that want to
-    /// display what is routed. Refreshed on every (re)connect.
-    pub fn routes(&self) -> Arc<Mutex<TunnelRoutes>> {
-        self.routes.clone()
-    }
-
-    /// Snapshot the current connection's iroh paths (relay/direct) for a status
-    /// UI. Empty while disconnected (during a drop/backoff or before the first
-    /// connect). Cheap and synchronous — [`connection_paths`] reads a
-    /// point-in-time snapshot, so no background watcher is involved.
-    pub fn conn_paths(&self) -> Vec<ConnPath> {
-        match self.current.borrow().as_ref() {
-            Some(conn) => connection_paths(conn),
-            None => Vec::new(),
+    /// The iroh paths (relay/direct) of the connection to the destination
+    /// named `host`, plus an on-demand `/healthz` probe of its custom relays —
+    /// for a status UI. Empty when `host` is not a destination or is not
+    /// connected right now; asking never connects it.
+    pub async fn connection_snapshot(&self, host: &str) -> ConnectionSnapshot {
+        match self.router.destination(host) {
+            Some(destination) => destination.connection_snapshot().await,
+            None => ConnectionSnapshot::default(),
         }
     }
 
-    /// Build a full connection snapshot — the iroh paths plus an on-demand
-    /// `/healthz` probe of each configured custom relay — for a status UI.
+    /// A cloneable handle for opening targets through this client's
+    /// destinations without a proxy listener (port forwards, `nc`).
+    pub fn dialer(&self) -> TunnelDialer {
+        TunnelDialer {
+            router: self.router.clone(),
+        }
+    }
+
+    /// Serve the given local front-ends and manage the destinations until the
+    /// future is dropped (or a front-end listener is lost for good).
     ///
-    /// Async because the relay health check performs on-demand HTTP; awaited when
-    /// a snapshot is built so it never blocks the runtime. Returns an empty
-    /// snapshot while disconnected (custom-relay health is only reported while the
-    /// tunnel is up, matching the paths list). The connection is cloned out of the
-    /// watch borrow before the `.await`, so the borrow is never held across it.
-    pub async fn connection_snapshot(&self) -> ConnectionSnapshot {
-        let conn = self.current.borrow().clone();
-        let Some(conn) = conn else {
-            return ConnectionSnapshot::default();
-        };
-        // relay_urls were parse-validated at connect time; fall back to the
-        // default relays (no custom health) if they somehow don't re-parse.
-        let relay_config = RelayConfig::from_urls_with_token(
-            &self.config.relay_urls,
-            self.config.relay_auth_token.clone(),
-        )
-        .unwrap_or_default();
-        crate::transport::paths::connection_snapshot(&conn, &relay_config).await
-    }
-
-    /// A cloneable server-direct forwarding handle sharing this client's live
-    /// connection and reconnect lifecycle.
-    pub fn server_forwarder(&self) -> ServerForwarder {
-        ServerForwarder {
-            current: self.current.clone(),
-        }
-    }
-
-    /// Flip the connected flag without disturbing the last-known route set.
-    fn set_connected(&self, connected: bool) {
-        if let Ok(mut routes) = self.routes.lock() {
-            routes.connected = connected;
-        }
-    }
-
-    /// A snapshot of the reconnect loop's progress through the current outage
-    /// (all defaults while connected).
-    pub fn reconnect_status(&self) -> ReconnectStatus {
-        self.reconnect
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or_default()
-    }
-
-    fn set_reconnect_status(&self, status: ReconnectStatus) {
-        if let Ok(mut s) = self.reconnect.lock() {
-            *s = status;
-        }
-    }
-
-    /// Bind the local SOCKS5 listener (and the optional HTTP listener) once, then
-    /// connect to the server and serve them. Reconnect policy: every
-    /// recoverable failure — a connection attempt that fails, the first one
-    /// included, or an established connection that drops — is retried with
-    /// exponential backoff (1s doubling to [`RECONNECT_BACKOFF_MAX`]),
-    /// indefinitely, unless `--max-reconnect-attempts` caps it or
-    /// `--no-auto-reconnect` is set. A server that is down, or not up yet, is
-    /// the ordinary case, not an error to exit on; only a permanent error (a
-    /// rejected credential, a malformed config) ends the session. The
-    /// listeners stay bound across reconnects: off-list targets keep
-    /// connecting directly, while on-list requests are held for the reconnect
-    /// (failing with network-unreachable only after [`TUNNEL_RECOVERY_HOLD`]).
-    /// An outage that reaches [`REBUILD_ENDPOINT_ATTEMPTS`] failures escalates
-    /// to a full endpoint rebuild, repeated at most every
-    /// [`REBUILD_ENDPOINT_MIN_INTERVAL`] for as long as the outage lasts.
-    pub async fn run(&self, endpoint: &ClientEndpoint) -> ProxyResult<()> {
-        let socks = match self.config.socks_listen {
-            Some(addr) => Some(TcpListener::bind(addr).await?),
-            None => None,
-        };
-        let http = match self.config.http_listen {
-            Some(addr) => Some(TcpListener::bind(addr).await?),
-            None => None,
-        };
-        self.run_with_optional_listeners(endpoint, socks, http).await
-    }
-
-    /// Serve on an already-bound SOCKS5 listener (see [`run`](Self::run) for the
-    /// reconnect policy). Callers that need the actual bound address — e.g. the
-    /// FFI binding to an ephemeral `127.0.0.1:0` and reporting the chosen port —
-    /// bind the [`TcpListener`] themselves, read `local_addr()`, then hand it
-    /// here. `run` is the thin convenience wrapper that binds `socks_listen`.
-    /// This path never enables the HTTP front-end.
-    pub async fn run_with_listener(
-        &self,
-        endpoint: &ClientEndpoint,
-        listener: TcpListener,
-    ) -> ProxyResult<()> {
-        self.run_with_listeners(endpoint, listener, None).await
-    }
-
-    /// Serve the SOCKS5 listener and, when present, the HTTP CONNECT listener,
-    /// both multiplexed over the same reconnecting server connection.
+    /// Nothing is dialed up front. A destination connects when a request for
+    /// it arrives — from a listener here or through [`Self::dialer`] — and
+    /// that request is held while it does; its connection is closed again
+    /// after [`ClientConfig::idle_timeout`] without an open stream. A failed
+    /// attempt or a dropped connection is retried with exponential backoff
+    /// (1s doubling to [`RECONNECT_BACKOFF_MAX`]) for as long as requests keep
+    /// waiting, escalating to an endpoint rebuild after
+    /// [`REBUILD_ENDPOINT_ATTEMPTS`] failures; a server that refuses this
+    /// client fails that destination's requests at once. No destination's
+    /// trouble ends the session or touches another destination, and targets on
+    /// no destination's list keep connecting directly throughout.
     ///
-    /// Public for callers that must own the enabled proxy ports before starting
-    /// the reconnecting session. Server-direct port forwards do not use either
-    /// proxy listener.
-    pub async fn run_with_listeners(
-        &self,
-        endpoint: &ClientEndpoint,
-        socks_listener: TcpListener,
-        http_listener: Option<TcpListener>,
-    ) -> ProxyResult<()> {
-        self.run_with_optional_listeners(
-            endpoint,
-            Some(socks_listener),
-            http_listener,
-        )
-        .await
-    }
-
-    /// Serve any enabled local proxy front-ends while maintaining the server
-    /// connection. Both may be absent for a forwarding-only GUI session.
-    pub async fn run_with_optional_listeners(
-        &self,
-        endpoint: &ClientEndpoint,
-        socks_listener: Option<TcpListener>,
-        http_listener: Option<TcpListener>,
-    ) -> ProxyResult<()> {
-        self.run_with_optional_listeners_ext(
-            endpoint,
-            socks_listener,
-            http_listener,
+    /// The listeners stay bound for the whole session. Dropping the returned
+    /// future stops everything but leaves the endpoints of the destinations in
+    /// use open: call [`Self::close`] afterwards.
+    pub async fn run(&self, listeners: LocalListeners) -> ProxyResult<()> {
+        let LocalListeners {
+            socks,
+            http,
             #[cfg(unix)]
-            None,
-        )
-        .await
-    }
-
-    /// Like [`run_with_listeners`](Self::run_with_listeners) but also serves a
-    /// SOCKS5 front-end on an optional **Unix domain socket** listener. The iOS
-    /// embedder uses this to expose the proxy over a socket file inside the app's
-    /// sandbox container (reachable only by this app) instead of a loopback TCP
-    /// port (reachable by any process on the device). Both front-ends speak the
-    /// same SOCKS5 protocol and share the one live tunnel + route policy.
-    ///
-    /// The extra Unix-domain listener is Unix-only; there is no Windows
-    /// equivalent (a named-pipe front-end was considered but dropped for lack of
-    /// a clear use case), so on Windows this takes the same arguments as
-    /// [`run_with_listeners`].
-    pub async fn run_with_listeners_ext(
-        &self,
-        endpoint: &ClientEndpoint,
-        socks_listener: TcpListener,
-        http_listener: Option<TcpListener>,
-        #[cfg(unix)] unix_listener: Option<UnixListener>,
-    ) -> ProxyResult<()> {
-        self.run_with_optional_listeners_ext(
-            endpoint,
-            Some(socks_listener),
-            http_listener,
-            #[cfg(unix)]
-            unix_listener,
-        )
-        .await
-    }
-
-    async fn run_with_optional_listeners_ext(
-        &self,
-        endpoint: &ClientEndpoint,
-        socks_listener: Option<TcpListener>,
-        http_listener: Option<TcpListener>,
-        #[cfg(unix)] unix_listener: Option<UnixListener>,
-    ) -> ProxyResult<()> {
-        if let Some(l) = &socks_listener {
-            log::info!(
-                "SOCKS5 proxy listening on {} (TCP CONNECT only)",
-                l.local_addr()?
-            );
+            unix_socks,
+        } = listeners;
+        let mut listen = ListenAddrs::default();
+        if let Some(l) = &socks {
+            let addr = l.local_addr()?;
+            log::info!("SOCKS5 proxy listening on {addr} (TCP CONNECT only)");
+            listen.socks = Some(addr);
         }
-        if let Some(l) = &http_listener {
+        if let Some(l) = &http {
+            let addr = l.local_addr()?;
             log::info!(
-                "HTTP proxy listening on {} (CONNECT tunneling + plain-HTTP forwarding)",
-                l.local_addr()?
+                "HTTP proxy listening on {addr} (CONNECT tunneling + plain-HTTP forwarding)"
             );
+            listen.http = Some(addr);
         }
         #[cfg(unix)]
-        if let Some(l) = &unix_listener {
+        if let Some(l) = &unix_socks {
             log::info!("SOCKS5 proxy also listening on unix socket {:?}", l.local_addr()?);
         }
+        *self.router.listen.lock().expect("listen addrs lock") = listen;
+        // The addresses are advertised for as long as they are served: until
+        // this future ends or is dropped, or the listeners are closed.
+        let _advertised = AdvertisedAddrs(&self.router);
+        log::info!(
+            "{} destination(s), connected on demand: {}",
+            self.router.destinations.len(),
+            self.router.table.hosts().collect::<Vec<_>>().join(", ")
+        );
 
-        // Shared state between the always-on accept loops and the connection
-        // manager: the current live connection (None during a drop/backoff) and
-        // the route policy (None until the first handshake learns it). Keeping the
-        // accept loops independent of the connection is what lets off-list targets
-        // keep connecting directly while the tunnel is down — only on-list targets
-        // fail until it recovers. The policy starts None so the client fails closed
-        // until it is known. `current` is the client's own field so status callers
-        // can snapshot the connection's paths (see [`Self::conn_paths`]).
-        let current = self.current.clone();
-        let routed_set: SharedRoutedSet = Arc::new(Mutex::new(None));
-
-        // The HTTP branch is inert (never resolves) when no HTTP listener is
-        // bound, so the `select!` shape is the same either way.
-        let http_accept = async {
-            match http_listener {
-                Some(l) => {
-                    accept_loop(l, &current, &routed_set, HttpProto, self.local_close.subscribe())
-                        .await
-                }
-                None => std::future::pending::<ProxyResult<()>>().await,
-            }
-        };
-
+        let router = &self.router;
+        // An absent front-end is an inert branch (never resolves), so the
+        // `select!` shape is the same whichever listeners are bound.
         let socks_accept = async {
-            match socks_listener {
-                Some(l) => {
-                    accept_loop(l, &current, &routed_set, Socks5Proto, self.local_close.subscribe())
-                        .await
-                }
+            match socks {
+                Some(l) => accept_loop(l, router, Socks5Proto, self.local_close.subscribe()).await,
                 None => std::future::pending::<ProxyResult<()>>().await,
             }
         };
-
-        // Same for the optional Unix-domain SOCKS5 front-end. Unix only: on other
-        // platforms this branch is inert (there is no Unix-domain listener), so
-        // the `select!` shape stays identical.
+        let http_accept = async {
+            match http {
+                Some(l) => accept_loop(l, router, HttpProto, self.local_close.subscribe()).await,
+                None => std::future::pending::<ProxyResult<()>>().await,
+            }
+        };
         let unix_accept = async {
             #[cfg(unix)]
-            if let Some(l) = unix_listener {
-                return accept_loop_unix(l, &current, &routed_set, self.local_close.subscribe())
-                    .await;
+            if let Some(l) = unix_socks {
+                return accept_loop_unix(l, router, self.local_close.subscribe()).await;
             }
             std::future::pending::<ProxyResult<()>>().await
         };
+        // The destination managers never finish; they are here so they run —
+        // and stop — with this future. One task, N concurrent futures: an
+        // embedder's `task.abort()` tears everything down, no orphaned task.
+        let managers = futures::future::join_all(
+            router.destinations.iter().map(|d| d.clone().run()),
+        );
 
-        // One task, N concurrent futures. When the manager returns (a fatal
-        // first-connect failure or a clean stop) the accept loops are dropped with
-        // it, so `flextunnel_stop`'s `task.abort()` tears everything down — no
-        // orphaned accept task.
+        // On the close signal every accept loop drops its listener and parks,
+        // so the session lives on with nothing listening: say so.
+        let listeners_closed = async {
+            listener_closed(&mut self.local_close.subscribe()).await;
+            router.withdraw_listen_addrs();
+            std::future::pending::<ProxyResult<()>>().await
+        };
+
         tokio::select! {
-            r = self.manage_connection(endpoint, &current, &routed_set) => r,
+            _ = managers => Ok(()),
             r = socks_accept => r,
             r = http_accept => r,
             r = unix_accept => r,
+            r = listeners_closed => r,
         }
     }
 
-    /// Maintain the server connection: (re)establish + authenticate, publish the
-    /// live connection and tunnel set for the accept loop, and retry with
-    /// backoff when an attempt fails or the connection drops (see
-    /// [`Self::handle_failure`] for what is retried and [`Self::run`] for the
-    /// policy).
-    async fn manage_connection(
-        &self,
-        endpoint: &ClientEndpoint,
-        current: &SharedConn,
-        routed_set_shared: &SharedRoutedSet,
-    ) -> ProxyResult<()> {
-        // Consecutive failed attempts in the current outage; 0 once connected.
-        let mut attempt: u32 = 0;
-        // When the current outage last rebuilt the endpoint (`None`: not yet).
-        let mut last_rebuild: Option<Instant> = None;
-        // Set when the last backoff was cut short by an event that reset the
-        // series (a restored network path, a foregrounded app): the endpoint
-        // still needs the rebind nudge below — the network may well have
-        // changed underneath it. Every retry passes through `wait_backoff`,
-        // which reassigns it.
-        let mut path_returned = false;
-        loop {
-            // Until (re)authenticated, nothing is being forwarded.
-            self.set_connected(false);
-            current.send_replace(None);
-
-            if rebuild_due(attempt, last_rebuild) {
-                // Escalation: the nudge below wasn't enough — rebuild the
-                // endpoint from scratch (see [`REBUILD_ENDPOINT_ATTEMPTS`] and
-                // [`REBUILD_ENDPOINT_MIN_INTERVAL`]). On a rebuild failure
-                // (e.g. no route to bind on a dead network) the current
-                // endpoint stays in place and this attempt proceeds with it;
-                // the failed rebuild still counts against the interval — a
-                // network that dead is a matter for the per-attempt nudge.
-                log::warn!("Still failing after {attempt} attempts; rebuilding the endpoint from scratch");
-                last_rebuild = Some(Instant::now());
-                if let Err(e) = endpoint.rebuild().await {
-                    log::warn!("Endpoint rebuild failed ({e:#}); retrying with the current endpoint");
-                }
-            } else if attempt > 0 || path_returned {
-                // Retrying after a failure: the endpoint's UDP sockets may be dead
-                // underneath it (iOS defuncts them while the process is suspended;
-                // a sleeping laptop can do the same) and iroh cannot always detect
-                // that by itself, leaving reconnects wedged forever. Nudging it
-                // re-checks and rebinds the transports — harmless when nothing
-                // actually changed.
-                endpoint.endpoint().network_change().await;
-            }
-
-            // Establish (connect + auth). The handshake also learns the server's
-            // tunnel set (drives split-tunneling) and returns the control-stream
-            // halves kept open for heartbeats. The endpoint handle is taken
-            // fresh per attempt — a rebuild above swapped it.
-            let (connection, routed_set, ctrl_send, ctrl_recv) = match self
-                .establish(&endpoint.endpoint())
-                .await
-            {
-                Ok(established) => {
-                    // Connected: the outage, if there was one, is over.
-                    attempt = 0;
-                    last_rebuild = None;
-                    self.set_reconnect_status(ReconnectStatus::default());
-                    established
-                }
-                Err(e) => match self.handle_failure(e, &mut attempt) {
-                    Ok(backoff) => {
-                        path_returned = self.wait_backoff(backoff, &mut attempt).await;
-                        continue;
-                    }
-                    Err(fatal) => return Err(fatal),
-                },
-            };
-
-            // Publish the live connection + route policy so the accept loop routes
-            // against them; the policy is retained on the next drop (never reset to
-            // None once known, so we only fail closed before the *first* connect).
-            *routed_set_shared.lock().expect("routed-set lock") = Some(routed_set);
-            // Publishing the reconnected handle wakes every request held in
-            // [`wait_for_tunnel`], which then proceeds on the fresh connection.
-            current.send_replace(Some(connection.clone()));
-
-            // Keep the connection alive until it drops, then reconnect (or exit).
-            let maintained = self.maintain(&connection, ctrl_send, ctrl_recv).await;
-            // The connection is no longer live; clear the FFI-visible flag and the
-            // shared handle so on-list targets hold for the reconnect (and fail
-            // cleanly if it doesn't land) during the gap.
-            self.set_connected(false);
-            current.send_replace(None);
-            if let Err(e) = maintained {
-                match self.handle_failure(e, &mut attempt) {
-                    Ok(backoff) => {
-                        path_returned = self.wait_backoff(backoff, &mut attempt).await;
-                        continue;
-                    }
-                    Err(fatal) => return Err(fatal),
-                }
-            } else {
-                return Ok(());
-            }
-        }
-    }
-
-    /// Decide what to do with a failed attempt or a lost connection:
-    /// `Ok(backoff)` to retry after that delay, or `Err(e)` to end the session.
-    ///
-    /// Every recoverable error (`ProxyError::is_recoverable`: a connect that
-    /// failed or timed out, a dropped connection) is retried, on the first
-    /// attempt exactly as after a year connected — a server that is down, or
-    /// not up yet, is the ordinary case — unless auto-reconnect is off or the
-    /// retry cap is reached. A permanent error (a rejected credential, a
-    /// malformed config) ends the session: the same credential and config
-    /// would fail the same way every time.
-    fn handle_failure(&self, e: ProxyError, attempt: &mut u32) -> Result<Duration, ProxyError> {
-        if !self.config.auto_reconnect || !e.is_recoverable() {
-            return Err(e);
-        }
-        *attempt += 1;
-        if let Some(max) = self.config.max_reconnect_attempts
-            && *attempt > max.get()
-        {
-            log::error!("Giving up after {} retries: {e}", max.get());
-            return Err(e);
-        }
-        let backoff = calculate_backoff(*attempt);
-        log::warn!(
-            "{e}; retrying in {:.1}s (attempt {})",
-            backoff.as_secs_f64(),
-            *attempt
-        );
-        self.set_reconnect_status(ReconnectStatus {
-            failed_attempts: *attempt,
-            last_error: Some(e.to_string()),
-            next_attempt_at: Some(Instant::now() + backoff),
-        });
-        Ok(backoff)
-    }
-
-    /// Sit out a reconnect backoff, gated on network availability: while the
-    /// device reports no usable path, park with **no timers at all** (retrying
-    /// into a dead path detects nothing and, on cellular, wakes the radio for
-    /// nothing) and return as soon as the path comes back — resetting the
-    /// backoff series so the restored network gets an immediate, fresh
-    /// reconnect. While the path is up this is a plain backoff sleep, except
-    /// that a mid-sleep loss switches to parking, and that the embedding app
-    /// coming to the foreground ends the sleep the same way a restored path
-    /// does — a backoff step sized for a long outage (up to
-    /// [`RECONNECT_BACKOFF_MAX`]) must not keep a user who is looking waiting.
-    ///
-    /// Returns whether the wait was cut short by one of those events (the
-    /// backoff series was reset), so the caller can nudge
-    /// `Endpoint::network_change()` even though the attempt counter is 0.
-    async fn wait_backoff(&self, backoff: Duration, attempt: &mut u32) -> bool {
-        let mut available = self.network_available.subscribe();
-        if !*available.borrow() {
-            self.park_until_path_returns(&mut available, attempt).await;
-            return true;
-        }
-        // A foreground flip only matters if the app is backgrounded right now;
-        // otherwise this branch stays inert. The senders live in self, so
-        // `wait_for` cannot error while we run.
-        let mut background = self.background.subscribe();
-        let foregrounded = async {
-            if *background.borrow() && background.wait_for(|b| !*b).await.is_ok() {
-                return;
-            }
-            std::future::pending::<()>().await
-        };
-        let cut_short = tokio::select! {
-            _ = tokio::time::sleep(backoff) => None,
-            r = available.wait_for(|a| !*a) => r.is_ok().then_some(BackoffWake::PathLost),
-            _ = foregrounded => Some(BackoffWake::Foregrounded),
-        };
-        match cut_short {
-            None => false,
-            Some(BackoffWake::PathLost) => {
-                self.park_until_path_returns(&mut available, attempt).await;
-                true
-            }
-            Some(BackoffWake::Foregrounded) => {
-                log::info!("App foregrounded; reconnecting now");
-                self.reset_backoff(attempt);
-                true
-            }
-        }
-    }
-
-    /// Park (no timers) until the device reports a usable path again, then
-    /// reset the backoff series for an immediate, fresh attempt.
-    async fn park_until_path_returns(
-        &self,
-        available: &mut watch::Receiver<bool>,
-        attempt: &mut u32,
-    ) {
-        log::info!("Network unavailable; pausing reconnects until a path returns");
-        let _ = available.wait_for(|a| *a).await;
-        log::info!("Network available again; reconnecting now");
-        self.reset_backoff(attempt);
-    }
-
-    /// Start a fresh backoff series with an attempt due right now.
-    fn reset_backoff(&self, attempt: &mut u32) {
-        *attempt = 0;
-        if let Ok(mut s) = self.reconnect.lock() {
-            s.next_attempt_at = Some(Instant::now());
-        }
-    }
-
-    /// Connect to the server and complete the auth handshake, returning the
-    /// connection, the routed set the server pushed, and the control-stream halves
-    /// (kept open for heartbeats).
-    async fn establish(
-        &self,
-        endpoint: &Endpoint,
-    ) -> ProxyResult<(Connection, Arc<RoutedSet>, SendStream, RecvStream)> {
-        let endpoint_addr = self.resolve_server_addr()?;
-        let alpn = match &self.config.auth {
-            ClientAuth::Key(_) => crate::transport::ALPN,
-            ClientAuth::QuickAllowlisted => crate::transport::QUICK_ALPN,
-        };
-        let connection = connect_with_timeout(endpoint, endpoint_addr, alpn).await?;
-        log::info!("Connected to server, authenticating...");
-        let (routed_set, send, recv) = self.handshake(&connection, endpoint.id()).await?;
-        log::info!("Authenticated.");
-        Ok((connection, Arc::new(routed_set), send, recv))
-    }
-
-    /// Keep the connection alive: run the heartbeat and watch for the QUIC
-    /// connection closing, whichever ends first. (Accepting local connections is
-    /// handled independently by [`accept_loop`] so it survives a drop.)
-    async fn maintain(
-        &self,
-        connection: &Connection,
-        ctrl_send: SendStream,
-        ctrl_recv: RecvStream,
-    ) -> ProxyResult<()> {
-        // Log the selected path (relay/direct) and any later switch, for the
-        // lifetime of this connection. Guard is dropped when `maintain` returns.
-        let _path_watcher = crate::transport::paths::watch_connection_paths(connection);
-        tokio::select! {
-            r = client_heartbeat_loop(ctrl_send, ctrl_recv, self.background.subscribe()) => r,
-            reason = connection.closed() => Err(ProxyError::ConnectionLost(reason.to_string())),
-        }
-    }
-
-    /// Resolve the server's `EndpointAddr`, attaching relay hints if given.
-    fn resolve_server_addr(&self) -> ProxyResult<EndpointAddr> {
-        let server_id: EndpointId = self.config.server_node_id.parse().map_err(|e| {
-            ProxyError::config_with_source(
-                format!("Invalid server node ID: {}", self.config.server_node_id),
-                e,
-            )
-        })?;
-        log::info!("Connecting to flextunnel server: {server_id}");
-
-        if self.config.relay_urls.is_empty() {
-            return Ok(EndpointAddr::new(server_id));
-        }
-        let mut addr = EndpointAddr::new(server_id);
-        for relay_url_str in &self.config.relay_urls {
-            let relay_url: RelayUrl = relay_url_str.parse().map_err(|e| {
-                ProxyError::config_with_source(format!("Invalid relay URL: {relay_url_str}"), e)
-            })?;
-            addr = addr.with_relay_url(relay_url);
-        }
-        log::info!("Using {} relay hint(s)", self.config.relay_urls.len());
-        Ok(addr)
-    }
-
-    /// Perform the connection-level auth handshake on the first bi-stream,
-    /// returning the routed set (the tunnel set) the server pushed plus the
-    /// control-stream halves — the stream is **not** closed; it stays open as the
-    /// heartbeat channel. The client uses the routed set to split-tunnel; it
-    /// configures no list of its own (the server is the single source of truth).
-    ///
-    /// `own_id` is this client's (ephemeral) endpoint id, which a keypair
-    /// client signs into its credential so the server can bind the signature
-    /// to this very connection.
-    async fn handshake(
-        &self,
-        connection: &Connection,
-        own_id: EndpointId,
-    ) -> ProxyResult<(RoutedSet, SendStream, RecvStream)> {
-        let (mut send, mut recv) = connection
-            .open_bi()
-            .await
-            .map_err(|e| ProxyError::Signaling(format!("Failed to open handshake stream: {e}")))?;
-
-        let auth = match &self.config.auth {
-            ClientAuth::Key(key) => Some(signaling::ClientAuthPayload {
-                public_key: key.public_str(),
-                endpoint_id: own_id.to_string(),
-                signature: crate::auth::sign_endpoint_id(key, &own_id),
-            }),
-            // Quick mode: the endpoint id is the credential; the server's
-            // allowlist hook already authenticated it at the TLS handshake.
-            ClientAuth::QuickAllowlisted => None,
-        };
-        let mut hello = Hello::new(auth, self.instance_nonce);
-        hello.duplicate_server_observed = self.duplicate_server.load(Ordering::Relaxed);
-        signaling::write_message(&mut send, &signaling::encode_hello(&hello)?).await?;
-        send.flush().await?;
-
-        let data = tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
-            signaling::read_message(&mut recv, signaling::MAX_HANDSHAKE_SIZE),
-        )
-        .await
-        .map_err(|_| {
-            ProxyError::Signaling("timed out waiting for server handshake response".into())
-        })??;
-        let response = signaling::decode_hello_response(&data)?;
-
-        // Record the server's instance nonce (drives duplicate-server detection)
-        // before the accept/reject branch so a rejection still updates history.
-        let newly_flagged_duplicate = self.observe_server_nonce(response.server_instance_nonce);
-
-        if !response.accepted {
-            let reason = response.reject_reason.unwrap_or_else(|| "unknown".to_string());
-            return Err(ProxyError::AuthenticationFailed(reason));
-        }
-
-        // The `Hello` already sent on this handshake could not carry the advisory
-        // (the duplicate was only detected from this very response). Drop the
-        // connection with a recoverable error so we reconnect immediately and the
-        // next `Hello` advises the server to self-block — rather than waiting for a
-        // natural disconnect that may never come while this connection is healthy.
-        if newly_flagged_duplicate {
-            return Err(ProxyError::ConnectionLost(
-                "duplicate server id detected; reconnecting to advise the server to self-block"
-                    .into(),
-            ));
-        }
-
-        // Build the tunnel set from the server's pushed list. The server
-        // validated these rules at startup, so a parse failure here is not
-        // expected; surface it as a signaling error rather than panicking.
-        // An empty set is valid: only the reserved `flextunnel.internal`
-        // namespace is then tunneled, everything else connects directly.
-        let routed_set = RoutedSet::new(&response.routed_domains, &response.routed_cidrs)
-            .map_err(|e| ProxyError::Signaling(format!("server pushed an invalid routed set: {e}")))?;
-        log::info!(
-            "Server tunnel set: {} domain rule(s), {} CIDR(s) — off-list targets connect directly",
-            response.routed_domains.len(),
-            response.routed_cidrs.len()
-        );
-
-        // Publish the live tunnel set so the FFI/app can show what's forwarded.
-        if let Ok(mut routes) = self.routes.lock() {
-            routes.connected = true;
-            routes.domains = response.routed_domains.clone();
-            routes.cidrs = response.routed_cidrs.clone();
-            routes.host_aliases = response.host_aliases.clone();
-            routes.dns_forwards = response.dns_forwards.clone();
-            routes.bridges = response.bridges.clone();
-        }
-        Ok((routed_set, send, recv))
+    /// Close every destination's endpoint gracefully. Call once the
+    /// [`Self::run`] future has been dropped (session teardown): a bound
+    /// endpoint must be closed, never just dropped. An endpoint still being
+    /// built at that moment is waited for and then closed, so this can take as
+    /// long as a build does — bound the wait if the caller cannot afford it.
+    pub async fn close(&self) {
+        self.router.shared.closed.store(true, Ordering::SeqCst);
+        futures::future::join_all(self.router.destinations.iter().map(|d| d.close())).await;
     }
 }
 
@@ -1084,7 +710,7 @@ impl ProxyClient {
 /// foregrounded, [`HEARTBEAT_INTERVAL_IDLE`] while `background` reads true —
 /// and await its `HeartbeatAck` within [`liveness_window`] of that cadence. A
 /// missing ack (or stream error) returns [`ProxyError::ConnectionLost`]
-/// (recoverable), which drives the reconnect loop.
+/// (recoverable), which ends the connection for its manager to redial.
 ///
 /// A cadence flip takes effect on the *current* wait: the deadline is
 /// recomputed from the last heartbeat, so a foreground flip 50s into an idle
@@ -1152,7 +778,7 @@ pub(crate) async fn client_heartbeat_loop(
 
 /// A local front-end request resolved to a wire [`Target`], plus how to begin
 /// the upstream exchange once connected.
-struct LocalRequest {
+pub(crate) struct LocalRequest {
     target: Target,
     /// Bytes to write upstream before splicing: the rewritten request head of
     /// an HTTP plain-forward, whose reply is the origin's own response. `None`
@@ -1163,19 +789,18 @@ struct LocalRequest {
 
 /// A local front-end protocol (SOCKS5 or HTTP). The protocols differ only in
 /// how they parse a local request into a [`LocalRequest`] and how they answer
-/// with a server reply code; everything after that — the route policy,
-/// split-tunnel dial, tunnel open, and byte pipe — is shared (see
-/// [`handle_local_conn`]).
+/// with a server reply code; everything after that — routing, the direct
+/// dial, tunnel open, and byte pipe — is shared (see [`handle_local_conn`]).
 ///
 /// Methods return `impl Future + Send` (not bare `async fn`) so the futures are
 /// `Send`, which [`accept_loop`] needs to `tokio::spawn` a generic handler.
 /// The local front-end stream can be a TCP loopback socket or a Unix domain
 /// socket (see [`accept_loop`] / [`accept_loop_unix`]), so the request parsing
 /// and byte-splicing are generic over any async stream.
-trait LocalStream: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(crate) trait LocalStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> LocalStream for S {}
 
-trait LocalProto: Clone + Send + Sync + 'static {
+pub(crate) trait LocalProto: Clone + Send + Sync + 'static {
     /// Parse the local handshake into a [`LocalRequest`]. Any error the caller
     /// can't yet answer with a reply code (a bad request, an unsupported
     /// method) must be written to `stream` here before returning `Err`, mirroring
@@ -1422,15 +1047,14 @@ async fn listener_closed(close: &mut watch::Receiver<bool>) {
 /// the loop parks forever so the enclosing `select!` keeps the session alive.
 async fn accept_loop<P: LocalProto>(
     mut listener: TcpListener,
-    current: &SharedConn,
-    routed_set_shared: &SharedRoutedSet,
+    router: &Arc<Router>,
     proto: P,
     mut close: watch::Receiver<bool>,
 ) -> ProxyResult<()> {
     let addr = listener.local_addr()?;
     let mut retry = AcceptRetry::new("Local proxy");
     let limiter = Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_CONNS));
-    let hold_limiter = Arc::new(Semaphore::new(MAX_HELD_CONNS));
+    let hold_limiter = Arc::new(HoldBudget::new(router.destinations.len()));
     let mut warned_saturated = false;
     loop {
         let accepted = tokio::select! {
@@ -1470,22 +1094,20 @@ async fn accept_loop<P: LocalProto>(
                 break;
             }
         };
-        let current = current.clone();
-        let routed_set_shared = routed_set_shared.clone();
+        let router = router.clone();
         let proto = proto.clone();
         let hold_limiter = hold_limiter.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) =
-                handle_local_conn(proto, tcp, current, routed_set_shared, hold_limiter).await
-            {
+            if let Err(e) = handle_local_conn(proto, tcp, router, hold_limiter).await {
                 log::debug!("proxy connection from {peer} ended: {e}");
             }
         });
     }
     // Closed on request. Release the socket so new local connections get an
     // immediate refusal, then park: returning would resolve the session's
-    // `select!` and tear down the tunnel, which must outlive its front-ends.
+    // `select!` and tear down the destinations, which must outlive its
+    // front-ends.
     drop(listener);
     std::future::pending().await
 }
@@ -1499,8 +1121,7 @@ async fn accept_loop<P: LocalProto>(
 #[cfg(unix)]
 async fn accept_loop_unix(
     mut listener: UnixListener,
-    current: &SharedConn,
-    routed_set_shared: &SharedRoutedSet,
+    router: &Arc<Router>,
     mut close: watch::Receiver<bool>,
 ) -> ProxyResult<()> {
     let path = listener
@@ -1509,7 +1130,7 @@ async fn accept_loop_unix(
         .and_then(|a| a.as_pathname().map(|p| p.to_path_buf()));
     let mut retry = AcceptRetry::new("Unix SOCKS5");
     let limiter = Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_CONNS));
-    let hold_limiter = Arc::new(Semaphore::new(MAX_HELD_CONNS));
+    let hold_limiter = Arc::new(HoldBudget::new(router.destinations.len()));
     let mut warned_saturated = false;
     loop {
         let accepted = tokio::select! {
@@ -1548,15 +1169,11 @@ async fn accept_loop_unix(
                 break;
             }
         };
-        let current = current.clone();
-        let routed_set_shared = routed_set_shared.clone();
+        let router = router.clone();
         let hold_limiter = hold_limiter.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) =
-                handle_local_conn(Socks5Proto, stream, current, routed_set_shared, hold_limiter)
-                    .await
-            {
+            if let Err(e) = handle_local_conn(Socks5Proto, stream, router, hold_limiter).await {
                 log::debug!("unix proxy connection ended: {e}");
             }
         });
@@ -1582,20 +1199,19 @@ async fn rebind_unix_listener(path: &std::path::Path) -> ProxyResult<UnixListene
     Ok(UnixListener::bind(path)?)
 }
 
-/// Handle one local proxy connection: parse the front-end request, then route by
-/// the current route policy — held (fail closed) up to [`TUNNEL_RECOVERY_HOLD`]
-/// while the policy is still unknown and refused with a general-failure reply if
-/// it never lands, otherwise an on-list target is tunneled to the
-/// server (held up to [`TUNNEL_RECOVERY_HOLD`] for the reconnect if the tunnel
-/// is down — concurrent holds capped by `hold_limiter` — then answered with a
-/// network-unreachable reply) and an off-list target is dialed directly from
-/// this device.
+/// Handle one local proxy connection: parse the front-end request, then route
+/// it by the client's table. A target on a destination's list is tunneled to
+/// that destination's server — connecting it first if need be, with the
+/// request held up to [`TUNNEL_RECOVERY_HOLD`] (concurrent holds capped by
+/// `hold_limiter`, per destination and in all) and answered
+/// network-unreachable if no connection lands. A
+/// target on no list is dialed directly from this device. The reserved
+/// `flextunnel.internal` names are answered here, by the client itself.
 async fn handle_local_conn<P: LocalProto, S: LocalStream>(
     proto: P,
     mut tcp: S,
-    current: SharedConn,
-    routed_set_shared: SharedRoutedSet,
-    hold_limiter: Arc<Semaphore>,
+    router: Arc<Router>,
+    hold_limiter: Arc<HoldBudget>,
 ) -> Result<()> {
     // Bound the local handshake so a peer that connects and sends nothing can't
     // pin this task and its socket indefinitely.
@@ -1606,50 +1222,58 @@ async fn handle_local_conn<P: LocalProto, S: LocalStream>(
         .await
         .map_err(|_| anyhow::anyhow!("timed out during local proxy handshake"))??;
 
-    // Fail closed until the route policy is known: before the first handshake
-    // learns the tunnel set we don't route anything, so no traffic leaks out
-    // (directly or tunneled) before we know how it should be routed. A request
-    // arriving in that window is held for the handshake rather than refused
-    // outright (see [`wait_for_route_policy`]); only one that never lands
-    // answers with a general-failure reply, so the app shows an error instead
-    // of hanging.
-    let Some(routed_set) = wait_for_route_policy(&routed_set_shared, &current, &hold_limiter).await
-    else {
-        log::debug!("Route policy still not known after hold; refusing: {target:?}");
-        let _ = proto.reply(&mut tcp, signaling::REP_GENERAL_FAILURE).await;
-        return Ok(());
+    let (dest, request) = match router.table.route(&target) {
+        Route::Tunnel { dest, request } => (dest, request),
+        // Split-tunnel: a target on no destination's list is dialed directly
+        // from this device's own network (its DNS, its IP) — whatever state
+        // the destinations are in.
+        Route::Direct => {
+            log::debug!("Direct (no destination routes it): {target:?}");
+            return direct_connect(proto, tcp, &target, upstream_preamble).await;
+        }
+        route @ (Route::ClientStatus | Route::Reserved) => {
+            log::debug!("Client status endpoint: {target:?}");
+            return client_status::serve(
+                &proto,
+                &mut tcp,
+                upstream_preamble,
+                &router,
+                route == Route::Reserved,
+                &hold_limiter,
+            )
+            .await;
+        }
     };
 
-    // The reserved `flextunnel.internal` namespace is always tunneled to the
-    // server (which serves it itself), regardless of the pushed routed set — a
-    // direct connection would just fail on a name that resolves nowhere.
-    let reserved_target = matches!(&target, signaling::Target::Domain(host, _)
-        if reserved::is_reserved_host(host));
-
-    // Split-tunnel: a target not in the tunnel set is dialed directly from this
-    // device's own network (its DNS, its IP) — works even when the tunnel is down.
-    if !reserved_target && !routed_set.allows(&target) {
-        log::debug!("Direct (off tunnel set): {target:?}");
-        return direct_connect(proto, tcp, &target, upstream_preamble).await;
-    }
-
-    // On-list: needs a live tunnel. If the connection is down (a drop/backoff),
-    // hold the request for the core's own reconnect — up to
-    // [`TUNNEL_RECOVERY_HOLD`] — so a routed page load racing a transient drop
-    // proceeds transparently once the link is back. Only a reconnect that never
-    // lands answers with a network-unreachable reply, so the app shows a
-    // connection error for this routed target instead of hanging forever.
-    let Some(conn) = wait_for_tunnel(&current, &hold_limiter).await else {
-        log::debug!("Tunnel still down after hold; on-list target unreachable: {target:?}");
-        let _ = proto.reply(&mut tcp, signaling::REP_NET_UNREACHABLE).await;
-        return Ok(());
+    // Tunneled: needs the destination's connection. If it is not up — an idle
+    // destination's first use, or a drop being retried — this request is what
+    // makes it connect, and is held while it does. Only a connection that
+    // never lands answers with an error reply, so the app shows a connection
+    // error for this target instead of hanging forever. A destination that is
+    // connected takes no hold at all.
+    let destination = &router.destinations[dest];
+    let lease = match destination.acquire(Some(hold_limiter.for_destination(dest))).await {
+        Ok(lease) => lease,
+        Err(e) => {
+            log::debug!("{}: {e}; refusing {target:?}", destination.host());
+            let rep = match e {
+                // The server turned this client away: no point in the app
+                // retrying as it would an unreachable network.
+                AcquireError::Failed(_) => signaling::REP_NOT_ALLOWED,
+                AcquireError::TimedOut | AcquireError::HoldCap | AcquireError::Closed => {
+                    signaling::REP_NET_UNREACHABLE
+                }
+            };
+            let _ = proto.reply(&mut tcp, rep).await;
+            return Ok(());
+        }
     };
-    log::debug!("Tunneling: {target:?}");
+    log::debug!("Tunneling via {}: {target:?}", destination.host());
 
     // Open the tunnel stream and read the server's reply. If any step fails the
     // local app hasn't been answered yet, so send a general-failure reply
     // (best effort) instead of dropping the connection with no response.
-    let opened = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, open_tunnel(&conn, &target))
+    let opened = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, open_tunnel(&lease.conn, &request))
         .await
         .map_err(|_| anyhow::anyhow!("timed out opening tunnel / awaiting server reply"))
         .and_then(|r| r);
@@ -1683,72 +1307,18 @@ async fn handle_local_conn<P: LocalProto, S: LocalStream>(
         }
     }
 
+    // The lease is held through the splice: an open stream keeps the
+    // destination's connection from being closed as idle.
     let mut iroh = tokio::io::join(recv, send);
     let _ = tokio::io::copy_bidirectional(&mut tcp, &mut iroh).await;
+    drop(lease);
     Ok(())
-}
-
-/// The route policy, immediately when a handshake has already published one,
-/// otherwise a bounded wait for one to land — the same
-/// [`TUNNEL_RECOVERY_HOLD`] the on-list path uses, since what an unknown policy
-/// waits on *is* a connection: the policy is published just before the
-/// connection, so a live connection means the policy is set.
-///
-/// `None` means no policy is known once the wait gives up, and the caller fails
-/// closed. Holding matters most on mobile, where the app relaunches the whole
-/// session after the OS suspends it: every local request between the relaunch
-/// and its first handshake would otherwise be refused, and for the browser a
-/// refusal there is worse than a wait — an unroutable name is handed back to the
-/// device's own DNS, which answers NXDOMAIN for hosts that only resolve
-/// server-side, seconds before the session is back.
-async fn wait_for_route_policy(
-    shared: &SharedRoutedSet,
-    current: &SharedConn,
-    holds: &Semaphore,
-) -> Option<Arc<RoutedSet>> {
-    let known = { shared.lock().expect("routed-set lock").clone() };
-    if known.is_some() {
-        return known;
-    }
-    log::debug!("Route policy not yet known; holding for the first handshake");
-    wait_for_tunnel(current, holds).await?;
-    shared.lock().expect("routed-set lock").clone()
-}
-
-/// The live tunnel connection, immediately when one is up, otherwise a bounded
-/// wait for the reconnect loop to publish a replacement. `None` once
-/// [`TUNNEL_RECOVERY_HOLD`] elapses — or the session is tearing down (sender
-/// gone) — without a connection. Concurrent holds are capped by `holds`
-/// ([`MAX_HELD_CONNS`] per listener): at the cap the wait is skipped entirely,
-/// so parked on-list requests can never pin the whole
-/// [`MAX_ACTIVE_LOCAL_CONNS`] budget that off-list/direct traffic shares.
-async fn wait_for_tunnel(current: &SharedConn, holds: &Semaphore) -> Option<Connection> {
-    let mut live = current.subscribe();
-    if let Some(conn) = live.borrow().clone() {
-        return Some(conn);
-    }
-    let Ok(_hold) = holds.try_acquire() else {
-        // Re-check before giving up: a reconnect landing between the borrow
-        // above and the failed acquire should still be served.
-        log::debug!("Hold capacity exhausted; not holding on-list request");
-        return live.borrow().clone();
-    };
-    log::debug!(
-        "Tunnel down; holding on-list request up to {}s for the reconnect",
-        TUNNEL_RECOVERY_HOLD.as_secs()
-    );
-    // `wait_for` re-inspects the current value first, so a publish racing the
-    // borrow above is never missed.
-    match tokio::time::timeout(TUNNEL_RECOVERY_HOLD, live.wait_for(|conn| conn.is_some())).await {
-        Ok(Ok(conn)) => conn.clone(),
-        _ => None,
-    }
 }
 
 /// Connect to `target` directly from this device (bypassing the tunnel) and pipe
 /// bytes, answering the local app's request with the matching reply code via
 /// `proto` (or, for an HTTP forward, writing its rewritten head upstream instead
-/// of a success reply). Used for off-routed-set targets in split-tunnel mode.
+/// of a success reply). Used for targets no destination routes.
 /// The dial is bounded by the same deadline as opening a tunnel so a slow target
 /// can't pin the task.
 async fn direct_connect<P: LocalProto, S: LocalStream>(
@@ -1757,8 +1327,8 @@ async fn direct_connect<P: LocalProto, S: LocalStream>(
     target: &signaling::Target,
     upstream_preamble: Option<Vec<u8>>,
 ) -> Result<()> {
-    // Split-tunnel direct connections resolve on the device via its own DNS;
-    // server-side conditional forwarding does not apply here.
+    // Direct connections resolve on the device via its own DNS; a server's
+    // conditional forwarding does not apply here.
     let dialed = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, dial::dial_target(target, None)).await;
     let mut upstream = match dialed {
         Ok(Ok(mut s)) => {
@@ -1781,15 +1351,15 @@ async fn direct_connect<P: LocalProto, S: LocalStream>(
     Ok(())
 }
 
-/// Open a bi-stream to the server, send the CONNECT request, and read back the
+/// Open a bi-stream to the server, send the stream request, and read back the
 /// reply code. Returns the stream halves and the reply so the caller can relay
 /// the reply to the local app and then pipe bytes.
-async fn open_tunnel(
+pub(crate) async fn open_tunnel(
     conn: &Connection,
-    target: &signaling::Target,
+    request: &StreamRequest,
 ) -> Result<(SendStream, RecvStream, u8)> {
     let (mut send, mut recv) = conn.open_bi().await?;
-    signaling::write_request(&mut send, target).await?;
+    signaling::write_request(&mut send, request).await?;
     send.flush().await?;
     let rep = signaling::read_reply(&mut recv).await?;
     Ok((send, recv, rep))
@@ -1798,22 +1368,130 @@ async fn open_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::destination::ClientAuth;
+    use crate::transport::endpoint::RelayConfig;
+    use iroh::SecretKey;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpStream;
     #[cfg(unix)]
     use tokio::net::UnixStream;
 
+    /// A destination named `host` whose server id derives from `seed`, routing
+    /// the given rules. Its key is throwaway: these tests never connect.
+    fn test_destination(host: &str, seed: u8, domains: &[&str], cidrs: &[&str]) -> DestinationConfig {
+        DestinationConfig {
+            host: host.to_string(),
+            server_id: SecretKey::from_bytes(&[seed; 32]).public(),
+            auth: ClientAuth::Key(Box::new(crate::auth::ClientKey::generate().unwrap())),
+            relay: RelayConfig::default(),
+            routed_domains: domains.iter().map(|s| s.to_string()).collect(),
+            routed_cidrs: cidrs.iter().map(|s| s.to_string()).collect(),
+            keep_connected: false,
+        }
+    }
+
+    /// A client whose one destination routes nothing a test dials, so loopback
+    /// targets take the direct path.
     fn test_client() -> ProxyClient {
         ProxyClient::new(ClientConfig {
-            server_node_id: "server".to_string(),
-            auth: ClientAuth::Key(Box::new(crate::auth::ClientKey::generate().unwrap())),
-            socks_listen: Some("127.0.0.1:0".parse().unwrap()),
-            http_listen: None,
-            relay_urls: Vec::new(),
-            relay_auth_token: None,
-            auto_reconnect: true,
-            max_reconnect_attempts: None,
+            destinations: vec![test_destination(
+                "m1.internal",
+                1,
+                &["nothing.internal"],
+                &["10.0.0.0/8"],
+            )],
+            idle_timeout: None,
         })
+        .unwrap()
+    }
+
+    fn config_error(destinations: Vec<DestinationConfig>) -> String {
+        match ProxyClient::new(ClientConfig {
+            destinations,
+            idle_timeout: None,
+        }) {
+            Ok(_) => panic!("expected a configuration error"),
+            Err(e) => {
+                assert!(matches!(e, ProxyError::Config(_)), "{e:?}");
+                assert!(!e.is_recoverable());
+                e.to_string()
+            }
+        }
+    }
+
+    /// The destinations are validated before anything is bound or dialed.
+    #[test]
+    fn invalid_destinations_are_rejected_at_construction() {
+        assert!(config_error(Vec::new()).contains("no destinations"));
+        // One server under two names.
+        let message = config_error(vec![
+            test_destination("m1.internal", 1, &[], &[]),
+            test_destination("m2.internal", 1, &[], &[]),
+        ]);
+        assert!(message.contains("same server"), "{message}");
+        assert!(message.contains("m1.internal") && message.contains("m2.internal"), "{message}");
+        // Routing-table errors surface as configuration errors too.
+        assert!(config_error(vec![test_destination("10.0.0.1", 1, &[], &[])]).contains("IP address"));
+        assert!(
+            config_error(vec![
+                test_destination("m1.internal", 1, &["*.corp.example"], &[]),
+                test_destination("m2.internal", 2, &["*.corp.example"], &[]),
+            ])
+            .contains("both route")
+        );
+    }
+
+    /// A built client is entirely idle, and its hosts are stored normalized.
+    #[test]
+    fn a_new_client_is_idle() {
+        let client = ProxyClient::new(ClientConfig {
+            destinations: vec![
+                test_destination(" Machine1.Internal ", 1, &["*.corp.example"], &[]),
+                test_destination("m2.internal", 2, &[], &["10.0.0.0/8"]),
+            ],
+            idle_timeout: Some(Duration::from_secs(300)),
+        })
+        .unwrap();
+        let status = client.status();
+        assert_eq!(status.idle_timeout, Some(Duration::from_secs(300)));
+        assert!(status.socks_listen.is_none() && status.http_listen.is_none());
+        let hosts: Vec<&str> = status.destinations.iter().map(|d| d.host.as_str()).collect();
+        assert_eq!(hosts, ["machine1.internal", "m2.internal"]);
+        for destination in &status.destinations {
+            assert_eq!(destination.state, crate::proxy::DestinationState::Idle);
+            assert!(destination.client_node_id.is_none());
+        }
+    }
+
+    /// The dialer routes like a proxy request but never connects directly: a
+    /// target no destination routes is an error.
+    #[tokio::test]
+    async fn dialer_refuses_what_no_destination_routes() {
+        let client = ProxyClient::new(ClientConfig {
+            destinations: vec![
+                test_destination("m1.internal", 1, &["*.corp.example"], &[]),
+                test_destination("m2.internal", 2, &[], &["10.0.0.0/8"]),
+            ],
+            idle_timeout: None,
+        })
+        .unwrap();
+        let dialer = client.dialer();
+        let domain = |host: &str| Target::Domain(host.to_string(), 80);
+        assert_eq!(dialer.destination_for(&domain("M1.internal")), Some("m1.internal"));
+        assert_eq!(dialer.destination_for(&domain("api.corp.example")), Some("m1.internal"));
+        assert_eq!(dialer.destination_for(&domain("10.2.3.4")), Some("m2.internal"));
+        assert_eq!(dialer.destination_for(&domain("example.org")), None);
+        assert_eq!(dialer.destination_for(&domain("flextunnel.internal")), None);
+
+        let err = dialer.connect(&domain("example.org")).await.err().expect("refused");
+        assert!(err.to_string().contains("no destination routes example.org"), "{err}");
+        let err = dialer.connect(&domain("flextunnel.internal")).await.err().expect("refused");
+        assert!(err.to_string().contains("status endpoint"), "{err}");
+        // Refusing never asked a destination to connect.
+        assert!(client.status().destinations.iter().all(|d| d.waiting == 0));
+
+        assert!(dialer.warm("m2.internal"));
+        assert!(!dialer.warm("nope.internal"));
     }
 
     /// fd exhaustion must be retried without ever rebinding; aborted/reset
@@ -1854,22 +1532,70 @@ mod tests {
         }
     }
 
+    /// An idle timeout the clock could not add to a moment is refused when the
+    /// client is built, not found out by a panic once a connection falls
+    /// unused. No timeout at all stays the way to never close one.
+    #[test]
+    fn an_oversized_idle_timeout_is_refused_at_construction() {
+        let build = |idle_timeout| {
+            ProxyClient::new(ClientConfig {
+                destinations: vec![test_destination("m1.internal", 1, &[], &[])],
+                idle_timeout,
+            })
+        };
+        for too_long in [Duration::MAX, Duration::from_secs(u64::MAX), MAX_IDLE_TIMEOUT + Duration::from_secs(1)] {
+            let err = build(Some(too_long)).err().expect("refused").to_string();
+            assert!(err.contains("idle timeout") && err.contains("set it to 0"), "{err}");
+        }
+        for fine in [None, Some(Duration::ZERO), Some(Duration::from_secs(300)), Some(MAX_IDLE_TIMEOUT)] {
+            assert!(build(fine).is_ok(), "{fine:?}");
+        }
+        // What an accepted timeout is added to cannot overflow.
+        assert!(tokio::time::Instant::now().checked_add(MAX_IDLE_TIMEOUT).is_some());
+    }
+
+    /// The hold budget keeps its total, gives every destination a share no
+    /// other can take, and leaves the rest to whoever needs it.
+    #[test]
+    fn the_hold_budget_reserves_a_share_per_destination() {
+        for destinations in [1, 2, 5, 8, 9, 64, 200] {
+            let budget = HoldBudget::new(destinations);
+            let total: usize = budget.reserved.iter().map(Semaphore::available_permits).sum::<usize>()
+                + budget.shared.available_permits();
+            assert_eq!(total, MAX_HELD_CONNS, "{destinations} destinations");
+        }
+        assert_eq!(HoldBudget::new(1).reserved[0].available_permits(), HOLDS_RESERVED_PER_DESTINATION);
+        assert_eq!(HoldBudget::new(200).reserved[0].available_permits(), 0, "too many to reserve for");
+
+        // One destination's server is down and its retries pile up: it holds
+        // everything it can reach...
+        let budget = HoldBudget::new(3);
+        let down = budget.for_destination(0);
+        let mut held = Vec::new();
+        while let Ok(permit) = down.reserved.try_acquire().or_else(|_| down.shared.try_acquire()) {
+            held.push(permit);
+        }
+        assert_eq!(held.len(), MAX_HELD_CONNS - 2 * HOLDS_RESERVED_PER_DESTINATION);
+        // ...and the other destinations can still hold their first requests.
+        for other in [1, 2] {
+            let holds = budget.for_destination(other);
+            assert_eq!(holds.reserved.available_permits(), HOLDS_RESERVED_PER_DESTINATION);
+            assert_eq!(holds.shared.available_permits(), 0);
+        }
+    }
+
     /// `close_local_listeners` must drop the front-end listener — local
     /// connects turn into refusals — while the accept future stays pending, so
-    /// the session `select!` it lives in keeps the tunnel running.
+    /// the session `select!` it lives in keeps the destinations running.
     #[tokio::test]
     async fn close_signal_drops_listener_without_ending_loop() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let client = test_client();
         let close = client.local_close.subscribe();
-        let current: SharedConn = Arc::new(watch::Sender::new(None));
-        let routed: SharedRoutedSet = Arc::new(Mutex::new(None));
         let task = {
-            let (current, routed) = (current.clone(), routed.clone());
-            tokio::spawn(async move {
-                accept_loop(listener, &current, &routed, Socks5Proto, close).await
-            })
+            let router = client.router.clone();
+            tokio::spawn(async move { accept_loop(listener, &router, Socks5Proto, close).await })
         };
         // Live: a local connect lands.
         TcpStream::connect(addr).await.unwrap();
@@ -1902,13 +1628,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let client = test_client();
         let close = client.local_close.subscribe();
-        let current: SharedConn = Arc::new(watch::Sender::new(None));
-        let routed: SharedRoutedSet = Arc::new(Mutex::new(None));
         let task = {
-            let (current, routed) = (current.clone(), routed.clone());
-            tokio::spawn(async move {
-                accept_loop(listener, &current, &routed, Socks5Proto, close).await
-            })
+            let router = client.router.clone();
+            tokio::spawn(async move { accept_loop(listener, &router, Socks5Proto, close).await })
         };
         // Saturate every permit with idle connections (each accepted handler
         // sits in the SOCKS handshake read for LOCAL_HANDSHAKE_TIMEOUT, holding
@@ -1946,13 +1668,9 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let client = test_client();
         let close = client.local_close.subscribe();
-        let current: SharedConn = Arc::new(watch::Sender::new(None));
-        let routed: SharedRoutedSet = Arc::new(Mutex::new(None));
         let task = {
-            let (current, routed) = (current.clone(), routed.clone());
-            tokio::spawn(async move {
-                accept_loop_unix(listener, &current, &routed, close).await
-            })
+            let router = client.router.clone();
+            tokio::spawn(async move { accept_loop_unix(listener, &router, close).await })
         };
         let mut held = Vec::new();
         for _ in 0..=MAX_ACTIVE_LOCAL_CONNS {
@@ -1995,13 +1713,13 @@ mod tests {
     }
 
     /// End-to-end over a real Unix-domain socket: `accept_loop_unix` accepts a
-    /// connection, the (generic) `handle_local_conn` speaks SOCKS5, and an
-    /// off-list target takes the direct path — proving the UDS front-end serves
-    /// SOCKS5 exactly like the TCP one.
+    /// connection, the (generic) `handle_local_conn` speaks SOCKS5, and a
+    /// target no destination routes takes the direct path — proving the UDS
+    /// front-end serves SOCKS5 exactly like the TCP one.
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_socks_direct_path_serves_socks5() {
-        // A local origin the proxy will dial directly (off-list).
+        // A local origin the proxy will dial directly (no destination routes it).
         let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin_port = origin.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -2016,14 +1734,11 @@ mod tests {
         let path = std::env::temp_dir().join(format!("ftuds{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
-        // 127.0.0.1 is off-list, so the CONNECT takes the direct path.
-        let routed = RoutedSet::new(&["nothing.internal".to_string()], &["10.0.0.0/8".to_string()])
-            .unwrap();
-        let current: SharedConn = Arc::new(watch::Sender::new(None));
-        let policy: SharedRoutedSet = Arc::new(Mutex::new(Some(Arc::new(routed))));
+        // 127.0.0.1 is on no destination's list, so the CONNECT goes direct.
+        let router = test_client().router.clone();
         let (_close_tx, close_rx) = watch::channel(false);
         tokio::spawn(async move {
-            accept_loop_unix(listener, &current, &policy, close_rx).await.ok();
+            accept_loop_unix(listener, &router, close_rx).await.ok();
         });
 
         // SOCKS5 client over the unix socket: greet, CONNECT 127.0.0.1:origin.
@@ -2047,130 +1762,6 @@ mod tests {
         assert_eq!(&got, b"pong");
 
         let _ = std::fs::remove_file(&path);
-    }
-
-    /// With the network reported unavailable, a reconnect backoff must park
-    /// (not sleep out its delay), then return promptly — with the backoff
-    /// series reset — the moment the path comes back.
-    #[tokio::test]
-    async fn backoff_parks_offline_and_resumes_on_path_return() {
-        let client = Arc::new(test_client());
-        client.set_network_available(false);
-        let c = client.clone();
-        let task = tokio::spawn(async move {
-            let mut attempt = 5;
-            // Far longer than the test timeout: only the path-return signal can
-            // end the wait in time.
-            let resumed = c.wait_backoff(Duration::from_secs(300), &mut attempt).await;
-            (attempt, resumed)
-        });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(!task.is_finished(), "backoff ended while offline");
-        client.set_network_available(true);
-        let (attempt, resumed) = tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .expect("backoff did not resume on path return")
-            .unwrap();
-        assert_eq!(attempt, 0, "restored path should reset the backoff series");
-        assert!(resumed, "a parked backoff must report the path return");
-    }
-
-    /// A path lost *during* the backoff sleep switches it to parking: the wait
-    /// outlives its original delay, then resumes — backoff series reset, path
-    /// return reported — once the path comes back.
-    #[tokio::test(start_paused = true)]
-    async fn backoff_parks_when_path_lost_mid_sleep() {
-        let client = Arc::new(test_client());
-        let c = client.clone();
-        let task = tokio::spawn(async move {
-            let mut attempt = 5;
-            let resumed = c.wait_backoff(Duration::from_millis(100), &mut attempt).await;
-            (attempt, resumed)
-        });
-        // Part-way into the 100ms sleep, drop the path (paused time only
-        // advances while every task is idle, so this lands mid-sleep).
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        client.set_network_available(false);
-        // Well past the original delay: the wait must be parked, not timing out.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(!task.is_finished(), "backoff ended while offline");
-        client.set_network_available(true);
-        let (attempt, resumed) = tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .expect("backoff did not resume on path return")
-            .unwrap();
-        assert_eq!(attempt, 0, "restored path should reset the backoff series");
-        assert!(resumed, "a mid-sleep loss must report the path return");
-    }
-
-    /// While the network is available a backoff is a plain sleep: it must run
-    /// its full delay and leave the attempt counter alone.
-    #[tokio::test]
-    async fn backoff_sleeps_normally_while_online() {
-        let client = test_client();
-        let mut attempt = 3;
-        let started = std::time::Instant::now();
-        let resumed = client
-            .wait_backoff(Duration::from_millis(200), &mut attempt)
-            .await;
-        assert!(started.elapsed() >= Duration::from_millis(200));
-        assert_eq!(attempt, 3);
-        assert!(!resumed, "an uninterrupted sleep saw no path return");
-    }
-
-    /// The app coming to the foreground ends a backoff sleep early, with the
-    /// series reset and the cut-short reported, so a user who is looking never
-    /// waits out a step sized for an unattended outage.
-    #[tokio::test]
-    async fn backoff_ends_early_when_app_foregrounded() {
-        let client = Arc::new(test_client());
-        client.set_background(true);
-        let c = client.clone();
-        let task = tokio::spawn(async move {
-            let mut attempt = 9;
-            let cut_short = c.wait_backoff(Duration::from_secs(300), &mut attempt).await;
-            (attempt, cut_short)
-        });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(!task.is_finished(), "backoff ended while still backgrounded");
-        client.set_background(false);
-        let (attempt, cut_short) = tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .expect("backoff did not end on the foreground flip")
-            .unwrap();
-        assert_eq!(attempt, 0, "a foreground flip should reset the backoff series");
-        assert!(cut_short);
-        assert_eq!(
-            client.reconnect_status().next_attempt_at.map(|t| t <= Instant::now()),
-            Some(true),
-            "the next attempt reads as due now"
-        );
-    }
-
-    /// A foreground flip while the device has no path changes nothing: the
-    /// wait stays parked (there is nothing to attempt into) until the path
-    /// returns.
-    #[tokio::test]
-    async fn parked_backoff_ignores_foreground_flip() {
-        let client = Arc::new(test_client());
-        client.set_background(true);
-        client.set_network_available(false);
-        let c = client.clone();
-        let task = tokio::spawn(async move {
-            let mut attempt = 5;
-            c.wait_backoff(Duration::from_millis(50), &mut attempt).await
-        });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        client.set_background(false);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(!task.is_finished(), "a parked backoff resumed without a path");
-        client.set_network_available(true);
-        assert!(
-            tokio::time::timeout(Duration::from_secs(5), task)
-                .await
-                .expect("backoff did not resume on path return")
-                .unwrap()
-        );
     }
 
     /// The backoff doubles from 1s and settles at the cap, jitter aside.
@@ -2211,193 +1802,10 @@ mod tests {
         assert!(!rebuild_due(REBUILD_ENDPOINT_ATTEMPTS - 1, long_ago));
     }
 
-    /// A recoverable failure is retried from the very first attempt — a server
-    /// that is not up yet is not a reason to exit — and the reconnect status
-    /// reflects it; a permanent error, or auto-reconnect being off, ends the
-    /// session on that same first failure.
-    #[test]
-    fn first_failure_is_retried_unless_permanent_or_reconnect_is_off() {
-        let client = test_client();
-        let mut attempt = 0;
-        let backoff = client
-            .handle_failure(ProxyError::Signaling("server not up yet".into()), &mut attempt)
-            .expect("a transient first failure is retried");
-        assert!(backoff >= Duration::from_secs(1));
-        assert_eq!(attempt, 1);
-        let status = client.reconnect_status();
-        assert_eq!(status.failed_attempts, 1);
-        assert!(status.last_error.unwrap().contains("server not up yet"));
-        assert!(status.next_attempt_at.is_some());
 
-        assert!(
-            client
-                .handle_failure(ProxyError::AuthenticationFailed("rejected".into()), &mut attempt)
-                .is_err(),
-            "a permanent error is never retried"
-        );
-
-        let no_retry = ProxyClient::new(ClientConfig {
-            auto_reconnect: false,
-            ..test_client().config
-        });
-        let mut attempt = 0;
-        assert!(
-            no_retry
-                .handle_failure(ProxyError::ConnectionLost("dropped".into()), &mut attempt)
-                .is_err()
-        );
-    }
-
-    /// `max_reconnect_attempts` caps consecutive retries: that many are
-    /// granted, the next failure ends the session.
-    #[test]
-    fn retry_cap_ends_the_session_after_that_many_retries() {
-        let client = ProxyClient::new(ClientConfig {
-            max_reconnect_attempts: NonZeroU32::new(2),
-            ..test_client().config
-        });
-        let mut attempt = 0;
-        for _ in 0..2 {
-            assert!(
-                client
-                    .handle_failure(ProxyError::ConnectionLost("dropped".into()), &mut attempt)
-                    .is_ok()
-            );
-        }
-        assert!(
-            client
-                .handle_failure(ProxyError::ConnectionLost("dropped".into()), &mut attempt)
-                .is_err()
-        );
-    }
-
-    /// While the tunnel stays down a held request must wait out the full
-    /// recovery window before giving up — the hold is a real wait, not a
-    /// fail-fast with extra steps.
-    #[tokio::test(start_paused = true)]
-    async fn tunnel_hold_times_out_after_recovery_window() {
-        let current: SharedConn = Arc::new(watch::Sender::new(None));
-        let holds = Semaphore::new(MAX_HELD_CONNS);
-        let started = tokio::time::Instant::now();
-        assert!(wait_for_tunnel(&current, &holds).await.is_none());
-        assert!(started.elapsed() >= TUNNEL_RECOVERY_HOLD);
-        // The hold permit is released once the wait gives up.
-        assert_eq!(holds.available_permits(), MAX_HELD_CONNS);
-    }
-
-    /// At the hold cap the wait is skipped: with no permits left a hold must
-    /// give up immediately (the pre-hold fail-fast) instead of parking.
-    #[tokio::test]
-    async fn tunnel_hold_fails_fast_at_hold_cap() {
-        let current: SharedConn = Arc::new(watch::Sender::new(None));
-        let exhausted = Semaphore::new(0);
-        let started = std::time::Instant::now();
-        assert!(wait_for_tunnel(&current, &exhausted).await.is_none());
-        assert!(
-            started.elapsed() < TUNNEL_RECOVERY_HOLD,
-            "an at-cap request must not wait out the recovery hold"
-        );
-    }
-
-    /// An on-list request arriving while the tunnel is down is *held* for the
-    /// reconnect — the SOCKS reply must not arrive in the window where the old
-    /// fail-fast behavior answered network-unreachable immediately. (The
-    /// held-then-proceeds path needs a real reconnect; see the e2e test
-    /// `on_list_request_is_held_across_reconnect`.)
-    #[tokio::test]
-    async fn on_list_request_holds_while_tunnel_down() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        // Loopback is on-list; no connection is published (drop/backoff).
-        let routed = RoutedSet::new(&[], &["127.0.0.0/8".to_string()]).unwrap();
-        let current: SharedConn = Arc::new(watch::Sender::new(None));
-        let policy: SharedRoutedSet = Arc::new(Mutex::new(Some(Arc::new(routed))));
-        tokio::spawn(async move {
-            let holds = Arc::new(Semaphore::new(MAX_HELD_CONNS));
-            let (tcp, _) = listener.accept().await.unwrap();
-            let _ = handle_local_conn(Socks5Proto, tcp, current, policy, holds).await;
-        });
-
-        let mut app = TcpStream::connect(addr).await.unwrap();
-        app.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut method = [0u8; 2];
-        app.read_exact(&mut method).await.unwrap();
-        assert_eq!(method, [0x05, 0x00], "no-auth method selected");
-        app.write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x1f, 0x90])
-            .await
-            .unwrap();
-        let mut reply = [0u8; 10];
-        let held =
-            tokio::time::timeout(Duration::from_millis(750), app.read_exact(&mut reply)).await;
-        assert!(held.is_err(), "on-list request was answered instead of held");
-    }
-
-    /// A request arriving before the first handshake has published a route
-    /// policy is *held* for it, not refused: the relaunch-after-suspension
-    /// window is exactly when the browser would otherwise see a page fail
-    /// seconds before the session is back.
-    #[tokio::test]
-    async fn request_holds_while_route_policy_unknown() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        // No policy and no connection: a freshly (re)launched session.
-        let current: SharedConn = Arc::new(watch::Sender::new(None));
-        let policy: SharedRoutedSet = Arc::new(Mutex::new(None));
-        tokio::spawn(async move {
-            let holds = Arc::new(Semaphore::new(MAX_HELD_CONNS));
-            let (tcp, _) = listener.accept().await.unwrap();
-            let _ = handle_local_conn(Socks5Proto, tcp, current, policy, holds).await;
-        });
-
-        let mut app = TcpStream::connect(addr).await.unwrap();
-        app.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut method = [0u8; 2];
-        app.read_exact(&mut method).await.unwrap();
-        assert_eq!(method, [0x05, 0x00], "no-auth method selected");
-        // A hostname that only resolves server-side (conditional DNS forwarding).
-        let host = b"private.corp.example";
-        let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
-        req.extend_from_slice(host);
-        req.extend_from_slice(&[0x01, 0xbb]);
-        app.write_all(&req).await.unwrap();
-        let mut reply = [0u8; 10];
-        let held =
-            tokio::time::timeout(Duration::from_millis(750), app.read_exact(&mut reply)).await;
-        assert!(
-            held.is_err(),
-            "request was refused instead of held for the first handshake"
-        );
-    }
-
-    #[test]
-    fn restart_sequence_not_flagged_as_duplicate() {
-        let c = test_client();
-        // A steady server, then a restart to fresh nonces (never reappearing).
-        // No observation should ever newly-flag a duplicate.
-        for n in [10u128, 10, 20, 30, 40] {
-            assert!(!c.observe_server_nonce(n));
-        }
-        assert!(!c.duplicate_server.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn reappearing_nonce_flags_duplicate() {
-        let c = test_client();
-        // A, B, then A again (flip-flop) → two concurrent servers share the id.
-        assert!(!c.observe_server_nonce(1));
-        assert!(!c.observe_server_nonce(2));
-        assert!(!c.duplicate_server.load(Ordering::Relaxed));
-        // The reappearance newly latches the flag → caller must reconnect.
-        assert!(c.observe_server_nonce(1));
-        assert!(c.duplicate_server.load(Ordering::Relaxed));
-        // Already latched: a further reappearance is not a *new* flag, so it must
-        // not force another reconnect abort.
-        assert!(!c.observe_server_nonce(2));
-    }
-
-    /// End-to-end plain-HTTP forwarding through the split-tunnel *direct* path:
-    /// the HTTP front-end rewrites the absolute-URI request to origin-form, the
-    /// off-list target is dialed directly, the rewritten head is written
+    /// End-to-end plain-HTTP forwarding through the *direct* path: the HTTP
+    /// front-end rewrites the absolute-URI request to origin-form, the target
+    /// no destination routes is dialed directly, the rewritten head is written
     /// upstream (no local success reply), and the origin's response streams
     /// back verbatim.
     #[tokio::test]
@@ -2428,23 +1836,15 @@ mod tests {
                 .unwrap();
         });
 
-        // The proxy: one accepted socket handled with a policy that leaves
-        // 127.0.0.1 off-list, so the request takes the direct path.
+        // The proxy: one accepted socket handled by a client none of whose
+        // destinations routes 127.0.0.1, so the request takes the direct path.
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        let routed = RoutedSet::new(
-            &["nothing.internal".to_string()],
-            &["10.0.0.0/8".to_string()],
-        )
-        .unwrap();
-        let current: SharedConn = Arc::new(watch::Sender::new(None));
-        let policy: SharedRoutedSet = Arc::new(Mutex::new(Some(Arc::new(routed))));
+        let router = test_client().router.clone();
         tokio::spawn(async move {
-            let holds = Arc::new(Semaphore::new(MAX_HELD_CONNS));
+            let holds = Arc::new(HoldBudget::new(router.destinations.len()));
             let (tcp, _) = proxy.accept().await.unwrap();
-            handle_local_conn(HttpProto, tcp, current, policy, holds)
-                .await
-                .unwrap();
+            handle_local_conn(HttpProto, tcp, router, holds).await.unwrap();
         });
 
         let mut app = TcpStream::connect(proxy_addr).await.unwrap();
@@ -2466,5 +1866,85 @@ mod tests {
         let resp = String::from_utf8(resp).unwrap();
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "got: {resp:?}");
         assert!(resp.ends_with("hi"), "got: {resp:?}");
+    }
+
+    /// Drive one already-parsed front-end exchange against `router`: write
+    /// `request` to a duplex "app" socket handled by `handle_local_conn`, and
+    /// return everything the app reads back.
+    async fn exchange<P: LocalProto>(proto: P, router: Arc<Router>, request: Vec<u8>) -> String {
+        let (mut app, server) = tokio::io::duplex(64 * 1024);
+        let handler = tokio::spawn(async move {
+            let holds = Arc::new(HoldBudget::new(router.destinations.len()));
+            handle_local_conn(proto, server, router, holds).await
+        });
+        app.write_all(&request).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), app.read_to_end(&mut response))
+            .await
+            .expect("response timed out")
+            .unwrap();
+        handler.await.unwrap().unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// A SOCKS5 CONNECT to `host:80` followed by `http_request`, as raw bytes.
+    fn socks_request(host: &str, http_request: &str) -> Vec<u8> {
+        let mut bytes = vec![0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, host.len() as u8];
+        bytes.extend_from_slice(host.as_bytes());
+        bytes.extend_from_slice(&80u16.to_be_bytes());
+        bytes.extend_from_slice(http_request.as_bytes());
+        bytes
+    }
+
+    /// `flextunnel.internal` is answered by the client itself from every
+    /// front-end — SOCKS5, HTTP CONNECT and a plain absolute-URI GET — and
+    /// answering never makes a destination connect.
+    #[tokio::test]
+    async fn client_status_endpoint_is_served_locally_from_every_front_end() {
+        let client = test_client();
+        let router = client.router.clone();
+
+        // SOCKS5: method reply (2 bytes) + CONNECT reply (10 bytes), then HTTP.
+        let get = "GET /status.json HTTP/1.1\r\nHost: flextunnel.internal\r\n\r\n";
+        let response = exchange(Socks5Proto, router.clone(), socks_request("flextunnel.internal", get)).await;
+        let body = response.split_once("\r\n\r\n").expect("an HTTP response").1;
+        let json: serde_json::Value = serde_json::from_str(body).expect("JSON status");
+        assert_eq!(json["destinations"][0]["host"], "m1.internal");
+        assert_eq!(json["destinations"][0]["state"], "idle");
+        assert_eq!(json["destinations"][0]["routed_cidrs"][0], "10.0.0.0/8");
+
+        // HTTP CONNECT, then the request through the "tunnel"; `Accept` picks text.
+        let connect = "CONNECT flextunnel.internal:80 HTTP/1.1\r\nHost: flextunnel.internal:80\r\n\r\n\
+                       GET / HTTP/1.1\r\nHost: flextunnel.internal\r\nAccept: text/plain\r\n\r\n";
+        let response = exchange(HttpProto, router.clone(), connect.as_bytes().to_vec()).await;
+        assert!(response.starts_with("HTTP/1.1 200 Connection Established\r\n\r\n"), "{response:.80}");
+        assert!(response.contains("Content-Type: text/plain"), "{response}");
+        assert!(response.contains("flextunnel client status"));
+        assert!(response.contains("m1.internal"));
+
+        // A plain absolute-URI GET: the response is the page itself.
+        let forward = "GET http://flextunnel.internal/ HTTP/1.1\r\nHost: flextunnel.internal\r\n\r\n";
+        let response = exchange(HttpProto, router.clone(), forward.as_bytes().to_vec()).await;
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response:.80}");
+        assert!(response.contains("Content-Type: text/html"));
+        assert!(response.contains("href=\"/servers/m1.internal/\""));
+
+        // Unknown pages and destinations, other methods, other reserved names.
+        for (request, status) in [
+            ("GET http://flextunnel.internal/nope HTTP/1.1\r\n\r\n", "404 Not Found"),
+            ("GET http://flextunnel.internal/servers/nope.internal/ HTTP/1.1\r\n\r\n", "404 Not Found"),
+            ("GET http://flextunnel.internal/servers/m1.internal/x HTTP/1.1\r\n\r\n", "404 Not Found"),
+            ("POST http://flextunnel.internal/ HTTP/1.1\r\nContent-Length: 0\r\n\r\n", "405 Method Not Allowed"),
+            ("GET http://localhost.flextunnel.internal/ HTTP/1.1\r\n\r\n", "404 Not Found"),
+        ] {
+            let response = exchange(HttpProto, router.clone(), request.as_bytes().to_vec()).await;
+            assert!(response.starts_with(&format!("HTTP/1.1 {status}\r\n")), "{request}: {response:.80}");
+        }
+
+        // None of it touched the destination.
+        let status = client.status();
+        assert_eq!(status.destinations[0].state, crate::proxy::DestinationState::Idle);
+        assert_eq!(status.destinations[0].waiting, 0);
+        assert!(status.destinations[0].client_node_id.is_none());
     }
 }

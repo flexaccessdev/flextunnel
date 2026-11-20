@@ -1,23 +1,24 @@
 //! The reserved `flextunnel.internal` namespace.
 //!
-//! `flextunnel.internal` and every `*.flextunnel.internal` subdomain are
-//! reserved by flextunnel itself: the operator may not use them as
-//! `[host_aliases]` names (rejected at config resolution), the
-//! client always tunnels them to the server rather than split-tunneling, and the
-//! server intercepts them before the routed-set whitelist. `flextunnel.internal`
-//! serves a read-only server status page (see [`super::status_page`]);
-//! `localhost.flextunnel.internal` is the server's own loopback (dialed like
-//! `localhost`, with no routed-set or alias config needed); other subdomains
-//! are reserved for future use and answer with an HTTP 404.
+//! `flextunnel.internal` and every `*.flextunnel.internal` subdomain belong to
+//! flextunnel itself and are answered by the **client**: `flextunnel.internal`
+//! is the running client's own status endpoint (see [`super::client_status`]);
+//! other subdomains are reserved for future use and answer with an HTTP 404.
+//! The client's own status and those 404s are served locally, without opening
+//! any connection. The one exception is `/servers/<host>/` on the status
+//! endpoint, which fetches that destination server's status page and so
+//! connects to the destination if it is not connected.
+//!
+//! The names never reach a server. A client destination may not use one as its
+//! host, and a server rejects them as `[host_aliases]` names (at config
+//! resolution) and as stream targets, so no `routed_domains = ["*"]` or alias
+//! can capture them.
 
-/// The status-page host. `http://flextunnel.internal` through the tunnel returns
-/// the server status page.
+use super::routed_set::routing_key;
+
+/// The client status host: `http://flextunnel.internal` through a client's
+/// proxy returns that client's status page.
 pub const STATUS_HOST: &str = "flextunnel.internal";
-
-/// The server-loopback host. `localhost.flextunnel.internal:<port>` through the
-/// tunnel reaches `localhost:<port>` on the server, bypassing the routed set
-/// and host aliases — the built-in equivalent of ssh's `-L port:localhost:port`.
-pub const LOCALHOST_HOST: &str = "localhost.flextunnel.internal";
 
 /// The reserved subdomain suffix (matches `*.flextunnel.internal`).
 const RESERVED_SUFFIX: &str = ".flextunnel.internal";
@@ -29,7 +30,7 @@ pub fn is_reserved_host(host: &str) -> bool {
     if is_status_host(host) {
         return true;
     }
-    let lower = host.to_ascii_lowercase();
+    let lower = routing_key(host).to_ascii_lowercase();
     // A non-empty subdomain label: strip the suffix and require something left.
     lower
         .strip_suffix(RESERVED_SUFFIX)
@@ -38,13 +39,7 @@ pub fn is_reserved_host(host: &str) -> bool {
 
 /// True only for the exact status host `flextunnel.internal` (case-insensitive).
 pub fn is_status_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case(STATUS_HOST)
-}
-
-/// True only for the exact server-loopback host `localhost.flextunnel.internal`
-/// (case-insensitive).
-pub fn is_localhost_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case(LOCALHOST_HOST)
+    routing_key(host).eq_ignore_ascii_case(STATUS_HOST)
 }
 
 #[cfg(test)]
@@ -57,6 +52,10 @@ mod tests {
         assert!(is_status_host("FlexTunnel.Internal"));
         assert!(is_reserved_host("flextunnel.internal"));
         assert!(is_reserved_host("FLEXTUNNEL.INTERNAL"));
+        // The root dot names the same host.
+        assert!(is_status_host("flextunnel.internal."));
+        assert!(is_reserved_host("x.flextunnel.internal."));
+        assert!(!is_status_host("x.flextunnel.internal."));
     }
 
     #[test]
@@ -64,18 +63,8 @@ mod tests {
         assert!(is_reserved_host("status.flextunnel.internal"));
         assert!(is_reserved_host("a.b.flextunnel.internal"));
         assert!(is_reserved_host("Foo.FlexTunnel.Internal"));
-        assert!(!is_status_host("status.flextunnel.internal"));
-    }
-
-    #[test]
-    fn localhost_host_is_reserved_and_exact() {
-        assert!(is_localhost_host("localhost.flextunnel.internal"));
-        assert!(is_localhost_host("LocalHost.FlexTunnel.Internal"));
         assert!(is_reserved_host("localhost.flextunnel.internal"));
-        // Neither the status host nor a deeper subdomain is the loopback host.
-        assert!(!is_localhost_host("flextunnel.internal"));
-        assert!(!is_localhost_host("a.localhost.flextunnel.internal"));
-        assert!(!is_localhost_host("localhost"));
+        assert!(!is_status_host("status.flextunnel.internal"));
     }
 
     #[test]

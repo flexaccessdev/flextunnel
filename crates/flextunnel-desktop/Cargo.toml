@@ -1,4 +1,4 @@
-# Tray app for flextunnel: client connections and a server. macOS and Windows only
+# Tray app for flextunnel: a client and a server. macOS and Windows only
 # (keychain + tray backends): every dependency is gated to those targets and build.rs
 # refuses any other target. Not in the workspace default-members, so a
 # server-side `cargo build` on Linux never touches it — build with
@@ -7,7 +7,7 @@
 name = "flextunnel-desktop"
 version.workspace = true
 edition.workspace = true
-description = "Tray app for flextunnel: client connections and this computer's server (macOS and Windows)"
+description = "Tray app for flextunnel: a client of any number of servers and this computer's server (macOS and Windows)"
 license.workspace = true
 
 # Gated so a stray Linux build fails fast in build.rs instead
@@ -29,7 +29,7 @@ iced = { version = "0.14", features = ["tokio"] }
 tray-icon = "0.26"
 keyring-core = "1"
 arboard = "3"
-# Native save/open dialogs for profile export/import.
+# Native save/open dialogs for the destinations' export/import.
 rfd = "0.18"
 env_filter = "2"
 tiny-skia = "0.12"

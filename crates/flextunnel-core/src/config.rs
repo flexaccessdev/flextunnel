@@ -12,8 +12,8 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// One `[bridges.<name>]` entry: a split-tunnel route forwarding matching
 /// targets to **another flextunnel server** over a persistent server-to-server
@@ -68,10 +68,11 @@ pub struct ServerConfig {
     pub host_aliases: Option<HashMap<String, String>>,
     /// Domains routed through the tunnel (the tunnel set). Exact (`example.com`),
     /// wildcard (`*.example.com`, subdomains only), or `*` to match every host
-    /// (full tunnel). Optional — the reserved `flextunnel.internal` and
-    /// `localhost.flextunnel.internal` (the server's own loopback) are always
-    /// routed. Off-list targets are rejected server-side and direct-connected
-    /// client-side. Keep in sync with `routed_cidrs`.
+    /// (full tunnel). Optional — a client always reaches the server's own
+    /// loopback (under the destination name it gives this server) and its
+    /// status page, routed set or not. A target off this list is rejected;
+    /// clients route by their own per-destination lists, so list here whatever
+    /// they are meant to send. Keep in sync with `routed_cidrs`.
     pub routed_domains: Option<Vec<String>>,
     /// CIDRs / bare IPs routed through the tunnel (matched against IP targets).
     /// A default route (`0.0.0.0/0` / `::/0`) matches every IP. See
@@ -94,13 +95,13 @@ pub struct ServerConfig {
     pub allowed_bridge_servers: Option<Vec<String>>,
 }
 
-/// One `[[forwards]]` entry in the client config: a server-direct port forward
-/// `localhost:local_port` → `remote_host:remote_port`, opened on the
-/// authenticated connection (the server enforces its routed set and resolves
-/// names). Config-file only — the CLI client's forwards are declared here and
-/// nowhere else; the control panel only shows them. Validated at startup
-/// (nonzero ports, valid host, unique local ports), like the rest of the
-/// config.
+/// One `[[forwards]]` entry in the client config: a port forward
+/// `localhost:local_port` → `remote_host:remote_port`, opened through the
+/// destination that routes `remote_host` (that destination's server enforces
+/// its routed set and resolves names). Config-file only — the CLI client's
+/// forwards are declared here and nowhere else; the control panel only shows
+/// them. Validated at startup (nonzero ports, valid host, unique local ports,
+/// a destination that routes the host), like the rest of the config.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardConfig {
@@ -110,21 +111,60 @@ pub struct ForwardConfig {
     pub label: String,
     /// Loopback port to listen on (binds `127.0.0.1`/`::1` only).
     pub local_port: u16,
-    /// Host to connect to from the server's network — an IP literal or a name
-    /// the server resolves (host aliases apply).
+    /// Host to connect to: a destination's own host (that server's loopback),
+    /// or an IP literal or name on a destination's routed list, which its
+    /// server resolves (host aliases apply). A host no destination routes is
+    /// a startup error — a forward never connects directly.
     pub remote_host: String,
     pub remote_port: u16,
 }
 
-/// Client config file schema. Every field is optional; CLI flags override these.
+/// One `[[destinations]]` entry in the client config: a host name and the
+/// server it stands for. Config-file only.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DestinationEntry {
+    /// The destination's name. `host:<port>` through the client reaches that
+    /// port on the server's own loopback. Any host name that is not an IP
+    /// address, `localhost`, or under `flextunnel.internal`.
+    pub host: String,
+    /// EndpointId of the server (from `flextunnel show-iroh-id`).
+    pub server_node_id: String,
+    /// Further domains sent through this server — an exact name, a
+    /// `*.suffix` wildcard (subdomains only), or `*` for every hostname. The
+    /// server must route them too (its own `routed_domains`).
+    #[serde(default)]
+    pub routed_domains: Vec<String>,
+    /// Further networks or bare IPs sent through this server. The server must
+    /// route them too (its own `routed_cidrs`).
+    #[serde(default)]
+    pub routed_cidrs: Vec<String>,
+    /// Client key file for this destination, overriding the top-level
+    /// `auth_key_file`.
+    pub auth_key_file: Option<PathBuf>,
+    /// Custom relay URL(s) for this destination, overriding the top-level
+    /// `relay_urls` — and with them the top-level `relay_auth_token`: a
+    /// destination that names its own relays uses only its own token.
+    pub relay_urls: Option<Vec<String>>,
+    /// Bearer token for this destination's own `relay_urls`. Only valid
+    /// alongside them.
+    pub relay_auth_token: Option<String>,
+}
+
+/// How long a destination's connection is kept with no stream open on it,
+/// unless `idle_timeout_secs` says otherwise.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Client config file schema. Every field is optional except that a client
+/// needs at least one `[[destinations]]` entry; CLI flags override the
+/// top-level values.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
-    /// EndpointId of the server to connect to.
-    pub server_node_id: Option<String>,
-    /// Friendly display name for this profile (e.g. "aws", "home network"),
-    /// shown in status UIs. Purely cosmetic — the client's on-disk identity
-    /// (lock, control socket) is keyed by `server_node_id`.
+    /// This client's instance name (e.g. "work", "home"): it keys the
+    /// single-instance lock and the control socket, so several clients can run
+    /// side by side under different names, and titles the status views.
+    /// Lowercase letters, digits, `-` and `_`; defaults to `default`.
     pub name: Option<String>,
     /// Loopback port for the optional SOCKS5 listener (binds `127.0.0.1`
     /// only, like the desktop client — the front-ends are unauthenticated and
@@ -137,28 +177,31 @@ pub struct ClientConfig {
     /// HTTP front-end disabled.
     pub http_port: Option<u16>,
     /// Inline client secret key (`ed25519-sec:...`) used to
-    /// authenticate to the server. Never settable from TOML (`serde(skip)` +
+    /// authenticate to the servers. Never settable from TOML (`serde(skip)` +
     /// `deny_unknown_fields` rejects it loudly) — carrier for the `--auth-key`
     /// CLI flag only; config files must use `auth_key_file`.
     #[serde(skip)]
     pub auth_key: Option<String>,
     /// File containing the client secret key (as generated by
-    /// `flexaccess-keys generate-auth-key`). The only way to configure the
-    /// key from a config file — there is no inline variant.
+    /// `flexaccess-keys generate-auth-key`), used for every destination that
+    /// does not name its own. The only way to configure the key from a config
+    /// file — there is no inline variant.
     pub auth_key_file: Option<PathBuf>,
-    /// Custom relay URL(s) for failover.
+    /// Custom relay URL(s) for failover, used for every destination that does
+    /// not name its own.
     pub relay_urls: Option<Vec<String>>,
     /// Shared bearer token sent to every custom relay's WebSocket upgrade. Only
     /// valid with custom `relay_urls`; rejected with the default iroh relays.
     pub relay_auth_token: Option<String>,
-    /// Retry failed connection attempts and lost connections with backoff
-    /// (default true; `false` exits on the first failure of either kind).
-    pub auto_reconnect: Option<bool>,
-    /// Cap on consecutive retries before the client gives up (default
-    /// unlimited).
-    pub max_reconnect_attempts: Option<NonZeroU32>,
-    /// Server-direct port forwards (`[[forwards]]` tables). Config-file only —
-    /// there is no CLI flag.
+    /// Close a destination's connection after this many seconds with no
+    /// stream open on it (default [`DEFAULT_IDLE_TIMEOUT`]); `0` never closes
+    /// one for idleness. Connections are opened on first use either way.
+    pub idle_timeout_secs: Option<u64>,
+    /// The servers this client reaches (`[[destinations]]` tables), each under
+    /// its own host name. Config-file only — there is no CLI flag.
+    pub destinations: Option<Vec<DestinationEntry>>,
+    /// Port forwards (`[[forwards]]` tables). Config-file only — there is no
+    /// CLI flag.
     pub forwards: Option<Vec<ForwardConfig>>,
 }
 
@@ -193,20 +236,130 @@ pub struct ResolvedServer {
 
 /// Fully-resolved client settings (CLI > file > default), paths tilde-expanded.
 pub struct ResolvedClient {
-    pub server_node_id: Option<String>,
     pub name: Option<String>,
     pub socks_port: Option<u16>,
     pub http_port: Option<u16>,
+    /// The default credential: an inline key (CLI only) or a key file. A
+    /// destination's own `auth_key_file` overrides it.
     pub auth_key: Option<String>,
     pub auth_key_file: Option<PathBuf>,
+    /// The default relays. A destination's own `relay_urls` override them.
     pub relay_urls: Vec<String>,
-    /// Shared bearer token for custom relays (custom relays only).
+    /// Shared bearer token for the default custom relays.
     pub relay_auth_token: Option<String>,
-    pub auto_reconnect: bool,
-    pub max_reconnect_attempts: Option<NonZeroU32>,
+    /// `None`: never close a connection for idleness.
+    pub idle_timeout: Option<Duration>,
+    /// Declared destinations, in config order (validated by
+    /// [`Self::proxy_config`]).
+    pub destinations: Vec<DestinationEntry>,
     /// Declared port forwards, in config order (validated by the client at
     /// startup).
     pub forwards: Vec<ForwardConfig>,
+}
+
+impl ResolvedClient {
+    /// Turn the resolved settings into the core client's configuration:
+    /// parse each destination's server id, load its key (its own
+    /// `auth_key_file`, else the default credential) and build its relay
+    /// config (its own `relay_urls` + token, else the defaults). Errors name
+    /// the destination at fault. Host and routing validation happens when the
+    /// client is built from the result.
+    pub fn proxy_config(&self) -> Result<crate::proxy::ClientConfig> {
+        use crate::proxy::{ClientAuth, DestinationConfig};
+        use crate::transport::endpoint::RelayConfig;
+
+        if self.destinations.is_empty() {
+            anyhow::bail!(
+                "The client has no destinations: add at least one [[destinations]] table \
+                 (host + server_node_id) to the config"
+            );
+        }
+        if self.auth_key.is_some() && self.auth_key_file.is_some() {
+            anyhow::bail!("Both an inline client key and a client key file are set; use one");
+        }
+        // The default credential and relays are loaded once, and only if some
+        // destination actually falls back to them.
+        let mut default_key: Option<crate::auth::ClientKey> = None;
+        let mut default_relay: Option<RelayConfig> = None;
+
+        let mut destinations = Vec::with_capacity(self.destinations.len());
+        for entry in &self.destinations {
+            let context = || format!("destination {:?}", entry.host);
+            let server_id = entry
+                .server_node_id
+                .trim()
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid server_node_id: {e}"))
+                .with_context(context)?;
+
+            let key = match &entry.auth_key_file {
+                Some(path) => crate::auth::load_client_key_from_file(path)
+                    .with_context(|| format!("Failed to load client key file {}", path.display()))
+                    .with_context(context)?,
+                None => match &default_key {
+                    Some(key) => key.clone(),
+                    None => {
+                        let key = self.load_default_key().with_context(context)?;
+                        default_key.insert(key).clone()
+                    }
+                },
+            };
+
+            let relay = match &entry.relay_urls {
+                Some(urls) => {
+                    RelayConfig::from_urls_with_token(urls, entry.relay_auth_token.clone())
+                        .with_context(context)?
+                }
+                None => {
+                    if entry.relay_auth_token.is_some() {
+                        anyhow::bail!(
+                            "{}: relay_auth_token is set without relay_urls; a destination's \
+                             token only applies to its own relays",
+                            context()
+                        );
+                    }
+                    match &default_relay {
+                        Some(relay) => relay.clone(),
+                        None => {
+                            let relay = RelayConfig::from_urls_with_token(
+                                &self.relay_urls,
+                                self.relay_auth_token.clone(),
+                            )?;
+                            default_relay.insert(relay).clone()
+                        }
+                    }
+                }
+            };
+
+            destinations.push(DestinationConfig {
+                host: entry.host.clone(),
+                server_id,
+                auth: ClientAuth::Key(Box::new(key)),
+                relay,
+                routed_domains: entry.routed_domains.clone(),
+                routed_cidrs: entry.routed_cidrs.clone(),
+                keep_connected: false,
+            });
+        }
+        Ok(crate::proxy::ClientConfig {
+            destinations,
+            idle_timeout: self.idle_timeout,
+        })
+    }
+
+    /// Load the default credential: the inline key, else the key file.
+    fn load_default_key(&self) -> Result<crate::auth::ClientKey> {
+        match (&self.auth_key, &self.auth_key_file) {
+            (Some(key), _) => crate::auth::ClientKey::from_secret_str(key.trim())
+                .context("Invalid client auth key"),
+            (None, Some(path)) => crate::auth::load_client_key_from_file(path)
+                .with_context(|| format!("Failed to load client key file {}", path.display())),
+            (None, None) => anyhow::bail!(
+                "no client key: set auth_key_file (top level, or on this destination) \
+                 or pass --auth-key-file"
+            ),
+        }
+    }
 }
 
 /// Expand a leading `~` / `~/…` to the user's home directory.
@@ -316,9 +469,9 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
     for key in host_aliases.keys() {
         validate_alias_key(key, "host_aliases")?;
     }
-    // The `flextunnel.internal` namespace is reserved by flextunnel itself (the
-    // server serves a status page there, and `localhost.flextunnel.internal` is
-    // its own loopback); it can't be used as an alias name.
+    // The `flextunnel.internal` namespace is reserved by flextunnel itself: a
+    // client answers it locally and never sends it to a server, so an alias
+    // under it could never match.
     for key in host_aliases.keys() {
         if crate::proxy::reserved::is_reserved_host(key) {
             anyhow::bail!(
@@ -437,8 +590,17 @@ pub fn resolve_client(cli: ClientConfig, file: Option<ClientConfig>) -> Resolved
         (None, file.auth_key_file)
     };
 
+    let idle_timeout = match cli.idle_timeout_secs.or(file.idle_timeout_secs) {
+        Some(0) => None,
+        Some(secs) => Some(Duration::from_secs(secs)),
+        None => Some(DEFAULT_IDLE_TIMEOUT),
+    };
+    let mut destinations = cli.destinations.or(file.destinations).unwrap_or_default();
+    for destination in &mut destinations {
+        destination.auth_key_file = destination.auth_key_file.as_deref().map(expand_tilde);
+    }
+
     ResolvedClient {
-        server_node_id: cli.server_node_id.or(file.server_node_id),
         name: cli.name.or(file.name),
         // No defaults: each proxy front-end is off unless explicitly configured.
         socks_port: cli.socks_port.or(file.socks_port),
@@ -447,8 +609,8 @@ pub fn resolve_client(cli: ClientConfig, file: Option<ClientConfig>) -> Resolved
         auth_key_file: auth_key_file.map(|p| expand_tilde(&p)),
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
         relay_auth_token: cli.relay_auth_token.or(file.relay_auth_token),
-        auto_reconnect: cli.auto_reconnect.or(file.auto_reconnect).unwrap_or(true),
-        max_reconnect_attempts: cli.max_reconnect_attempts.or(file.max_reconnect_attempts),
+        idle_timeout,
+        destinations,
         forwards: cli.forwards.or(file.forwards).unwrap_or_default(),
     }
 }
@@ -476,24 +638,161 @@ mod tests {
     #[test]
     fn parse_client_config() {
         let toml = r#"
-            server_node_id = "abc123"
+            name = "work"
             socks_port = 1085
             auth_key_file = "~/.config/flextunnel/client.key"
-            auto_reconnect = false
-            max_reconnect_attempts = 5
+            idle_timeout_secs = 60
+
+            [[destinations]]
+            host = "machine1.internal"
+            server_node_id = "abc123"
+            routed_domains = ["*.corp.example"]
+            routed_cidrs = ["10.0.0.0/8"]
+
+            [[destinations]]
+            host = "machine2.internal"
+            server_node_id = "def456"
+            auth_key_file = "~/other.key"
+            relay_urls = ["https://relay.example"]
+            relay_auth_token = "t"
         "#;
         let cfg: ClientConfig = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.server_node_id.as_deref(), Some("abc123"));
+        assert_eq!(cfg.name.as_deref(), Some("work"));
         assert_eq!(cfg.socks_port, Some(1085));
-        assert_eq!(cfg.auto_reconnect, Some(false));
-        assert_eq!(cfg.max_reconnect_attempts, NonZeroU32::new(5));
+        assert_eq!(cfg.idle_timeout_secs, Some(60));
+        let destinations = cfg.destinations.as_deref().expect("destinations parsed");
+        assert_eq!(destinations.len(), 2);
+        assert_eq!(destinations[0].host, "machine1.internal");
+        assert_eq!(destinations[0].server_node_id, "abc123");
+        assert_eq!(destinations[0].routed_domains, vec!["*.corp.example"]);
+        assert_eq!(destinations[0].routed_cidrs, vec!["10.0.0.0/8"]);
+        assert!(destinations[0].auth_key_file.is_none() && destinations[0].relay_urls.is_none());
+        assert!(destinations[1].routed_domains.is_empty());
+        assert_eq!(destinations[1].relay_auth_token.as_deref(), Some("t"));
+
+        // Per-destination key paths are tilde-expanded like the top-level one.
+        let resolved = resolve_client(ClientConfig::default(), Some(cfg));
+        assert_eq!(resolved.idle_timeout, Some(Duration::from_secs(60)));
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(
+                resolved.destinations[1].auth_key_file.as_deref(),
+                Some(home.join("other.key").as_path())
+            );
+        }
+    }
+
+    #[test]
+    fn single_server_keys_are_gone() {
+        // The one-server schema is not accepted: its keys are unknown fields,
+        // and a destination needs both a host and a server id.
+        for stale in [
+            "server_node_id = \"abc123\"",
+            "auto_reconnect = false",
+            "max_reconnect_attempts = 5",
+        ] {
+            let err = toml::from_str::<ClientConfig>(stale).unwrap_err();
+            assert!(err.to_string().contains("unknown field"), "{stale}: {err}");
+        }
+        assert!(toml::from_str::<ClientConfig>("[[destinations]]\nhost = \"m1.internal\"").is_err());
+        assert!(
+            toml::from_str::<ClientConfig>("[[destinations]]\nserver_node_id = \"abc\"").is_err()
+        );
+        let err = toml::from_str::<ClientConfig>(
+            "[[destinations]]\nhost = \"m1.internal\"\nserver_node_id = \"abc\"\nrouted = []",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    /// A resolved client with these destinations and a generated default key.
+    fn resolved_with(destinations: Vec<DestinationEntry>) -> ResolvedClient {
+        let key = crate::auth::ClientKey::generate().unwrap();
+        ResolvedClient {
+            name: None,
+            socks_port: None,
+            http_port: None,
+            auth_key: Some(key.secret_str()),
+            auth_key_file: None,
+            relay_urls: Vec::new(),
+            relay_auth_token: None,
+            idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
+            destinations,
+            forwards: Vec::new(),
+        }
+    }
+
+    fn entry(host: &str, seed: u8) -> DestinationEntry {
+        DestinationEntry {
+            host: host.to_string(),
+            server_node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public().to_string(),
+            routed_domains: Vec::new(),
+            routed_cidrs: Vec::new(),
+            auth_key_file: None,
+            relay_urls: None,
+            relay_auth_token: None,
+        }
+    }
+
+    #[test]
+    fn proxy_config_builds_every_destination() {
+        let mut second = entry("m2.internal", 2);
+        second.routed_domains = vec!["*.corp.example".to_string()];
+        second.relay_urls = Some(vec![
+            "https://relay-a.example".to_string(),
+            "https://relay-b.example".to_string(),
+        ]);
+        second.relay_auth_token = Some("token".to_string());
+        let config = resolved_with(vec![entry("m1.internal", 1), second])
+            .proxy_config()
+            .unwrap();
+        assert_eq!(config.idle_timeout, Some(DEFAULT_IDLE_TIMEOUT));
+        assert_eq!(config.destinations.len(), 2);
+        // The first falls back to the default (iroh) relays; the second uses
+        // its own.
+        assert!(!config.destinations[0].relay.is_custom());
+        assert_eq!(config.destinations[1].relay.custom_urls().len(), 2);
+        assert_eq!(config.destinations[1].relay.relay_auth_token(), Some("token"));
+        assert_eq!(config.destinations[1].routed_domains, vec!["*.corp.example"]);
+        assert!(config.destinations.iter().all(|d| !d.keep_connected));
+    }
+
+    #[test]
+    fn proxy_config_errors_name_the_destination() {
+        let err = |resolved: ResolvedClient| match resolved.proxy_config() {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => format!("{e:#}"),
+        };
+
+        assert!(err(resolved_with(Vec::new())).contains("no destinations"));
+
+        let mut bad_id = entry("m1.internal", 1);
+        bad_id.server_node_id = "not-an-id".to_string();
+        let message = err(resolved_with(vec![bad_id]));
+        assert!(message.contains("m1.internal") && message.contains("server_node_id"), "{message}");
+
+        let mut stray_token = entry("m1.internal", 1);
+        stray_token.relay_auth_token = Some("t".to_string());
+        let message = err(resolved_with(vec![stray_token]));
+        assert!(message.contains("m1.internal") && message.contains("relay_urls"), "{message}");
+
+        let mut no_key = resolved_with(vec![entry("m1.internal", 1)]);
+        no_key.auth_key = None;
+        let message = err(no_key);
+        assert!(message.contains("m1.internal") && message.contains("no client key"), "{message}");
+
+        let mut both = resolved_with(vec![entry("m1.internal", 1)]);
+        both.auth_key_file = Some(PathBuf::from("/nonexistent.key"));
+        assert!(err(both).contains("use one"));
+
+        let mut missing_file = entry("m1.internal", 1);
+        missing_file.auth_key_file = Some(PathBuf::from("/nonexistent/flextunnel.key"));
+        let message = err(resolved_with(vec![missing_file]));
+        assert!(message.contains("m1.internal") && message.contains("flextunnel.key"), "{message}");
     }
 
     #[test]
     fn client_forwards_parse_with_optional_label() {
         let toml = r#"
-            server_node_id = "abc123"
-
             [[forwards]]
             local_port = 5432
             remote_host = "db.internal"
@@ -741,7 +1040,19 @@ mod tests {
     fn client_defaults_applied() {
         let r = resolve_client(ClientConfig::default(), None);
         assert_eq!(r.socks_port, None);
-        assert!(r.auto_reconnect);
+        assert_eq!(r.idle_timeout, Some(DEFAULT_IDLE_TIMEOUT));
+        assert!(r.destinations.is_empty());
+
+        // `0` means "never close an idle connection"; the CLI value wins.
+        let never = ClientConfig {
+            idle_timeout_secs: Some(0),
+            ..ClientConfig::default()
+        };
+        let file = ClientConfig {
+            idle_timeout_secs: Some(90),
+            ..ClientConfig::default()
+        };
+        assert_eq!(resolve_client(never, Some(file)).idle_timeout, None);
     }
 
     #[test]
@@ -793,14 +1104,22 @@ mod tests {
         assert!(s.secret_file.is_some() && s.dns_forwards.is_some() && s.bridges.is_some());
 
         let client = r#"
-            server_node_id = "<server endpoint id>"
-            name = "aws"
+            name = "work"
             socks_port = 1080
             http_port = 8081
             auth_key_file = "~/.config/flextunnel/client.key"
             relay_urls = ["https://relay.example"]
-            auto_reconnect = true
-            max_reconnect_attempts = 10
+            relay_auth_token = "shared-relay-secret"
+            idle_timeout_secs = 300
+
+            [[destinations]]
+            host = "machine1.internal"
+            server_node_id = "<server endpoint id>"
+            routed_domains = ["*.corp.example"]
+            routed_cidrs = ["10.0.0.0/8"]
+            auth_key_file = "~/.config/flextunnel/machine1.key"
+            relay_urls = ["https://relay-a.example", "https://relay-b.example"]
+            relay_auth_token = "machine1-relay-secret"
 
             [[forwards]]
             label = "db"
@@ -809,7 +1128,9 @@ mod tests {
             remote_port = 5432
         "#;
         let c: ClientConfig = toml::from_str(client).expect("maximal client config parses");
-        assert!(c.server_node_id.is_some() && c.max_reconnect_attempts.is_some());
+        assert!(c.name.is_some() && c.idle_timeout_secs.is_some() && c.relay_auth_token.is_some());
+        let destination = &c.destinations.as_deref().expect("destinations parsed")[0];
+        assert!(destination.auth_key_file.is_some() && destination.relay_urls.is_some());
         assert_eq!(c.forwards.as_deref().map(<[_]>::len), Some(1));
     }
 }

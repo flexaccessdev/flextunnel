@@ -1,28 +1,38 @@
 //! Background tunnel controller: a supervisor thread routing UI commands to
-//! one session per connected profile, each on its own OS thread running its
-//! own Tokio runtime whose threads are named `tunnel-<profile>` — so every
-//! log line a session emits (core internals included) is attributed to its
-//! profile by thread name (see `logging`). Status is published as per-profile
-//! snapshots the UI polls each frame. Each session owns its `ProxyClient`
-//! future, so dropping it (disconnect/shutdown) tears down the accept loops
-//! and the connection manager together, followed by a graceful endpoint
-//! close. The app's server ([`crate::server_session`]) is routed through the
-//! same supervisor, so one controller owns every session and one shutdown
-//! stops them all.
+//! the app's two sessions — the client and the server — each on its own OS
+//! thread running its own Tokio runtime, whose threads carry the session's
+//! name (`client` / `server`) so every log line a session emits (core
+//! internals included) is attributed to it by thread name (see `logging`).
+//! Status is published as snapshots the UI polls each frame.
+//!
+//! The client session is one [`ProxyClient`] over every destination: it binds
+//! the local proxy ports and the port forwards, and connects to a destination
+//! only when something is sent to it — closing the connection again once it
+//! has gone unused (see [`flextunnel_core::proxy::ProxyClient::run`]). The
+//! session owns its client future, so dropping it (stop/shutdown) tears down
+//! the accept loops and every destination's manager together, followed by a
+//! graceful close of the endpoints in use. The app's server
+//! ([`crate::server_session`]) is routed through the same supervisor, so one
+//! controller owns both sessions and one shutdown stops them.
 
-use crate::config::{Profile, ServerConfig};
+use crate::config::{self, AuthKey, ClientSettings, Destination, ServerConfig};
 use crate::server_session::{self, ServerCmd, ServerHandle, ServerSnapshot, SharedServerSnapshot};
+use flextunnel_core::config::DEFAULT_IDLE_TIMEOUT;
 use flextunnel_core::forwards::{ForwardManager, ForwardStatus, PortForward};
-use flextunnel_core::proxy::{ClientAuth, ClientConfig, ProxyClient, TunnelRoutes};
-use flextunnel_core::transport::endpoint::{RelayConfig, create_client_endpoint};
+use flextunnel_core::proxy::{
+    ClientAuth, ClientConfig, DestinationConfig, DestinationStatus, LocalListeners, ProxyClient,
+};
+use flextunnel_core::transport::endpoint::RelayConfig;
 use flextunnel_core::transport::paths::ConnectionSnapshot;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-pub type ProfileId = String;
+pub type DestinationId = String;
+
+/// The client session's thread name, and so its log tag (`[client]`).
+pub const CLIENT_THREAD_NAME: &str = "client";
 
 /// Bound on the GUI thread's wait for a connection-path reply (see
 /// [`Controller::query_conn_path`]). Must exceed the custom-relay `/healthz`
@@ -31,66 +41,115 @@ pub type ProfileId = String;
 /// hang if a session stalls.
 const CONN_PATH_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Phase {
-    Idle,
-    Connecting,
-    Connected,
-    Reconnecting,
+/// Bound on the client's graceful endpoint close at teardown. The close waits
+/// out an endpoint still being built (see `ProxyClient::close`), which a stop
+/// or a restart during a slow dial must not hang behind; an ordinary close
+/// finishes well inside it.
+const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ClientPhase {
+    /// No session: nothing is listening.
+    #[default]
+    Stopped,
+    /// Validating the settings and binding the local ports.
+    Starting,
+    /// The proxy ports and forwards are listening; each destination connects
+    /// when something is sent to it.
+    Running,
+    /// Closing the endpoints in use; a restart waits for this to finish.
+    Stopping,
+    /// The session could not start (a local port is taken, say) or lost its
+    /// listeners.
     Failed,
 }
 
-#[derive(Clone)]
-pub struct Snapshot {
-    pub phase: Phase,
-    pub connected_since: Option<Instant>,
-    pub socks_addr: Option<SocketAddr>,
-    pub http_addr: Option<SocketAddr>,
-    pub routes: TunnelRoutes,
+#[derive(Clone, Default)]
+pub struct ClientSnapshot {
+    pub phase: ClientPhase,
+    /// What the session whose state this is was started with — the ports,
+    /// destinations and key secrets actually in use. Published by the session
+    /// itself, with the rest of its state, so it is never a start that was
+    /// only asked for, queued behind a stop, or turned down. `None` while no
+    /// session is starting or running.
+    pub spec: Option<Arc<ClientSpec>>,
+    pub running_since: Option<Instant>,
     pub last_error: Option<String>,
+    /// Live state per destination of the running session, in its order; empty
+    /// while none runs.
+    pub destinations: Vec<DestinationStatus>,
     /// Live status per running forward; empty while no session runs, which the
     /// UI renders as "stopped".
     pub forwards: Vec<ForwardStatus>,
 }
 
-impl Default for Snapshot {
-    fn default() -> Self {
-        Self {
-            phase: Phase::Idle,
-            connected_since: None,
-            socks_addr: None,
-            http_addr: None,
-            routes: TunnelRoutes::default(),
-            last_error: None,
-            forwards: Vec::new(),
-        }
+/// One destination as a session runs it: its settings plus the secret of the
+/// auth key it references.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DestinationSpec {
+    pub destination: Destination,
+    pub auth_secret: String,
+}
+
+/// Everything a client session is started with and keeps for its lifetime:
+/// the proxy ports and the destinations. Comparing two tells whether saved
+/// settings differ from the running ones (forwards are not part of it — they
+/// apply live).
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClientSpec {
+    pub socks_port: Option<u16>,
+    pub http_port: Option<u16>,
+    pub destinations: Vec<DestinationSpec>,
+}
+
+impl ClientSpec {
+    /// Resolve the settings against the key list. `None` when a destination's
+    /// key is missing or has lost its secret — see
+    /// [`ClientSettings::start_blocker`], which says so in words.
+    pub fn resolve(client: &ClientSettings, keys: &[AuthKey]) -> Option<Self> {
+        let destinations = client
+            .destinations
+            .iter()
+            .map(|destination| {
+                let key = config::find_key(keys, &destination.auth_key_id)?;
+                (!key.secret.is_empty()).then(|| DestinationSpec {
+                    destination: destination.clone(),
+                    auth_secret: key.secret.clone(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            socks_port: client.socks_port,
+            http_port: client.http_port,
+            destinations,
+        })
     }
 }
 
-impl Snapshot {
-    /// Shared idle snapshot for profiles that never ran a session, so views
-    /// can borrow a `&Snapshot` uniformly.
-    pub fn empty() -> &'static Snapshot {
-        static EMPTY: std::sync::OnceLock<Snapshot> = std::sync::OnceLock::new();
-        EMPTY.get_or_init(Snapshot::default)
-    }
-}
+/// A client session to start: what it runs with, and its forwards.
+type ClientStart = Box<(ClientSpec, Vec<PortForward>)>;
 
 enum Command {
-    /// Start a session for the profile, authenticating with the given secret
-    /// key (resolved by the UI from the profile's shared auth-key reference).
-    Connect(Box<Profile>, String),
-    Disconnect(ProfileId),
-    /// Replace one profile's desired forward list (the UI sends the full list
-    /// after every add/edit/delete/toggle); applied live mid-session.
-    SetForwards(ProfileId, Vec<PortForward>),
-    /// Disconnect and drop the profile's snapshot slot (profile deleted).
-    RemoveProfile(ProfileId),
-    /// One-shot request for the profile's current iroh connection path(s),
-    /// answered on the reply channel (the UI's connection-path CTA). Empty when
-    /// no session is running. A `std` channel (not tokio `oneshot`) so the GUI
-    /// caller can wait with a bounded [`std::sync::mpsc::Receiver::recv_timeout`].
-    QueryConnPath(ProfileId, std::sync::mpsc::Sender<ConnectionSnapshot>),
+    /// Start the client session (the auth secrets travel inside the spec).
+    StartClient(ClientStart),
+    /// Stop the running client and start this one once it has stopped — how
+    /// changed settings are applied. A restart already waiting for its stop
+    /// takes this newer start instead; a client that is not running, or is
+    /// stopping for good, is left alone.
+    RestartClient(ClientStart),
+    StopClient,
+    /// Replace the desired forward list (the UI sends the full list after
+    /// every add/edit/delete/toggle); applied live mid-session.
+    SetForwards(Vec<PortForward>),
+    /// Ask the destination named by this host for one connection attempt now,
+    /// instead of waiting for its first use.
+    ConnectNow(String),
+    /// One-shot request for a destination's current iroh connection path(s),
+    /// by host, answered on the reply channel (the UI's connection-path CTA).
+    /// Empty when no session is running or the destination is not connected.
+    /// A `std` channel (not tokio `oneshot`) so the GUI caller can wait with a
+    /// bounded [`std::sync::mpsc::Receiver::recv_timeout`].
+    QueryConnPath(String, std::sync::mpsc::Sender<ConnectionSnapshot>),
     /// Start the server session (its identity secret travels inside).
     StartServer(Box<ServerConfig>),
     /// Stop the running server and start this config once it has stopped —
@@ -106,35 +165,46 @@ enum Command {
 }
 
 enum SessionCmd {
-    Disconnect,
+    Stop,
     SetForwards(Vec<PortForward>),
-    /// Answer the reply channel with the live connection's path snapshot, once.
-    QueryConnPath(std::sync::mpsc::Sender<ConnectionSnapshot>),
-    Shutdown,
+    ConnectNow(String),
+    /// Answer the reply channel with the destination's path snapshot, once.
+    QueryConnPath(String, std::sync::mpsc::Sender<ConnectionSnapshot>),
 }
 
-type SharedSnapshots = Arc<Mutex<HashMap<ProfileId, Snapshot>>>;
+type SharedClientSnapshot = Arc<Mutex<ClientSnapshot>>;
 
-/// One profile's slot in the shared snapshot map, written by its session task.
+/// The shared client snapshot, written by the session task.
 #[derive(Clone)]
-struct SnapshotSlot {
-    shared: SharedSnapshots,
-    id: ProfileId,
+struct ClientSlot {
+    shared: SharedClientSnapshot,
 }
 
-impl SnapshotSlot {
-    fn update<F: FnOnce(&mut Snapshot)>(&self, f: F) {
-        let mut map = match self.shared.lock() {
+impl ClientSlot {
+    fn update<F: FnOnce(&mut ClientSnapshot)>(&self, f: F) {
+        let mut snapshot = match self.shared.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        f(map.entry(self.id.clone()).or_default());
+        f(&mut snapshot);
+    }
+
+    /// End a session that could not start: nothing is listening.
+    fn fail(&self, reason: String) {
+        log::error!("{reason}");
+        self.update(|s| {
+            *s = ClientSnapshot {
+                phase: ClientPhase::Failed,
+                last_error: Some(reason),
+                ..ClientSnapshot::default()
+            };
+        });
     }
 }
 
 pub struct Controller {
     tx: mpsc::Sender<Command>,
-    shared: SharedSnapshots,
+    client_shared: SharedClientSnapshot,
     server_shared: SharedServerSnapshot,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -142,8 +212,8 @@ pub struct Controller {
 impl Controller {
     pub fn start() -> Self {
         let (tx, rx) = mpsc::channel(16);
-        let shared: SharedSnapshots = Arc::new(Mutex::new(HashMap::new()));
-        let worker_shared = shared.clone();
+        let client_shared: SharedClientSnapshot = Arc::default();
+        let worker_client_shared = client_shared.clone();
         let server_shared: SharedServerSnapshot = Arc::default();
         let worker_server_shared = server_shared.clone();
         // The supervisor only routes commands; sessions get their own
@@ -152,21 +222,21 @@ impl Controller {
             .name("tunnel".into())
             .spawn(move || {
                 match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                    Ok(rt) => rt.block_on(run_loop(rx, worker_shared, worker_server_shared)),
+                    Ok(rt) => rt.block_on(run_loop(rx, worker_client_shared, worker_server_shared)),
                     Err(e) => log::error!("Failed to build the Tokio runtime: {e:#}"),
                 }
             })
             .expect("spawn tunnel thread");
         Self {
             tx,
-            shared,
+            client_shared,
             server_shared,
             thread: Some(thread),
         }
     }
 
-    pub fn snapshots(&self) -> HashMap<ProfileId, Snapshot> {
-        self.shared
+    pub fn client_snapshot(&self) -> ClientSnapshot {
+        self.client_shared
             .lock()
             .map(|s| s.clone())
             .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
@@ -195,37 +265,41 @@ impl Controller {
         let _ = self.tx.blocking_send(Command::RemoveServer);
     }
 
-    pub fn connect(&self, profile: Profile, auth_key: String) {
+    pub fn start_client(&self, spec: ClientSpec, forwards: Vec<PortForward>) {
         let _ = self
             .tx
-            .blocking_send(Command::Connect(Box::new(profile), auth_key));
+            .blocking_send(Command::StartClient(Box::new((spec, forwards))));
     }
 
-    pub fn disconnect(&self, id: &str) {
-        let _ = self.tx.blocking_send(Command::Disconnect(id.into()));
-    }
-
-    pub fn set_forwards(&self, id: &str, forwards: Vec<PortForward>) {
+    pub fn restart_client(&self, spec: ClientSpec, forwards: Vec<PortForward>) {
         let _ = self
             .tx
-            .blocking_send(Command::SetForwards(id.into(), forwards));
+            .blocking_send(Command::RestartClient(Box::new((spec, forwards))));
     }
 
-    pub fn remove_profile(&self, id: &str) {
-        let _ = self.tx.blocking_send(Command::RemoveProfile(id.into()));
+    pub fn stop_client(&self) {
+        let _ = self.tx.blocking_send(Command::StopClient);
     }
 
-    /// Fetch the profile's current iroh connection path(s), once. Returns empty
-    /// when no session is running, the request can't be sent, or the session
-    /// doesn't answer within [`CONN_PATH_TIMEOUT`]. The round-trip is a channel
-    /// hop (normally sub-millisecond), but the deadline is what guarantees a
-    /// wedged session can never freeze the GUI thread calling this from
-    /// `App::update`.
-    pub fn query_conn_path(&self, id: &str) -> ConnectionSnapshot {
+    pub fn set_forwards(&self, forwards: Vec<PortForward>) {
+        let _ = self.tx.blocking_send(Command::SetForwards(forwards));
+    }
+
+    pub fn connect_now(&self, host: &str) {
+        let _ = self.tx.blocking_send(Command::ConnectNow(host.into()));
+    }
+
+    /// Fetch a destination's current iroh connection path(s), once. Returns
+    /// empty when no session is running, the destination is not connected, the
+    /// request can't be sent, or the session doesn't answer within
+    /// [`CONN_PATH_TIMEOUT`]. The round-trip is a channel hop (normally
+    /// sub-millisecond), but the deadline is what guarantees a wedged session
+    /// can never freeze the GUI thread calling this from `App::update`.
+    pub fn query_conn_path(&self, host: &str) -> ConnectionSnapshot {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         if self
             .tx
-            .blocking_send(Command::QueryConnPath(id.into(), reply_tx))
+            .blocking_send(Command::QueryConnPath(host.into(), reply_tx))
             .is_err()
         {
             return ConnectionSnapshot::default();
@@ -233,7 +307,7 @@ impl Controller {
         reply_rx.recv_timeout(CONN_PATH_TIMEOUT).unwrap_or_default()
     }
 
-    /// Stop all sessions and join the worker thread (blocks briefly for the
+    /// Stop both sessions and join the worker thread (blocks briefly for the
     /// bounded graceful endpoint closes).
     pub fn shutdown(&mut self) {
         let _ = self.tx.blocking_send(Command::Shutdown);
@@ -257,81 +331,77 @@ async fn bind_local(addr: SocketAddr, label: &str) -> Result<tokio::net::TcpList
 
 struct SessionHandle {
     tx: mpsc::Sender<SessionCmd>,
-    /// Resolves when the session's thread finishes (its receiver dropping
-    /// also marks `tx` closed).
+    /// Resolves when the session's thread finishes. The session keeps its
+    /// command receiver until then, so `tx.is_closed()` also means "done".
     done: tokio::sync::oneshot::Receiver<()>,
-    /// For the supervisor's duplicate-server guard and its error message.
-    server_node_id: String,
-    profile_name: String,
 }
 
-/// Spawn one profile's session on its own OS thread with its own runtime, all
-/// threads named `tunnel-<profile>` so the logger can attribute every line
+/// Spawn the client session on its own OS thread with its own runtime, all
+/// threads named [`CLIENT_THREAD_NAME`] so the logger can attribute every line
 /// the session emits. `None` when the thread could not be spawned (the
 /// snapshot is set to Failed instead).
-fn spawn_session(
-    profile: Profile,
-    auth_key: String,
-    shared: &SharedSnapshots,
+fn spawn_client(
+    spec: ClientSpec,
+    forwards: Vec<PortForward>,
+    shared: &SharedClientSnapshot,
 ) -> Option<SessionHandle> {
     let (tx, session_rx) = mpsc::channel(8);
     let (done_tx, done) = tokio::sync::oneshot::channel();
-    let slot = SnapshotSlot {
+    let slot = ClientSlot {
         shared: shared.clone(),
-        id: profile.id.clone(),
     };
     let error_slot = slot.clone();
-    let server_node_id = profile.server_node_id.clone();
-    let profile_name = profile.name.clone();
-    let thread_name = format!("tunnel-{}", profile.name);
-    let runtime_name = thread_name.clone();
-    let spawned = std::thread::Builder::new().name(thread_name).spawn(move || {
-        // One worker is plenty for a tunnel session; multi_thread (rather
-        // than current_thread) keeps the runtime semantics identical to the
-        // other flextunnel binaries.
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name(runtime_name)
-            .enable_all()
-            .build();
-        match runtime {
-            Ok(rt) => rt.block_on(run_session(profile, auth_key, session_rx, slot)),
-            Err(e) => {
-                log::error!("Failed to build the session runtime: {e:#}");
-                slot.update(|s| {
-                    s.phase = Phase::Failed;
-                    s.last_error = Some(format!("Failed to start: {e:#}"));
-                });
+    let spawned = std::thread::Builder::new()
+        .name(CLIENT_THREAD_NAME.into())
+        .spawn(move || {
+            // One worker is plenty for the client; multi_thread (rather than
+            // current_thread) keeps the runtime semantics identical to the
+            // other flextunnel binaries.
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name(CLIENT_THREAD_NAME)
+                .enable_all()
+                .build();
+            match runtime {
+                Ok(rt) => rt.block_on(run_client(spec, forwards, session_rx, slot)),
+                Err(e) => slot.fail(format!("Failed to build the client runtime: {e:#}")),
             }
-        }
-        let _ = done_tx.send(());
-    });
+            let _ = done_tx.send(());
+        });
     match spawned {
-        Ok(_) => Some(SessionHandle {
-            tx,
-            done,
-            server_node_id,
-            profile_name,
-        }),
+        Ok(_) => Some(SessionHandle { tx, done }),
         Err(e) => {
-            log::error!("Failed to spawn the session thread: {e:#}");
-            error_slot.update(|s| {
-                s.phase = Phase::Failed;
-                s.last_error = Some(format!("Failed to start: {e:#}"));
-            });
+            error_slot.fail(format!("Failed to spawn the client thread: {e:#}"));
             None
         }
     }
 }
 
-/// Supervisor: routes profile-scoped commands to per-profile sessions and
-/// server commands to the server session.
+/// Resolves when `handle`'s session has ended, if a start is waiting for that
+/// (`waiting`); otherwise never.
+async fn ended<T>(done: Option<&mut tokio::sync::oneshot::Receiver<T>>, waiting: bool) {
+    match done {
+        Some(done) if waiting => {
+            let _ = done.await;
+        }
+        _ => std::future::pending().await,
+    }
+}
+
+/// Supervisor: routes client commands to the client session and server
+/// commands to the server session.
 async fn run_loop(
     mut rx: mpsc::Receiver<Command>,
-    shared: SharedSnapshots,
+    client_shared: SharedClientSnapshot,
     server_shared: SharedServerSnapshot,
 ) {
-    let mut sessions: HashMap<ProfileId, SessionHandle> = HashMap::new();
+    let mut client: Option<SessionHandle> = None;
+    // A restart's start, run once the old session has ended: until then it
+    // still holds the local ports and its connections to the servers.
+    let mut pending_client: Option<ClientStart> = None;
+    // Whether the current client session was told to stop: it reads no
+    // further commands, and a start meanwhile waits in `pending_client`.
+    let mut client_stopping = false;
     let mut server: Option<ServerHandle> = None;
     // A restart's config, started once the old session has ended: until its
     // endpoint is closed it holds the identity and its server lock.
@@ -341,6 +411,16 @@ async fn run_loop(
     let mut stopping = false;
     loop {
         // An ended session drops its receiver, closing the sender.
+        if client.as_ref().is_some_and(|handle| handle.tx.is_closed()) {
+            client = None;
+        }
+        if client.is_none() {
+            client_stopping = false;
+            if let Some(start) = pending_client.take() {
+                let (spec, forwards) = *start;
+                client = spawn_client(spec, forwards, &client_shared);
+            }
+        }
         if server.as_ref().is_some_and(|handle| handle.tx.is_closed()) {
             server = None;
         }
@@ -352,21 +432,81 @@ async fn run_loop(
         {
             server = server_session::spawn_server(config, &server_shared);
         }
-        let cmd = match server.as_mut() {
-            // Waiting out a restart's stop: wake when the old session ends,
-            // so the new one starts without waiting for the next command.
-            Some(handle) if pending_start.is_some() => tokio::select! {
-                cmd = rx.recv() => cmd,
-                _ = &mut handle.done => continue,
-            },
-            _ => rx.recv().await,
+        // Waiting out a restart's stop: wake when the old session ends, so
+        // the new one starts without waiting for the next command.
+        let cmd = tokio::select! {
+            cmd = rx.recv() => cmd,
+            _ = ended(client.as_mut().map(|h| &mut h.done), pending_client.is_some()) => continue,
+            _ = ended(server.as_mut().map(|h| &mut h.done), pending_start.is_some()) => continue,
         };
-        sessions.retain(|_, handle| !handle.tx.is_closed());
+        if client.as_ref().is_some_and(|handle| handle.tx.is_closed()) {
+            client = None;
+            client_stopping = false;
+        }
         if server.as_ref().is_some_and(|handle| handle.tx.is_closed()) {
             server = None;
             stopping = false;
         }
+        // The session reading commands, if there is one: a stopping session
+        // reads no more, so nothing is queued behind its close.
+        let live_client = client.as_ref().filter(|_| !client_stopping);
         match cmd {
+            Some(Command::StartClient(start)) => match &client {
+                // Still closing (disabled and enabled again in quick
+                // succession): start once it has.
+                Some(_) if client_stopping => pending_client = Some(start),
+                Some(_) => log::warn!("The client is still running"),
+                None => {
+                    // This start is the newest word: a restart whose old
+                    // session ended just now must not start after it.
+                    pending_client = None;
+                    let (spec, forwards) = *start;
+                    client = spawn_client(spec, forwards, &client_shared);
+                }
+            },
+            Some(Command::RestartClient(start)) => match &client {
+                // Decided here rather than from the UI's snapshot, which lags
+                // the session by a poll.
+                Some(_) if client_stopping => {
+                    if pending_client.is_some() {
+                        pending_client = Some(start);
+                    }
+                }
+                Some(handle) => {
+                    let _ = handle.tx.send(SessionCmd::Stop).await;
+                    client_stopping = true;
+                    pending_client = Some(start);
+                }
+                None => {}
+            },
+            Some(Command::StopClient) => {
+                // Also calls off a restart that is waiting for the old stop.
+                pending_client = None;
+                if let Some(handle) = live_client {
+                    let _ = handle.tx.send(SessionCmd::Stop).await;
+                    client_stopping = true;
+                }
+            }
+            Some(Command::SetForwards(forwards)) => match (live_client, &mut pending_client) {
+                // A restart in flight starts with the newer list.
+                (_, Some(start)) => start.1 = forwards,
+                (Some(handle), None) => {
+                    let _ = handle.tx.send(SessionCmd::SetForwards(forwards)).await;
+                }
+                // No session: nothing to do — the next start carries them.
+                (None, None) => {}
+            },
+            Some(Command::ConnectNow(host)) => {
+                if let Some(handle) = live_client {
+                    let _ = handle.tx.send(SessionCmd::ConnectNow(host)).await;
+                }
+            }
+            Some(Command::QueryConnPath(host, reply)) => {
+                if let Some(handle) = live_client {
+                    let _ = handle.tx.send(SessionCmd::QueryConnPath(host, reply)).await;
+                }
+                // No session: `reply` drops, and the caller gets an empty one.
+            }
             Some(Command::StartServer(config)) => {
                 match &server {
                     // A server still stopping holds the identity and the
@@ -375,7 +515,11 @@ async fn run_loop(
                     // succession).
                     Some(_) if stopping => pending_start = Some(*config),
                     Some(_) => log::warn!("The server is still running"),
-                    None => server = server_session::spawn_server(*config, &server_shared),
+                    None => {
+                        // As for the client: no stale restart behind this.
+                        pending_start = None;
+                        server = server_session::spawn_server(*config, &server_shared);
+                    }
                 }
             }
             Some(Command::RestartServer(config)) => match &server {
@@ -419,86 +563,20 @@ async fn run_loop(
                     None => reset_server_snapshot(&server_shared),
                 }
             }
-            Some(Command::Connect(profile, auth_key)) => {
-                if sessions.contains_key(&profile.id) {
-                    log::warn!("Profile \"{}\" is already running a session", profile.name);
-                    continue;
-                }
-                // Backend duplicate-server guard: whatever path asked for the
-                // connection, never run two sessions against one server.
-                if let Some(other) = sessions
-                    .values()
-                    .find(|h| h.server_node_id == profile.server_node_id)
-                {
-                    let reason = format!(
-                        "Profile \"{}\" is already connected to this server",
-                        other.profile_name
-                    );
-                    log::error!("Not connecting \"{}\": {reason}", profile.name);
-                    SnapshotSlot {
-                        shared: shared.clone(),
-                        id: profile.id.clone(),
-                    }
-                    .update(|s| {
-                        *s = Snapshot {
-                            phase: Phase::Failed,
-                            last_error: Some(reason),
-                            ..Snapshot::default()
-                        };
-                    });
-                    continue;
-                }
-                let id = profile.id.clone();
-                if let Some(handle) = spawn_session(*profile, auth_key, &shared) {
-                    sessions.insert(id, handle);
-                }
-            }
-            Some(Command::Disconnect(id)) => {
-                if let Some(handle) = sessions.get(&id) {
-                    let _ = handle.tx.send(SessionCmd::Disconnect).await;
-                }
-            }
-            Some(Command::SetForwards(id, forwards)) => {
-                if let Some(handle) = sessions.get(&id) {
-                    let _ = handle.tx.send(SessionCmd::SetForwards(forwards)).await;
-                }
-                // No session: nothing to do — forwards travel inside the
-                // profile on the next Connect.
-            }
-            Some(Command::QueryConnPath(id, reply)) => {
-                if let Some(handle) = sessions.get(&id) {
-                    let _ = handle.tx.send(SessionCmd::QueryConnPath(reply)).await;
-                }
-                // No session: `reply` drops, and the caller gets an empty Vec.
-            }
-            Some(Command::RemoveProfile(id)) => {
-                if let Some(handle) = sessions.remove(&id) {
-                    let _ = handle.tx.send(SessionCmd::Disconnect).await;
-                    // Drop the slot only after the session's final writes, or
-                    // they would recreate it.
-                    let shared = shared.clone();
-                    tokio::spawn(async move {
-                        let _ = handle.done.await;
-                        remove_slot(&shared, &id);
-                    });
-                } else {
-                    remove_slot(&shared, &id);
-                }
-            }
             Some(Command::Shutdown) | None => break,
         }
     }
-    // Bounded grace so quitting stays responsive: ask every session to stop,
+    // Bounded grace so quitting stays responsive: ask both sessions to stop,
     // give the graceful endpoint closes a shared deadline, then return — the
     // process is going away anyway.
-    for handle in sessions.values() {
-        let _ = handle.tx.send(SessionCmd::Shutdown).await;
+    if let Some(handle) = client.as_ref().filter(|_| !client_stopping) {
+        let _ = handle.tx.send(SessionCmd::Stop).await;
     }
     if let Some(handle) = &server {
         let _ = handle.tx.send(ServerCmd::Shutdown).await;
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    for (_, handle) in sessions {
+    if let Some(handle) = client {
         let _ = tokio::time::timeout_at(deadline, handle.done).await;
     }
     if let Some(handle) = server {
@@ -514,149 +592,69 @@ fn reset_server_snapshot(shared: &SharedServerSnapshot) {
     *snapshot = ServerSnapshot::default();
 }
 
-fn remove_slot(shared: &SharedSnapshots, id: &str) {
-    let mut map = match shared.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    map.remove(id);
+/// The core's configuration of one destination, or why its settings cannot be
+/// used. The forms check all of it on save, but a hand-edited file or a
+/// corrupted keychain entry can still surface here.
+fn destination_config(spec: &DestinationSpec) -> Result<DestinationConfig, String> {
+    let destination = &spec.destination;
+    let host = &destination.host;
+    let relay = RelayConfig::from_urls_with_token(
+        &destination.relay_urls,
+        destination.relay_auth_token.clone(),
+    )
+    .map_err(|e| format!("Destination \"{host}\": invalid relay configuration: {e:#}"))?;
+    let client_key = flextunnel_core::auth::ClientKey::from_secret_str(spec.auth_secret.trim())
+        .map_err(|e| format!("Destination \"{host}\": invalid client auth key: {e:#}"))?;
+    let server_id = destination
+        .server_node_id
+        .trim()
+        .parse()
+        .map_err(|e| format!("Destination \"{host}\": invalid server node id: {e}"))?;
+    Ok(DestinationConfig {
+        host: host.clone(),
+        server_id,
+        auth: ClientAuth::Key(Box::new(client_key)),
+        relay,
+        routed_domains: destination.routed_domains.clone(),
+        routed_cidrs: destination.routed_cidrs.clone(),
+        keep_connected: false,
+    })
 }
 
-/// Publish the manager's current per-forward statuses to the snapshot.
-fn refresh_forward_statuses(slot: &SnapshotSlot, fwd_mgr: &ForwardManager) {
-    let statuses = fwd_mgr.statuses();
-    slot.update(|s| s.forwards = statuses);
-}
-
-async fn run_session(
-    profile: Profile,
-    auth_key: String,
+async fn run_client(
+    spec: ClientSpec,
+    mut forwards: Vec<PortForward>,
     mut rx: mpsc::Receiver<SessionCmd>,
-    slot: SnapshotSlot,
+    slot: ClientSlot,
 ) {
-    let mut forwards = profile.forwards.clone();
-    let socks_addr = profile
-        .socks_port
-        .map(|port| SocketAddr::from(([127, 0, 0, 1], port)));
-    let http_addr = profile.http_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p)));
+    let loopback = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+    let socks_addr = spec.socks_port.map(loopback);
+    let http_addr = spec.http_port.map(loopback);
+    let spec = Arc::new(spec);
     slot.update(|s| {
-        *s = Snapshot {
-            phase: Phase::Connecting,
-            socks_addr,
-            http_addr,
-            ..Snapshot::default()
+        *s = ClientSnapshot {
+            phase: ClientPhase::Starting,
+            spec: Some(spec.clone()),
+            ..ClientSnapshot::default()
         };
     });
 
-    // Endpoint creation can block for up to ~10s (the relay online-wait), so
-    // it races the command channel — otherwise a Disconnect or app quit issued
-    // during it would stall until it finished. It runs as a spawned task
-    // rather than a raced future because cancelling it by drop could drop a
-    // bound endpoint without `close()`, which is fatal under panic=abort (see
-    // the CLI's run_client); on a stop the task finishes on its own and the
-    // endpoint is closed gracefully.
-    let relay_config = match RelayConfig::from_urls_with_token(
-        &profile.relay_urls,
-        profile.relay_auth_token.clone(),
-    ) {
-        Ok(relay_config) => relay_config,
-        Err(e) => {
-            log::error!("Invalid relay configuration: {e:#}");
-            slot.update(|s| {
-                s.phase = Phase::Failed;
-                s.last_error = Some(format!("{e:#}"));
-            });
-            return;
-        }
+    // Everything the session needs is validated before anything is bound, so
+    // a bad setting fails the session cleanly rather than panicking.
+    let destinations = match spec.destinations.iter().map(destination_config).collect() {
+        Ok(destinations) => destinations,
+        Err(reason) => return slot.fail(reason),
     };
-    // The key form validated the secret on save, but a corrupted keychain
-    // entry can still surface here — fail the session cleanly rather than
-    // panic.
-    let client_key = match flextunnel_core::auth::ClientKey::from_secret_str(auth_key.trim()) {
-        Ok(key) => key,
-        Err(e) => {
-            log::error!("Invalid client auth key: {e:#}");
-            slot.update(|s| {
-                s.phase = Phase::Failed;
-                s.last_error = Some(format!("Invalid client auth key: {e:#}"));
-            });
-            return;
-        }
+    // Building the client validates the hosts and routes together and dials
+    // nothing.
+    // Shared, so a connection-path probe can run on a task of its own.
+    let client = match ProxyClient::new(ClientConfig {
+        destinations,
+        idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
+    }) {
+        Ok(client) => Arc::new(client),
+        Err(e) => return slot.fail(e.to_string()),
     };
-    let mut create = tokio::spawn({
-        let relay_config = relay_config.clone();
-        async move { create_client_endpoint(&relay_config).await }
-    });
-    let endpoint = loop {
-        tokio::select! {
-            created = &mut create => match created.map_err(anyhow::Error::from) {
-                Ok(Ok(endpoint)) => break endpoint,
-                Ok(Err(e)) | Err(e) => {
-                    log::error!("Failed to create the iroh endpoint: {e:#}");
-                    slot.update(|s| {
-                        s.phase = Phase::Failed;
-                        s.last_error = Some(format!("{e:#}"));
-                    });
-                    return;
-                }
-            },
-            cmd = rx.recv() => match cmd {
-                Some(SessionCmd::Disconnect) => {
-                    log::info!("Disconnecting \"{}\"", profile.name);
-                    slot.update(|s| s.phase = Phase::Idle);
-                    // The UI already shows Idle and this session makes no
-                    // further snapshot writes, so release the command channel
-                    // now — an immediate reconnect may start a fresh session
-                    // while this thread lingers briefly (bounded — the
-                    // session runtime dies with the thread, so a detached
-                    // close task would be cut off) to close the endpoint
-                    // gracefully when creation finishes quickly.
-                    drop(rx);
-                    let _ = tokio::time::timeout(Duration::from_secs(2), async {
-                        if let Ok(Ok(endpoint)) = create.await {
-                            endpoint.close().await;
-                        }
-                    })
-                    .await;
-                    return;
-                }
-                Some(SessionCmd::SetForwards(f)) => forwards = f,
-                // No connection yet during endpoint creation — report none.
-                Some(SessionCmd::QueryConnPath(reply)) => {
-                    let _ = reply.send(ConnectionSnapshot::default());
-                }
-                Some(SessionCmd::Shutdown) | None => {
-                    // Bounded grace so quitting stays responsive: close
-                    // cleanly when creation finishes quickly, otherwise just
-                    // exit — the process is going away anyway.
-                    let _ = tokio::time::timeout(Duration::from_secs(2), async {
-                        if let Ok(Ok(endpoint)) = create.await {
-                            endpoint.close().await;
-                        }
-                    })
-                    .await;
-                    return;
-                }
-            }
-        }
-    };
-    log::info!(
-        "flextunnel client node id for \"{}\": {}",
-        profile.name,
-        endpoint.id()
-    );
-
-    let client = ProxyClient::new(ClientConfig {
-        server_node_id: profile.server_node_id.clone(),
-        auth: ClientAuth::Key(Box::new(client_key)),
-        socks_listen: socks_addr,
-        http_listen: http_addr,
-        relay_urls: profile.relay_urls.clone(),
-        relay_auth_token: profile.relay_auth_token.clone(),
-        auto_reconnect: true,
-        max_reconnect_attempts: None,
-    });
-    let routes = client.routes();
 
     // Bind enabled proxy front-ends before any forward listener exists. A
     // taken proxy port fails the session before forwards come up.
@@ -673,102 +671,205 @@ async fn run_session(
     };
     let (socks_listener, http_listener) = match listeners.await {
         Ok(listeners) => listeners,
-        Err(reason) => {
-            log::error!("{reason}");
-            slot.update(|s| {
-                s.phase = Phase::Failed;
-                s.last_error = Some(reason);
-            });
-            endpoint.close().await;
-            return;
-        }
+        // No endpoint exists yet, so there is nothing to close.
+        Err(reason) => return slot.fail(reason),
     };
 
-    // Forwards run for the whole session (including reconnect gaps — the SOCKS
-    // listener above stays bound); they die with the manager when the session
-    // ends.
+    // Forwards listen for the whole session, whatever the connections are
+    // doing (a forwarded connection connects its destination on demand); they
+    // die with the manager when the session ends.
     let mut fwd_mgr = ForwardManager::new(
         tokio::runtime::Handle::current(),
-        client.server_forwarder(),
+        client.dialer(),
         &forwards,
     );
 
-    let run = client.run_with_optional_listeners(&endpoint, socks_listener, http_listener);
-    tokio::pin!(run);
+    // Boxed so it can be dropped before the endpoints are closed below.
+    let mut run = Box::pin(client.run(LocalListeners::tcp(socks_listener, http_listener)));
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
-    let mut ever_connected = false;
+    log::info!("The client is running with {} destination(s)", spec.destinations.len());
+    slot.update(|s| {
+        s.phase = ClientPhase::Running;
+        s.running_since = Some(Instant::now());
+    });
 
-    loop {
+    // How the session ended, for its final snapshot.
+    let failure = loop {
         tokio::select! {
-            res = &mut run => {
-                match res {
-                    Ok(()) => slot.update(|s| s.phase = Phase::Idle),
-                    Err(e) => {
-                        log::error!("Client error: {e}");
-                        slot.update(|s| {
-                            s.phase = Phase::Failed;
-                            s.last_error = Some(e.to_string());
-                        });
-                    }
+            res = &mut run => break match res {
+                Ok(()) => None,
+                Err(e) => {
+                    log::error!("Client error: {e}");
+                    Some(e.to_string())
                 }
-                break;
-            }
+            },
             _ = ticker.tick() => {
-                let routes = routes
-                    .lock()
-                    .map(|r| r.clone())
-                    .unwrap_or_default();
-                ever_connected |= routes.connected;
+                let destinations = client.status().destinations;
+                let statuses = fwd_mgr.statuses();
                 slot.update(|s| {
-                    if routes.connected {
-                        if s.phase != Phase::Connected {
-                            s.connected_since = Some(Instant::now());
-                        }
-                        s.phase = Phase::Connected;
-                    } else {
-                        s.connected_since = None;
-                        s.phase = if ever_connected {
-                            Phase::Reconnecting
-                        } else {
-                            Phase::Connecting
-                        };
-                    }
-                    s.routes = routes;
+                    s.destinations = destinations;
+                    s.forwards = statuses;
                 });
-                refresh_forward_statuses(&slot, &fwd_mgr);
             }
             cmd = rx.recv() => match cmd {
-                Some(SessionCmd::Disconnect) => {
-                    log::info!("Disconnecting \"{}\"", profile.name);
-                    slot.update(|s| s.phase = Phase::Idle);
-                    break;
-                }
                 Some(SessionCmd::SetForwards(f)) => {
                     forwards = f;
                     fwd_mgr.apply(&forwards);
-                    refresh_forward_statuses(&slot, &fwd_mgr);
+                    let statuses = fwd_mgr.statuses();
+                    slot.update(|s| s.forwards = statuses);
                 }
-                Some(SessionCmd::QueryConnPath(reply)) => {
-                    let _ = reply.send(client.connection_snapshot().await);
+                Some(SessionCmd::ConnectNow(host)) => {
+                    if !client.dialer().warm(&host) {
+                        log::warn!("No destination \"{host}\" in the running client");
+                    }
                 }
-                Some(SessionCmd::Shutdown) | None => {
-                    slot.update(|s| s.phase = Phase::Idle);
-                    break;
+                // On its own task, never awaited here: the snapshot probes the
+                // destination's custom relays over HTTP (~3s worst case), and
+                // this loop is what drives the client — its accept loops and
+                // every destination's manager would stand still meanwhile.
+                Some(SessionCmd::QueryConnPath(host, reply)) => {
+                    let client = Arc::clone(&client);
+                    tokio::spawn(async move {
+                        let _ = reply.send(client.connection_snapshot(&host).await);
+                    });
+                }
+                Some(SessionCmd::Stop) | None => {
+                    log::info!("Stopping the client");
+                    break None;
                 }
             }
         }
-    }
+    };
 
     // The select loop is done with `run`; dropping it cancels the client.
     // Tear the forward listeners down with the session so their rows read
-    // "stopped" immediately, then close the endpoint gracefully before it is
-    // dropped (see the CLI's run_client for why an ungraceful drop is fatal
-    // under panic=abort).
-    drop(fwd_mgr);
-    endpoint.close().await;
+    // "stopped" immediately, then close the endpoints in use gracefully before
+    // they are dropped (see the CLI's close_or_exit for why an ungraceful drop
+    // is fatal under panic=abort). The command receiver lives until this
+    // returns, so the supervisor starts nothing new before the close is done.
     slot.update(|s| {
-        s.routes.connected = false;
-        s.connected_since = None;
+        s.phase = ClientPhase::Stopping;
+        s.spec = None;
+        s.running_since = None;
+        s.destinations.clear();
         s.forwards.clear();
     });
+    drop(fwd_mgr);
+    drop(run);
+    if tokio::time::timeout(SESSION_CLOSE_TIMEOUT, client.close())
+        .await
+        .is_err()
+    {
+        log::warn!("Closing the client's endpoints is taking too long; giving up");
+    }
+    slot.update(|s| {
+        *s = match failure {
+            Some(reason) => ClientSnapshot {
+                phase: ClientPhase::Failed,
+                last_error: Some(reason),
+                ..ClientSnapshot::default()
+            },
+            None => ClientSnapshot::default(),
+        };
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(id: &str, secret: &str) -> AuthKey {
+        AuthKey {
+            id: id.into(),
+            name: format!("key {id}"),
+            public_key: format!("ed25519-pub:{id}"),
+            secret: secret.into(),
+        }
+    }
+
+    fn destination(host: &str, auth_key_id: &str) -> Destination {
+        Destination {
+            id: host.into(),
+            host: host.into(),
+            server_node_id: format!("node-{host}"),
+            routed_domains: Vec::new(),
+            routed_cidrs: Vec::new(),
+            auth_key_id: auth_key_id.into(),
+            relay_urls: Vec::new(),
+            relay_auth_token: None,
+        }
+    }
+
+    #[test]
+    fn a_spec_carries_each_destinations_key_secret() {
+        let keys = [key("k1", "secret-1"), key("k2", "secret-2")];
+        let client = ClientSettings {
+            socks_port: Some(1085),
+            http_port: None,
+            destinations: vec![destination("a.internal", "k2"), destination("b.internal", "k1")],
+            ..ClientSettings::default()
+        };
+        let spec = ClientSpec::resolve(&client, &keys).expect("every key resolves");
+        assert_eq!((spec.socks_port, spec.http_port), (Some(1085), None));
+        let secrets: Vec<&str> = spec.destinations.iter().map(|d| d.auth_secret.as_str()).collect();
+        assert_eq!(secrets, ["secret-2", "secret-1"]);
+
+        // A missing key, or one whose secret was lost, resolves to nothing.
+        assert!(ClientSpec::resolve(&client, &keys[..1]).is_none());
+        assert!(ClientSpec::resolve(&client, &[key("k1", ""), key("k2", "s")]).is_none());
+    }
+
+    /// What tells the UI a restart is due: the ports, the destinations and the
+    /// secrets they authenticate with — not the forwards, which apply live.
+    #[test]
+    fn a_spec_changes_with_what_a_session_keeps() {
+        let keys = [key("k1", "secret-1")];
+        let client = ClientSettings {
+            destinations: vec![destination("a.internal", "k1")],
+            ..ClientSettings::default()
+        };
+        let spec = ClientSpec::resolve(&client, &keys).unwrap();
+
+        let mut with_forward = client.clone();
+        with_forward.forwards.push(PortForward {
+            id: "f".into(),
+            label: String::new(),
+            local_port: 8080,
+            remote_host: "a.internal".into(),
+            remote_port: 80,
+            enabled: true,
+        });
+        with_forward.enabled = false;
+        assert!(ClientSpec::resolve(&with_forward, &keys).unwrap() == spec);
+
+        let mut other_port = client.clone();
+        other_port.http_port = Some(18080);
+        assert!(ClientSpec::resolve(&other_port, &keys).unwrap() != spec);
+        let mut routed = client.clone();
+        routed.destinations[0].routed_domains.push("*.corp.example".into());
+        assert!(ClientSpec::resolve(&routed, &keys).unwrap() != spec);
+        assert!(ClientSpec::resolve(&client, &[key("k1", "rotated")]).unwrap() != spec);
+    }
+
+    #[test]
+    fn unusable_destination_settings_name_the_destination() {
+        let spec = |destination: Destination, secret: &str| DestinationSpec {
+            destination,
+            auth_secret: secret.into(),
+        };
+        let secret = flextunnel_core::auth::ClientKey::generate().unwrap().secret_str();
+        let server_id = flextunnel_core::iroh::SecretKey::generate().public().to_string();
+        let mut good = destination("a.internal", "k1");
+        good.server_node_id = server_id.clone();
+        assert!(destination_config(&spec(good.clone(), &secret)).is_ok());
+
+        let err = |spec: DestinationSpec| destination_config(&spec).err().expect("rejected");
+        assert!(err(spec(good.clone(), "not-a-key")).contains("\"a.internal\": invalid client auth key"));
+        let mut bad_server = good.clone();
+        bad_server.server_node_id = "nope".into();
+        assert!(err(spec(bad_server, &secret)).contains("invalid server node id"));
+        let mut one_relay = good;
+        one_relay.relay_urls = vec!["https://relay.example".into()];
+        assert!(err(spec(one_relay, &secret)).contains("invalid relay configuration"));
+    }
 }

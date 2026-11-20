@@ -1,8 +1,8 @@
-//! Per-user client single-instance locks: one client per (user, target
-//! server) — keyed by the server-id prefix (see `instance.rs`), so two clients
-//! for the same server cannot run at once, while clients for different servers
-//! coexist. (The server lock, likewise one per identity, is shared with the
-//! desktop app and lives in [`flextunnel_core::server::acquire_server_lock`].)
+//! Per-user client single-instance locks: one client per (user, instance
+//! name) — see `instance.rs` — so two clients started from the same config
+//! cannot run at once, while clients with different names coexist. (The server
+//! lock, one per identity, is shared with the desktop app and lives in
+//! [`flextunnel_core::server::acquire_server_lock`].)
 //!
 //! The lock files live under the user's own config dir
 //! (`~/.config/flextunnel/`), so each user gets independent locks. This guards
@@ -21,19 +21,19 @@ use flextunnel_core::lock::InstanceLock;
 
 use crate::instance;
 
-/// Acquire the per-(user, server) client lock
-/// (`~/.config/flextunnel/client-<key>.lock`, keyed by the server-id prefix),
-/// held for the process lifetime. Holding it is also what makes removing a
-/// stale control socket before bind safe (see `ipc.rs`).
-pub fn acquire_client(key: &str) -> Result<InstanceLock> {
+/// Acquire the per-(user, instance name) client lock
+/// (`~/.config/flextunnel/client-<name>.lock`), held for the process lifetime.
+/// Holding it is also what makes removing a stale control socket before bind
+/// safe (see `ipc.rs`).
+pub fn acquire_client(name: &str) -> Result<InstanceLock> {
     let path = instance::instance_dir()
         .context("The client single-instance lock cannot be enforced")?
-        .join(format!("client-{key}.lock"));
+        .join(format!("client-{name}.lock"));
     InstanceLock::acquire(
         &path,
         &format!(
-            "Another flextunnel client is already running for this server \
-             (id prefix {key}). Only one client per server is allowed."
+            "Another flextunnel client named '{name}' is already running. To run a second \
+             client alongside it, give this one a different `name` in its config."
         ),
     )
 }

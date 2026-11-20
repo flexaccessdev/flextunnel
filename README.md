@@ -1,25 +1,38 @@
 # flextunnel
 
 A TCP tunnel over QUIC with optional local SOCKS5/HTTP proxies and port
-forwards. Proxy requests matching the server's tunnel set go through the
-**server**, which resolves DNS and connects from its own network; off-list
-requests connect directly from the client. Port forwards always send their
-fixed target to the server, which enforces its routed set.
+forwards. A client names the servers it can reach as **destinations** —
+`machine1.internal` is one server, `machine2.internal` another — and a request
+for a destination goes through that **server**, which resolves DNS and connects
+from its own network. Requests for anything else connect directly from the
+client. Port forwards and `flextunnel client nc` always go through a
+destination.
 
-This lets you reach hosts that are only reachable from the server side — a
-private network, the server's own `localhost`, or names that only resolve via
-the server's DNS — without a VPN. Because it uses ordinary userspace sockets
+This lets you reach hosts that are only reachable from a server's side — the
+server's own `localhost`, a private network behind it, or names that only
+resolve via its DNS — without a VPN. Because it uses ordinary userspace sockets
 (no TUN device), **neither the client nor the server needs admin/root**.
 
+Connections are **made on demand**: the client connects to a server when
+something is first sent to it, and closes the connection again once it has gone
+unused for a while. A client configured with twenty destinations holds no
+connection until one is used.
+
 Transport, NAT traversal, relay fallback, and TLS 1.3 encryption are provided by
-[iroh](https://www.iroh.computer/): the client dials the server by its
-`EndpointId`, so the server needs no public inbound port or port forwarding.
+[iroh](https://www.iroh.computer/): the client dials each server by its
+`EndpointId`, so a server needs no public inbound port or port forwarding.
 
 ```
 local app ──SOCKS5/HTTP──► flextunnel client (optional listeners, e.g. 127.0.0.1:1080 / :8081)
+                          │  routes each request by its own table:
+                          │    machine1.internal, *.corp.example ─► server 1
+                          │    machine2.internal, 10.0.0.0/8     ─► server 2
+                          │    anything else                     ─► direct, from the client
+                          │
+                          │  per server, opened on first use and closed when idle:
                           │  one iroh QUIC connection (fixed ALPN + auth handshake)
-                          │  ├─ control stream:  Hello / HelloResponse
-                          │  └─ N data streams:  [target header][reply][raw bytes]
+                          │  ├─ control stream:  Hello / HelloResponse, then heartbeats
+                          │  └─ N data streams:  [request header][reply][raw bytes]
                           ▼
                       flextunnel server  (no root, no TUN)
                           │  per stream: resolve DNS ─► TcpStream::connect
@@ -113,8 +126,8 @@ published to `ghcr.io/flexaccessdev/flextunnel`.
 Stable releases also include the desktop app
 (`flextunnel-desktop-macos-arm64.dmg` and
 `flextunnel-desktop-windows-amd64.msi`), a tray app with two roles of equal
-weight, either one optional: client connections to any number of servers
-elsewhere, and this computer's own server (a generated identity, then the
+weight, either one optional: a client of any number of servers elsewhere
+(one destination per server, connected on demand), and this computer's own server (a generated identity, then the
 clients you authorize). See [its README](crates/flextunnel-desktop/README.md).
 The installers are **unsigned** — if you'd rather not apply the workarounds
 below, build it yourself instead:
@@ -255,11 +268,8 @@ All commands above accept `--json` for machine-readable output (QA automation).
 
 ### 2. Configure and run the server (no root needed)
 
-The routed set is configured in `server.toml`. It is optional:
-`flextunnel.internal` (the status page) and `localhost.flextunnel.internal` (the
-server's own `localhost`) are always routed, so a server with no routed set
-still serves those. This example is a full tunnel; narrow it later with
-specific domains/CIDRs if you want split tunneling.
+A server needs only its identity and the clients it authorizes. That is enough
+for clients to reach the machine it runs on: its own `localhost`, on any port.
 
 ```toml
 secret_file = "./server.key"
@@ -267,11 +277,10 @@ secret_file = "./server.key"
 # Authorized client public keys — always a file (ssh authorized_keys style).
 authorized_keys_file = "./authorized_keys"
 
+# Optional: what else clients may reach through this server. This example
+# allows everything; narrow it to specific domains/CIDRs if you prefer.
 routed_domains = ["*"]
 routed_cidrs = ["0.0.0.0/0", "::/0"]
-
-[host_aliases]
-"server.internal" = "127.0.0.1"
 ```
 
 ```sh
@@ -280,31 +289,59 @@ flextunnel server start -c server.toml
 
 It prints `flextunnel server Node ID: <ENDPOINT_ID>` — give that to clients.
 
-### 3. Run the client (no root needed)
+### 3. Configure and run the client (no root needed)
+
+The client's config names each server as a destination. `host` is a name of
+your choosing; `<host>:<port>` then reaches that port on the server machine
+itself.
+
+```toml
+# client.toml
+socks_port    = 1080          # SOCKS5 on 127.0.0.1:1080 (loopback only)
+auth_key_file = "./client.key"
+
+[[destinations]]
+host           = "machine1.internal"
+server_node_id = "<ENDPOINT_ID>"
+# Optional: send more than the machine itself through this server. The server
+# must allow these too (its routed_domains / routed_cidrs above).
+routed_domains = ["*.corp.example"]
+routed_cidrs   = ["10.0.0.0/8"]
+
+# More servers are more [[destinations]] tables.
+```
 
 ```sh
-flextunnel client start \
-    --server-node-id <ENDPOINT_ID> \
-    --auth-key-file  client.key \
-    --socks-port     1080            # SOCKS5 on 127.0.0.1:1080 (loopback only)
+flextunnel client start -c client.toml
 ```
+
+Starting the client connects nothing. It connects to a server when something
+is first sent to it.
 
 ### 4. Use it
 
-Point any SOCKS5 client at `127.0.0.1:1080`. Use `socks5h://` so routed
-hostnames reach flextunnel as names and are resolved on the server side:
+Point any SOCKS5 client at `127.0.0.1:1080`. Use `socks5h://` so hostnames
+reach flextunnel as names — that is what routes them, and routed names are then
+resolved on the server side:
 
 ```sh
-# With the full-tunnel routed set above, DNS + connect happen server-side.
+# The destination's own name is the server machine: here, its port 8000.
+curl -x socks5h://127.0.0.1:1080 http://machine1.internal:8000/
+
+# A routed name: resolved and connected by that server.
+curl -x socks5h://127.0.0.1:1080 https://wiki.corp.example/
+
+# Not on any destination's list: connected directly from this machine.
 curl -x socks5h://127.0.0.1:1080 https://example.com
 
-# a server-side host alias, for example server.internal -> 127.0.0.1
-curl -x socks5h://127.0.0.1:1080 http://server.internal:8000/
-
-# SSH through the tunnel (see `client nc`; needs no proxy port). -n names the
-# running client by its server, since this one was started without a config.
-ssh -o ProxyCommand='flextunnel client nc -n <ENDPOINT_ID> %h %p' user@internal-host
+# SSH through a destination (see `client nc`; needs no proxy port): the
+# destination's name reaches that machine's own sshd.
+ssh -o ProxyCommand='flextunnel client nc -c client.toml %h %p' user@machine1.internal
 ```
+
+The first request to a destination waits while the client connects to it;
+later ones reuse the connection until it has been idle for five minutes (see
+[Connection lifecycle](#connection-lifecycle)).
 
 #### Quick ephemeral tunnel (no setup)
 
@@ -333,7 +370,11 @@ is entered.
 
 The quick server runs a full tunnel (`routed_domains = ["*"]`,
 `routed_cidrs = ["0.0.0.0/0", "::/0"]`); enter a SOCKS5/HTTP port at the client
-prompt to open a local proxy listener. Both sides are fully ephemeral: neither
+prompt to open a local proxy listener. The quick client has one destination,
+named `quick.internal`, which routes everything — so every proxied request goes
+through the quick server, and `quick.internal:<port>` is the server's own
+loopback. Unlike a regular client it connects at once and stays connected (the
+quick server is waiting for it). Both sides are fully ephemeral: neither
 takes the single-instance lock (so a quick session can run alongside a real one,
 or another quick one), and both forget everything on exit.
 
@@ -343,12 +384,13 @@ opens **no control socket** (nothing else can attach to it), and quitting the
 panel (`q`) **disconnects** the tunnel and exits, rather than detaching. A
 quick client reads no config, so it has no port forwards.
 
-#### Server status page
+#### Status pages
 
-From a connected client, `flextunnel.internal` (and every `*.flextunnel.internal`
-subdomain) is reserved by flextunnel and is always tunneled to the server,
-regardless of the routed set. The browser view is HTML; `/status.txt` is plain
-text and `/status.json` is structured JSON for scripts:
+`flextunnel.internal` is reserved by flextunnel and answered by the **client
+itself**, through either proxy listener. It shows the client's destinations and
+what each is doing — idle, connecting, connected, retrying — without connecting
+to anything. The browser view is HTML; `/status.txt` is plain text and
+`/status.json` is structured JSON for scripts:
 
 ```sh
 # plain-text status through a SOCKS5 listener configured on port 1080
@@ -358,29 +400,46 @@ curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.txt
 curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.json
 
 # same endpoint through the optional HTTP proxy listener
-curl -sS -x http://127.0.0.1:8081 http://flextunnel.internal/status.txt
 curl -sS -x http://127.0.0.1:8081 http://flextunnel.internal/status.json
 ```
 
-The JSON response includes `version`, `server_node_id`, `routed_domains`,
-`routed_cidrs`, `host_aliases`, `dns_forwards`, `bridges`,
-`inbound_bridges`, and duplicate-id blocklist counts under
-`duplicate_id_blocklist`.
+The JSON response includes `version`, `socks_listen`, `http_listen`,
+`idle_timeout_secs`, and one entry per destination under `destinations`:
+`host`, `server_node_id`, `state` (`idle`, `connecting`, `connected`,
+`backoff` or `failed`), `connected_secs`, `open_streams`, `waiting`,
+`client_node_id`, `failed_attempts`, `next_attempt_secs`, `last_error`,
+`routed_domains`, `routed_cidrs`, `relay_urls`, and `server_status`.
 
-#### Server loopback
-
-`localhost.flextunnel.internal` is the server's own `localhost`, with no server
-config needed: it bypasses the routed set, bridges and host aliases, and is
-dialed on both `127.0.0.1` and `::1`, so a service bound to only one of them is
-still reached. It works from the proxies and as a forward's `remote_host`:
+Each **server's** own status page is under `/servers/<destination>/`, with the
+same `/status.txt` and `/status.json` variants. Fetching it connects to that
+server if it is not connected:
 
 ```sh
-# a web app listening on the server's loopback port 8000
-curl -sS -x socks5h://127.0.0.1:1080 http://localhost.flextunnel.internal:8000/
+curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/servers/machine1.internal/status.json
 ```
 
-Only the exact name maps to loopback; other `*.flextunnel.internal` subdomains
-answer with an HTTP 404.
+That JSON includes `version`, `server_node_id`, `routed_domains`,
+`routed_cidrs`, `host_aliases`, `dns_forwards`, `bridges`, `inbound_bridges`,
+and duplicate-id blocklist counts under `duplicate_id_blocklist`.
+
+Other `*.flextunnel.internal` names are reserved and answer with an HTTP 404.
+
+#### A server's loopback
+
+A destination's `host` **is** the server machine: `machine1.internal:8000` is
+port 8000 on that server's own `localhost`. No server config is needed — it
+bypasses the server's routed set, bridges and host aliases — and it is dialed
+on both `127.0.0.1` and `::1`, so a service bound to only one of them is still
+reached. It works from the proxies, as a forward's `remote_host`, and with
+`client nc`:
+
+```sh
+# a web app listening on machine1's loopback port 8000
+curl -sS -x socks5h://127.0.0.1:1080 http://machine1.internal:8000/
+```
+
+Only the exact host maps to loopback: `foo.machine1.internal` is a different
+name, routed (or not) like any other.
 
 For more ways to use the proxy — `curl`/`git`/browser recipes, `ssh` through the
 tunnel, and putting a plain local TCP port in front of it for apps that can't
@@ -393,19 +452,15 @@ Add `--http-port <PORT>` to also run an HTTP proxy alongside SOCKS5 — useful
 for the many tools that only speak an HTTP proxy or whose SOCKS5 support
 resolves DNS client-side (`wget`, Docker pulls, npm/yarn, JVM/JDBC). It
 handles HTTPS (and any TCP) via `CONNECT` tunneling and plain-HTTP via
-absolute-URI forwarding; either way the hostname goes to the proxy, so DNS
-still happens on the server.
+absolute-URI forwarding; either way the hostname goes to the proxy, so routed
+names are still resolved on their server.
 
 ```sh
-flextunnel client start \
-    --server-node-id <ENDPOINT_ID> \
-    --auth-key-file  client.key \
-    --socks-port     1080 \
-    --http-port      8081
+flextunnel client start -c client.toml --http-port 8081
 
 # HTTPS tunnels via CONNECT; plain HTTP is forwarded
-https_proxy=http://127.0.0.1:8081 curl https://example.com
-http_proxy=http://127.0.0.1:8081  curl http://example.com
+https_proxy=http://127.0.0.1:8081 curl https://wiki.corp.example/
+http_proxy=http://127.0.0.1:8081  curl http://machine1.internal:8000/
 ```
 
 See [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) for remaining
@@ -416,9 +471,9 @@ HTTP proxy work. Apps without proxy support can use built-in port forwards.
 | Command | Description |
 |---|---|
 | `server start` | Run the proxy server. |
-| `client start` | Run the proxy client (optional SOCKS5 and HTTP proxy listeners, plus the port forwards declared in its config). |
+| `client start` | Run the proxy client (optional SOCKS5 and HTTP proxy listeners, plus the destinations and port forwards declared in its config). |
 | `client control` | Attach the read-only terminal control panel to a running client. |
-| `client nc` | Relay stdin/stdout through a running client to a server-side `host:port` (SSH `ProxyCommand`). |
+| `client nc` | Relay stdin/stdout through a running client to a `host:port` behind one of its destinations (SSH `ProxyCommand`). |
 | `client help` | Show the client subcommands and their help. |
 | `generate-iroh-key [-o <FILE>] [--force] [--json]` | Generate the server's iroh identity key (stdout without `-o`). |
 | `show-iroh-id --secret-file <FILE> [--json]` | Print the iroh id (EndpointId) for a key. |
@@ -450,121 +505,135 @@ second start of the same identity is refused.
 | Flag | Description |
 |---|---|
 | `-c, --config <FILE>` | Load options from a TOML file (CLI flags override it). Without it, `~/.config/flextunnel/client.toml` is used if present. |
-| `-n, --server-node-id <ID>` | Server EndpointId. |
 | `--socks-port <PORT>` | Optional SOCKS5 listener port, e.g. `1080`. Binds `127.0.0.1` only. Disabled unless set. |
 | `--http-port <PORT>` | Optional HTTP proxy listener port (CONNECT + plain-HTTP forwarding). Binds `127.0.0.1` only. |
-| `--auth-key <SECRET>` / `--auth-key-file <FILE>` | Client auth keypair (one required): the inline `ed25519-sec:…` secret, or the key file from `flexaccess-keys generate-auth-key`. |
-| `--relay-url <URL>` | Custom relay URLs (repeatable; at least two distinct URLs, matching the server's set). See the shared relay guide above. |
+| `--auth-key <SECRET>` / `--auth-key-file <FILE>` | Client auth keypair for every destination that names no key file of its own: the inline `ed25519-sec:…` secret, or the key file from `flexaccess-keys generate-auth-key`. |
+| `--relay-url <URL>` | Custom relay URLs (repeatable; at least two distinct URLs, matching the servers' set), for every destination that names no relays of its own. See the shared relay guide above. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
-| `--auto-reconnect` | Force auto-reconnect on (overrides `auto_reconnect = false` in the config). |
-| `--no-auto-reconnect` | Exit on the first failed connection attempt or drop instead of retrying. |
-| `--max-reconnect-attempts <N>` | Cap consecutive retries before giving up (unlimited if unset). |
-| `--quick` | Self-contained ephemeral session (pairs with `server start --quick`): ignore any saved config, print this client's EndpointId (enter it at the quick server's prompt — that allowlist entry is the credential; no auth keypair), prompt for the server EndpointId, then run the live control panel in this terminal. Needs an interactive terminal. Takes no lock and opens no control socket; quitting the panel disconnects. Nothing is persisted. Conflicts with `-c`/`--auth-key(-file)`. |
+| `--idle-timeout <SECS>` | How long a destination's connection is kept with nothing using it (default 300; `0` never closes an idle connection). |
+| `--quick` | Self-contained ephemeral session (pairs with `server start --quick`): ignore any saved config, print this client's EndpointId (enter it at the quick server's prompt — that allowlist entry is the credential; no auth keypair), prompt for the server EndpointId, then run the live control panel in this terminal. Needs an interactive terminal. Takes no lock and opens no control socket; quitting the panel disconnects. Nothing is persisted. Conflicts with `-c`/`--auth-key(-file)`/`--idle-timeout`. |
 
-`flextunnel client start` needs at least one flag — run with no arguments and it
-prints help. With a flag but no `-c`, it loads `~/.config/flextunnel/client.toml`
-if it exists (so `flextunnel client start --socks-port 1080` runs off the default
-config). `--quick` ignores any saved config, prints this client's EndpointId
-(its credential — enter it on the quick server; there is no auth keypair), and
-prompts (on an interactive terminal) for the server EndpointId and optional
-proxy ports, then
-runs the self-contained control panel described under [`client control`](#client-control)
+The servers a client reaches are the `[[destinations]]` tables of its config;
+there is no flag for them. So `client start` always runs off a config (except
+`--quick`): `-c <FILE>`, or `~/.config/flextunnel/client.toml`, which is loaded
+when `client start` is given any other flag (`flextunnel client start
+--socks-port 1080`). Run with no arguments, it prints help. `--quick` ignores
+any saved config, prints this client's EndpointId (its credential — enter it on
+the quick server; there is no auth keypair), and prompts (on an interactive
+terminal) for the server EndpointId and optional proxy ports, then runs the
+self-contained control panel described under [`client control`](#client-control)
 right in that terminal — but with no control socket exposed, and quitting the
 panel disconnects instead of detaching. Nothing is saved.
 
-Port forwards are declared in the config as `[[forwards]]` tables (see
-[`client.toml.example`](client.toml.example)): each listens on
-`localhost:<local_port>` and opens a server-direct stream to
-`<remote_host>:<remote_port>` on the authenticated connection (the server
-enforces its routed set and resolves the host). They are validated at startup
-(nonzero ports, valid host, unique local ports) and all come up with the
-client. There is no CLI flag and nothing can be changed live: to change the
-set, edit the config and restart the client.
+Each `[[destinations]]` table (see [`client.toml.example`](client.toml.example))
+has a `host` and a `server_node_id`, and optionally `routed_domains` /
+`routed_cidrs` (see [Routing](#routing)) and its own `auth_key_file`,
+`relay_urls` and `relay_auth_token`, which override the top-level ones for that
+destination. Hosts and server ids must each be unique. The config is validated
+at startup; an invalid destination or an ambiguous route stops the client
+before anything is bound.
 
-**Forwarding to the server's loopback works differently from `ssh -L`.** With
-ssh, `-L 8080:localhost:80` always reaches the remote's own port 80. The
-flextunnel equivalent is `remote_host = "localhost.flextunnel.internal"`, a
-reserved name that always means the server's own loopback and needs no server
-config. Any other spelling is checked against the server's routed set first,
-like any other tunneled target, and loopback is **not** allowed by default.
-What the server needs depends on how `remote_host` is written:
+Port forwards are declared in the config as `[[forwards]]` tables: each listens
+on `localhost:<local_port>` and opens a stream to `<remote_host>:<remote_port>`
+through the destination that routes `remote_host`, connecting that server on
+the first forwarded connection. They are validated at startup (nonzero ports,
+valid host, unique local ports, a destination that routes the host) and all
+come up with the client. There is no CLI flag and nothing can be changed live:
+to change the set, edit the config and restart the client.
 
-| `remote_host` | Checked against | Server config needed |
+**A forward always goes through a destination — never directly.** That is the
+one way a forward's `remote_host` is routed differently from a proxy request,
+and it makes a host that no destination routes a startup error
+(`forward #1: no destination routes example.org`).
+
+**Forwarding to a server's loopback** uses the destination's own host. With
+ssh, `-L 8080:localhost:80` reaches the remote's own port 80; the flextunnel
+equivalent is `remote_host = "machine1.internal"`, which always means that
+server's own loopback and needs no server config. Any other spelling is an
+ordinary routed target: a destination must route it, and its server must allow
+it. What that takes depends on how `remote_host` is written:
+
+| `remote_host` | Client config needed | Server config needed |
 | --- | --- | --- |
-| `localhost.flextunnel.internal` | nothing (reserved) | none |
-| `127.0.0.1` / `::1` | `routed_cidrs` | a loopback CIDR, e.g. `routed_cidrs = ["127.0.0.0/8", "::1"]` |
-| `localhost` | `routed_domains` (it is a hostname) | `"localhost"` (or `"*"`) in `routed_domains` |
-| a `[host_aliases]` name, e.g. `server.internal` → `127.0.0.1` | `routed_domains`, before aliasing | the alias name in `routed_domains` |
+| a destination's `host`, e.g. `machine1.internal` | none (it is the destination) | none |
+| `127.0.0.1` / `::1` | a loopback CIDR in that destination's `routed_cidrs` | the same CIDR in the server's `routed_cidrs`, e.g. `["127.0.0.0/8", "::1"]` |
+| `localhost` | `"localhost"` (or `"*"`) in that destination's `routed_domains` (it is a hostname) | `"localhost"` (or `"*"`) in the server's `routed_domains` |
+| a server `[host_aliases]` name, e.g. `server.internal` → `127.0.0.1` | the name in that destination's `routed_domains` | the name in the server's `routed_domains` |
 
-When the check passes, `localhost` and loopback literals are dialed on both
-`127.0.0.1` and `::1`, so a service bound to only one of them is still reached.
-When it fails, nothing is dialed: the client logs
-`Forward localhost:<port>: server rejected target: connection not allowed`
-and the local connection closes. Covering loopback in the routed set also opens the server's loopback to
-SOCKS5/HTTP proxy users of that server, not just to forwards.
+When the server refuses a target, nothing is dialed: the client logs
+`Forward localhost:<port>: … rejected target: connection not allowed` and the
+local connection closes.
 
-With neither `--socks-port` nor `--http-port` (nor the config keys) the
-client runs in **port-forward-only mode**: it holds the tunnel and serves only
-the control panel and the port forwards.
+With neither `--socks-port` nor `--http-port` (nor the config keys) the client
+runs in **port-forward-only mode**: it serves the port forwards, `client nc`
+and the control panel.
 
-A client's on-disk identity — the single-instance lock and the control
-socket — is keyed by the prefix of its `server_node_id` (which never changes
-for a profile). So one client runs per server per user, and clients for
-different servers coexist without any extra configuration. The optional `name`
-key in the config ("aws", "home network") is a display-only label shown in the
-control panel. (A `--quick` client is exempt: it takes neither — no lock, no
-socket.)
+A client's on-disk identity — the single-instance lock and the control socket
+— is keyed by its **name**: the optional `name` key in its config, or
+`default`. One client reaches every server you configure, so a single unnamed
+client is the usual setup; give a second config a different `name` to run two
+clients side by side (they need different proxy and forward ports too). (A
+`--quick` client is exempt: it takes neither — no lock, no socket.)
 
 ### `client control`
 
 ```sh
-flextunnel client control                # profile from ~/.config/flextunnel/client.toml
-flextunnel client control -c aws.toml    # profile from a specific config
-flextunnel client control -n <ENDPOINT_ID>   # or by server id directly
+flextunnel client control                # the client from ~/.config/flextunnel/client.toml
+flextunnel client control -c work.toml   # the client started from a specific config
+flextunnel client control -n work        # or by client name directly
 ```
 
-Attaches a **read-only** terminal control panel to the **running** client for
-a profile, over its control socket
-(`~/.config/flextunnel/client-<server id prefix>.sock`; a named pipe on
-Windows). It shows live status — connection phase and uptime, server/client
-node ids, connection paths (direct/relay), the server-pushed routing breakdown
-(split-tunnel rules, host aliases, DNS forwards, and bridge routes), and the
-**port forwards** declared in the client's config with their live state
-(listening, active connections, or switched off with the bind-failure reason).
+Attaches a **read-only** terminal control panel to a **running** client, over
+its control socket (`~/.config/flextunnel/client-<name>.sock`; a named pipe on
+Windows). It lists the client's **destinations** with their live state — idle,
+connecting, connected with its uptime and open streams, or retrying with the
+failed attempts so far and when the next one is due. Select one (`↑`/`↓`) to see
+its server and client node ids, the last error, what it routes, and — with `p`
+— its connection paths (direct/relay). Below are the **port forwards** declared
+in the client's config with their live state (listening, active connections, or
+switched off with the bind-failure reason) and the destination each goes
+through.
 
-Nothing about the client can be changed from the panel: the forward set is
-fixed by the config for the life of the client (edit the config and restart to
-change it), and the channel carries no mutations. It runs as the same user as
-the client — no elevated privilege on either end.
+Looking never connects anything: a destination shown as idle stays idle.
 
-Detaching (`q`) never affects the tunnel; several panels can attach at once.
+Nothing about the client can be changed from the panel: destinations and
+forwards are fixed by the config for the life of the client (edit the config
+and restart to change them), and the channel carries no mutations. It runs as
+the same user as the client — no elevated privilege on either end.
+
+Detaching (`q`) never affects the client; several panels can attach at once.
 
 ### `client nc`
 
 ```sh
-flextunnel client nc <HOST> <PORT>               # profile from ~/.config/flextunnel/client.toml
-flextunnel client nc -c aws.toml <HOST> <PORT>   # profile from a specific config
-flextunnel client nc -n <ENDPOINT_ID> <HOST> <PORT>
+flextunnel client nc <HOST> <PORT>                # the client from ~/.config/flextunnel/client.toml
+flextunnel client nc -c work.toml <HOST> <PORT>   # the client started from a specific config
+flextunnel client nc -n work <HOST> <PORT>        # or by client name directly
 ```
 
-Opens one tunnel to `<HOST>:<PORT>` through the **running** client for a
-profile (picked the same way as for `client control`, over the same control
-socket) and relays it to stdin/stdout — a built-in netcat for SSH's
-`ProxyCommand`:
+Opens one tunnel to `<HOST>:<PORT>` through a **running** client (picked the
+same way as for `client control`, over the same control socket) and relays it
+to stdin/stdout — a built-in netcat for SSH's `ProxyCommand`. `<HOST>` is routed
+like a port forward, so a destination's own name reaches that machine itself:
 
 ```
-Host workstation
-    HostName workstation.internal
-    ProxyCommand flextunnel client nc -c ~/.config/flextunnel/aws.toml %h %p
+Host machine1.internal machine2.internal
+    ProxyCommand flextunnel client nc %h %p
 ```
 
-The tunnel rides the client's live connection, so it opens instantly, and it
-works with no SOCKS or HTTP port configured. Like a port forward, the target
-goes to the server, which enforces its routed set and resolves the host; an
-off-list target is refused rather than connected directly. It fails fast with
-the reason (client not running, tunnel down, target refused), which ssh prints.
-It reaches clients started with `client start`; the desktop app's connections
-have no control socket, so reach those through their SOCKS port instead
+With that, `ssh machine1.internal` reaches machine1's own sshd through its
+server, and `ssh machine2.internal` reaches machine2's — one client, one line
+of ssh config.
+
+If the destination is not connected, `nc` waits while the client connects to
+it (up to 45s); otherwise the tunnel opens at once. It works with no SOCKS or
+HTTP port configured. Like a port forward, the target goes to the destination's
+server, which enforces its routed set and resolves the host; a host that no
+destination routes is refused rather than connected directly. It fails with the
+reason (client not running, no destination routes the host, server unreachable,
+target refused), which ssh prints. It reaches clients started with `client
+start`; the desktop app's client has no control socket, so reach it
+through its SOCKS port instead
 (`ProxyCommand nc -X 5 -x 127.0.0.1:<port> %h %p`).
 
 ## Configuration files
@@ -590,19 +659,22 @@ See [`server.toml.example`](server.toml.example) and
 client file:
 
 ```toml
+socks_port    = 1080          # SOCKS5 on 127.0.0.1:1080 (loopback only)
+auth_key_file = "~/.config/flextunnel/client.key"
+
+[[destinations]]
+host           = "machine1.internal"
 server_node_id = "<server endpoint id>"
-socks_port     = 1080          # SOCKS5 on 127.0.0.1:1080 (loopback only)
-auth_key_file  = "~/.config/flextunnel/client.key"
 ```
 
 Private keys are always file references in a config (`secret_file`,
 `auth_key_file`) — there are no inline-key config keys. CLI flags still work
 and override any of these (`--auth-key` exists only as a CLI flag).
 
-Server-only routing keys include `host_aliases`,
-`dns_forwards`, outbound `[bridges.<name>]`, and inbound
-`allowed_bridge_servers`; these are config-file only because they describe the
-server's routing policy. Bridges carry no keypair: a bridging server
+The client's `[[destinations]]` and `[[forwards]]` are config-file only, as are
+the server's `routed_domains`, `routed_cidrs`, `host_aliases`, `dns_forwards`,
+outbound `[bridges.<name>]`, and inbound `allowed_bridge_servers`: they
+describe routing policy. Bridges carry no keypair: a bridging server
 authenticates by its TLS-authenticated endpoint id, which the receiving server
 must list in `allowed_bridge_servers` (enforced natively at the handshake).
 
@@ -623,110 +695,160 @@ it to the value — an IP or another hostname — keeping the requested port, th
 resolves and connects like any other target. Only domain targets are aliased;
 literal IPs pass through unchanged.
 
-For the server's own loopback no alias is needed: the reserved
-`localhost.flextunnel.internal` (see [Server loopback](#server-loopback)) always
+For the server's own loopback no alias is needed: the name a client gives the
+server as a destination (see [A server's loopback](#a-servers-loopback)) always
 maps there, which also sidesteps Firefox refusing to proxy literal
-`localhost` / `127.0.0.1`. Aliases are for other hosts on the server's network,
-or for giving loopback a name of your choosing. Either way, use `socks5h://` (or
-set Firefox's `network.proxy.socks_remote_dns = true`) so the name is resolved
-by the server, not locally.
+`localhost` / `127.0.0.1`. Aliases are for other hosts on the server's network.
+An alias only takes effect for a name that reaches the server — the client must
+route it (`routed_domains` on that destination) and the server must allow it
+(its own `routed_domains`). Either way, use `socks5h://` (or set Firefox's
+`network.proxy.socks_remote_dns = true`) so the name is resolved by the server,
+not locally.
 
-## Routed-set split-tunneling
+## Routing
 
-The routed set (the **tunnel set**) is a VPN-style split-tunnel "included routes"
-list that decides which proxy destinations traverse the tunnel. Off-list proxy
-requests connect directly from the client; server-direct forwards are rejected
-if their target is off-list. This suits a client that must send *all* its
-traffic to the local proxy (for example a WebView with a global proxy config)
-when only some hosts should be tunneled. The set is optional and configured on
-the server only, through its config file or the desktop server pane:
+Routing has two halves, each configured where it applies. Nothing about it
+crosses the connection — which is what lets a client decide where a request
+goes without being connected to anything.
+
+**The client decides which server a request goes to**, from its
+`[[destinations]]`:
 
 ```toml
-# server.toml
-routed_domains = ["*.example.com", "httpbin.org"]
+# client.toml
+[[destinations]]
+host           = "machine1.internal"
+server_node_id = "<endpoint id 1>"
+routed_domains = ["*.corp.example", "httpbin.org"]
 routed_cidrs   = ["10.0.0.0/8", "192.168.1.5"]
+
+[[destinations]]
+host           = "machine2.internal"
+server_node_id = "<endpoint id 2>"
+routed_domains = ["*.dev.corp.example"]
 ```
 
-The reserved `flextunnel.internal` namespace is **always routed**, independent
-of the tunnel set: `flextunnel.internal` (the [status page](#server-status-page))
-and `localhost.flextunnel.internal` (the server's own `localhost`, see
-[Server loopback](#server-loopback)). So a server with an empty tunnel set (both
-lists omitted) is valid — clients reach just those two names through it and
-connect everything else directly. An empty set never means "tunnel
-everything". To route **all** traffic through the tunnel (full tunnel), use the
-catch-alls:
+For each request, the most specific match wins:
+
+1. `flextunnel.internal` — the client's own [status pages](#status-pages).
+2. A destination's own `host` — that server's loopback.
+3. An exact `routed_domains` entry, then the longest `*.suffix`, then `*`. For
+   an IP target, the `routed_cidrs` entry with the longest prefix.
+4. Nothing matches — the proxy listeners connect **directly** from the client
+   (split-tunneling); a port forward or `client nc` is refused.
+
+So with the config above, `api.corp.example` goes to server 1 and
+`x.dev.corp.example` to server 2. Destinations may nest like that, but the
+*same* rule on two destinations is ambiguous and rejected at startup, as is
+listing a destination's `host` under `routed_domains`.
+
+This suits a client that must send *all* its traffic to the local proxy (for
+example a WebView with a global proxy config) when only some hosts should be
+tunneled. To route **all** traffic through one server (full tunnel), give its
+destination the catch-alls:
 
 ```toml
 routed_domains = ["*"]
 routed_cidrs   = ["0.0.0.0/0", "::/0"]
 ```
 
-The server is the single source of truth. It **pushes** the list to every client
-in the handshake response, so there is no client list to keep in sync:
+**The server decides what it will connect to**, from its own lists:
 
-- **Client** — on connect it learns the server's list. It tunnels only matching
-  targets and connects everything else **directly** from its own network
-  (split-tunneling). The direct path is independent of the tunnel, so off-list
-  targets keep connecting even while the tunnel is down; an on-list target during
-  a drop/backoff is held for the client's own reconnect (up to 45s, deploy-style
-  connection holding) and proceeds transparently once the link is back — only a
-  reconnect that never lands within the hold gets a network-unreachable failure
-  (SOCKS5 reply `0x03`; the HTTP front-end maps it to `502 Bad Gateway`).
-- **Server** — it also enforces the same list independently as a **whitelist**,
-  **rejecting** any tunnel request for a target not on it (SOCKS5 reply `0x02`).
-  This enforces routing policy for trusted clients and catches accidental
-  misconfiguration; it is not an isolation boundary for untrusted clients.
+```toml
+# server.toml
+routed_domains = ["*.corp.example", "httpbin.org"]
+routed_cidrs   = ["10.0.0.0/8", "192.168.1.5"]
+```
 
-Matching: domain entries are exact (`example.com`), wildcard (`*.example.com`,
-which matches subdomains only — not the bare apex), or `*` (matches every
-hostname), case-insensitive; CIDR entries match IP targets, accept a bare IP as a
-single host, and a default route (`0.0.0.0/0` / `::/0`) matches every IP.
-Hostnames are matched only against `routed_domains` and IPs only against
-`routed_cidrs`. A numeric IP literal is always gated by `routed_cidrs` even
-when a client sends it in hostname form (SOCKS5 `ATYP_DOMAIN`), so `*` never lets
-a raw IP through — it can only route real hostnames.
+It enforces them as a **whitelist**, **rejecting** any request for a target not
+on them (SOCKS5 reply `0x02`). So a route must be on both sides to work: on the
+client's destination, to be sent to the server at all, and on the server, to be
+accepted. A route the client lists and the server does not is answered
+"connection not allowed"; one the server lists and the client does not is
+simply never sent — it connects directly. The server's whitelist enforces
+routing policy for trusted clients and catches accidental misconfiguration; it
+is not an isolation boundary for untrusted clients.
+
+Two things reach a server **outside** its lists: its own loopback, under the
+destination's `host`, and its [status page](#status-pages). So a server with
+both lists omitted is valid — clients reach just the machine itself through it.
+An empty list never means "tunnel everything".
+
+Matching is the same on both sides: domain entries are exact (`example.com`),
+wildcard (`*.example.com`, which matches subdomains only — not the bare apex),
+or `*` (matches every hostname), case-insensitive; CIDR entries match IP
+targets, accept a bare IP as a single host, and a default route (`0.0.0.0/0` /
+`::/0`) matches every IP. Hostnames are matched only against `routed_domains`
+and IPs only against `routed_cidrs`. A numeric IP literal is always gated by
+`routed_cidrs` even when it arrives in hostname form (SOCKS5 `ATYP_DOMAIN`), so
+`*` never lets a raw IP through — it can only route real hostnames.
 
 Either list, or both, may be omitted. The two never cross: an omitted/empty
-list means that whole category is off-list and always direct-connected. So `routed_domains` alone (no `routed_cidrs`)
-tunnels those hostnames but direct-connects every bare-IP target, and
-`routed_cidrs` alone tunnels those IPs but direct-connects every hostname.
+list means that whole category is not routed. So `routed_domains` alone (no
+`routed_cidrs`) tunnels those hostnames but direct-connects every bare-IP
+target, and `routed_cidrs` alone tunnels those IPs but direct-connects every
+hostname.
 
 ### Roadmap
 
-- **Client blocking mode.** Today the client **always direct-connects** every
-  off-list target (split-tunneling), and this is
-  the same for the desktop and iOS clients (they share the same core). A future
-  client option — likely `routed_mode = "block" | "direct"` (default
-  `"direct"`) — will let a client instead **refuse** an off-list connection,
-  returning a SOCKS5 error to the local app rather than falling back to a direct
-  connection. This is aimed mainly at the desktop client, where blocking off-list
-  traffic can be preferable to letting it leak out directly; the iOS client keeps
-  defaulting to direct-connect. (The server's `0x02` rejection above is a
-  separate, server-side control and is unaffected.)
+- **Client blocking mode.** Today the proxy listeners **always direct-connect**
+  a target that no destination routes (split-tunneling), and this is the same
+  for the desktop and iOS clients (they share the same core). A future client
+  option — likely `routed_mode = "block" | "direct"` (default `"direct"`) — will
+  let a client instead **refuse** such a connection, returning a SOCKS5 error to
+  the local app rather than falling back to a direct connection. This is aimed
+  mainly at the desktop client, where blocking unrouted traffic can be
+  preferable to letting it leak out directly; the iOS client keeps defaulting to
+  direct-connect. (The server's `0x02` rejection above is a separate,
+  server-side control and is unaffected.)
 
-## Reconnect behavior
+## Connection lifecycle
 
-Auto-reconnect is **enabled by default** (`auto_reconnect = true`); pass
-`--no-auto-reconnect` (or set `auto_reconnect = false`) to disable it, and
-`--auto-reconnect` to force it on over a config that disabled it.
+A client holds **no connection** to a server until something is sent to it,
+and gives the connection up again once it is unused.
 
-- A failed connection attempt — the **first one included** — or a lost
-  connection is retried with **exponential backoff + jitter** (1s doubling to
-  60s), indefinitely, unless `--max-reconnect-attempts` caps it or
-  auto-reconnect is disabled. A server that is down, or not up yet, is the
-  ordinary case, not a reason to exit: the client waits it out and connects
-  when the server appears.
-- The delay between attempts is capped at 60s plus jitter; connection and
-  handshake time add to it. After three consecutive failures, the next attempt
-  rebuilds the endpoint; further rebuilds are at least 30 minutes apart during
-  that outage. See the [reconnect policy](docs/architecture.md#reconnect-policy-client).
-- A permanent error, such as a rejected key or malformed config, ends the
-  session. Transient errors also end it when retries are disabled or exhausted.
-- The control panel shows the outage's progress: failed attempts so far, the
-  last error, and when the next attempt is due.
-- The local proxy listeners stay bound across reconnects. Off-list targets keep
-  connecting directly; on-list requests are held for the reconnect (up to 45s)
-  and only then fail with a network-unreachable reply.
+- **First use connects.** A request for a destination that is not connected —
+  through a proxy listener, a port forward, or `client nc` — makes the client
+  connect to that server, and is **held** while it does, for up to 45s. The
+  request then proceeds as if the connection had been there all along. Only a
+  connection that never lands gets a failure: network-unreachable from the
+  proxies (SOCKS5 reply `0x03`; the HTTP front-end maps it to `502 Bad
+  Gateway`), an error from a forward or `nc`.
+- **Idle disconnects.** A connection with no open stream for `idle_timeout_secs`
+  (default 300; `--idle-timeout`) is closed. An open stream — an ssh session, a
+  long download — keeps it up for as long as it lasts. `idle_timeout_secs = 0`
+  never closes an idle connection.
+- **A lost connection is redialed only if wanted.** If requests are waiting,
+  the client retries with **exponential backoff + jitter** (1s doubling to
+  60s) until one succeeds or they give up waiting. If nothing is waiting, the
+  destination just goes idle, and the next request redials — after whatever is
+  left of the backoff, so a server that is down is still probed at most once
+  per step. There is no background reconnect loop, and no flag to turn one
+  off.
+- **A down server is not a reason to exit.** A destination whose server is
+  unreachable, or not up yet, only fails the requests for it; the client keeps
+  running and the other destinations are unaffected.
+- **A rejected key fails fast.** If a server refuses the client (an
+  unauthorized key), requests for that destination fail at once instead of
+  waiting, and the client tries again only after a backoff step. The client
+  keeps running here too.
+- **Each destination has its own endpoint**, created when it connects and
+  closed when it goes idle. After three consecutive failed attempts in one
+  outage, the next attempt rebuilds that endpoint; further rebuilds are at
+  least 30 minutes apart during that outage. See the
+  [connection policy](docs/architecture.md#connection-policy-client).
+- **Targets that no destination routes** keep connecting directly, whatever
+  state the destinations are in.
+
+The first request after an idle period pays for a fresh endpoint and
+connection. With the default relays that is a bind plus a relay connection;
+with custom relays every relay is probed first, and one that is down holds the
+probe to its 10s limit — on every such first request, where it used to be once
+at startup. If that shows, raise `idle_timeout_secs`.
+
+The control panel and the [status page](#status-pages) show each destination's
+state: failed attempts so far, the last error, and when the next attempt is
+due.
 
 Server home-relay failover is provided by `flexaccess-iroh`; see the
 [shared failover design](https://github.com/flexaccessdev/flexaccess-iroh/blob/main/docs/relay-failover.md).
@@ -755,14 +877,13 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
   domain-separated authentication transcript.
 - [`docs/architecture.md`](docs/architecture.md) — how it works: connection
   lifecycle (fixed ALPN, auth handshake, per-stream protocol), module map,
-  concurrency model, reconnect policy, security boundaries, and reference
-  constants.
+  concurrency model, the client's per-destination connection policy, security
+  boundaries, and reference constants.
 - [`docs/local-ci.md`](docs/local-ci.md) — clippy and tests on all three host
   platforms via `ci/all.sh`; Linux/macOS run natively on the current host and
   the other platforms use SSH.
 - [`docs/systemd.md`](docs/systemd.md) — running the CLI client under systemd:
-  one template-unit instance per server, reconnects, the control panel and
-  journald logging.
+  one unit for all your servers, the control panel and journald logging.
 - [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) — remaining HTTP
   proxy work.
 - [`docs/proxy-usage.md`](docs/proxy-usage.md) — using the SOCKS5 and HTTP

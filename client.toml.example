@@ -9,17 +9,19 @@
 #             runs a self-contained live panel in the terminal (no config, no
 #             lock, no control socket; quitting disconnects).
 #
-# CLI flags override these values. Unknown keys are rejected.
+# One client reaches any number of servers. Each `[[destinations]]` table below
+# gives a server a host name; the client connects to a server only when
+# something is actually sent to it, and closes the connection again once it
+# has been unused for a while.
+#
+# CLI flags override the top-level values. Unknown keys are rejected.
 
-# EndpointId of the server to connect to (from `flextunnel show-iroh-id`).
-# Also the client's identity: its prefix keys the single-instance lock and the
-# control socket, so one client runs per server (per user) and `flextunnel
-# client control` finds it from this config.
-server_node_id = "<server endpoint id>"
-
-# Optional friendly name for this profile, shown in the control panel and
-# statuses. Display-only.
-# name = "aws"
+# Optional name of this client instance. It keys the single-instance lock and
+# the control socket, so `flextunnel client control` and `flextunnel client nc`
+# find the running client from this config (or with `-n <name>`), and two
+# clients can run side by side under different names. Lowercase letters,
+# digits, `-` and `_`. Default: "default".
+# name = "work"
 
 # Optional local SOCKS5 listener port. Unset means disabled. Listeners bind
 # 127.0.0.1 only (they are unauthenticated, so they are never exposed beyond
@@ -28,58 +30,102 @@ server_node_id = "<server endpoint id>"
 
 # Optional HTTP proxy listener port (CONNECT + absolute-URI plain-HTTP
 # forwarding). Unset means disabled. With neither socks_port nor http_port
-# set, the client runs in port-forward-only mode (see [[forwards]] below).
+# set, the client runs in port-forward-only mode (see [[forwards]] below);
+# `flextunnel client nc` works either way.
 # http_port = 8081
 
 # This client's authentication keypair — always a key file (generate with
 # `flexaccess-keys generate-auth-key -o ~/.config/flextunnel/client.key`;
 # put its public entry, from `flexaccess-keys show-auth-key
-# --private-key-file ~/.config/flextunnel/client.key`, on the server's
-# authorized_keys_file). There is no inline variant in the config;
-# `--auth-key` exists only as a CLI flag.
+# --private-key-file ~/.config/flextunnel/client.key`, on each server's
+# authorized_keys_file). Used for every destination that does not name its
+# own. There is no inline variant in the config; `--auth-key` exists only as a
+# CLI flag.
 auth_key_file = "~/.config/flextunnel/client.key"
 
-# Optional iroh tuning and reconnect behavior.
-# Custom relay(s) for failover. Configuring custom relays disables n0 internet
-# discovery (pkarr/DNS) — the peer is reached via relay hints instead; mDNS
-# local-network discovery stays on. relay_auth_token is an optional shared bearer
-# token sent to every custom relay's WebSocket upgrade; it is only valid with
-# custom relay_urls (rejected with the default iroh relays).
-# relay_urls = ["https://relay.example"]
+# Optional iroh tuning.
+# Custom relays for failover (at least two), used for every destination that
+# does not name its own. Configuring custom relays disables n0 internet
+# discovery (pkarr/DNS) — a server is reached via relay hints instead; mDNS
+# local-network discovery stays on. relay_auth_token is an optional shared
+# bearer token sent to every custom relay's WebSocket upgrade; it is only
+# valid with custom relay_urls (rejected with the default iroh relays).
+# relay_urls = ["https://relay-a.example", "https://relay-b.example"]
 # relay_auth_token = "shared-relay-secret"
-# auto_reconnect = true                      # default: true. set false to exit on the first failed attempt or drop
-# max_reconnect_attempts = 10                # default: unlimited (omit for no cap). retries before giving up
 
-# The split-tunnel routed set (the "tunnel set") is configured on the server and
-# pushed to this client during the handshake — there is no client-side routed-set
-# config. See server.toml.example.
+# How long a destination's connection is kept with nothing using it, in
+# seconds. Default: 300, at most 31536000 (one year). `0` never closes an idle
+# connection (it is still only opened on first use). A connection with an open stream — an ssh session, a
+# download — is never idle, however long it lasts. The first use after an idle
+# close pays for a fresh connection; raise this if that delay is noticeable
+# (most likely with custom relays, which are probed before each one).
+# idle_timeout_secs = 300
 
-# Server-direct port forwards: each `[[forwards]]` table listens on
-# localhost:<local_port> (127.0.0.1/::1 only) and opens a stream to
-# <remote_host>:<remote_port> on the authenticated server connection. The
-# server enforces its routed set and resolves the host (host aliases apply),
-# so the remote must be covered by the server's tunnel set. Forwards are
-# declared here only — the control panel (`flextunnel client control`) shows
-# their state but cannot change them; edit this file and restart the client
-# instead. A forward whose local port cannot bind is switched off with the
-# reason shown next to its row. Local ports must be unique and nonzero. label
-# is optional (display only).
+# A destination: a host name for one server.
 #
-# Use remote_host = "localhost.flextunnel.internal" to reach the server's
-# loopback without adding a route. Literal `127.0.0.1`/`::1` targets need a
-# loopback CIDR in routed_cidrs (e.g. "127.0.0.0/8", "::1"), while `localhost`
-# needs "localhost" (or "*") in routed_domains. Unrouted non-reserved targets
-# are rejected ("connection not allowed").
+#   host            The name. `<host>:<port>` through this client — the SOCKS5
+#                   or HTTP proxy, a [[forwards]] entry, `flextunnel client nc`
+#                   — reaches that port on the *server's own loopback*, with no
+#                   server-side routing config. Any host name except an IP
+#                   address, `localhost`, or one under `flextunnel.internal`.
+#   server_node_id  The server's EndpointId (from `flextunnel show-iroh-id`).
+#   routed_domains  Optional further names sent through this server: an exact
+#                   name, a `*.suffix` wildcard (subdomains only), or `*` for
+#                   every hostname. Names only — an IP address goes under
+#                   routed_cidrs. Resolved on the server (its host aliases
+#                   and DNS forwards apply).
+#   routed_cidrs    Optional further networks or bare IPs sent through this
+#                   server. `*` never covers IP literals; pair it with
+#                   "0.0.0.0/0" (and "::/0") for a full tunnel.
+#
+# The server enforces its own routed_domains / routed_cidrs (see
+# server.toml.example) as an allowlist, so list a route here only if the
+# server lists it too — otherwise the server answers "connection not allowed".
+# Nothing about routing is exchanged between the two.
+#
+# When destinations overlap, the most specific rule wins: a destination's own
+# host, then an exact domain, then the longest `*.suffix`, then `*`; for IPs
+# the longest prefix. The same rule on two destinations is an error. Anything
+# on no destination's list is connected directly from this machine.
+[[destinations]]
+host = "machine1.internal"
+server_node_id = "<server endpoint id>"
+# routed_domains = ["*.corp.example", "db.internal"]
+# routed_cidrs = ["10.0.0.0/8"]
+
+# A destination may override the client key and the relays above. One that
+# names its own relay_urls uses only its own relay_auth_token.
+# [[destinations]]
+# host = "machine2.internal"
+# server_node_id = "<another server endpoint id>"
+# auth_key_file = "~/.config/flextunnel/machine2.key"
+# relay_urls = ["https://relay-c.example", "https://relay-d.example"]
+# relay_auth_token = "machine2-relay-secret"
+
+# Port forwards: each `[[forwards]]` table listens on localhost:<local_port>
+# (127.0.0.1/::1 only) and opens a stream to <remote_host>:<remote_port>
+# through the destination that routes remote_host — connecting to that server
+# on the first forwarded connection. remote_host is routed exactly like a proxy
+# request, except that a host no destination routes is a startup error: a
+# forward never connects directly. Forwards are declared here only — the
+# control panel (`flextunnel client control`) shows their state but cannot
+# change them; edit this file and restart the client instead. A forward whose
+# local port cannot bind is switched off with the reason shown next to its
+# row. Local ports must be unique and nonzero. label is optional (display
+# only).
+#
+# Use a destination's own host to reach the server's loopback without any
+# server-side route.
 # [[forwards]]
 # label = "local-web"
 # local_port = 8080
-# remote_host = "localhost.flextunnel.internal"   # always reaches server loopback
+# remote_host = "machine1.internal"   # port 80 on machine1 itself
 # remote_port = 80
 #
 # [[forwards]]
 # label = "db"
 # local_port = 5432
-# remote_host = "db.internal"
+# remote_host = "db.internal"         # needs a route above, and on the server
 # remote_port = 5432
 #
 # [[forwards]]

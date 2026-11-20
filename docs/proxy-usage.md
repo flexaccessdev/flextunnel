@@ -12,11 +12,12 @@ machine (this guide's examples assume SOCKS5 on `127.0.0.1:1080`). With
 neither enabled the client runs in port-forward-only mode.
 
 Which one you point a tool at depends only on what that tool can speak — the
-client applies the server-pushed tunnel set after parsing the request. On-list
-targets are tunneled over the QUIC connection; off-list targets are connected
-directly from the client device. For on-list targets, the server sees the same
-wire `Target` either way and does not care which local front-end you used. This
-guide covers, in order:
+client routes the request by its own destinations after parsing it. A target a
+destination routes is tunneled to that destination's server, which the client
+connects to on first use; any other target is connected directly from the
+client device. For a routed target, the server sees the same wire request
+either way and does not care which local front-end you used. This guide covers,
+in order:
 
 1. **DNS** — pass hostnames through so routed names resolve on the server.
 2. **Which listener to use** — SOCKS5 vs HTTP proxy, and when only one works.
@@ -34,18 +35,36 @@ guide covers, in order:
 ## The one rule: let the server resolve names
 
 flextunnel's whole point is that DNS and the outbound connection for **routed**
-targets happen on the **server's** network. The server only accepts targets in
-its `routed_domains` / `routed_cidrs` tunnel set and maps some names via
-`[host_aliases]` (e.g. `networking.internal` -> `127.0.0.1` on the server).
-Those names usually **do not resolve on the client at all**.
+targets happen on a **server's** network. The client sends a target to a server
+when it is on that destination's `routed_domains` / `routed_cidrs` (or is the
+destination's own `host`, the server machine itself); the server accepts it when
+it is in its own `routed_domains` / `routed_cidrs` tunnel set, and maps some
+names via `[host_aliases]` (e.g. `networking.internal` -> `127.0.0.1` on the
+server). Those names usually **do not resolve on the client at all**.
 
-The tunnel set is pushed to the client during the handshake. Anything outside
-that set is direct-connected from the client, so add every internal hostname or
-alias you intend to route to `routed_domains`; add literal IP destinations to
-`routed_cidrs` only when you really want those IPs tunneled. Both lists are
-optional: `flextunnel.internal` (the status page) and
-`localhost.flextunnel.internal` (the server's own `localhost`) are always
-routed, whatever the set holds.
+The two lists are configured separately and nothing is exchanged between them.
+Anything on no destination's list is direct-connected from the client, so add
+every internal hostname or alias you intend to route to that destination's
+`routed_domains` in `client.toml` **and** to the server's `routed_domains`; add
+literal IP destinations to `routed_cidrs` (both sides again) only when you
+really want those IPs tunneled. Both lists are optional on both sides: a
+destination's own `host` (the server's `localhost`) and the status pages at
+`flextunnel.internal` work whatever they hold.
+
+The examples in this guide assume a client config along these lines:
+
+```toml
+socks_port    = 1080
+http_port     = 8081
+auth_key_file = "~/.config/flextunnel/client.key"
+
+[[destinations]]
+host           = "machine1.internal"
+server_node_id = "<ENDPOINT_ID>"
+routed_domains = ["*.internal", "example.com"]
+```
+
+with the server routing the same names.
 
 By default the server resolves those names through its own system resolver. If
 some internal names are only known to a specific (e.g. internal) DNS server, add
@@ -63,13 +82,15 @@ So whatever you use must send the target **hostname** to the proxy and let
 flextunnel resolve it. The two front-ends reach this differently:
 
 - **HTTP proxy** — sends the hostname to flextunnel (`CONNECT host:port` or an
-  absolute-URI `GET http://host/...`), so DNS happens server-side for on-list
+  absolute-URI `GET http://host/...`), so DNS happens server-side for routed
   targets with no extra configuration. There is no SOCKS-style client-DNS
   footgun here.
 - **SOCKS5** — *can* resolve either at the client or at the proxy, and the
   default in many tools is the wrong one. You want the `socks5h` behavior (the
   `h` means "resolve host at the proxy"). Never pre-resolve the name to an IP on
-  the client, and don't attach a client-side resolver.
+  the client, and don't attach a client-side resolver. A pre-resolved name
+  arrives as a bare IP, which no `routed_domains` entry — and no destination's
+  `host` — can match.
 
 For curl and libcurl-based tools, use `socks5h://` for proxy-side DNS;
 `socks5://` resolves locally. Scheme behavior is tool-specific: Go's HTTP
@@ -88,15 +109,12 @@ The HTTP proxy carries any TCP protocol through `CONNECT`, provided the client
 or an adapter performs that handshake. Apps that speak neither proxy protocol
 can use built-in port forwards. Plain HTTP also supports absolute-URI forwarding.
 
-Enable the HTTP proxy by adding `--http-port` when you start the client.
-SOCKS5 is not on by default — keep `--socks-port` too if you also want it:
+Enable the HTTP proxy with `http_port` in the config, or by adding
+`--http-port` when you start the client. SOCKS5 is not on by default either —
+keep `socks_port` / `--socks-port` too if you also want it:
 
 ```sh
-flextunnel client start \
-    --server-node-id <ENDPOINT_ID> \
-    --auth-key-file  client.key \
-    --socks-port     1080 \
-    --http-port      8081
+flextunnel client start -c client.toml --socks-port 1080 --http-port 8081
 ```
 
 ## Programs that speak SOCKS5 natively
@@ -104,20 +122,21 @@ flextunnel client start \
 ### `curl`
 
 ```sh
-# For an on-list target, DNS + connection happen server-side (note socks5h)
+# For a routed target, DNS + connection happen server-side (note socks5h)
 curl -x socks5h://127.0.0.1:1080 https://example.com
 
 # a host alias defined on the server, for example networking.internal -> 127.0.0.1
 curl -x socks5h://127.0.0.1:1080 http://networking.internal/
 
-# flextunnel server status, as plain text
-curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.txt
+# the server machine itself (port 8000 on its loopback), no server config needed
+curl -sS -x socks5h://127.0.0.1:1080 http://machine1.internal:8000/
 
-# flextunnel server status, as JSON
+# this client's status, as plain text and as JSON
+curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.txt
 curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.json
 
-# the server's own loopback (port 8000), no server config needed
-curl -sS -x socks5h://127.0.0.1:1080 http://localhost.flextunnel.internal:8000/
+# that server's own status
+curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/servers/machine1.internal/status.json
 ```
 
 You can also set it for a whole shell session via the standard proxy env vars
@@ -128,17 +147,29 @@ export ALL_PROXY=socks5h://127.0.0.1:1080
 curl https://example.com
 ```
 
-`http://flextunnel.internal/` is the HTML status page; `/status.txt` is the
-script-friendly text form; `/status.json` is the structured JSON form. The JSON
-response includes `version`, `server_node_id`, `routed_domains`,
-`routed_cidrs`, `host_aliases`, `dns_forwards`, `bridges`,
-`inbound_bridges`, and duplicate-id blocklist counts under
-`duplicate_id_blocklist`. `localhost.flextunnel.internal:<port>` is the server's
-own `localhost:<port>`, bypassing the routed set and host aliases. These names
-are reserved by flextunnel and are always tunneled, even when they are not in
-the server's routed set. If the client is
-also running the HTTP proxy front-end, query the same endpoints through it
-instead:
+`http://flextunnel.internal/` is the client's own status page, answered by the
+client without connecting to anything: its destinations and whether each is
+idle, connecting, connected or retrying. `/status.txt` is the script-friendly
+text form; `/status.json` is the structured JSON form, with one entry per
+destination (`host`, `server_node_id`, `state`, `connected_secs`,
+`open_streams`, `waiting`, `failed_attempts`, `last_error`, its routes, …).
+
+`http://flextunnel.internal/servers/<destination>/` is that **server's** status
+page, in the same three forms; fetching it connects to the server if need be.
+The client fetches the page and serves it under headers of its own, sandboxed
+(`Content-Security-Policy: sandbox`), so one server's page shares no browser
+origin with the client's page or another server's; a server that does not
+answer within 30 seconds is a `502`.
+Its JSON includes `version`, `server_node_id`, `routed_domains`,
+`routed_cidrs`, `host_aliases`, `dns_forwards`, `bridges`, `inbound_bridges`,
+and duplicate-id blocklist counts under `duplicate_id_blocklist`.
+
+`machine1.internal:<port>` — the destination's own host — is the server's own
+`localhost:<port>`, bypassing the server's routed set and host aliases.
+
+`flextunnel.internal` is reserved by flextunnel and never leaves the client. If
+the client is also running the HTTP proxy front-end, query the same endpoints
+through it instead:
 
 ```sh
 curl -sS -x http://127.0.0.1:8081 http://flextunnel.internal/status.txt
@@ -172,7 +203,7 @@ which does its own DNS and would fail with `Could not resolve hostname`. Route
 through SSH's `ProxyCommand` instead:
 
 ```sh
-GIT_SSH_COMMAND='ssh -o "ProxyCommand=flextunnel client nc -n <ENDPOINT_ID> %h %p"' \
+GIT_SSH_COMMAND='ssh -o "ProxyCommand=flextunnel client nc %h %p"' \
   git clone ssh://networking.internal/repo.git
 ```
 
@@ -181,7 +212,7 @@ plain `git clone ssh://networking.internal/repo.git` just works:
 
 ```
 Host networking.internal
-    ProxyCommand flextunnel client nc -n <ENDPOINT_ID> %h %p
+    ProxyCommand flextunnel client nc %h %p
 ```
 
 ### `kubectl` (inline `proxy-url` in kubeconfig)
@@ -194,8 +225,9 @@ context affected by `HTTPS_PROXY`; see the
 Use the `socks5h://` scheme so flextunnel resolves the API server's hostname
 server-side — the same "let the server resolve names" rule as everywhere else.
 The `server:` host must be a name the flextunnel **server** can resolve and
-reach, and it must be on the tunnel set (a `routed_domains` entry or a
-`[host_aliases]` name that is also listed in `routed_domains`):
+reach, routed by the client's destination and on the server's tunnel set (a
+`routed_domains` entry on both sides — a server `[host_aliases]` name needs
+listing in both too):
 
 ```yaml
 apiVersion: v1
@@ -233,25 +265,26 @@ still notes a SOCKS5 limitation for SPDY `exec`, `attach` and port forwarding;
 if an older or non-kubectl client hits it, use the HTTP proxy.
 
 > Note the DNS semantics: with `socks5h://`, a `server:` of
-> `https://localhost:6443` reaches the server's localhost only if `localhost`
-> is routed. Use `https://localhost.flextunnel.internal:6443` for the reserved
-> server-loopback name, with a TLS certificate or `tls-server-name` matching
-> the API server.
+> `https://localhost:6443` reaches a server's localhost only if `localhost` is
+> routed — on a destination and on its server. For an API server on the
+> flextunnel server's loopback, use the destination's host instead
+> (`https://machine1.internal:6443`), with a TLS certificate or
+> `tls-server-name` matching the API server.
 
 ### Web browsers
 
 Point the browser's SOCKS proxy at `127.0.0.1:1080` **with remote DNS enabled**
-so on-list hostnames resolve on the server:
+so routed hostnames reach flextunnel as names and resolve on the server:
 
 - **Firefox** — set a manual SOCKS v5 proxy of `127.0.0.1:1080` in its network
   settings, and enable the option to proxy DNS through SOCKS v5 so hostnames
   for tunneled targets resolve on the server rather than locally.
 - **Chrome / Chromium** — configure a SOCKS5 proxy of `127.0.0.1:1080` (Chrome
-  sends the hostname to the proxy, so DNS happens server-side for on-list
+  sends the hostname to the proxy, so DNS happens server-side for routed
   targets).
 
 A browser can also use the HTTP proxy on `127.0.0.1:8081` instead — it sends the
-hostname either way, so DNS still happens server-side for on-list targets. For
+hostname either way, so DNS still happens server-side for routed targets. For
 per-site control instead of a system-wide switch, a browser extension like
 FoxyProxy lets you route only the internal domains through the proxy.
 
@@ -277,8 +310,8 @@ Then add one **Include** pattern per routed name, e.g.:
 | Include | Type | Pattern |
 |---|---|---|
 | Include | Wildcard | `*.proxkube.internal` |
+| Include | Wildcard | `machine1.internal` |
 | Include | Wildcard | `flextunnel.internal` |
-| Include | Wildcard | `*.flextunnel.internal` |
 
 Finally, **enable pattern mode**: click the FoxyProxy toolbar icon and select
 **Proxy by Patterns**. The extension starts out disabled — with it set to
@@ -286,11 +319,11 @@ Disable (or pinned to a single proxy), the patterns you just saved are not
 consulted at all.
 
 `*.example.internal` matches the subdomains; add a second bare
-`example.internal` pattern if you also browse the apex name. A
-`flextunnel.internal` pattern is handy to keep the server status page
-(`http://flextunnel.internal/`) reachable, and `*.flextunnel.internal` covers
-the server's loopback (`localhost.flextunnel.internal`). Requests that match no pattern
-bypass the proxy entirely, so off-list browsing is untouched even before
+`example.internal` pattern if you also browse the apex name. Add each
+destination's own host (`machine1.internal`) to browse services on that
+server's loopback, and a `flextunnel.internal` pattern to keep the status pages
+(`http://flextunnel.internal/`) reachable. Requests that match no pattern
+bypass the proxy entirely, so other browsing is untouched even before
 flextunnel's own routing decision.
 
 An HTTP-proxy entry (`Type: HTTP`, `127.0.0.1:8081`) works with the same
@@ -402,35 +435,46 @@ go over `CONNECT` automatically; you never send them as absolute-URI forwards.
 ## `ssh` through the tunnel
 
 Use `flextunnel client nc` as SSH's `ProxyCommand`. It opens one tunnel
-through the running client for the profile and relays it to ssh's
-stdin/stdout, so it needs no SOCKS or HTTP port and no external netcat (which
-Windows' OpenSSH lacks):
+through the running client and relays it to ssh's stdin/stdout, so it needs no
+SOCKS or HTTP port and no external netcat (which Windows' OpenSSH lacks):
 
 ```sh
-ssh -o ProxyCommand='flextunnel client nc -n <ENDPOINT_ID> %h %p' user@workstation.internal
+ssh -o ProxyCommand='flextunnel client nc %h %p' user@machine1.internal
 ```
 
-`%h`/`%p` expand to the target host/port. Like a port forward, the target goes
-to the server: it must be in the routed set, and the server resolves
-`workstation.internal`. `-n` picks the running client by its server's
-EndpointId, which works however the client was started; a client started from
-a config can be named by that config with `-c` instead, and with neither,
-`client nc` uses `~/.config/flextunnel/client.toml`.
+`%h`/`%p` expand to the target host/port. The host is routed like a port
+forward. A destination's own host — `machine1.internal` here — is that server
+machine itself, so this reaches its sshd with no routing config on either side.
+Any other host must be routed by a destination and allowed by its server, which
+resolves it. If the destination is not connected, `nc` waits while the client
+connects to it.
 
-Make it permanent in `~/.ssh/config` so plain `ssh workstation` just works (and
-so `git@workstation:…` remotes route through the tunnel too):
+`client nc` finds the running client by its name: with no flags, the `name` in
+`~/.config/flextunnel/client.toml` (or `default`); `-c <file>` reads the name
+from another config, and `-n <name>` gives it directly.
+
+Make it permanent in `~/.ssh/config`. One block covers every destination:
+
+```
+Host machine1.internal machine2.internal
+    User user
+    ProxyCommand flextunnel client nc %h %p
+```
+
+and a host behind a server, with a short alias (so `git@workstation:…` remotes
+route through the tunnel too):
 
 ```
 Host workstation
     HostName workstation.internal
     User user
-    ProxyCommand flextunnel client nc -c ~/.config/flextunnel/aws.toml %h %p
+    ProxyCommand flextunnel client nc %h %p
 ```
 
 A client with a SOCKS port can also be reached with OpenBSD netcat
 (`ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p`). That path follows normal
-proxy routing, so an off-list target connects directly from the client instead
-of being refused.
+proxy routing, so a target no destination routes connects directly from the
+client instead of being refused.
 
 ### Combine with SSH's own forwards
 
@@ -439,11 +483,11 @@ second hop *from the SSH host's* network:
 
 ```sh
 # Local forward: localhost:5432 -> db.internal:5432, as seen from workstation.internal
-ssh -o ProxyCommand='flextunnel client nc -n <ENDPOINT_ID> %h %p' \
+ssh -o ProxyCommand='flextunnel client nc %h %p' \
     -L 127.0.0.1:5432:db.internal:5432 user@workstation.internal
 
 # Dynamic (SOCKS) forward: a second SOCKS5 proxy scoped to the SSH host's network
-ssh -o ProxyCommand='flextunnel client nc -n <ENDPOINT_ID> %h %p' \
+ssh -o ProxyCommand='flextunnel client nc %h %p' \
     -D 127.0.0.1:1081 user@workstation.internal
 ```
 
@@ -454,7 +498,7 @@ SSH box can.
 ## Adapters for programs that don't speak either proxy
 
 For database clients, RDP and other apps without proxy support, first consider
-a built-in server-direct forward in `client.toml`:
+a built-in forward in `client.toml`:
 
 ```toml
 [[forwards]]
@@ -463,13 +507,16 @@ remote_host = "db.internal"
 remote_port = 5432
 ```
 
-Connect the app to `localhost:15432`. The target must be in the server's routed
-set; forwards never connect off-list targets directly from the client. See
+Connect the app to `localhost:15432`. The target must be routed by a
+destination (here, `db.internal` on its `routed_domains`) and be in that
+server's routed set; a forward never connects directly from the client, so a
+target no destination routes is a startup error. Use a destination's own host
+as `remote_host` to reach a service on the server machine itself. See
 [`client.toml.example`](../client.toml.example).
 
 An external adapter such as `socat` is useful for a temporary forward or a
 custom bind address. Its SOCKS5 path uses normal proxy routing, including
-direct connections for off-list targets.
+direct connections for targets no destination routes.
 
 `socat` 1.8+'s `SOCKS5-CONNECT` address dials a target *through* the SOCKS5 proxy and
 sends the target as a **domain name** (it emits SOCKS5 `ATYP=DOMAIN`, so

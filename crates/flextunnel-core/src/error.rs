@@ -16,6 +16,14 @@ pub struct ErrorContext {
 }
 
 impl ErrorContext {
+    /// Create a context error that is its own root cause.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            source: None,
+        }
+    }
+
     /// Create context error with an underlying source.
     pub fn with_source<E>(message: impl Into<String>, source: E) -> Self
     where
@@ -60,6 +68,11 @@ pub enum ProxyError {
 }
 
 impl ProxyError {
+    /// Create a configuration error from a message alone.
+    pub fn config(message: impl Into<String>) -> Self {
+        Self::Config(ErrorContext::new(message))
+    }
+
     /// Create a configuration error with preserved source.
     pub fn config_with_source<E>(message: impl Into<String>, source: E) -> Self
     where

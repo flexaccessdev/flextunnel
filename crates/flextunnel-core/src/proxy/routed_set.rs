@@ -1,12 +1,17 @@
 //! Destination routed set shared by the client and server.
 //!
-//! A routed set is the *tunnel set*: the destinations that are routed through
-//! the QUIC tunnel. The client uses it to decide per-connection whether to
-//! tunnel a target or connect directly from the device (split-tunneling);
-//! targets not on the set are **not** rejected client-side, they fall back to a
-//! direct connection. The server, by contrast, enforces the same rules as a
-//! **whitelist**: it rejects any tunnel request for a target that is not on the
-//! set (defense in depth). For both roles the lists should be kept in sync.
+//! A routed set is a *tunnel set*: targets that are routed through a QUIC
+//! tunnel. The two sides each configure their own, and nothing about routing
+//! crosses the handshake:
+//!
+//! * The **client** holds one set per destination (see
+//!   [`super::route_table`]) and uses them to decide per connection which
+//!   server, if any, a target is tunneled to (split-tunneling); a target on no
+//!   set is **not** rejected, it is dialed directly from the device.
+//! * The **server** enforces its set as a **whitelist**: it rejects any tunnel
+//!   request for a target that is not on it. A client route the server does
+//!   not also list is therefore answered "not allowed" — the two lists should
+//!   be kept in step.
 //!
 //! Two independent lists are matched against the requested [`Target`]. A
 //! *hostname* is matched only against domain rules and an *IP* only against CIDR
@@ -28,10 +33,10 @@
 //!
 //! The routed set is a VPN-style split-tunnel "included routes" set and is
 //! **optional** — an empty routed set routes nothing, never "tunnel
-//! everything". The reserved `flextunnel.internal` namespace (the status page
-//! and `localhost.flextunnel.internal`, the server's own loopback) is always
-//! routed outside of it (see [`super::reserved`]). To tunnel *all* traffic, use
-//! the catch-alls: `*` for hostnames and `0.0.0.0/0` (+ `::/0`) for IPs.
+//! everything". Two things reach a server outside of it: a client destination's
+//! own name, which is that server's loopback, and the server's status page
+//! (see [`super::signaling::StreamRequest`]). To tunnel *all* traffic, use the
+//! catch-alls: `*` for hostnames and `0.0.0.0/0` (+ `::/0`) for IPs.
 
 use crate::proxy::signaling::Target;
 use anyhow::{Context, Result, bail};
@@ -39,6 +44,24 @@ use ipnetwork::IpNetwork;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::str::FromStr;
+
+/// How specifically a [`RoutedSet`] rule matches a target (see
+/// [`RoutedSet::specificity`]). Ordered least to most specific: among hostname
+/// rules the catch-all `*` loses to any `*.suffix`, a longer suffix beats a
+/// shorter one, and an exact name beats them all; among networks a longer
+/// prefix wins. Hostname and network rules never compete — a target is one or
+/// the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Specificity {
+    /// Matched by the `*` hostname catch-all.
+    CatchAll,
+    /// Matched by a `*.suffix` rule; the length of the stored `.suffix`.
+    Suffix(usize),
+    /// Matched by an exact domain rule.
+    Exact,
+    /// Matched by a network of this prefix length.
+    Cidr(u8),
+}
 
 /// A parsed destination routed set (the tunnel set). See the module docs.
 #[derive(Debug, Default, Clone)]
@@ -66,7 +89,7 @@ impl RoutedSet {
         let mut domains_suffix = Vec::new();
         let mut domains_all = false;
         for raw in domains {
-            let entry = raw.trim();
+            let entry = routing_key(raw.trim());
             if entry == "*" {
                 // Full-tunnel catch-all: match every hostname.
                 domains_all = true;
@@ -127,7 +150,7 @@ impl RoutedSet {
         if self.domains_all {
             return true;
         }
-        let host = host.to_ascii_lowercase();
+        let host = routing_key(host).to_ascii_lowercase();
         self.domains_exact.contains(&host)
             || self
                 .domains_suffix
@@ -139,6 +162,62 @@ impl RoutedSet {
         self.cidrs.iter().any(|net| net.contains(ip))
     }
 
+    /// How specifically this set matches `target`, or `None` when it does not
+    /// match at all (exactly when [`Self::allows`] is false). Lets a client
+    /// holding several sets — one per destination — send a target to the one
+    /// with the most specific rule (see [`super::route_table`]).
+    pub fn specificity(&self, target: &Target) -> Option<Specificity> {
+        match target {
+            Target::Domain(host, _) => match parse_ip_literal(host) {
+                Some(ip) => self.ip_specificity(ip),
+                None => self.host_specificity(host),
+            },
+            Target::Ip(sa) => self.ip_specificity(sa.ip()),
+        }
+    }
+
+    fn host_specificity(&self, host: &str) -> Option<Specificity> {
+        let host = routing_key(host).to_ascii_lowercase();
+        if self.domains_exact.contains(&host) {
+            return Some(Specificity::Exact);
+        }
+        self.domains_suffix
+            .iter()
+            .filter(|suffix| host.ends_with(suffix.as_str()))
+            .map(|suffix| Specificity::Suffix(suffix.len()))
+            .max()
+            .or(self.domains_all.then_some(Specificity::CatchAll))
+    }
+
+    fn ip_specificity(&self, ip: IpAddr) -> Option<Specificity> {
+        self.cidrs
+            .iter()
+            .filter(|net| net.contains(ip))
+            .map(|net| Specificity::Cidr(net.prefix()))
+            .max()
+    }
+
+    /// The set's rules in a normalized spelling, one string per rule: an exact
+    /// domain as itself, a wildcard as `*.suffix`, the catch-all as `*`, a
+    /// network as `addr/prefix`. Two sets sharing a rule would route the same
+    /// targets with equal specificity, so [`super::route_table`] compares these
+    /// to reject the ambiguity at config load.
+    pub fn rules(&self) -> Vec<String> {
+        let mut rules: Vec<String> = self.domains_exact.iter().cloned().collect();
+        rules.extend(self.domains_suffix.iter().map(|suffix| format!("*{suffix}")));
+        if self.domains_all {
+            rules.push("*".to_string());
+        }
+        rules.extend(
+            self.cidrs
+                .iter()
+                .map(|net| format!("{}/{}", net.network(), net.prefix())),
+        );
+        rules.sort();
+        rules.dedup();
+        rules
+    }
+
     /// Validate that every rule in `domains`/`cidrs` (routed-set syntax, as in
     /// a bridge's route rules) can ever fire under this set — i.e. this set
     /// routes at least one target the rule matches. A rule no routed target
@@ -148,7 +227,7 @@ impl RoutedSet {
     /// as [`RoutedSet::new`]; the error names the offending rule.
     pub fn validate_rules_reachable(&self, domains: &[String], cidrs: &[String]) -> Result<()> {
         for raw in domains {
-            let entry = raw.trim();
+            let entry = routing_key(raw.trim());
             let reachable = if entry == "*" {
                 // A `*` rule fires for any routed hostname, so it is dead only
                 // when the set routes no hostnames at all.
@@ -216,6 +295,20 @@ impl RoutedSet {
 
 /// Parse a host string as an IP literal, tolerating a single bracketed IPv6 form
 /// (`[2606:4700::1]`). Returns `None` for genuine hostnames.
+/// The form of a hostname that routing compares: without the DNS root dot.
+/// `db.internal.` and `db.internal` are one name, so they must select one
+/// route — on the client's table, a server's routed set and the reserved
+/// namespace alike. Only the comparison uses this; a target keeps its own
+/// spelling for resolution.
+pub(crate) fn routing_key(host: &str) -> &str {
+    match host.strip_suffix('.') {
+        // Only a dot that ends a label is the root: `*.` and `a..` are
+        // malformed, and stay as written for their callers to reject.
+        Some(name) if !name.is_empty() && !name.ends_with(['.', '*']) => name,
+        _ => host,
+    }
+}
+
 fn parse_ip_literal(host: &str) -> Option<IpAddr> {
     let unbracketed = host
         .strip_prefix('[')
@@ -273,6 +366,20 @@ mod tests {
         assert!(full.allows(&domain("anything.example")));
         assert!(full.allows(&ip("8.8.8.8")));
         assert!(full.allows(&ip("[2606:4700::1]")));
+    }
+
+    /// The DNS root dot is not part of the name routing compares: a rule and
+    /// a request match with or without it.
+    #[test]
+    fn the_root_dot_does_not_change_a_match() {
+        let w = rs(&["example.com", "*.corp.example."], &[]);
+        for host in ["example.com", "example.com.", "EXAMPLE.com.", "api.corp.example", "api.corp.example."] {
+            assert!(w.allows(&domain(host)), "{host}");
+        }
+        assert_eq!(w.specificity(&domain("example.com.")), Some(Specificity::Exact));
+        assert!(!w.allows(&domain("corp.example.")), "the apex stays out of a wildcard");
+        assert!(!w.allows(&domain("other.example.")));
+        assert_eq!(w.rules(), ["*.corp.example", "example.com"]);
     }
 
     #[test]

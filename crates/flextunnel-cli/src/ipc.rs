@@ -2,40 +2,44 @@
 //! commands that attach to it: `flextunnel client control` and
 //! `flextunnel client nc`.
 //!
-//! Transport: a Unix domain socket (`~/.config/flextunnel/client-<key>.sock`)
-//! or a Windows named pipe (`\\.\pipe\flextunnel-client-<key>`), where `<key>`
-//! is the server-id-prefix instance key (see `instance.rs`). Protocol:
+//! Transport: a Unix domain socket (`~/.config/flextunnel/client-<name>.sock`,
+//! a long name shortened — see [`socket_stem`]) or a Windows named pipe
+//! (`\\.\pipe\flextunnel-client-<user SID>-<name>`), where `<name>` is the
+//! client's instance name (see `instance.rs`). Protocol:
 //! JSON Lines, strict request → response over a long-lived connection. Both
 //! ends are this one binary and the repo has a no-compatibility policy, so
 //! there is no protocol version field.
 //!
 //! A connection either carries status requests (status and connection-path
 //! snapshots), or opens with one [`Request::Connect`] and, once answered with
-//! [`Response::Connected`], turns into one tunnel to a server-side target —
-//! `client nc`'s stdio relay. From there the client sends length-prefixed
+//! [`Response::Connected`], turns into one tunnel to a target behind one of
+//! the client's destinations — `client nc`'s stdio relay. From there the client sends length-prefixed
 //! frames ending in an empty one (see [`copy_to_frames`]) and the session sends
 //! the target's raw bytes, closing the connection when the target closes. A
 //! Windows named pipe has no half-close, so neither end of the tunnel may rely
 //! on one to carry an EOF. The snapshots describe the
 //! user's network and a tunnel reaches into it, so the Unix socket is chmod'd
-//! 0600 (owner only), in a 0700 directory. Windows pipe names are global and
-//! the default pipe descriptor lets Everyone read, so each pipe instance gets
-//! an owner-only descriptor and attaching commands refuse a pipe another user
-//! owns (see `pipe_security.rs`).
+//! 0600 (owner only), in a 0700 directory. Windows pipe names are one
+//! machine-wide namespace and the default pipe descriptor lets Everyone read,
+//! so the name carries the user's SID (two users' clients of one name do not
+//! collide), each pipe instance gets an owner-only descriptor, and attaching
+//! commands refuse a pipe another user owns (see `pipe_security.rs`).
 //!
 //! The socket is not the single-instance lock — see `lock.rs` for why. But
 //! *because* the caller holds that lock, unconditionally removing a stale
 //! socket file before bind is safe: no other live client of this instance can
 //! own it.
 //!
-//! macOS caps `sun_path` around 104 bytes; with the socket under
-//! `~/.config/flextunnel/` and the 16-char key, only a pathological home path
-//! overflows — that surfaces as a clear bind error.
+//! macOS caps `sun_path` at 104 bytes; the socket's file name is kept to
+//! [`MAX_SOCKET_FILE_NAME`] bytes whatever the instance name, so under
+//! `~/.config/flextunnel/` the path fits for a home directory of up to 50
+//! bytes. A longer home path still surfaces as a clear bind error.
 
 use anyhow::{Context, Result};
 use flextunnel_core::forwards::validate_remote_host;
-use flextunnel_core::proxy::ServerForwarder;
+use flextunnel_core::proxy::client::{TUNNEL_OPEN_TIMEOUT, TUNNEL_RECOVERY_HOLD};
 use flextunnel_core::proxy::signaling::Target;
+use flextunnel_core::proxy::{DestinationState, TunnelDialer, TunnelStream};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -57,9 +61,13 @@ use crate::pipe_security;
 const MAX_LINE: usize = 1024 * 1024;
 /// Client-side timeout for connect and for each request round trip.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-/// Client-side timeout for a [`Request::Connect`] answer: past the core's own
-/// 30 s bound on opening a tunnel, so the client's error arrives first.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(35);
+/// Client-side timeout for a [`Request::Connect`] answer: past everything the
+/// session may spend on it — holding the request while the destination
+/// connects, then opening the stream — so the session's own error arrives
+/// first.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(
+    TUNNEL_RECOVERY_HOLD.as_secs() + TUNNEL_OPEN_TIMEOUT.as_secs() + 5,
+);
 /// Largest payload of one client-to-session tunnel frame.
 const MAX_FRAME: usize = 64 * 1024;
 
@@ -71,14 +79,19 @@ const MAX_FRAME: usize = 64 * 1024;
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Status,
-    /// On-demand connection-path + custom-relay-health snapshot (mirrors the
-    /// desktop modal / iOS sheet). Kept off the polled `Status` because the
-    /// custom-relay `/healthz` probe does on-demand HTTP.
-    ConnPath,
-    /// Open a tunnel to `host:port` on the server side, like a port forward:
-    /// the server enforces its routed set and resolves the host. Answered with
+    /// On-demand connection-path + custom-relay-health snapshot of the
+    /// destination named `host` (mirrors the desktop modal / iOS sheet). Kept
+    /// off the polled `Status` because the custom-relay `/healthz` probe does
+    /// on-demand HTTP. Empty for a destination that is not connected; asking
+    /// never connects it.
+    ConnPath { host: String },
+    /// Open a tunnel to `host:port` through the destination that routes
+    /// `host`, like a port forward: the destination connects if it is idle
+    /// (the request is held while it does), and its server enforces its
+    /// routed set and resolves the host. Answered with
     /// [`Response::Connected`], after which the connection is that tunnel's
-    /// byte stream, or with [`Response::Error`].
+    /// byte stream, or with [`Response::Error`] — including for a host no
+    /// destination routes.
     Connect { host: String, port: u16 },
 }
 
@@ -113,58 +126,96 @@ impl WireForward {
     }
 }
 
+/// What a destination is doing (the wire form of the core's
+/// [`DestinationState`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Phase {
+pub enum DestState {
+    /// Not connected and nothing is asking for it — the resting state.
+    Idle,
     Connecting,
     Connected,
-    Reconnecting,
+    /// The last attempt failed; waiting to retry for requests still held.
+    Backoff,
+    /// The server refused this client; requests fail at once for now.
     Failed,
 }
 
-impl Phase {
+impl DestState {
     pub fn label(self) -> &'static str {
         match self {
-            Phase::Connecting => "connecting",
-            Phase::Connected => "connected",
-            Phase::Reconnecting => "reconnecting",
-            Phase::Failed => "failed",
+            DestState::Idle => "idle",
+            DestState::Connecting => "connecting",
+            DestState::Connected => "connected",
+            DestState::Backoff => "retrying",
+            DestState::Failed => "failed",
         }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StatusSnapshot {
-    /// The server-id-prefix instance key (see `instance.rs`).
-    pub instance: String,
-    /// Friendly profile name from the config ("aws", "home network"), if set.
-    pub name: Option<String>,
-    pub phase: Phase,
+impl From<DestinationState> for DestState {
+    fn from(state: DestinationState) -> Self {
+        match state {
+            DestinationState::Idle => DestState::Idle,
+            DestinationState::Connecting => DestState::Connecting,
+            DestinationState::Connected => DestState::Connected,
+            DestinationState::Backoff => DestState::Backoff,
+            DestinationState::Failed => DestState::Failed,
+        }
+    }
+}
+
+/// One destination of the client as the panel sees it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DestinationRow {
+    /// The destination's name; `host:<port>` is the server's own loopback.
+    pub host: String,
+    pub server_node_id: String,
+    pub state: DestState,
     /// Uptime of the current connection, if connected.
     pub connected_secs: Option<u64>,
-    pub server_node_id: String,
-    pub client_node_id: String,
+    /// Streams open on the connection right now.
+    pub open_streams: usize,
+    /// Requests held while the destination connects.
+    pub waiting: usize,
+    /// This client's endpoint id toward this server; `None` while idle (the
+    /// endpoint only exists while the destination is in use).
+    pub client_node_id: Option<String>,
+    /// Consecutive failed attempts in the current outage (0 once connected).
+    pub failed_attempts: u32,
+    /// Seconds until the next attempt may run (`Some(0)`: due now); `None`
+    /// when there is no failed attempt to retry. Reached only if a request
+    /// still wants the destination by then.
+    pub next_attempt_secs: Option<u64>,
+    /// What the last attempt (or the last connection) failed with.
+    pub last_error: Option<String>,
+    /// Further domains this client sends through the destination.
+    pub routed_domains: Vec<String>,
+    /// Further networks this client sends through the destination.
+    pub routed_cidrs: Vec<String>,
+    /// Its custom relays; empty for the default iroh relays.
+    pub relay_urls: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatusSnapshot {
+    /// The client's instance name (see `instance.rs`).
+    pub name: String,
     pub socks_addr: Option<SocketAddr>,
     pub http_addr: Option<SocketAddr>,
-    /// Reserved host that is always tunneled to the server's status page.
+    /// Reserved host the client itself answers with its status page.
     pub status_page_host: String,
-    /// Reserved host that is always tunneled to the server's own loopback.
-    pub localhost_host: String,
-    /// Consecutive failed connection attempts in the current outage (0 while
-    /// connected).
-    pub failed_attempts: u32,
-    /// Seconds until the next connection attempt is due while backing off;
-    /// `Some(0)` while an attempt is in progress, `None` when none is pending.
-    pub next_attempt_secs: Option<u64>,
-    /// What the last connection attempt failed with, while the tunnel is down.
-    pub last_error: Option<String>,
-    pub routes: WireRoutes,
+    /// Seconds an unused connection is kept; `None` when one is never closed
+    /// for idleness.
+    pub idle_timeout_secs: Option<u64>,
+    /// The client's destinations, in configuration order.
+    pub destinations: Vec<DestinationRow>,
     pub forwards: Vec<ForwardRow>,
 }
 
 /// On-demand connection snapshot served for [`Request::ConnPath`]: the live iroh
-/// path(s) plus custom-relay `/healthz` health. Both are empty while the tunnel
-/// link is down.
+/// path(s) plus custom-relay `/healthz` health. Both are empty while the
+/// destination is not connected.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct WireConnSnapshot {
     pub paths: Vec<WireConnPath>,
@@ -177,25 +228,6 @@ pub struct WireCustomRelay {
     /// `Some(true)` = up (2xx), `Some(false)` = down, `None` = check not run.
     pub working: Option<bool>,
     pub error: Option<String>,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct WireRoutes {
-    pub domains: Vec<String>,
-    pub cidrs: Vec<String>,
-    /// alias → target, resolved server-side.
-    pub host_aliases: Vec<(String, String)>,
-    /// suffix → upstream servers.
-    pub dns_forwards: Vec<(String, Vec<String>)>,
-    pub bridges: Vec<WireBridge>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WireBridge {
-    pub name: String,
-    pub endpoint_id: String,
-    pub domains: Vec<String>,
-    pub cidrs: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -220,6 +252,8 @@ pub enum ForwardRowState {
 pub struct ForwardRow {
     #[serde(flatten)]
     pub forward: WireForward,
+    /// The host of the destination that carries this forward.
+    pub destination: String,
     pub state: ForwardRowState,
     /// Bind-failure reason — including the retained reason of a forward that
     /// was auto-disabled after its listener failed to bind.
@@ -236,21 +270,19 @@ pub struct ForwardRow {
 /// What a connection task asks of the client session loop.
 pub enum IpcCmd {
     Status(oneshot::Sender<StatusSnapshot>),
-    ConnPath(oneshot::Sender<WireConnSnapshot>),
+    /// Connection snapshot of the destination with this host.
+    ConnPath(String, oneshot::Sender<WireConnSnapshot>),
 }
 
 /// Opens the tunnels [`Request::Connect`] asks for: the session's
-/// [`ServerForwarder`], or an in-memory stand-in in tests.
+/// [`TunnelDialer`], or an in-memory stand-in in tests.
 pub trait TunnelOpener: Clone + Send + Sync + 'static {
     type Stream: AsyncRead + AsyncWrite + Unpin + Send;
     fn open(&self, target: Target) -> impl Future<Output = Result<Self::Stream>> + Send;
 }
 
-impl TunnelOpener for ServerForwarder {
-    type Stream = tokio::io::Join<
-        flextunnel_core::iroh::endpoint::RecvStream,
-        flextunnel_core::iroh::endpoint::SendStream,
-    >;
+impl TunnelOpener for TunnelDialer {
+    type Stream = TunnelStream;
 
     async fn open(&self, target: Target) -> Result<Self::Stream> {
         self.connect(&target).await
@@ -261,14 +293,50 @@ impl TunnelOpener for ServerForwarder {
 // Naming
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
-fn socket_path(key: &str) -> Result<std::path::PathBuf> {
-    Ok(instance::instance_dir()?.join(format!("client-{key}.sock")))
+/// Longest control-socket file name, in bytes: macOS's `sun_path` holds 103
+/// bytes plus a NUL, and `<home>/.config/flextunnel/` takes 20 past the home
+/// directory, so this fits under a home path of up to 50 bytes.
+#[cfg(any(unix, test))]
+const MAX_SOCKET_FILE_NAME: usize = 33;
+/// Longest stem — the part of the file name that comes from the instance name.
+#[cfg(any(unix, test))]
+const MAX_SOCKET_STEM: usize = MAX_SOCKET_FILE_NAME - "client-".len() - ".sock".len();
+
+/// The part of the control socket's file name that stands for the instance
+/// `name`: the name itself when it fits, else its start and a hash of all of
+/// it, joined by a `.` — which no instance name contains, so a shortened stem
+/// is never another instance's name. Only the socket file is named this way;
+/// the instance is still selected, locked and shown by its full name. The
+/// client that binds and the commands that attach both derive it here.
+#[cfg(any(unix, test))]
+fn socket_stem(name: &str) -> String {
+    if name.len() <= MAX_SOCKET_STEM {
+        return name.to_string();
+    }
+    // FNV-1a: fixed by definition, so every build names the socket alike.
+    let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    let digest = format!("{:08x}", hash as u32);
+    // Instance names are ASCII, so any byte offset is a character boundary.
+    let kept = MAX_SOCKET_STEM - 1 - digest.len();
+    format!("{}.{digest}", &name[..kept])
 }
 
+#[cfg(unix)]
+fn socket_path(name: &str) -> Result<std::path::PathBuf> {
+    Ok(instance::instance_dir()?.join(format!("client-{}.sock", socket_stem(name))))
+}
+
+/// The control pipe of this user's client named `name`. Pipe names are one
+/// machine-wide namespace, so the user's SID is part of it: another user's
+/// client of the same name gets a pipe of its own instead of finding this one
+/// taken. The client that serves and the commands that attach both derive it
+/// here.
 #[cfg(windows)]
-fn pipe_name(key: &str) -> String {
-    format!(r"\\.\pipe\flextunnel-client-{key}")
+fn pipe_name(name: &str) -> std::io::Result<String> {
+    let sid = pipe_security::current_user_sid()?;
+    Ok(format!(r"\\.\pipe\flextunnel-client-{sid}-{name}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -291,21 +359,22 @@ impl Drop for IpcServerGuard {
     }
 }
 
-/// Start serving the control channel for `instance`, opening `client nc`
-/// tunnels through `opener`. The caller must already hold the instance lock
-/// (that is what makes the stale-socket removal safe).
+/// Start serving the control channel for the instance `name`, opening `client
+/// nc` tunnels through `opener`. The caller must already hold the instance
+/// lock (that is what makes the stale-socket removal safe).
 pub fn spawn_ipc_server(
-    key: &str,
+    name: &str,
     tx: mpsc::Sender<IpcCmd>,
     opener: impl TunnelOpener,
 ) -> Result<IpcServerGuard> {
     #[cfg(unix)]
     {
-        spawn_unix(socket_path(key)?, tx, opener)
+        spawn_unix(socket_path(name)?, tx, opener)
     }
     #[cfg(windows)]
     {
-        spawn_pipe(pipe_name(key), tx, opener)
+        let pipe = pipe_name(name).context("Failed to read the current user's SID")?;
+        spawn_pipe(pipe, tx, opener)
     }
 }
 
@@ -443,7 +512,8 @@ where
     }
 }
 
-/// Open the tunnel a [`Request::Connect`] asked for, answer it, and on success
+/// Open the tunnel a [`Request::Connect`] asked for — which may first connect
+/// its destination, the request held meanwhile — answer it, and on success
 /// relay it: the caller's frames into the tunnel, ending in a half-close of the
 /// tunnel at the empty frame, and the tunnel's bytes back raw. The connection
 /// closes when the target closes, which is how the caller sees that EOF.
@@ -604,9 +674,9 @@ fn build_cmd(request: Request) -> Option<(IpcCmd, PendingReply)> {
             let (reply, rx) = oneshot::channel();
             (IpcCmd::Status(reply), PendingReply::Status(rx))
         }
-        Request::ConnPath => {
+        Request::ConnPath { host } => {
             let (reply, rx) = oneshot::channel();
-            (IpcCmd::ConnPath(reply), PendingReply::ConnPath(rx))
+            (IpcCmd::ConnPath(host, reply), PendingReply::ConnPath(rx))
         }
         Request::Connect { .. } => return None,
     })
@@ -651,23 +721,23 @@ type ClientStream = tokio::net::UnixStream;
 type ClientStream = tokio::net::windows::named_pipe::NamedPipeClient;
 
 pub struct IpcClient {
-    /// Kept so a request that had to discard its stream (see [`request`]) can
-    /// reconnect on the next call.
+    /// The instance name, kept so a request that had to discard its stream
+    /// (see [`request`]) can reconnect on the next call.
     ///
     /// [`request`]: IpcClient::request
-    key: String,
+    name: String,
     /// `None` after a timed-out request left a half-consumed response on the
     /// wire; the next request reconnects before sending.
     stream: Option<BufReader<ClientStream>>,
 }
 
 impl IpcClient {
-    /// Connect to the running client for the given instance key. `Ok(None)`
+    /// Connect to the running client with the given instance name. `Ok(None)`
     /// means nothing is listening — the client is not running.
-    pub async fn connect(key: &str) -> Result<Option<Self>> {
-        match tokio::time::timeout(REQUEST_TIMEOUT, Self::open(key)).await {
+    pub async fn connect(name: &str) -> Result<Option<Self>> {
+        match tokio::time::timeout(REQUEST_TIMEOUT, Self::open(name)).await {
             Ok(Ok(stream)) => Ok(Some(Self {
-                key: key.to_string(),
+                name: name.to_string(),
                 stream: Some(BufReader::new(stream)),
             })),
             Ok(Err(e)) if is_not_running(&e) => Ok(None),
@@ -677,18 +747,18 @@ impl IpcClient {
     }
 
     #[cfg(unix)]
-    async fn open(key: &str) -> std::io::Result<ClientStream> {
-        let path = socket_path(key)
+    async fn open(name: &str) -> std::io::Result<ClientStream> {
+        let path = socket_path(name)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         tokio::net::UnixStream::connect(path).await
     }
 
     #[cfg(windows)]
-    async fn open(key: &str) -> std::io::Result<ClientStream> {
+    async fn open(name: &str) -> std::io::Result<ClientStream> {
         use tokio::net::windows::named_pipe::ClientOptions;
 
         const ERROR_PIPE_BUSY: i32 = 231;
-        let name = pipe_name(key);
+        let name = pipe_name(name)?;
         let sid = pipe_security::current_user_sid()?;
         // All pipe instances can be momentarily busy between one attacher
         // connecting and the server pre-creating the next instance; retry
@@ -728,7 +798,7 @@ impl IpcClient {
 
     /// Re-establish the connection after a prior request discarded its stream.
     async fn reconnect(&mut self) -> Result<()> {
-        match tokio::time::timeout(REQUEST_TIMEOUT, Self::open(&self.key)).await {
+        match tokio::time::timeout(REQUEST_TIMEOUT, Self::open(&self.name)).await {
             Ok(Ok(stream)) => {
                 self.stream = Some(BufReader::new(stream));
                 Ok(())
@@ -746,8 +816,8 @@ impl IpcClient {
         round_trip(stream, request).await
     }
 
-    /// Turn this connection into a tunnel to `host:port` on the server side
-    /// (see [`Request::Connect`]): write to it in frames ([`copy_to_frames`]);
+    /// Turn this connection into a tunnel to `host:port` through the client's
+    /// destination for `host` (see [`Request::Connect`]): write to it in frames ([`copy_to_frames`]);
     /// it reads back the target's bytes, starting with any the target sent
     /// before this call returned, and ends when the target closes.
     pub async fn open_tunnel(
@@ -757,7 +827,7 @@ impl IpcClient {
     ) -> Result<impl AsyncRead + AsyncWrite + Unpin + use<>> {
         let mut stream = match self.stream.take() {
             Some(stream) => stream,
-            None => BufReader::new(Self::open(&self.key).await?),
+            None => BufReader::new(Self::open(&self.name).await?),
         };
         let request = Request::Connect {
             host: host.to_string(),
@@ -817,33 +887,46 @@ mod tests {
 
     fn snapshot() -> StatusSnapshot {
         StatusSnapshot {
-            instance: "62e463a6d67fdeac".into(),
-            name: Some("aws".into()),
-            phase: Phase::Connected,
-            connected_secs: Some(61),
-            server_node_id: "server".into(),
-            client_node_id: "client".into(),
+            name: "work".into(),
             socks_addr: Some("127.0.0.1:1080".parse().unwrap()),
             http_addr: None,
             status_page_host: "flextunnel.internal".into(),
-            localhost_host: "localhost.flextunnel.internal".into(),
-            failed_attempts: 0,
-            next_attempt_secs: None,
-            last_error: None,
-            routes: WireRoutes {
-                domains: vec!["*.internal".into()],
-                cidrs: vec![],
-                host_aliases: vec![("nas.internal".into(), "10.0.0.7".into())],
-                dns_forwards: vec![("test.example".into(), vec!["10.22.33.10".into()])],
-                bridges: vec![WireBridge {
-                    name: "kube1".into(),
-                    endpoint_id: "abc".into(),
-                    domains: vec!["*.svc".into()],
-                    cidrs: vec![],
-                }],
-            },
+            idle_timeout_secs: Some(300),
+            destinations: vec![
+                DestinationRow {
+                    host: "machine1.internal".into(),
+                    server_node_id: "server1".into(),
+                    state: DestState::Connected,
+                    connected_secs: Some(61),
+                    open_streams: 2,
+                    waiting: 0,
+                    client_node_id: Some("client".into()),
+                    failed_attempts: 0,
+                    next_attempt_secs: None,
+                    last_error: None,
+                    routed_domains: vec!["*.internal".into()],
+                    routed_cidrs: vec![],
+                    relay_urls: vec![],
+                },
+                DestinationRow {
+                    host: "machine2.internal".into(),
+                    server_node_id: "server2".into(),
+                    state: DestState::Idle,
+                    connected_secs: None,
+                    open_streams: 0,
+                    waiting: 0,
+                    client_node_id: None,
+                    failed_attempts: 0,
+                    next_attempt_secs: None,
+                    last_error: None,
+                    routed_domains: vec![],
+                    routed_cidrs: vec!["10.0.0.0/8".into()],
+                    relay_urls: vec!["https://relay.example/".into()],
+                },
+            ],
             forwards: vec![ForwardRow {
                 forward: wire_forward(),
+                destination: "machine1.internal".into(),
                 state: ForwardRowState::Listening,
                 error: None,
                 active: 2,
@@ -858,7 +941,10 @@ mod tests {
             host: "workstation.internal".into(),
             port: 22,
         };
-        for request in [Request::Status, Request::ConnPath, connect] {
+        let conn_path = Request::ConnPath {
+            host: "machine1.internal".into(),
+        };
+        for request in [Request::Status, conn_path, connect] {
             let json = serde_json::to_string(&request).unwrap();
             let _: Request = serde_json::from_str(&json).unwrap();
         }
@@ -867,9 +953,13 @@ mod tests {
         let back: Response = serde_json::from_str(&json).unwrap();
         match back {
             Response::Status(s) => {
-                assert_eq!(s.phase, Phase::Connected);
+                assert_eq!(s.destinations.len(), 2);
+                assert_eq!(s.destinations[0].state, DestState::Connected);
+                assert_eq!(s.destinations[1].state, DestState::Idle);
+                assert!(s.destinations[1].client_node_id.is_none());
                 assert_eq!(s.forwards.len(), 1);
                 assert_eq!(s.forwards[0].forward.local_port, 5432);
+                assert_eq!(s.forwards[0].destination, "machine1.internal");
                 assert_eq!(s.forwards[0].state, ForwardRowState::Listening);
             }
             other => panic!("expected Status, got {other:?}"),
@@ -885,7 +975,11 @@ mod tests {
                     IpcCmd::Status(reply) => {
                         let _ = reply.send(snapshot());
                     }
-                    IpcCmd::ConnPath(reply) => {
+                    // Only the connected destination has a path to show.
+                    IpcCmd::ConnPath(host, reply) if host != "machine1.internal" => {
+                        let _ = reply.send(WireConnSnapshot::default());
+                    }
+                    IpcCmd::ConnPath(_, reply) => {
                         let _ = reply.send(WireConnSnapshot {
                             paths: vec![WireConnPath {
                                 kind: "direct".into(),
@@ -927,13 +1021,13 @@ mod tests {
             (dir, guard)
         };
         #[cfg(windows)]
-        let guard = spawn_pipe(pipe_name(&instance), stub_session(), EchoOpener).unwrap();
+        let guard = spawn_pipe(pipe_name(&instance).unwrap(), stub_session(), EchoOpener).unwrap();
 
         #[cfg(unix)]
         let mut client = {
             let path = _dir.path().join(format!("client-{instance}.sock"));
             IpcClient {
-                key: instance.clone(),
+                name: instance.clone(),
                 stream: Some(BufReader::new(
                     tokio::net::UnixStream::connect(path).await.unwrap(),
                 )),
@@ -945,16 +1039,19 @@ mod tests {
         // Status.
         match client.request(&Request::Status).await.unwrap() {
             Response::Status(s) => {
-                assert_eq!(s.instance, "62e463a6d67fdeac");
-                assert_eq!(s.name.as_deref(), Some("aws"));
+                assert_eq!(s.name, "work");
+                assert_eq!(s.destinations[0].host, "machine1.internal");
             }
             other => panic!("expected Status, got {other:?}"),
         }
 
-        // The on-demand snapshot...
-        match client.request(&Request::ConnPath).await.unwrap() {
-            Response::ConnPath(s) => assert_eq!(s.paths.len(), 1),
-            other => panic!("expected ConnPath, got {other:?}"),
+        // The on-demand snapshot, per destination...
+        for (host, paths) in [("machine1.internal", 1), ("machine2.internal", 0)] {
+            let request = Request::ConnPath { host: host.into() };
+            match client.request(&request).await.unwrap() {
+                Response::ConnPath(s) => assert_eq!(s.paths.len(), paths, "{host}"),
+                other => panic!("expected ConnPath, got {other:?}"),
+            }
         }
 
         // ...and a malformed line gets an error while the connection stays open.
@@ -974,9 +1071,10 @@ mod tests {
         drop(guard);
     }
 
-    /// Stand-in for the session's forwarder: each tunnel is an in-memory pipe
+    /// Stand-in for the session's dialer: each tunnel is an in-memory pipe
     /// whose far end greets first (as an SSH server does), then echoes until
-    /// EOF. `refused.internal` is turned away, as an off-list target would be.
+    /// EOF. `refused.internal` is turned away, as a target the server does
+    /// not route would be.
     #[derive(Clone)]
     struct EchoOpener;
 
@@ -1026,7 +1124,8 @@ mod tests {
             }
             #[cfg(windows)]
             {
-                let guard = spawn_pipe(pipe_name(&instance), stub_session(), EchoOpener).unwrap();
+                let pipe = pipe_name(&instance).unwrap();
+                let guard = spawn_pipe(pipe, stub_session(), EchoOpener).unwrap();
                 Self { guard, instance }
             }
         }
@@ -1035,7 +1134,7 @@ mod tests {
             #[cfg(unix)]
             {
                 IpcClient {
-                    key: String::new(),
+                    name: String::new(),
                     stream: Some(BufReader::new(
                         tokio::net::UnixStream::connect(&self.path).await.unwrap(),
                     )),
@@ -1088,6 +1187,51 @@ mod tests {
         let oversized = ((MAX_FRAME + 1) as u32).to_be_bytes();
         let err = copy_from_frames(&mut &oversized[..], &mut Vec::new()).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// The socket's file name fits macOS's socket address limit for any
+    /// instance name, under a home directory of up to 50 bytes.
+    #[test]
+    fn the_socket_file_name_is_bounded() {
+        // Short names are used as they are.
+        for name in ["default", "work", &"x".repeat(MAX_SOCKET_STEM)] {
+            assert_eq!(socket_stem(name), name);
+        }
+        // Longer ones keep their start and gain a digest of the whole name.
+        let longest = "a".repeat(32);
+        let stem = socket_stem(&longest);
+        assert_eq!(stem.len(), MAX_SOCKET_STEM);
+        assert!(stem.starts_with("aaaaaaaaaaaa."), "{stem}");
+        assert_eq!(stem, socket_stem(&longest), "the same on every call");
+        // Names that share a start do not share a socket, and a shortened
+        // stem (it has a dot) is never some other instance's own name.
+        let sibling = format!("{}b", "a".repeat(31));
+        assert_ne!(socket_stem(&sibling), stem);
+
+        // `<50-byte home>/.config/flextunnel/client-<stem>.sock`, NUL included.
+        let home = format!("/{}", "h".repeat(49));
+        let path = format!("{home}/.config/flextunnel/client-{stem}.sock");
+        assert_eq!(home.len(), 50);
+        assert!(path.len() < 104, "{} bytes", path.len());
+        assert_eq!(format!("client-{stem}.sock").len(), MAX_SOCKET_FILE_NAME);
+    }
+
+    /// Bind and attach agree on the path of a long-named instance, and it is
+    /// short enough to bind where the unshortened name would not be.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_long_instance_name_binds_and_attaches() {
+        let name = "n".repeat(32);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("client-{}.sock", socket_stem(&name)));
+        let guard = spawn_unix(path.clone(), stub_session(), EchoOpener).unwrap();
+        let mut client = IpcClient {
+            name: name.clone(),
+            stream: Some(BufReader::new(tokio::net::UnixStream::connect(&path).await.unwrap())),
+        };
+        assert!(matches!(client.request(&Request::Status).await.unwrap(), Response::Status(_)));
+        assert_eq!(socket_path(&name).unwrap().file_name(), path.file_name());
+        drop(guard);
     }
 
     #[cfg(unix)]

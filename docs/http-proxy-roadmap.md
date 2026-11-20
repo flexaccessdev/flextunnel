@@ -15,9 +15,10 @@ Expected shape:
 - Decide whether a combined budget is needed beyond the per-listener limits in
   `crates/flextunnel-core/src/proxy/client.rs`.
 - Apply it before spawning per-connection handlers for both SOCKS5 and HTTP.
-- Preserve current behavior under normal load: both listeners stay bound across
-  reconnects, off-list targets can still direct-connect, and on-list targets
-  still wait for recovery or return a clean proxy error while the tunnel is down.
+- Preserve current behavior under normal load: both listeners stay bound
+  whatever the destinations are doing, unrouted targets can still
+  direct-connect, and routed targets still wait while their destination
+  connects or return a clean proxy error if it cannot.
 - Decide what local clients see when the cap is full: backpressure in `accept`,
   immediate proxy failure, or a bounded wait.
 

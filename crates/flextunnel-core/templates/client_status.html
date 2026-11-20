@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>flextunnel client status</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.5;
+    margin: 0;
+    padding: 2rem 1rem;
+    background: #f6f7f9;
+    color: #1b1f24;
+  }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 0.25rem; }
+  .sub { color: #6a737d; margin: 0 0 1.5rem; font-size: 0.9rem; }
+  section {
+    background: #fff;
+    border: 1px solid #e1e4e8;
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 1rem;
+  }
+  h2 { font-size: 1rem; margin: 0 0 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; color: #444d56; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; word-break: break-all; }
+  ul { margin: 0; padding-left: 1.25rem; }
+  li { margin: 0.15rem 0; }
+  a { color: #0969da; }
+  .empty { color: #6a737d; font-style: italic; }
+  .muted { color: #6a737d; font-size: 0.85em; font-weight: 400; }
+  .connected { color: #1a7f37; font-weight: 600; }
+  .connecting, .backoff { color: #9a6700; font-weight: 600; }
+  .failed { color: #cf222e; font-weight: 600; }
+  .idle { color: #6a737d; font-weight: 600; }
+  .error { color: #cf222e; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 0.2rem 0.5rem 0.2rem 0; vertical-align: top; }
+  td:first-child { white-space: nowrap; color: #444d56; }
+  .dest-name { font-weight: 600; margin-bottom: 0.35rem; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #0d1117; color: #c9d1d9; }
+    section { background: #161b22; border-color: #30363d; }
+    .sub, h2, td:first-child, .idle, .muted, .empty { color: #8b949e; }
+    a { color: #58a6ff; }
+    .connected { color: #3fb950; }
+    .connecting, .backoff { color: #d29922; }
+    .failed, .error { color: #f85149; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>flextunnel client status</h1>
+  <p class="sub">flextunnel {{ version }}</p>
+
+  <section>
+    <h2>This client</h2>
+    <table>
+      <tr><td>SOCKS5 proxy</td><td class="mono">{{ socks_listen }}</td></tr>
+      <tr><td>HTTP proxy</td><td class="mono">{{ http_listen }}</td></tr>
+      <tr><td>Idle timeout</td><td>{{ idle_timeout }}</td></tr>
+    </table>
+  </section>
+
+  {% if rows.is_empty() %}
+  <section>
+    <h2>Destinations</h2>
+    <p class="empty">none</p>
+  </section>
+  {% endif %}
+  {% for row in rows %}
+  <section>
+    <div class="dest-name mono">{{ row.status.host }}
+      <span class="{{ row.state }}">{{ row.state }}</span>
+      {% if !row.detail.is_empty() %}<span class="muted">{{ row.detail }}</span>{% endif %}
+    </div>
+    <table>
+      <tr><td>Server node id</td><td class="mono">{{ row.status.server_node_id }}</td></tr>
+      <tr><td>Reaches</td><td><span class="mono">{{ row.status.host }}:&lt;port&gt;</span> <span class="muted">the server's own loopback</span></td></tr>
+      <tr><td>Open streams</td><td>{{ row.status.open_streams }}{% if row.status.waiting > 0 %} <span class="muted">({{ row.status.waiting }} waiting)</span>{% endif %}</td></tr>
+      {% if let Some(id) = row.status.client_node_id %}
+      <tr><td>Client node id</td><td class="mono">{{ id }}</td></tr>
+      {% endif %}
+      {% if let Some(error) = row.status.last_error %}
+      <tr><td>Last error</td><td class="error">{{ error }}</td></tr>
+      {% endif %}
+      {% if !row.status.routed_domains.is_empty() %}
+      <tr><td>Routed domains</td><td><ul>{% for d in row.status.routed_domains %}<li class="mono">{{ d }}</li>{% endfor %}</ul></td></tr>
+      {% endif %}
+      {% if !row.status.routed_cidrs.is_empty() %}
+      <tr><td>Routed CIDRs</td><td><ul>{% for c in row.status.routed_cidrs %}<li class="mono">{{ c }}</li>{% endfor %}</ul></td></tr>
+      {% endif %}
+      {% if !row.status.relay_urls.is_empty() %}
+      <tr><td>Relays</td><td><ul>{% for r in row.status.relay_urls %}<li class="mono">{{ r }}</li>{% endfor %}</ul></td></tr>
+      {% endif %}
+      <tr><td>Server status</td><td><a href="{{ row.server_status_path }}">server status page</a> <span class="muted">connects to the server</span></td></tr>
+    </table>
+  </section>
+  {% endfor %}
+</main>
+</body>
+</html>

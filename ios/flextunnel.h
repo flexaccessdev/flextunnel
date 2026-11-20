@@ -6,7 +6,12 @@
  *
  * Unlike a VPN, there is no Network Extension and no utun fd. Browser sessions
  * may run a SOCKS5 listener for WKWebView; forwarding-only sessions omit it and
- * use server-direct local forward listeners owned by the Rust core.
+ * use local forward listeners owned by the Rust core.
+ *
+ * One client reaches any number of servers — its "destinations", each a host
+ * name for one server — and connects to a server only when something is first
+ * sent to it, closing the connection again once it has gone unused. Starting a
+ * session therefore connects nothing.
  *
  * Lifecycle:
  *
@@ -17,7 +22,8 @@
  *        On error `buf` holds the error message. At most ONE instance may run
  *        at a time; a second start while one is live returns NULL.
  *   3. flextunnel_health(handle) -> 1 running / 0 ended / -1 null  (poll)
- *   -  flextunnel_conn_path(handle, buf, len)             (on-demand path readout)
+ *   -  flextunnel_status(handle, buf, len)                (per-destination state; poll)
+ *   -  flextunnel_conn_path(handle, host, buf, len)       (on-demand path readout)
  *   -  flextunnel_set_background(handle, 1|0)             (scene-phase changes)
  *   -  flextunnel_set_network_available(handle, 1|0)      (NWPathMonitor updates)
  *   -  flextunnel_close_listeners(handle)                 (just before suspension)
@@ -43,8 +49,9 @@ extern "C" {
 typedef struct FlextunnelHandle FlextunnelHandle;
 
 /*
- * Initialize logging (stderr -> unified log / Console). Honors RUST_LOG,
- * defaults to "info". Idempotent; safe to call more than once.
+ * Initialize logging (stderr -> unified log / Console). Honors RUST_LOG;
+ * otherwise flextunnel's own crates log at "info" and their dependencies at
+ * "warn". Idempotent; safe to call more than once.
  */
 void flextunnel_init_logging(void);
 
@@ -69,24 +76,39 @@ int flextunnel_generate_client_key(char *out_buf, size_t out_len);
 int flextunnel_client_public_key(const char *secret_key, char *out_buf, size_t out_len);
 
 /*
- * Start the in-process tunnel: create the iroh endpoint, optionally bind a
- * loopback SOCKS5 listener, and spawn the connect/auth/serve loop.
+ * Start the in-process client: validate the config, optionally bind a
+ * loopback SOCKS5 listener, and start serving. No server is contacted — a
+ * destination connects on first use (see flextunnel_status).
  *
  * config_json : NUL-terminated UTF-8 JSON, e.g.
- *   {"server_node_id":"<id>","auth_key":"ed25519-sec:...",
- *    "socks_port":0,"relay_urls":[],"relay_auth_token":null}
+ *   {"auth_key":"ed25519-sec:...","socks_port":0,
+ *    "relay_urls":[],"relay_auth_token":null,"idle_timeout_secs":300,
+ *    "destinations":[
+ *      {"host":"machine1.internal","server_node_id":"<id>",
+ *       "routed_domains":["*.corp.example"],"routed_cidrs":["10.0.0.0/8"]}]}
  *   auth_key is this client's secret key (from flextunnel_generate_client_key
- *   or `flexaccess-keys generate-auth-key`); its public half must be on the
+ *   or `flexaccess-keys generate-auth-key`); its public half must be on each
  *   server's authorized_keys_file.
  *   socks_port is optional; null/omitted disables SOCKS5, 0 requests an
  *   OS-assigned port (read the bound port from the result JSON), and a nonzero
  *   port is required (an in-use port fails the start).
- *   relay_auth_token is
- *   optional: a shared bearer token sent to every custom relay's WebSocket
- *   upgrade; it is only valid with custom relay_urls (rejected with the default
- *   iroh relays). The routed set
- *   is configured on the server and pushed to the client during the
- *   handshake, so the app sends no routed set of its own.
+ *   relay_auth_token is optional: a shared bearer token sent to every custom
+ *   relay's WebSocket upgrade; it is only valid with custom relay_urls
+ *   (rejected with the default iroh relays). Custom relays need at least two
+ *   URLs.
+ *   idle_timeout_secs is optional: how long a destination's connection is kept
+ *   with no stream open on it. Omitted means 300; 0 means never close one for
+ *   idleness.
+ *   destinations is required, with at least one entry. host names the server:
+ *   "<host>:<port>" through the client is that port on the server's own
+ *   loopback. Any host name except an IP address, "localhost", or one under
+ *   "flextunnel.internal"; hosts and server ids must each be unique.
+ *   routed_domains (exact name, "*.suffix", or "*") and routed_cidrs (network
+ *   or bare IP) are optional further targets sent through that server, which
+ *   must route them too — its own routed set is the allowlist. The same rule
+ *   on two destinations is an error; otherwise the most specific rule wins.
+ *   Routing is entirely this config's: nothing is learned from a server, and
+ *   a target on no destination's list connects directly from the device.
  * out_buf/out_len : caller buffer. On success receives {"socks_port":N|null};
  *   on failure receives an error message. Always NUL-terminated. If out_buf is
  *   too small for the success JSON, this is treated as a failure (returns NULL,
@@ -98,15 +120,18 @@ int flextunnel_client_public_key(const char *secret_key, char *out_buf, size_t o
 FlextunnelHandle *flextunnel_start(const char *config_json, char *out_buf, size_t out_len);
 
 /*
- * Replace the complete server-direct local-forward set. forwards_json must be a
- * valid NUL-terminated JSON string holding an array of objects:
+ * Replace the complete local-forward set. forwards_json must be a valid
+ * NUL-terminated JSON string holding an array of objects:
  *   [{"id":"uuid","local_port":8080,"remote_host":"db.internal",
  *     "remote_port":5432,"enabled":true}]
  *
  * Enabled listeners bind loopback only (127.0.0.1 and ::1). Each accepted TCP
- * connection opens a QUIC data stream directly to the authenticated server;
- * no SOCKS5 proxy is involved. The server enforces its routed-set whitelist and
- * rejects off-list targets.
+ * connection opens a QUIC data stream through the destination that routes
+ * remote_host — connecting that destination first if it is idle; no SOCKS5
+ * proxy is involved. remote_host is routed like a proxy request (a
+ * destination's own host is that server's loopback), and the server enforces
+ * its routed-set whitelist. A forward never connects directly: an enabled
+ * forward whose remote_host no destination routes is invalid input.
  *
  * Returns 1 on success, 0 for invalid input, and -1 for a NULL handle.
  * out_buf receives an error message on failure.
@@ -115,7 +140,7 @@ int flextunnel_set_forwards(const FlextunnelHandle *handle, const char *forwards
                            char *out_buf, size_t out_len);
 
 /*
- * Snapshot direct-forward states:
+ * Snapshot forward states:
  *   {"forwards":[{"id":"uuid","state":"listening","error":null,
  *     "active":1,"last_conn_error":null}]}
  * Returns the byte count the JSON needs including the trailing NUL, or -1 for
@@ -127,8 +152,8 @@ ptrdiff_t flextunnel_forward_statuses(const FlextunnelHandle *handle,
                                       char *out_buf, size_t out_len);
 
 /*
- * Close every local listener — the SOCKS5 front-end and all server-direct
- * forward listeners — while keeping the session handle alive. One-way: call it
+ * Close every local listener — the SOCKS5 front-end and all forward
+ * listeners — while keeping the session handle alive. One-way: call it
  * when suspension is imminent, so local clients get an immediate
  * connection-refused instead of hanging on the frozen process's backlog. There
  * is no reopen — relaunch the session (flextunnel_stop + flextunnel_start, then
@@ -144,11 +169,11 @@ int flextunnel_close_listeners(const FlextunnelHandle *handle);
 /*
  * Report the app's scene state: 1 when backgrounded, 0 when foregrounded.
  * Backgrounded, the core's app-level heartbeat — the connection's only periodic
- * traffic — slows from 10s to 60s so an idle session wakes the cellular radio
- * once a minute instead of six times; the foreground flip snaps it back and
- * sends any overdue beat immediately, and ends any reconnect backoff in
- * progress (up to 60s once a long outage has pushed it to the cap) so the
- * next attempt runs at once with a fresh backoff series. Idempotent.
+ * traffic — slows from 10s to 60s so a connected session wakes the cellular
+ * radio once a minute instead of six times; the foreground flip snaps it back
+ * and sends any overdue beat immediately, and ends any destination's retry
+ * backoff in progress (up to 60s once a long outage has pushed it to the cap)
+ * so the next attempt runs at once with a fresh backoff series. Idempotent.
  *
  * Returns 1 on success and -1 for a NULL handle.
  */
@@ -156,69 +181,85 @@ int flextunnel_set_background(const FlextunnelHandle *handle, int background);
 
 /*
  * Report whether the device has a usable network path (from NWPathMonitor):
- * 1 available, 0 unavailable. While unavailable the core's reconnect loop parks
- * with no timers instead of burning backoff retries into a dead network; the
- * flip back to available reconnects immediately with a fresh backoff series.
- * Defaults to available if never called.
+ * 1 available, 0 unavailable. While unavailable no destination dials, instead
+ * of burning retries into a dead network; the flip back to available gives
+ * every destination with requests waiting an immediate attempt with a fresh
+ * backoff series. Defaults to available if never called.
  *
  * Returns 1 on success and -1 for a NULL handle.
  */
 int flextunnel_set_network_available(const FlextunnelHandle *handle, int available);
 
 /*
- * Liveness probe. Returns 1 while the connect/serve loop is running, 0 once it
- * has ended (gave up on a permanent error: a bad node id, a rejected key; an
- * unreachable server keeps retrying with backoff, on the first attempt or
- * after a drop), and -1 for a NULL handle.
+ * Liveness probe. Returns 1 while the client is serving, 0 once it has ended,
+ * and -1 for a NULL handle. The client ends only when a local listener is lost
+ * for good. No destination's trouble ends it — an unreachable server, a
+ * dropped connection or a rejected key is that destination's state (see
+ * flextunnel_status), and the client keeps serving the rest.
  */
 int flextunnel_health(const FlextunnelHandle *handle);
 
 /*
- * Snapshot the tunnel's current forwarding set as JSON into out_buf:
- *   {"connected":true,"domains":["*.example.com"],"cidrs":["10.0.0.0/8"],
- *    "host_aliases":[["nas.internal","192.168.1.9"]],
- *    "dns_forwards":[{"suffix":"corp.example.com","servers":["10.1.0.10:5353"]}],
- *    "bridges":[{"name":"lab","endpoint_id":"…","domains":["*.svc"],"cidrs":["fd34::/64"]}]}
- * This is the split-tunnel set the server pushes during the handshake — the
- * domains/CIDRs routed through the tunnel. The local SOCKS proxy owns the split:
- * matching targets use the tunnel, while off-list targets connect directly from
- * the client device. The server independently rejects any off-list request that
- * reaches it. The caller may use the lists for OS routing or display, but does
- * not need to enforce the split itself. Before the first successful handshake,
- * connected is false and the lists are empty. The set becomes available shortly
- * after start once the handshake completes, so poll it. host_aliases ([alias,
- * target] pairs) is informational, for display only — the server resolves the
- * aliases itself. dns_forwards is the
- * server's conditional DNS-forwarding table, also informational: each entry is
- * {"suffix","servers"} — names under suffix resolve via servers instead of the
- * server's system resolver. Empty when none are configured. bridges is the
- * server's outbound bridge-route table (targets it forwards to another
- * flextunnel server), also informational: each entry is
- * {"name","endpoint_id","domains","cidrs"}; the bridged rules are already part
- * of the routed set. Empty when none are configured.
+ * Snapshot the client's destinations as JSON into out_buf:
+ *   {"idle_timeout_secs":300,
+ *    "destinations":[
+ *     {"host":"machine1.internal","server_node_id":"…",
+ *      "state":"connected","connected_secs":42,
+ *      "open_streams":1,"waiting":0,"client_node_id":"…",
+ *      "failed_attempts":0,"next_attempt_secs":null,"last_error":null,
+ *      "routed_domains":["*.corp.example"],"routed_cidrs":["10.0.0.0/8"],
+ *      "relay_urls":[]}]}
+ * One entry per configured destination, in config order. state is one of:
+ *   "idle"        not connected and nothing is asking for it — the resting
+ *                 state. A destination connects when something is first sent
+ *                 to it and returns to idle after idle_timeout_secs without an
+ *                 open stream (null: never).
+ *   "connecting"  building its endpoint, connecting or authenticating.
+ *   "connected"   connected_secs is the connection's age.
+ *   "backoff"     the last attempt failed and requests are still waiting;
+ *                 next_attempt_secs is when it retries.
+ *   "failed"      the server refused this client (e.g. an unauthorized key);
+ *                 requests fail at once until next_attempt_secs.
+ * open_streams / waiting count the streams open on the connection and the
+ * requests held while it connects. client_node_id is this client's endpoint id
+ * toward that server, null while idle. failed_attempts and last_error describe
+ * the current outage and are cleared by a successful connection; an idle
+ * destination with failed_attempts > 0 retries on its next use, not before.
+ *
+ * routed_domains / routed_cidrs echo the destination's configured routes, for
+ * display. The local SOCKS proxy owns the split: a target a destination routes
+ * uses that destination's tunnel, everything else connects directly from the
+ * device, so the caller has nothing to enforce. A server's own view (its
+ * routed set, host aliases, DNS forwards, bridges) is its status page,
+ * reachable through the SOCKS proxy at
+ *   http://flextunnel.internal/servers/<host>/status.json
+ * and the client's own at http://flextunnel.internal/status.json.
+ *
+ * Reading this never causes a connection.
  *
  * Returns 1 on success (full JSON written), 0 if out_buf was too small (the JSON
- * is truncated; retry larger), and -1 for a NULL handle or if the route snapshot
- * could not be read. out_buf is always NUL-terminated when usable (non-NULL,
- * out_len > 0): the error returns write an empty string.
+ * is truncated; retry larger), and -1 for a NULL handle. out_buf is always
+ * NUL-terminated when usable (non-NULL, out_len > 0): the NULL-handle return
+ * writes an empty string.
  */
-int flextunnel_routes(const FlextunnelHandle *handle, char *out_buf, size_t out_len);
+int flextunnel_status(const FlextunnelHandle *handle, char *out_buf, size_t out_len);
 
 /*
- * Snapshot the live connection's iroh path(s) as JSON into out_buf, mirroring
- * `ezvpn client status`:
+ * Snapshot the iroh path(s) of the connection to the destination named `host`
+ * as JSON into out_buf, mirroring `ezvpn client status`:
  *   {"paths":[
  *     {"kind":"direct","display":"Direct 1.2.3.4:52186 (rtt 1ms)","selected":true},
  *     {"kind":"relay","display":"Relay https://relay.example/ (rtt 42ms)","selected":false}],
  *    "custom_relays":[
  *     {"url":"https://relay.example/","working":true,"error":null}],
  *    "udp_tx_datagrams":1234,"udp_rx_datagrams":1201}
- * A point-in-time snapshot of how the client currently reaches the server,
+ * A point-in-time snapshot of how the client currently reaches that server,
  * showing ALL discovered paths (not just the selected one). kind is "direct",
  * "relay", or "other" (forward-compatible catch-all); selected marks the path
- * iroh routes over right now. The paths array is EMPTY while disconnected (during
- * a drop/backoff or before the first connect), so only offer this once the tunnel
- * link is up.
+ * iroh routes over right now. The whole snapshot is EMPTY while the destination
+ * is not connected (idle, connecting, backing off) or when `host` names no
+ * destination, so only offer this for a destination flextunnel_status reports
+ * "connected". Asking never connects it.
  *
  * custom_relays reports each configured custom relay's health from an on-demand
  * GET of its /healthz endpoint (checked in parallel, only when this snapshot is
@@ -228,20 +269,22 @@ int flextunnel_routes(const FlextunnelHandle *handle, char *out_buf, size_t out_
  * it confirms the relay is up, not that a relay_auth_token is accepted.
  *
  * udp_tx_datagrams/udp_rx_datagrams count the UDP datagrams the live connection
- * has sent/received since it was established (0 while disconnected). On cellular
+ * has sent/received since it was established (0 while not connected). On cellular
  * energy is per-wakeup rather than per-byte, so sampling the tx count over an
  * interval is the cheap proxy for the tunnel's radio cost.
  *
  * Returns 1 on success (full JSON written), 0 if out_buf was too small (the JSON
- * is truncated; retry larger), and -1 for a NULL handle. out_buf is always
- * NUL-terminated when usable (non-NULL, out_len > 0); the NULL-handle return
- * writes an empty string.
+ * is truncated; retry larger), and -1 for a NULL handle or an unusable `host`
+ * (NULL or not UTF-8). out_buf is always NUL-terminated when usable (non-NULL,
+ * out_len > 0); the -1 returns write an empty string.
  */
-int flextunnel_conn_path(const FlextunnelHandle *handle, char *out_buf, size_t out_len);
+int flextunnel_conn_path(const FlextunnelHandle *handle, const char *host,
+                         char *out_buf, size_t out_len);
 
 /*
- * Stop the proxy and free the handle. After this call the handle is invalid.
- * Passing NULL is a safe no-op.
+ * Stop the client, close the endpoints of the destinations in use, and free
+ * the handle. After this call the handle is invalid. Passing NULL is a safe
+ * no-op.
  */
 void flextunnel_stop(FlextunnelHandle *handle);
 

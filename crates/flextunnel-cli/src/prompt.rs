@@ -6,31 +6,42 @@
 use anyhow::{Context, Result};
 use std::io::{self, Write};
 
-use flextunnel_core::config::ClientConfig;
 use flextunnel_core::iroh::EndpointId;
 
-/// Prompt (on the terminal) for any client values still missing from `cli`,
-/// mutating it in place. Never writes a config file — the collected values live
-/// only for this session. No auth keypair is involved: the quick client's
+/// What `client start --quick` needs to know that the command line may not
+/// have said.
+pub struct QuickClient {
+    /// The quick server to connect to.
+    pub server_id: EndpointId,
+    pub socks_port: Option<u16>,
+    pub http_port: Option<u16>,
+}
+
+/// Prompt (on the terminal) for the quick client's connection details: always
+/// the server's EndpointId, and each proxy port not already given on the
+/// command line. Never writes a config file — the collected values live only
+/// for this session. No auth keypair is involved: the quick client's
 /// credential is its endpoint id, entered on the quick server.
-pub fn fill_client_config(cli: &mut ClientConfig) -> Result<()> {
+pub fn quick_client(socks_port: Option<u16>, http_port: Option<u16>) -> Result<QuickClient> {
     // EndpointId of the server to connect to (printed by `server start --quick`).
-    if cli.server_node_id.is_none() {
-        cli.server_node_id = Some(
-            prompt_endpoint_id("Server EndpointId (shown by `flextunnel server start --quick`)")?
-                .to_string(),
-        );
-    }
+    let server_id =
+        prompt_endpoint_id("Server EndpointId (shown by `flextunnel server start --quick`)")?;
 
     // Optional loopback proxy listeners; blank leaves them disabled.
-    if cli.socks_port.is_none() {
-        cli.socks_port = prompt_optional_port("SOCKS5 port (blank = disabled)")?;
-    }
-    if cli.http_port.is_none() {
-        cli.http_port = prompt_optional_port("HTTP proxy port (blank = disabled)")?;
-    }
+    let socks_port = match socks_port {
+        Some(port) => Some(port),
+        None => prompt_optional_port("SOCKS5 port (blank = disabled)")?,
+    };
+    let http_port = match http_port {
+        Some(port) => Some(port),
+        None => prompt_optional_port("HTTP proxy port (blank = disabled)")?,
+    };
 
-    Ok(())
+    Ok(QuickClient {
+        server_id,
+        socks_port,
+        http_port,
+    })
 }
 
 /// Prompt for an `EndpointId` under `label`, re-asking until it parses. Shared
