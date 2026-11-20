@@ -80,8 +80,8 @@ Normal client connections authenticate with an ed25519 keypair:
   replayed from another endpoint.
 
 (The keyless exception is a `--quick` session, whose credential is the
-client's TLS-authenticated **EndpointId**, checked natively against an
-allowlist at the handshake — the `authorized_keys` model.)
+client's TLS-authenticated **EndpointId**: it is entered at the quick server's
+prompt and checked natively at the handshake.)
 
 The QUIC ALPN is a fixed protocol identifier (`flextunnel/1`), not a secret: it
 ensures both peers speak the flextunnel protocol but provides no access control

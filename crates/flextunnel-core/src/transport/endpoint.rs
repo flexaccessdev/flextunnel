@@ -91,9 +91,11 @@ fn base_builder(relay_config: &RelayConfig, publish_address: bool) -> Result<End
 }
 
 /// What makes an endpoint a flextunnel server's, whatever base it is built
-/// on: its persistent identity, both server ALPNs and the allowlist hook over
-/// `quick_clients`. Applied here and nowhere else, so the hermetic tests'
-/// loopback servers get exactly what a real one does.
+/// on: its persistent identity, the client [`ALPN`] and the quick-client
+/// [`QUICK_ALPN`], and an [`AllowlistHook`] over `quick_clients` gating the
+/// latter natively (an empty set = quick mode disabled). Applied here and
+/// nowhere else, so the hermetic tests' loopback servers get exactly what a
+/// real one does.
 pub(crate) fn server_setup(
     base: EndpointBuilder,
     secret: SecretKey,
@@ -104,20 +106,9 @@ pub(crate) fn server_setup(
         .secret_key(secret)
 }
 
-/// A server endpoint builder: the shared base (the identity is published on
-/// the default relays) made a server's by [`server_setup`].
-fn server_builder(
-    relay_config: &RelayConfig,
-    secret: SecretKey,
-    quick_clients: HashSet<EndpointId>,
-) -> Result<EndpointBuilder> {
-    Ok(server_setup(base_builder(relay_config, true)?, secret, quick_clients))
-}
-
-/// Create a server endpoint with a persistent identity, accepting the client
-/// [`ALPN`] and the quick-client [`QUICK_ALPN`]. Inbound quick-client
-/// connections are gated natively by an [`AllowlistHook`] over
-/// `quick_clients` (an empty set = quick mode disabled).
+/// Create a server endpoint on the shared base (its identity published on the
+/// default relays); `setup` makes that base the server's own — see
+/// [`server_setup`].
 ///
 /// A single endpoint serves both relay modes. With the default relays internet
 /// discovery is on, so the server publishes its current home relay and clients
@@ -129,10 +120,9 @@ fn server_builder(
 /// the CLI's serve loop) to restore once they are connectable.
 pub async fn create_server_endpoint(
     relay_config: &RelayConfig,
-    secret: SecretKey,
-    quick_clients: HashSet<EndpointId>,
+    setup: impl FnOnce(EndpointBuilder) -> EndpointBuilder,
 ) -> Result<CreatedEndpoint> {
-    create_endpoint(relay_config, server_builder(relay_config, secret, quick_clients)?).await
+    create_endpoint(relay_config, setup(base_builder(relay_config, true)?)).await
 }
 
 /// A client endpoint builder. A client never publishes its address (it only

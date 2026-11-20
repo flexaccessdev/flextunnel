@@ -18,8 +18,9 @@ use crate::flexaccess_iroh::relay_failover::fail_over_home_relay;
 use crate::lock::InstanceLock;
 use crate::proxy::{DnsForwarder, ProxyServer, ProxyServerParams, RoutedSet};
 use crate::secret::secret_to_endpoint_id;
-use crate::transport::endpoint::{RelayConfig, create_server_endpoint};
+use crate::transport::endpoint::{RelayConfig, create_server_endpoint, server_setup};
 use anyhow::{Context, Result};
+use iroh::endpoint::Builder as EndpointBuilder;
 use iroh::{Endpoint, EndpointId, RelayUrl, SecretKey};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -225,11 +226,18 @@ impl PreparedServer {
         self.own_id
     }
 
+    /// This server's endpoint, built on `base`: its identity, the ALPNs and
+    /// the quick-client allowlist. The only place the prepared identity and
+    /// allowlist reach an endpoint, whichever way it is bound.
+    fn endpoint_on(&self, base: EndpointBuilder) -> EndpointBuilder {
+        server_setup(base, self.secret_key.clone(), self.quick_clients.clone())
+    }
+
     /// Bind the iroh endpoint (with the relays that pass the startup probe).
     /// Can take several seconds (the relay online-wait).
     pub async fn bind(self) -> Result<RunningServer> {
         let CreatedEndpoint { endpoint, relays_left_out } =
-            create_server_endpoint(&self.relay_config, self.secret_key, self.quick_clients)
+            create_server_endpoint(&self.relay_config, |base| self.endpoint_on(base))
                 .await
                 .context("Failed to create iroh endpoint")?;
         log::info!("flextunnel server Node ID: {}", endpoint.id());
@@ -242,19 +250,15 @@ impl PreparedServer {
     }
 
     /// [`bind`](Self::bind) on a caller-built base instead of the relay
-    /// setup, which needs a network (hermetic loopback tests). The identity,
-    /// the ALPNs and the quick-client allowlist are applied as `bind` applies
-    /// them.
+    /// setup, which needs a network (hermetic loopback tests). Like `bind`,
+    /// the endpoint is [`endpoint_on`](Self::endpoint_on) that base.
     #[cfg(test)]
-    pub(crate) async fn bind_with(self, base: iroh::endpoint::Builder) -> RunningServer {
-        let endpoint = crate::transport::endpoint::server_setup(
-            base,
-            self.secret_key,
-            self.quick_clients,
-        )
-        .bind()
-        .await
-        .expect("bind the test endpoint");
+    pub(crate) async fn bind_with(self, base: EndpointBuilder) -> RunningServer {
+        let endpoint = self
+            .endpoint_on(base)
+            .bind()
+            .await
+            .expect("bind the test endpoint");
         RunningServer {
             endpoint,
             server: self.server,
