@@ -435,7 +435,7 @@ Client auth keypairs are generated with the standalone
 | `--default-config` | Load `~/.config/flextunnel/server.toml`. |
 | `--secret-file <FILE>` | Server identity key. |
 | `--authorized-keys-file <FILE>` | File of authorized client public keys, one `ed25519-pub:…` per line (optional trailing comment, ssh `authorized_keys` style). |
-| `--relay-url <URL>` | Custom relay URLs (repeatable; at least two distinct URLs). See the [shared relay guide](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/relays-and-address-lookup.md) for discovery and dialing requirements. |
+| `--relay-url <URL>` | Custom relay URLs (repeatable; at least two distinct URLs). See the [shared relay guide](https://github.com/flexaccessdev/flexaccess-iroh/blob/main/docs/relays-and-address-lookup.md) for discovery and dialing requirements. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
 | `--quick` | Ephemeral one-off server: prompt for the client's EndpointId (shown by `client start --quick`) and natively allowlist it as the only allowed client — no auth keypair — then mint an in-memory identity, full-tunnel all traffic, print this server's EndpointId, and exit if the client doesn't connect within 5 minutes. Needs an interactive terminal. Takes no single-instance lock; nothing is persisted. Conflicts with `-c`/`--secret-file`/`--authorized-keys-file`. |
 
@@ -729,7 +729,7 @@ Auto-reconnect is **enabled by default** (`auto_reconnect = true`); pass
   and only then fail with a network-unreachable reply.
 
 Server home-relay failover is provided by `flexaccess-iroh`; see the
-[shared failover design](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/relay-failover.md).
+[shared failover design](https://github.com/flexaccessdev/flexaccess-iroh/blob/main/docs/relay-failover.md).
 
 ## Logging
 
@@ -738,13 +738,13 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
 
 ## Documentation
 
-- [iroh-common-architecture](https://github.com/flexaccessdev/iroh-common-architecture) —
+- [flexaccess-iroh docs](https://github.com/flexaccessdev/flexaccess-iroh/tree/main/docs) —
   the iroh transport layer shared with [tunnel-rs](https://github.com/andrewtheguy/tunnel-rs)
   and [ezvpn](https://github.com/flexaccessdev/ezvpn):
-  [relays and address lookup](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/relays-and-address-lookup.md)
+  [relays and address lookup](https://github.com/flexaccessdev/flexaccess-iroh/blob/main/docs/relays-and-address-lookup.md)
   (default vs custom relays, relay hints, the per-relay startup probe, relay auth
   tokens) and
-  [self-hosting](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/self-hosting.md)
+  [self-hosting](https://github.com/flexaccessdev/flexaccess-iroh/blob/main/docs/self-hosting.md)
   (running your own iroh relay).
 - [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys) — the
   app-independent Ed25519 key format and tooling shared with tunnel-rs: the

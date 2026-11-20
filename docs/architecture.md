@@ -260,8 +260,8 @@ and desktop use this same server lifecycle.
 
 Relay configuration, startup probes, discovery, authentication tokens and
 in-place home-relay failover belong to the shared crate. See
-[iroh-common-architecture](https://github.com/flexaccessdev/iroh-common-architecture),
-including its [relay-failover design](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/relay-failover.md).
+[flexaccess-iroh docs](https://github.com/flexaccessdev/flexaccess-iroh/tree/main/docs),
+including its [relay-failover design](https://github.com/flexaccessdev/flexaccess-iroh/blob/main/docs/relay-failover.md).
 The client's endpoint rebuild described above is implemented in flextunnel.
 
 Callers close endpoints with `endpoint.close().await` after serving stops,
