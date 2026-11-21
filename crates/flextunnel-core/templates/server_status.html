@@ -91,19 +91,6 @@
   </section>
 
   <section>
-    <h2>DNS forwards</h2>
-    {% if dns_forwards.is_empty() %}
-      <p class="empty">none configured</p>
-    {% else %}
-      <table>
-      {% for (suffix, servers) in dns_forwards %}
-        <tr><td class="mono">{{ suffix }} <span class="muted">(+ subdomains)</span></td><td class="mono">&rarr; {{ servers|join(", ") }}</td></tr>
-      {% endfor %}
-      </table>
-    {% endif %}
-  </section>
-
-  <section>
     <h2>Duplicate-id blocklist</h2>
     <table class="counts">
       <tr><td>File</td><td class="mono">{{ blocklist_path }}</td></tr>

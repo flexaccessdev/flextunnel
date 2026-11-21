@@ -53,13 +53,6 @@ pub struct ServerConfig {
     /// A default route (`0.0.0.0/0` / `::/0`) matches every IP. See
     /// `routed_domains`.
     pub routed_cidrs: Option<Vec<String>>,
-    /// Conditional DNS forwarding (split-DNS), server-side. Each key is a bare
-    /// domain suffix and each value a list of DNS servers (`IP` or `IP:port`,
-    /// default port 53). A tunneled hostname that equals or is a subdomain of a
-    /// key is resolved via that key's upstream server(s) instead of the server's
-    /// system resolver; everything else uses the system resolver. Keys are
-    /// matched most-specific-first. See [`crate::proxy::DnsForwarder`].
-    pub dns_forwards: Option<HashMap<String, Vec<String>>>,
 }
 
 /// One `[[forwards]]` entry in the client config: a port forward
@@ -185,9 +178,6 @@ pub struct ResolvedServer {
     /// Raw routed-set entries (parsed into a `RoutedSet` at startup).
     pub routed_domains: Vec<String>,
     pub routed_cidrs: Vec<String>,
-    /// Conditional DNS-forwarding rules, suffix keys lowercased for
-    /// case-insensitive matching (parsed into a `DnsForwarder` at startup).
-    pub dns_forwards: HashMap<String, Vec<String>>,
     /// Path to the duplicate-id blocklist file. Always the fixed default
     /// (`~/.config/flextunnel/blocklist.json`); it is deliberately **not**
     /// configurable, since relocating this security guard rail would let it be
@@ -419,12 +409,6 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
         cli.host_aliases.or(file.host_aliases).unwrap_or_default(),
         "host_aliases",
     )?;
-    // DNS-forward suffixes are matched case-insensitively too; lowercase the keys
-    // and reject case-only duplicates for the same reason.
-    let dns_forwards = collect_lowercased(
-        cli.dns_forwards.or(file.dns_forwards).unwrap_or_default(),
-        "dns_forwards",
-    )?;
     // Alias keys are either an exact host or a `*.suffix` wildcard (same syntax
     // as the routed set); reject malformed patterns loudly at startup.
     for key in host_aliases.keys() {
@@ -472,7 +456,6 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
             .or(file.routed_domains)
             .unwrap_or_default(),
         routed_cidrs: cli.routed_cidrs.or(file.routed_cidrs).unwrap_or_default(),
-        dns_forwards,
         blocklist_file,
     })
 }
@@ -906,38 +889,6 @@ mod tests {
     }
 
     #[test]
-    fn dns_forwards_parsed_and_lowercased() {
-        let toml = r#"
-            [dns_forwards]
-            "Local.168234.XYZ" = ["10.0.0.53"]
-            "corp.example.com" = ["10.1.0.10:5353", "10.1.0.11"]
-        "#;
-        let file: ServerConfig = toml::from_str(toml).unwrap();
-        let r = resolve_server(ServerConfig::default(), Some(file)).unwrap();
-        // Keys lowercased for case-insensitive matching; values kept verbatim.
-        assert_eq!(
-            r.dns_forwards.get("local.168234.xyz").map(Vec::as_slice),
-            Some(["10.0.0.53".to_string()].as_slice())
-        );
-        assert_eq!(r.dns_forwards.get("corp.example.com").map(Vec::len), Some(2));
-        assert!(!r.dns_forwards.contains_key("Local.168234.XYZ"));
-        // Defaults to empty (forwarding inactive) when unset.
-        assert!(resolve_server(ServerConfig::default(), None).unwrap().dns_forwards.is_empty());
-    }
-
-    #[test]
-    fn dns_forwards_case_only_duplicate_is_rejected() {
-        let toml = r#"
-            [dns_forwards]
-            "Corp.Example.com" = ["10.0.0.1"]
-            "corp.example.com" = ["10.0.0.2"]
-        "#;
-        let file: ServerConfig = toml::from_str(toml).unwrap();
-        let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
-        assert!(err.to_string().contains("dns_forwards"), "{err}");
-    }
-
-    #[test]
     fn client_defaults_applied() {
         let r = resolve_client(ClientConfig::default(), None);
         assert_eq!(r.socks_port, None);
@@ -991,12 +942,9 @@ mod tests {
 
             [host_aliases]
             "server.internal" = "127.0.0.1"
-
-            [dns_forwards]
-            "corp.example.com" = ["10.1.0.10:5353"]
         "#;
         let s: ServerConfig = toml::from_str(server).expect("maximal server config parses");
-        assert!(s.secret_file.is_some() && s.dns_forwards.is_some());
+        assert!(s.secret_file.is_some() && s.host_aliases.is_some());
 
         let client = r#"
             name = "work"

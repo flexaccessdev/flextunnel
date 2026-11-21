@@ -14,10 +14,6 @@ host_aliases:
 {% if tpl.host_aliases.is_empty() %}  none configured
 {% else %}{% for (name, target) in tpl.host_aliases %}  - {{ name }} -> {{ target }}
 {% endfor %}{% endif %}
-dns_forwards:
-{% if tpl.dns_forwards.is_empty() %}  none configured
-{% else %}{% for (suffix, servers) in tpl.dns_forwards %}  - {{ suffix }} (+ subdomains) -> {{ servers|join(", ") }}
-{% endfor %}{% endif %}
 duplicate_id_blocklist:
   file: {{ tpl.blocklist_path }}
   blocked_clients: {{ tpl.blocked_client_count }}

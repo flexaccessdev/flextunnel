@@ -4,7 +4,6 @@
 //! network) and the client's split-tunnel path (which dials non-routed
 //! targets directly from the device). Callers wrap these in their own timeouts.
 
-use crate::proxy::dns_forward::DnsForwarder;
 use crate::proxy::signaling::{self, Target};
 use iroh::endpoint::{RecvStream, SendStream};
 use std::io;
@@ -20,23 +19,20 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Connect to `target`: a loopback target tries both loopback families (see
 /// [`loopback_addrs`]), any other literal IP connects directly, and a domain is
-/// resolved (via `forwarder` when its name matches a configured suffix, else the
-/// caller's system DNS) and tried address-by-address (see [`connect_resolved`]).
-///
-/// `forwarder` is the server's conditional-DNS-forwarding table; the client's
-/// split-tunnel path passes `None`.
+/// resolved through the system DNS and tried address-by-address (see
+/// [`connect_resolved`]).
 ///
 /// An address in domain form (`127.0.0.1.`, `[fd00::1]`) is dialed as that
 /// address, the way the routing read it ([`Target::into_numeric`]), never
 /// looked up by name — on the client's direct path as on a server's.
-pub async fn dial_target(target: &Target, forwarder: Option<&DnsForwarder>) -> io::Result<TcpStream> {
+pub async fn dial_target(target: &Target) -> io::Result<TcpStream> {
     let target = &target.clone().into_numeric();
     if let Some(port) = loopback_port(target) {
         return connect_any(&loopback_addrs(port)).await;
     }
     match target {
         Target::Ip(sa) => TcpStream::connect(*sa).await,
-        Target::Domain(host, port) => connect_resolved(host, *port, forwarder).await,
+        Target::Domain(host, port) => connect_resolved(host, *port).await,
     }
 }
 
@@ -85,28 +81,13 @@ async fn connect_any(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
     }))
 }
 
-/// Resolve a host:port and connect to the first address that accepts. When a
-/// `forwarder` is given and `host` matches a configured suffix, resolution goes
-/// through that suffix's upstream DNS server; otherwise the local system DNS is
-/// used. When every resolved address is loopback, IPv4 is tried first (most
+/// Resolve a host:port through the system DNS and connect to the first address
+/// that accepts. When every resolved address is loopback, IPv4 is tried first (most
 /// local services bind `127.0.0.1`; this also dodges the macOS ::1-first stall).
 /// Returns the last connect error, or a host-unreachable error if resolution
 /// yielded no addresses.
-pub async fn connect_resolved(
-    host: &str,
-    port: u16,
-    forwarder: Option<&DnsForwarder>,
-) -> io::Result<TcpStream> {
-    // Forwarded resolution when a matching suffix is configured; otherwise (no
-    // forwarder, or the host matches no suffix) fall back to the system DNS.
-    let forwarded = match forwarder {
-        Some(f) => f.resolve(host, port).await,
-        None => None,
-    };
-    let mut addrs: Vec<SocketAddr> = match forwarded {
-        Some(res) => res?,
-        None => tokio::net::lookup_host((host, port)).await?.collect(),
-    };
+pub async fn connect_resolved(host: &str, port: u16) -> io::Result<TcpStream> {
+    let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
     if addrs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::HostUnreachable,
@@ -124,17 +105,14 @@ pub async fn connect_resolved(
 /// pipe bytes bidirectionally until either side closes.
 ///
 /// This is the server's exit-point body, run for a normal tunneled target
-/// (dialing from its own network, optionally with a `forwarder` for
-/// conditional DNS). Per-stream errors stay per-stream; the shared QUIC
+/// (dialing from its own network). Per-stream errors stay per-stream; the shared QUIC
 /// connection is never torn down here.
 pub async fn connect_and_pipe(
     mut send: SendStream,
     recv: RecvStream,
     target: &Target,
-    forwarder: Option<&DnsForwarder>,
 ) -> io::Result<()> {
-    let connected = match tokio::time::timeout(CONNECT_TIMEOUT, dial_target(target, forwarder)).await
-    {
+    let connected = match tokio::time::timeout(CONNECT_TIMEOUT, dial_target(target)).await {
         Ok(res) => res,
         Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")),
     };
@@ -221,7 +199,7 @@ mod tests {
             Target::Domain("127.0.0.2".into(), port),
             Target::Domain("127.0.0.2.".into(), port),
         ] {
-            let stream = dial_target(&target, None).await.unwrap_or_else(|e| panic!("{target:?}: {e}"));
+            let stream = dial_target(&target).await.unwrap_or_else(|e| panic!("{target:?}: {e}"));
             assert_eq!(stream.peer_addr().unwrap().ip(), Ipv4Addr::new(127, 0, 0, 2), "{target:?}");
             listener.accept().await.unwrap();
         }
@@ -252,7 +230,7 @@ mod tests {
             Target::Domain("[::1].".into(), port),
             Target::Domain("localhost".into(), port),
         ] {
-            dial_target(&target, None)
+            dial_target(&target)
                 .await
                 .unwrap_or_else(|e| panic!("dial {target:?} to ::1 service failed: {e}"));
         }

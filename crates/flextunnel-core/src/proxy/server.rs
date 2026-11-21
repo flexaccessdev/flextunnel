@@ -6,7 +6,7 @@ use crate::blocklist::{self, BlockList};
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::signaling::{self, ControlMsg, HelloResponse, StreamRequest, Target};
 use crate::proxy::status_page::{self, ServerStatusTemplate};
-use crate::proxy::{dial, reserved, DnsForwarder, RoutedSet};
+use crate::proxy::{dial, reserved, RoutedSet};
 use crate::transport::LIVENESS_WINDOW;
 use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointId};
@@ -104,11 +104,6 @@ pub struct ProxyServer {
     /// Raw routed-set rules, shown verbatim on the status page.
     routed_domains: Vec<String>,
     routed_cidrs: Vec<String>,
-    /// Conditional DNS forwarding (split-DNS): names under a configured suffix
-    /// are resolved via that suffix's upstream server instead of the system
-    /// resolver. `None` when no `[dns_forwards]` are configured. See
-    /// [`DnsForwarder`].
-    dns_forwarder: Option<DnsForwarder>,
     /// Live-connection registry for duplicate-client detection.
     registry: Arc<Mutex<Registry>>,
     /// Persistent duplicate-id blocklist (shared, synced to disk on mutation).
@@ -130,7 +125,6 @@ pub struct ProxyServerParams {
     pub routed_set: RoutedSet,
     pub routed_domains: Vec<String>,
     pub routed_cidrs: Vec<String>,
-    pub dns_forwarder: Option<DnsForwarder>,
     pub blocklist: BlockList,
     /// Fired once when the first client successfully connects. `server start
     /// --quick` uses it to cancel its "exit if idle" grace timer; `None` for a
@@ -148,7 +142,6 @@ impl ProxyServer {
             routed_set: params.routed_set,
             routed_domains: params.routed_domains,
             routed_cidrs: params.routed_cidrs,
-            dns_forwarder: params.dns_forwarder,
             registry: Arc::new(Mutex::new(Registry::new())),
             blocklist: Arc::new(Mutex::new(params.blocklist)),
             shutdown: Arc::new(Notify::new()),
@@ -166,16 +159,6 @@ impl ProxyServer {
             .collect();
         host_aliases.sort();
         host_aliases
-    }
-
-    /// The configured conditional DNS forwards as `(suffix, servers)` pairs,
-    /// sorted by suffix. Empty when no `[dns_forwards]` are configured. Shown on
-    /// the status page.
-    fn dns_forwards(&self) -> Vec<(String, Vec<String>)> {
-        self.dns_forwarder
-            .as_ref()
-            .map(DnsForwarder::forwards)
-            .unwrap_or_default()
     }
 
     /// The distinct authorized keys (`ed25519-pub:...`) of the clients
@@ -201,7 +184,6 @@ impl ProxyServer {
             routed_domains: self.routed_domains.clone(),
             routed_cidrs: self.routed_cidrs.clone(),
             host_aliases: self.sorted_host_aliases(),
-            dns_forwards: self.dns_forwards(),
             blocklist_path: bl.path().display().to_string(),
             blocked_client_count: bl.blocked_client_count(),
             conflicted_server_count: bl.conflicted_server_count(),
@@ -701,8 +683,7 @@ async fn handle_socks_stream(
         StreamRequest::Loopback(port) => {
             let target = Target::Domain("localhost".to_string(), port);
             log::debug!("Loopback request -> {target:?}");
-            return dial::connect_and_pipe(send, recv, &target, server.dns_forwarder.as_ref())
-                .await;
+            return dial::connect_and_pipe(send, recv, &target).await;
         }
         StreamRequest::Status => return serve_status(send, recv, server).await,
     };
@@ -731,7 +712,7 @@ async fn handle_socks_stream(
 
     let target = apply_alias(requested, &server.host_aliases);
     log::debug!("Stream target: {target:?}");
-    dial::connect_and_pipe(send, recv, &target, server.dns_forwarder.as_ref()).await
+    dial::connect_and_pipe(send, recv, &target).await
 }
 
 /// Answer a stream with "connection not allowed by ruleset".

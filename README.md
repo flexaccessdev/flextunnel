@@ -436,7 +436,7 @@ curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/servers/machine1
 ```
 
 That JSON includes `version`, `server_node_id`, `routed_domains`,
-`routed_cidrs`, `host_aliases`, `dns_forwards`, and duplicate-id blocklist
+`routed_cidrs`, `host_aliases`, and duplicate-id blocklist
 counts under `duplicate_id_blocklist`.
 
 Other `*.flextunnel.internal` names are reserved and answer with an HTTP 404.
@@ -690,8 +690,8 @@ Private keys are always file references in a config (`secret_file`,
 and override any of these (`--auth-key` exists only as a CLI flag).
 
 The client's `[[destinations]]` and `[[forwards]]` are config-file only, as are
-the server's `routed_domains`, `routed_cidrs`, `host_aliases` and
-`dns_forwards`: they describe routing policy.
+the server's `routed_domains`, `routed_cidrs` and `host_aliases`: they
+describe routing policy.
 
 ## Host aliases (server-side)
 

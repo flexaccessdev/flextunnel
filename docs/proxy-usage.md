@@ -64,19 +64,8 @@ server_node_id = "<ENDPOINT_ID>"
 routed_domains = ["*.internal", "example.com"]
 ```
 
-with the server routing the same names.
-
-By default the server resolves those names through its own system resolver. If
-some internal names are only known to a specific (e.g. internal) DNS server, add
-a `[dns_forwards]` entry: names under a configured suffix are then resolved via
-that suffix's upstream DNS server instead of the system resolver, with everything
-else unchanged. For example, `"local.168234.xyz" = ["10.0.0.53"]` sends
-`local.168234.xyz` and its subdomains to `10.0.0.53:53`. This is server-side
-only — the client still just sends the hostname (`socks5h` / HTTP proxy). The
-suffix must be on the tunnel set (`routed_domains`), since the whitelist is
-enforced on the requested hostname before resolution — the server refuses to
-start if a forward suffix is not covered (it would be a no-op). See
-`server.toml.example`.
+with the server routing the same names. The server resolves those names
+through its own system resolver.
 
 So whatever you use must send the target **hostname** to the proxy and let
 flextunnel resolve it. The two front-ends reach this differently:
@@ -161,7 +150,7 @@ The client fetches the page and serves it under headers of its own, sandboxed
 origin with the client's page or another server's; a server that does not
 answer within 30 seconds is a `502`.
 Its JSON includes `version`, `server_node_id`, `routed_domains`,
-`routed_cidrs`, `host_aliases`, `dns_forwards`, and duplicate-id blocklist
+`routed_cidrs`, `host_aliases`, and duplicate-id blocklist
 counts under `duplicate_id_blocklist`.
 
 `machine1.internal:<port>` — the destination's own host — is the server's own

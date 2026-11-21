@@ -16,7 +16,7 @@ use crate::blocklist::BlockList;
 use crate::flexaccess_iroh::endpoint::CreatedEndpoint;
 use crate::flexaccess_iroh::relay_failover::fail_over_home_relay;
 use crate::lock::InstanceLock;
-use crate::proxy::{DnsForwarder, ProxyServer, ProxyServerParams, RoutedSet};
+use crate::proxy::{ProxyServer, ProxyServerParams, RoutedSet};
 use crate::secret::secret_to_endpoint_id;
 use crate::transport::endpoint::{RelayConfig, create_server_endpoint, server_setup};
 use anyhow::{Context, Result};
@@ -48,8 +48,6 @@ pub struct ServerOptions {
     /// page are reachable regardless).
     pub routed_domains: Vec<String>,
     pub routed_cidrs: Vec<String>,
-    /// Conditional DNS-forwarding rules, suffix keys lowercased.
-    pub dns_forwards: HashMap<String, Vec<String>>,
     /// The duplicate-id blocklist (always
     /// [`crate::blocklist::default_blocklist_path`] outside tests).
     pub blocklist_file: PathBuf,
@@ -93,23 +91,6 @@ pub fn acquire_server_lock(own_id: &EndpointId) -> Result<InstanceLock> {
     )
 }
 
-/// Reject any conditional DNS-forwarding suffix the routed set does not cover.
-/// Such a forward is dead config: the server rejects off-list targets before
-/// resolution, so a suffix no routed rule reaches would never fire.
-fn validate_dns_forwards_coverage(forwarder: &DnsForwarder, routed_set: &RoutedSet) -> Result<()> {
-    for suffix in forwarder.suffixes() {
-        if !routed_set.covers_suffix(suffix) {
-            anyhow::bail!(
-                "[dns_forwards] suffix {suffix:?} is not covered by the routed set, so it \
-                 would never be used: the server rejects off-list targets before resolving \
-                 them. Add \"*.{suffix}\" (and/or \"{suffix}\") to routed_domains, or remove \
-                 the forward."
-            );
-        }
-    }
-    Ok(())
-}
-
 /// A validated server, not yet bound to an endpoint.
 pub struct PreparedServer {
     own_id: EndpointId,
@@ -134,7 +115,6 @@ pub fn prepare(opts: ServerOptions) -> Result<PreparedServer> {
         host_aliases,
         routed_domains,
         routed_cidrs,
-        dns_forwards,
         blocklist_file,
     } = opts;
 
@@ -177,23 +157,11 @@ pub fn prepare(opts: ServerOptions) -> Result<PreparedServer> {
     let routed_set = RoutedSet::new(&routed_domains, &routed_cidrs)
         .context("Invalid routed-set configuration")?;
 
-    let dns_forwarder = DnsForwarder::new(&dns_forwards)
-        .context("Invalid dns_forwards configuration")?;
-    if let Some(forwarder) = &dns_forwarder {
-        validate_dns_forwards_coverage(forwarder, &routed_set)?;
-    }
-
     let relay_config = RelayConfig::from_urls_with_token(&relay_urls, relay_auth_token)
         .context("Invalid relay configuration")?;
 
     if !host_aliases.is_empty() {
         log::info!("Loaded {} host alias(es)", host_aliases.len());
-    }
-    if !dns_forwards.is_empty() {
-        log::info!(
-            "Loaded {} conditional DNS-forwarding rule(s)",
-            dns_forwards.len()
-        );
     }
     log::info!(
         "Tunnel set: {} domain rule(s), {} CIDR(s) — off-list tunnel requests are rejected",
@@ -207,7 +175,6 @@ pub fn prepare(opts: ServerOptions) -> Result<PreparedServer> {
         routed_set,
         routed_domains,
         routed_cidrs,
-        dns_forwarder,
         blocklist,
         first_client,
     });
@@ -315,34 +282,6 @@ impl RunningServer {
 mod tests {
     use super::*;
 
-    fn forwarder(suffix: &str) -> DnsForwarder {
-        let mut m = HashMap::new();
-        m.insert(suffix.to_string(), vec!["10.0.0.53".to_string()]);
-        DnsForwarder::new(&m).unwrap().expect("one forward configured")
-    }
-
-    fn routed(domains: &[&str]) -> RoutedSet {
-        let d: Vec<String> = domains.iter().map(|s| s.to_string()).collect();
-        RoutedSet::new(&d, &[]).unwrap()
-    }
-
-    #[test]
-    fn dns_forwards_coverage_accepts_covered_suffix() {
-        let f = forwarder("local.168234.xyz");
-        // A wildcard whose zone reaches the suffix makes the forward live.
-        assert!(validate_dns_forwards_coverage(&f, &routed(&["*.local.168234.xyz"])).is_ok());
-        assert!(validate_dns_forwards_coverage(&f, &routed(&["*"])).is_ok());
-    }
-
-    #[test]
-    fn dns_forwards_coverage_rejects_uncovered_suffix() {
-        let f = forwarder("local.168234.xyz");
-        let err = validate_dns_forwards_coverage(&f, &routed(&["*.example.com"])).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("local.168234.xyz"), "{msg}");
-        assert!(msg.contains("not covered"), "{msg}");
-    }
-
     fn options(dir: &std::path::Path) -> ServerOptions {
         let client = crate::auth::ClientKey::generate().unwrap();
         ServerOptions {
@@ -359,7 +298,6 @@ mod tests {
             host_aliases: HashMap::new(),
             routed_domains: vec!["*".into()],
             routed_cidrs: Vec::new(),
-            dns_forwards: HashMap::new(),
             blocklist_file: dir.join("blocklist.json"),
         }
     }

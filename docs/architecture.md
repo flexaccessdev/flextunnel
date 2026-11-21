@@ -60,7 +60,6 @@ Core paths below are relative to `crates/flextunnel-core/src/`.
 | `proxy/server.rs`, `proxy/dial.rs` | Connection handling, routed-set checks and outbound TCP connections |
 | `proxy/server_routes.rs` | One-shot read of a server's routed set, for setting up a destination |
 | `proxy/reserved.rs`, `proxy/status_page.rs` | The reserved `flextunnel.internal` namespace; the server status page and shared HTTP plumbing |
-| `proxy/dns_forward.rs` | Conditional DNS resolution on the server |
 | `forwards.rs`, `proxy/forward.rs` | Forward definitions and loopback forward listeners |
 
 `crates/flextunnel-cli/src/` holds command dispatch, client supervision, IPC and
@@ -151,8 +150,8 @@ A **connect** request is checked against the routed set before a host alias is
 applied; a name in the reserved `flextunnel.internal` namespace is refused
 before that check, so no `routed_domains = ["*"]` can capture it (the client
 answers that namespace itself and never sends it). The server then applies any
-alias and dials locally. Hostnames use a matching conditional DNS forward or
-the server's system resolver, and the server tries the resolved addresses in
+alias and dials locally. Hostnames are resolved through the server's system
+resolver, and the server tries the resolved addresses in
 turn until one accepts. Loopback targets try both IPv4 and IPv6; other literal
 IPs are dialed as given. DNS and TCP connection share a 10s timeout in
 `proxy/dial.rs`. Connect failures map to SOCKS5 reply codes through
@@ -403,7 +402,7 @@ catches accidental identity reuse.
 - A server only ever sees the targets a client chose to send it. The client's
   routes are local configuration and are never transmitted. The server's
   routed set is its own whitelist; every admitted client can read it, with the
-  host aliases and DNS forwards, on the server's status page.
+  host aliases, on the server's status page.
 - Proxy listeners are unauthenticated and bind only to `127.0.0.1`;
   forwards bind `127.0.0.1` and `::1`. Local callers share the
   authenticated client's access.

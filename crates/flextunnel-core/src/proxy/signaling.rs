@@ -210,7 +210,7 @@ impl Target {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamRequest {
     /// Connect to `Target` from the server's network. The server enforces its
-    /// routed set, then applies host aliases and DNS forwards.
+    /// routed set, then applies host aliases.
     Connect(Target),
     /// Connect to this port on the server's own loopback — what a client
     /// destination's own name means. Outside the routed set and aliases:
