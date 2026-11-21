@@ -85,7 +85,7 @@ auth_key_file = "~/.config/flextunnel/client.key"
 # http://flextunnel.internal/servers/<host>/status.json — a URL that only
 # this client's own proxy answers, so it needs socks_port or http_port set
 # above and a request made through that listener, e.g.
-#   curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/servers/<host>/status.json
+#   curl -sS -x socks5h://127.0.0.1:1080 'http://flextunnel.internal/servers/<host>/status.json'
 #
 # When destinations overlap, the most specific rule wins: a destination's own
 # host, then an exact domain, then the longest `*.suffix`, then `*`; for IPs
