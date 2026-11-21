@@ -253,7 +253,8 @@ maps a target to one of:
 Validation rejects what precedence cannot resolve: a duplicate name
 (case-insensitive), the same rule on two destinations, a rule in the reserved
 namespace, and a name that is not one DNS label (`validate_destination_name`:
-letters, digits and inner hyphens, at most 63). A name is only a label, never a
+letters, digits and inner hyphens, at most 63, and no reserved `ab--` label
+such as `xn--`, which browsers refuse unless it is valid IDNA). A name is only a label, never a
 host: everything the table answers without a rule lives under the reserved
 `flextunnel.internal` namespace, so no configured name shadows a real host. `ProxyClient::new` additionally rejects two destinations for one
 server.

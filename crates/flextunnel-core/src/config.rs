@@ -86,7 +86,8 @@ pub struct ForwardConfig {
 #[serde(deny_unknown_fields)]
 pub struct DestinationEntry {
     /// The destination's name, unique within the client: one DNS label
-    /// (letters, digits and inner hyphens, up to 63; case-insensitive).
+    /// (letters, digits and inner hyphens, up to 63, no `--` as the third
+    /// and fourth characters; case-insensitive).
     /// `<name>.localhost.flextunnel.internal:<port>` through the client
     /// reaches that port on the server's own loopback.
     pub name: String,
