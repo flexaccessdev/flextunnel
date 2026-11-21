@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use flexaccess_iroh::endpoint::{
     CreatedEndpoint, EndpointOptions, create_endpoint, endpoint_builder,
 };
+pub use flexaccess_iroh::endpoint::PendingCloses;
 use futures::future::BoxFuture;
 use iroh::{
     Endpoint, EndpointId, SecretKey,
@@ -122,7 +123,10 @@ pub async fn create_server_endpoint(
     relay_config: &RelayConfig,
     setup: impl FnOnce(EndpointBuilder) -> EndpointBuilder,
 ) -> Result<CreatedEndpoint> {
-    create_endpoint(relay_config, setup(base_builder(relay_config, true)?)).await
+    // A server's runtime is the process's: a close the creation stops waiting
+    // for finishes on it by itself.
+    let closes = PendingCloses::new();
+    create_endpoint(relay_config, setup(base_builder(relay_config, true)?), &closes).await
 }
 
 /// A client endpoint builder. A client never publishes its address (it only
@@ -139,8 +143,16 @@ fn client_builder(relay_config: &RelayConfig, secret: Option<SecretKey>) -> Resu
 /// mid-session. The first creation probes every custom relay and must come
 /// online (see [`create_endpoint`]); rebuilds are tolerant (see
 /// [`rebuild_client_endpoint`]).
-pub async fn create_client_endpoint(relay_config: &RelayConfig) -> Result<ClientEndpoint> {
-    create_client(relay_config, None).await
+///
+/// The closes that creation stops waiting for — a relay probe's, or the
+/// endpoint's own when it never came online — are kept in `closes`, whether
+/// it succeeds or not. A caller whose runtime ends with its request waits for
+/// them ([`PendingCloses::finished`]); one whose runtime lasts drops the set.
+pub async fn create_client_endpoint(
+    relay_config: &RelayConfig,
+    closes: &PendingCloses,
+) -> Result<ClientEndpoint> {
+    create_client(relay_config, None, closes).await
 }
 
 /// Create a **quick-mode** client endpoint: same as [`create_client_endpoint`]
@@ -153,17 +165,23 @@ pub async fn create_client_endpoint(relay_config: &RelayConfig) -> Result<Client
 pub async fn create_quick_client_endpoint(
     relay_config: &RelayConfig,
     secret: SecretKey,
+    closes: &PendingCloses,
 ) -> Result<ClientEndpoint> {
-    create_client(relay_config, Some(secret)).await
+    create_client(relay_config, Some(secret), closes).await
 }
 
-async fn create_client(relay_config: &RelayConfig, secret: Option<SecretKey>) -> Result<ClientEndpoint> {
+async fn create_client(
+    relay_config: &RelayConfig,
+    secret: Option<SecretKey>,
+    closes: &PendingCloses,
+) -> Result<ClientEndpoint> {
     // A relay that failed the startup probe stays out of this endpoint's relay
     // map for its lifetime: a client only dials, runs no failover, and
     // reaches the server through the relay hints it attaches, so a rebuilt
     // endpoint (below) goes back to the full configured set instead.
     let CreatedEndpoint { endpoint, .. } =
-        create_endpoint(relay_config, client_builder(relay_config, secret.clone())?).await?;
+        create_endpoint(relay_config, client_builder(relay_config, secret.clone())?, closes)
+            .await?;
     let factory: EndpointFactory = {
         let relay_config = relay_config.clone();
         Arc::new(move || {

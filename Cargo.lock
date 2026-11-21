@@ -1895,8 +1895,8 @@ dependencies = [
 
 [[package]]
 name = "flexaccess-iroh"
-version = "0.0.16"
-source = "git+https://github.com/flexaccessdev/flexaccess-iroh?tag=v0.0.16#3ac94ac85fcfc449c591a57b6405a38c484d2b3a"
+version = "0.0.19"
+source = "git+https://github.com/flexaccessdev/flexaccess-iroh?tag=v0.0.19#67bb55080dd62d32b0a69c836b9fbfa0dbc0d0cb"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1925,7 +1925,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-cli"
-version = "0.0.99"
+version = "0.0.100"
 dependencies = [
  "anyhow",
  "clap",
@@ -1942,7 +1942,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-core"
-version = "0.0.99"
+version = "0.0.100"
 dependencies = [
  "anyhow",
  "askama",
@@ -1972,7 +1972,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-desktop"
-version = "0.0.99"
+version = "0.0.100"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
@@ -2004,7 +2004,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-ffi"
-version = "0.0.99"
+version = "0.0.100"
 dependencies = [
  "flextunnel-core",
  "iroh",

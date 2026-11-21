@@ -39,9 +39,10 @@ use crate::proxy::client::{
     HANDSHAKE_TIMEOUT, TUNNEL_RECOVERY_HOLD, calculate_backoff, client_heartbeat_loop,
     connect_with_timeout, rebuild_due,
 };
-use crate::proxy::signaling::{self, Hello};
+use crate::proxy::signaling::{self, Hello, HelloResponse};
 use crate::transport::endpoint::{
-    ClientEndpoint, RelayConfig, create_client_endpoint, create_quick_client_endpoint,
+    ClientEndpoint, PendingCloses, RelayConfig, create_client_endpoint,
+    create_quick_client_endpoint,
 };
 use crate::transport::paths::ConnectionSnapshot;
 use futures::future::BoxFuture;
@@ -118,12 +119,85 @@ pub(crate) fn default_endpoint_provider() -> EndpointProvider {
             ClientAuth::Quick(secret) => Some(secret.clone()),
         };
         Box::pin(async move {
+            // A client session's runtime outlives its endpoints: a close the
+            // creation stops waiting for finishes on it by itself.
+            let closes = PendingCloses::new();
             match secret {
-                Some(secret) => create_quick_client_endpoint(&relay, *secret).await,
-                None => create_client_endpoint(&relay).await,
+                Some(secret) => create_quick_client_endpoint(&relay, *secret, &closes).await,
+                None => create_client_endpoint(&relay, &closes).await,
             }
         })
     })
+}
+
+/// Dial the server `server_id` from `endpoint`, on the ALPN `auth` calls for.
+pub(crate) async fn dial_server(
+    endpoint: &Endpoint,
+    server_id: EndpointId,
+    relay: &RelayConfig,
+    auth: &ClientAuth,
+) -> ProxyResult<Connection> {
+    // Custom relays are also where the server is found: with them
+    // configured, internet discovery is off and these hints are the route.
+    let mut addr = EndpointAddr::new(server_id);
+    for relay_url in relay.custom_urls() {
+        addr = addr.with_relay_url(relay_url.clone());
+    }
+    let alpn = match auth {
+        ClientAuth::Key(_) => crate::transport::ALPN,
+        ClientAuth::Quick(_) => crate::transport::QUICK_ALPN,
+    };
+    connect_with_timeout(endpoint, addr, alpn).await
+}
+
+/// Send this client's `Hello` on the connection's first bi-stream and read the
+/// server's answer, returning it — accepted or not — with the stream halves.
+/// The stream is the connection's control channel: the server ends the
+/// connection when it closes, so the halves are kept for as long as the
+/// connection is used.
+///
+/// `own_id` is the client's endpoint id, which a keypair client signs into its
+/// credential so the server can bind the signature to this very connection.
+///
+/// The whole exchange has [`HANDSHAKE_TIMEOUT`], the stream's opening
+/// included: `open_bi` waits for the peer to grant a stream, with no bound of
+/// its own, so a peer that grants none would otherwise hold the caller for as
+/// long as it keeps the connection up.
+pub(crate) async fn exchange_hello(
+    connection: &Connection,
+    auth: &ClientAuth,
+    own_id: EndpointId,
+    instance_nonce: u128,
+    duplicate_server_observed: bool,
+) -> ProxyResult<(SendStream, RecvStream, HelloResponse)> {
+    let auth = match auth {
+        ClientAuth::Key(key) => Some(signaling::ClientAuthPayload {
+            public_key: key.public_str(),
+            endpoint_id: own_id.to_string(),
+            signature: crate::auth::sign_endpoint_id(key, &own_id),
+        }),
+        // Quick mode: the endpoint id is the credential; the server's
+        // allowlist hook already authenticated it at the TLS handshake.
+        ClientAuth::Quick(_) => None,
+    };
+    let mut hello = Hello::new(auth, instance_nonce);
+    hello.duplicate_server_observed = duplicate_server_observed;
+    let hello = signaling::encode_hello(&hello)?;
+
+    let exchange = async {
+        let (mut send, mut recv) = connection.open_bi().await.map_err(|e| {
+            ProxyError::Signaling(format!("Failed to open handshake stream: {e}"))
+        })?;
+        signaling::write_message(&mut send, &hello).await?;
+        send.flush().await?;
+        let data = signaling::read_message(&mut recv, signaling::MAX_HANDSHAKE_SIZE).await?;
+        ProxyResult::Ok((send, recv, data))
+    };
+    let (send, recv, data) = tokio::time::timeout(HANDSHAKE_TIMEOUT, exchange)
+        .await
+        .map_err(|_| ProxyError::Signaling("timed out waiting for server handshake response".into()))??;
+    let response = signaling::decode_hello_response(&data)?;
+    Ok((send, recv, response))
 }
 
 /// What a destination is doing, for status displays.
@@ -926,18 +1000,9 @@ impl Destination {
         &self,
         endpoint: &Endpoint,
     ) -> ProxyResult<(Connection, SendStream, RecvStream)> {
-        // Custom relays are also where the server is found: with them
-        // configured, internet discovery is off and these hints are the route.
-        let mut addr = EndpointAddr::new(self.cfg.server_id);
-        for relay_url in self.cfg.relay.custom_urls() {
-            addr = addr.with_relay_url(relay_url.clone());
-        }
-        let alpn = match &self.cfg.auth {
-            ClientAuth::Key(_) => crate::transport::ALPN,
-            ClientAuth::Quick(_) => crate::transport::QUICK_ALPN,
-        };
         log::info!("{}: connecting to server {}", self.host(), self.cfg.server_id);
-        let connection = connect_with_timeout(endpoint, addr, alpn).await?;
+        let connection =
+            dial_server(endpoint, self.cfg.server_id, &self.cfg.relay, &self.cfg.auth).await?;
         log::info!("{}: connected, authenticating...", self.host());
         let (send, recv) = self.handshake(&connection, endpoint.id()).await?;
         log::info!("{}: authenticated", self.host());
@@ -956,35 +1021,14 @@ impl Destination {
         connection: &Connection,
         own_id: EndpointId,
     ) -> ProxyResult<(SendStream, RecvStream)> {
-        let (mut send, mut recv) = connection
-            .open_bi()
-            .await
-            .map_err(|e| ProxyError::Signaling(format!("Failed to open handshake stream: {e}")))?;
-
-        let auth = match &self.cfg.auth {
-            ClientAuth::Key(key) => Some(signaling::ClientAuthPayload {
-                public_key: key.public_str(),
-                endpoint_id: own_id.to_string(),
-                signature: crate::auth::sign_endpoint_id(key, &own_id),
-            }),
-            // Quick mode: the endpoint id is the credential; the server's
-            // allowlist hook already authenticated it at the TLS handshake.
-            ClientAuth::Quick(_) => None,
-        };
-        let mut hello = Hello::new(auth, self.shared.instance_nonce);
-        hello.duplicate_server_observed = self.duplicate_server.load(Ordering::Relaxed);
-        signaling::write_message(&mut send, &signaling::encode_hello(&hello)?).await?;
-        send.flush().await?;
-
-        let data = tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
-            signaling::read_message(&mut recv, signaling::MAX_HANDSHAKE_SIZE),
+        let (send, recv, response) = exchange_hello(
+            connection,
+            &self.cfg.auth,
+            own_id,
+            self.shared.instance_nonce,
+            self.duplicate_server.load(Ordering::Relaxed),
         )
-        .await
-        .map_err(|_| {
-            ProxyError::Signaling("timed out waiting for server handshake response".into())
-        })??;
-        let response = signaling::decode_hello_response(&data)?;
+        .await?;
 
         // Record the server's instance nonce (drives duplicate-server detection)
         // before the accept/reject branch so a rejection still updates history.

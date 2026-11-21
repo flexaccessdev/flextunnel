@@ -31,6 +31,7 @@ use super::status_page::{
 };
 use anyhow::Result;
 use askama::Template;
+use iroh::endpoint::Connection;
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Instant;
@@ -357,31 +358,7 @@ async fn serve_server_status<S: LocalStream>(
             .acquire(Some(holds.for_destination(dest)))
             .await
             .map_err(|e| e.to_string())?;
-        let (mut send, mut recv) = match tokio::time::timeout(
-            TUNNEL_OPEN_TIMEOUT,
-            open_tunnel(&lease.conn, &StreamRequest::Status),
-        )
-        .await
-        {
-            Ok(Ok((send, recv, signaling::REP_SUCCESS))) => (send, recv),
-            Ok(Ok((_, _, rep))) => {
-                return Err(format!("server refused: {}", super::socks5::describe_reply(rep)));
-            }
-            Ok(Err(e)) => return Err(e.to_string()),
-            Err(_) => return Err("timed out asking the server for its status page".to_string()),
-        };
-
-        // The server picks its format from this request's path and `Accept`.
-        let accept = match accept {
-            Some(StatusFormat::Json) => "application/json",
-            Some(StatusFormat::Text) => "text/plain",
-            Some(StatusFormat::Html) | None => "*/*",
-        };
-        let request = format!(
-            "GET {tail} HTTP/1.1\r\nHost: {}\r\nAccept: {accept}\r\nConnection: close\r\n\r\n",
-            super::reserved::STATUS_HOST
-        );
-        exchange(&mut send, &mut recv, request.as_bytes(), TUNNEL_OPEN_TIMEOUT).await
+        fetch_server_status(&lease.conn, &tail, accept).await
         // `lease` ends here, on every path.
     };
     let fetched = fetched.await;
@@ -401,6 +378,39 @@ async fn serve_server_status<S: LocalStream>(
             respond(tcp, "502 Bad Gateway", CONTENT_TYPE_TEXT, &body).await
         }
     }
+}
+
+/// Ask the server on `conn` for its status page at `tail` (`/`, `/status.txt`
+/// or `/status.json`) over a [`StreamRequest::Status`] stream, and return its
+/// whole HTTP response for [`parse_server_status`] to take apart.
+pub(crate) async fn fetch_server_status(
+    conn: &Connection,
+    tail: &str,
+    accept: Option<StatusFormat>,
+) -> Result<Vec<u8>, String> {
+    let (mut send, mut recv) =
+        match tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, open_tunnel(conn, &StreamRequest::Status))
+            .await
+        {
+            Ok(Ok((send, recv, signaling::REP_SUCCESS))) => (send, recv),
+            Ok(Ok((_, _, rep))) => {
+                return Err(format!("server refused: {}", super::socks5::describe_reply(rep)));
+            }
+            Ok(Err(e)) => return Err(e.to_string()),
+            Err(_) => return Err("timed out asking the server for its status page".to_string()),
+        };
+
+    // The server picks its format from this request's path and `Accept`.
+    let accept = match accept {
+        Some(StatusFormat::Json) => "application/json",
+        Some(StatusFormat::Text) => "text/plain",
+        Some(StatusFormat::Html) | None => "*/*",
+    };
+    let request = format!(
+        "GET {tail} HTTP/1.1\r\nHost: {}\r\nAccept: {accept}\r\nConnection: close\r\n\r\n",
+        super::reserved::STATUS_HOST
+    );
+    exchange(&mut send, &mut recv, request.as_bytes(), TUNNEL_OPEN_TIMEOUT).await
 }
 
 /// Send `request` on a status stream and read the server's whole response —
@@ -442,7 +452,7 @@ where
 /// the reason. A response that states its `Content-Length` must carry exactly
 /// that many body bytes: a stream that ended early would otherwise be relayed
 /// as a whole page. One without the header is delimited by the stream's end.
-fn parse_server_status(response: &[u8]) -> Result<(&'static str, &str), String> {
+pub(crate) fn parse_server_status(response: &[u8]) -> Result<(&'static str, &str), String> {
     if response.len() > SERVER_STATUS_LIMIT {
         return Err("the server's status page is too large".to_string());
     }

@@ -18,9 +18,11 @@
 use crate::config::{self, AuthKey, ClientSettings, Destination, ServerConfig};
 use crate::server_session::{self, ServerCmd, ServerHandle, ServerSnapshot, SharedServerSnapshot};
 use flextunnel_core::config::DEFAULT_IDLE_TIMEOUT;
+use flextunnel_core::error::ProxyError;
 use flextunnel_core::forwards::{ForwardManager, ForwardStatus, PortForward};
 use flextunnel_core::proxy::{
     ClientAuth, ClientConfig, DestinationConfig, DestinationStatus, LocalListeners, ProxyClient,
+    ServerRoutes,
 };
 use flextunnel_core::transport::endpoint::RelayConfig;
 use flextunnel_core::transport::paths::ConnectionSnapshot;
@@ -314,6 +316,41 @@ impl Controller {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+/// A server to ask for its routes: its id, and the key and relays a
+/// destination for it would use.
+pub struct RoutesQuery {
+    pub server_id: flextunnel_core::iroh::EndpointId,
+    pub key: flextunnel_core::auth::ClientKey,
+    pub relay: RelayConfig,
+}
+
+/// Ask a server what it routes (see
+/// [`flextunnel_core::proxy::fetch_server_routes`]): one connection made for
+/// the question, whatever the client session is doing — it need not be
+/// running, nor know the server.
+///
+/// The request runs on a thread and runtime of its own, named like the client
+/// session's so its log lines are filed with the client's. It always runs to
+/// its end — the endpoint it binds is closed there, after the answer — even
+/// when nobody waits for the answer any more.
+pub async fn fetch_server_routes(query: RoutesQuery) -> Result<ServerRoutes, String> {
+    let answer = flextunnel_core::proxy::fetch_server_routes(
+        CLIENT_THREAD_NAME,
+        query.server_id,
+        query.key,
+        query.relay,
+    );
+    match answer.await {
+        Ok(Ok(routes)) => Ok(routes),
+        Ok(Err(ProxyError::AuthenticationFailed(reason))) => Err(format!(
+            "The server refused this client ({reason}): it must authorize the auth key's \
+             public half before it answers."
+        )),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("The request to the server could not be made".into()),
     }
 }
 

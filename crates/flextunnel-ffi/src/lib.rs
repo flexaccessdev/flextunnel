@@ -29,6 +29,9 @@
 //! 9. [`flextunnel_stop`] — stop the client, close its endpoints, free the
 //!    handle.
 //!
+//! Apart from a session, [`flextunnel_fetch_server_routes`] asks a server what
+//! it routes, for the app to offer while a destination is set up.
+//!
 //! Unlike the ezvpn FFI there is **no VPN / Network Extension and no `utun` fd**:
 //! flextunnel is pure-userspace proxying and forwarding over QUIC, so its
 //! optional proxy and forwarding listeners run entirely inside the app
@@ -52,8 +55,8 @@
 //! client reaches that port on the server's own loopback. Its optional
 //! `routed_domains` / `routed_cidrs` are further targets sent through that
 //! server (which must route them too — its own routed set is the allowlist).
-//! Routing is entirely this config's: nothing is learned from a server, and a
-//! target on no destination's list is connected directly from the device.
+//! Routing is entirely this config's: a session learns nothing from a server,
+//! and a target on no destination's list is connected directly from the device.
 //!
 //! `idle_timeout_secs` is how long a destination's connection is kept with no
 //! stream open on it: absent means the default (300), `0` means never close
@@ -99,6 +102,10 @@ use flextunnel_core::proxy::{
 };
 use flextunnel_core::transport::endpoint::RelayConfig;
 use flextunnel_core::transport::paths::ConnPathKind;
+
+/// The thread a routes request runs on (see
+/// [`flextunnel_fetch_server_routes`]).
+const ROUTES_THREAD_NAME: &str = "flextunnel-routes";
 
 /// Bound on [`flextunnel_stop`]'s graceful close of the client's endpoints.
 /// Closing waits out an endpoint still being built (see
@@ -162,6 +169,18 @@ struct FfiDestination {
     /// Further networks or bare IPs sent through this server.
     #[serde(default)]
     routed_cidrs: Vec<String>,
+}
+
+/// Input of [`flextunnel_fetch_server_routes`]: a server, and the key and
+/// relays a destination for it would use.
+#[derive(Deserialize)]
+struct FfiRoutesRequest {
+    auth_key: String,
+    server_node_id: String,
+    #[serde(default)]
+    relay_urls: Vec<String>,
+    #[serde(default)]
+    relay_auth_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -420,6 +439,96 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
     ))
 }
 
+/// Ask a server what it routes — its own `routed_domains` and `routed_cidrs`
+/// — so a destination being set up can be filled in to match. One connection
+/// made for the question and closed again, on an endpoint and a thread of its
+/// own: it needs no handle and touches no running session.
+///
+/// `request_json` names the server and how to reach it, as a destination for
+/// it would:
+///
+/// ```json
+/// { "auth_key": "ed25519-sec:...", "server_node_id": "<iroh endpoint id>",
+///   "relay_urls": [], "relay_auth_token": null }
+/// ```
+///
+/// `relay_urls` and `relay_auth_token` are optional. The server must already
+/// authorize the key's public half. The server's answer is
+///
+/// ```json
+/// { "routed_domains": ["*.corp.example"], "routed_cidrs": ["10.0.0.0/8"] }
+/// ```
+///
+/// with both lists empty for a server that routes nothing beyond itself.
+///
+/// Returns the number of bytes that JSON needs **including the trailing NUL**
+/// once the server has answered — like [`flextunnel_forward_statuses`], the
+/// buffer holds the complete JSON iff the return value is `<= out_len`, and on
+/// a larger return it holds a NUL-terminated truncation: call again with a
+/// buffer of at least the returned size (which asks the server again). Returns
+/// -1, with an error message in `out_buf`, for an invalid request, an
+/// unreachable server or a key it refuses — a failure a larger buffer does not
+/// change.
+///
+/// **Blocks** until the server has answered or an attempt has failed — a few
+/// seconds as a rule, about a minute against a server that never answers — so
+/// call it off the main thread. Nothing is retried. The request's endpoint
+/// closes after the answer, on the request's own thread: the call does not
+/// wait for it.
+///
+/// # Safety
+/// - `request_json` must be a valid, NUL-terminated UTF-8 C string.
+/// - `out_buf` must point to at least `out_len` writable bytes (may be null
+///   only if `out_len` is 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flextunnel_fetch_server_routes(
+    request_json: *const c_char,
+    out_buf: *mut c_char,
+    out_len: usize,
+) -> isize {
+    if request_json.is_null() {
+        write_cstr(out_buf, out_len, "request_json is null");
+        return -1;
+    }
+    let json = match unsafe { CStr::from_ptr(request_json) }.to_str() {
+        Ok(json) => json,
+        Err(_) => {
+            write_cstr(out_buf, out_len, "request_json is not valid UTF-8");
+            return -1;
+        }
+    };
+    match fetch_server_routes_inner(json) {
+        Ok(routes) => write_sized(out_buf, out_len, &routes),
+        Err(message) => {
+            write_cstr(out_buf, out_len, &message);
+            -1
+        }
+    }
+}
+
+fn fetch_server_routes_inner(json: &str) -> Result<String, String> {
+    let request: FfiRoutesRequest =
+        serde_json::from_str(json).map_err(|e| format!("invalid request JSON: {e}"))?;
+    let relay = RelayConfig::from_urls_with_token(&request.relay_urls, request.relay_auth_token)
+        .map_err(|e| format!("invalid relay configuration: {e}"))?;
+    let key = flextunnel_core::auth::ClientKey::from_secret_str(request.auth_key.trim())
+        .map_err(|e| format!("invalid auth key: {e:#}"))?;
+    let server_id = request
+        .server_node_id
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid server_node_id: {e}"))?;
+
+    // The request has a thread of its own, which stays to close the endpoint
+    // once this one has the answer.
+    let routes =
+        flextunnel_core::proxy::fetch_server_routes(ROUTES_THREAD_NAME, server_id, key, relay)
+            .blocking_recv()
+            .map_err(|_| "the routes request could not be started".to_string())?
+            .map_err(|e| e.to_string())?;
+    serde_json::to_string(&routes).map_err(|e| format!("failed to encode the routes: {e}"))
+}
+
 /// Replace the complete desired forward set.
 ///
 /// `forwards_json` is a JSON array of
@@ -559,8 +668,7 @@ pub unsafe extern "C" fn flextunnel_forward_statuses(
         })
         .collect();
     let json = serde_json::json!({ "forwards": statuses }).to_string();
-    write_cstr(out_buf, out_len, &json);
-    (json.len() + 1) as isize
+    write_sized(out_buf, out_len, &json)
 }
 
 /// Close every local listener — the SOCKS5 front-end and all forward
@@ -926,6 +1034,14 @@ fn write_cstr(buf: *mut c_char, len: usize, s: &str) -> bool {
     copy == bytes.len()
 }
 
+/// [`write_cstr`] for a result of no fixed size: returns the bytes `s` needs
+/// **including the trailing NUL**, so the caller can tell a complete write
+/// (the return is `<= len`) from a truncated one and size its next buffer.
+fn write_sized(buf: *mut c_char, len: usize, s: &str) -> isize {
+    write_cstr(buf, len, s);
+    (s.len() + 1) as isize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1014,6 +1130,69 @@ mod tests {
             serde_json::from_str(&status_json(&handle.client.status(), Instant::now())).unwrap();
         assert!(status["idle_timeout_secs"].is_null());
         stop_handle(handle);
+    }
+
+    /// A result of no fixed size reports what it needs, whether it fit or not.
+    #[test]
+    fn a_sized_write_reports_the_bytes_it_needs() {
+        let json = r#"{"routed_domains":[],"routed_cidrs":[]}"#;
+        let read = |buf: &[c_char]| unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap().to_owned();
+
+        let mut exact = vec![0 as c_char; json.len() + 1];
+        assert_eq!(write_sized(exact.as_mut_ptr(), exact.len(), json), exact.len() as isize);
+        assert_eq!(read(&exact), json);
+
+        // One byte short: truncated, NUL-terminated, and the size to retry with.
+        let mut short = vec![0 as c_char; json.len()];
+        let needed = write_sized(short.as_mut_ptr(), short.len(), json);
+        assert_eq!(needed, json.len() as isize + 1);
+        assert!(needed > short.len() as isize);
+        assert_eq!(read(&short), &json[..json.len() - 1]);
+        assert_eq!(write_sized(ptr::null_mut(), 0, json), needed);
+    }
+
+    /// A failed routes request is -1 whatever the buffer: never a size to
+    /// retry with, which would ask the server again for the same failure.
+    #[test]
+    fn a_failed_routes_request_is_not_a_short_buffer() {
+        let request = std::ffi::CString::new("{").unwrap();
+        let mut tiny = [0 as c_char; 8];
+        let status =
+            unsafe { flextunnel_fetch_server_routes(request.as_ptr(), tiny.as_mut_ptr(), tiny.len()) };
+        assert_eq!(status, -1);
+        let mut roomy = [0 as c_char; 256];
+        let status =
+            unsafe { flextunnel_fetch_server_routes(request.as_ptr(), roomy.as_mut_ptr(), roomy.len()) };
+        assert_eq!(status, -1);
+        let message = unsafe { CStr::from_ptr(roomy.as_ptr()) }.to_str().unwrap();
+        assert!(message.contains("invalid request JSON"), "{message}");
+        assert_eq!(unsafe { flextunnel_fetch_server_routes(ptr::null(), ptr::null_mut(), 0) }, -1);
+    }
+
+    /// A routes request that cannot be acted on is refused before anything is
+    /// bound or dialed.
+    #[test]
+    fn invalid_routes_requests_are_rejected() {
+        let key = flextunnel_core::auth::ClientKey::generate().unwrap().secret_str();
+        let request = |value: serde_json::Value| fetch_server_routes_inner(&value.to_string());
+        let err = |value: serde_json::Value| request(value).expect_err("rejected");
+
+        assert!(fetch_server_routes_inner("{").unwrap_err().contains("invalid request JSON"));
+        assert!(err(serde_json::json!({ "auth_key": key })).contains("server_node_id"));
+        assert!(
+            err(serde_json::json!({ "auth_key": key, "server_node_id": "nope" }))
+                .contains("invalid server_node_id")
+        );
+        assert!(
+            err(serde_json::json!({ "auth_key": "nope", "server_node_id": node_id(1) }))
+                .contains("invalid auth key")
+        );
+        let one_relay = serde_json::json!({
+            "auth_key": key,
+            "server_node_id": node_id(1),
+            "relay_urls": ["https://relay.example"],
+        });
+        assert!(err(one_relay).contains("invalid relay configuration"));
     }
 
     #[test]

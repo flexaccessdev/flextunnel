@@ -21,12 +21,13 @@
 //!   duplicate client id, exactly as the design intends.
 
 use crate::blocklist::BlockList;
+use crate::error::ProxyError;
 use crate::proxy::signaling::{self, Hello, HelloResponse, StreamRequest, Target};
 use crate::proxy::dns_forward::DnsForwarder;
 use crate::proxy::{
     ClientAuth, ClientConfig, DestinationConfig, DestinationState, DestinationStatus,
     EndpointProvider, ForwardManager, ForwardSpec, LocalListeners, ProxyClient, ProxyServer,
-    ProxyServerParams, RoutedSet,
+    ProxyServerParams, RoutedSet, ServerRoutes, server_routes,
 };
 use crate::transport::endpoint::{ClientEndpoint, RelayConfig, server_setup};
 use crate::transport::{ALPN, QUICK_ALPN, build_quic_transport_config};
@@ -1195,6 +1196,107 @@ async fn a_servers_status_page_is_fetched_through_the_client() {
     // The client's own page now shows the destination connected.
     let page = status_get(client.socks, "/status.json").await;
     assert!(page.contains("\"state\": \"connected\""), "{page}");
+}
+
+/// A server's routed lists are read from it by a connection made for the
+/// question alone — no client session, no destination — and gone once it is
+/// answered. A key the server does not authorize is turned away as such.
+#[tokio::test]
+async fn a_servers_routes_are_fetched_in_one_connection() {
+    let (server_ep, server_addr) = server_endpoint(SecretKey::generate()).await;
+    let server_id = server_ep.id();
+    let domains = strings(&["*.corp.example", "marker.example.com"]);
+    let cidrs = strings(&["10.0.0.0/8", "192.168.1.7"]);
+    let server = spawn_server_handle(
+        server_ep,
+        ProxyServerParams {
+            routed_set: RoutedSet::new(&domains, &cidrs).unwrap(),
+            routed_domains: domains.clone(),
+            routed_cidrs: cidrs.clone(),
+            ..base_params(server_id, temp_blocklist("routes-fetch"))
+        },
+    );
+    let endpoint = loopback_endpoint_full(
+        SecretKey::generate(),
+        false,
+        MemoryLookup::from_endpoint_info(vec![server_addr]),
+        HashSet::new(),
+    )
+    .await;
+    let relay = RelayConfig::default();
+
+    let auth = ClientAuth::Key(Box::new(test_client_key().clone()));
+    let routes = with_timeout(server_routes::fetch_over(&endpoint, server_id, &relay, &auth))
+        .await
+        .expect("an authorized key is answered");
+    assert_eq!(
+        routes,
+        ServerRoutes {
+            routed_domains: domains,
+            routed_cidrs: cidrs,
+        }
+    );
+    wait_until("the server to see the connection gone", || {
+        server.connected_client_keys().is_empty()
+    })
+    .await;
+
+    let stranger = ClientAuth::Key(Box::new(crate::auth::ClientKey::generate().unwrap()));
+    let err = with_timeout(server_routes::fetch_over(&endpoint, server_id, &relay, &stranger))
+        .await
+        .expect_err("an unauthorized key is refused");
+    assert!(matches!(err, ProxyError::AuthenticationFailed(_)), "{err}");
+    endpoint.close().await;
+}
+
+/// A peer that takes the connection but grants no stream to say `Hello` on
+/// holds the handshake for its timeout and no longer: opening the stream waits
+/// on the peer, and has no bound of its own.
+#[tokio::test]
+async fn a_peer_granting_no_stream_times_the_handshake_out() {
+    let no_streams = iroh::endpoint::QuicTransportConfig::builder()
+        .max_concurrent_bidi_streams(0u32.into())
+        .build();
+    let server = server_setup(
+        loopback_base(MemoryLookup::new()).transport_config(no_streams),
+        SecretKey::generate(),
+        HashSet::new(),
+    )
+    .bind()
+    .await
+    .unwrap();
+    let server_addr = EndpointAddr::new(server.id()).with_ip_addr(server.bound_sockets()[0]);
+    // Accepts, then only holds the connection open.
+    let accepted = tokio::spawn({
+        let server = server.clone();
+        async move { server.accept().await.expect("an incoming connection").await }
+    });
+
+    let client = loopback_endpoint(SecretKey::generate(), false).await;
+    let connection = with_timeout(client.connect(server_addr, ALPN)).await.unwrap();
+    let _held = with_timeout(accepted).await.unwrap().expect("the server accepts");
+
+    // Waited out for real (the timeout is 10s): an endpoint's own tasks keep
+    // a paused clock from running ahead.
+    let handshake_timeout = crate::proxy::client::HANDSHAKE_TIMEOUT;
+    let started = Instant::now();
+    let auth = ClientAuth::Key(Box::new(test_client_key().clone()));
+    let result = tokio::time::timeout(
+        handshake_timeout + Duration::from_secs(10),
+        crate::proxy::destination::exchange_hello(&connection, &auth, client.id(), 1, false),
+    )
+    .await
+    .expect("the handshake gives up by itself");
+    match result {
+        Err(ProxyError::Signaling(reason)) => assert!(reason.contains("timed out"), "{reason}"),
+        Err(other) => panic!("expected the handshake to time out: {other}"),
+        Ok(_) => panic!("a handshake with no stream to run on succeeded"),
+    }
+    assert!(started.elapsed() >= handshake_timeout, "{:?}", started.elapsed());
+
+    connection.close(0u32.into(), b"done");
+    client.close().await;
+    server.close().await;
 }
 
 /// The front-end addresses are part of the status only while something
