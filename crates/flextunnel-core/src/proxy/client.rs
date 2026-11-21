@@ -1334,8 +1334,7 @@ async fn direct_connect<P: LocalProto, S: LocalStream>(
     target: &signaling::Target,
     upstream_preamble: Option<Vec<u8>>,
 ) -> Result<()> {
-    // Direct connections resolve on the device via its own DNS; a server's
-    // conditional forwarding does not apply here.
+    // Direct connections resolve on the device via its own DNS.
     let dialed = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, dial::dial_target(target)).await;
     let mut upstream = match dialed {
         Ok(Ok(mut s)) => {
