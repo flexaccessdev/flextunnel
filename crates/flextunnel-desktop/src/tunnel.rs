@@ -143,9 +143,6 @@ enum Command {
     /// Replace the desired forward list (the UI sends the full list after
     /// every add/edit/delete/toggle); applied live mid-session.
     SetForwards(Vec<PortForward>),
-    /// Ask the destination with this name for one connection attempt now,
-    /// instead of waiting for its first use.
-    ConnectNow(String),
     /// One-shot request for a destination's current iroh connection path(s),
     /// by name, answered on the reply channel (the UI's connection-path CTA).
     /// Empty when no session is running or the destination is not connected.
@@ -169,7 +166,6 @@ enum Command {
 enum SessionCmd {
     Stop,
     SetForwards(Vec<PortForward>),
-    ConnectNow(String),
     /// Answer the reply channel with the destination's path snapshot, once.
     QueryConnPath(String, std::sync::mpsc::Sender<ConnectionSnapshot>),
 }
@@ -285,10 +281,6 @@ impl Controller {
 
     pub fn set_forwards(&self, forwards: Vec<PortForward>) {
         let _ = self.tx.blocking_send(Command::SetForwards(forwards));
-    }
-
-    pub fn connect_now(&self, name: &str) {
-        let _ = self.tx.blocking_send(Command::ConnectNow(name.into()));
     }
 
     /// Fetch a destination's current iroh connection path(s), once. Returns
@@ -533,11 +525,6 @@ async fn run_loop(
                 // No session: nothing to do — the next start carries them.
                 (None, None) => {}
             },
-            Some(Command::ConnectNow(name)) => {
-                if let Some(handle) = live_client {
-                    let _ = handle.tx.send(SessionCmd::ConnectNow(name)).await;
-                }
-            }
             Some(Command::QueryConnPath(name, reply)) => {
                 if let Some(handle) = live_client {
                     let _ = handle.tx.send(SessionCmd::QueryConnPath(name, reply)).await;
@@ -754,11 +741,6 @@ async fn run_client(
                     fwd_mgr.apply(&forwards);
                     let statuses = fwd_mgr.statuses();
                     slot.update(|s| s.forwards = statuses);
-                }
-                Some(SessionCmd::ConnectNow(name)) => {
-                    if !client.dialer().warm(&name) {
-                        log::warn!("No destination \"{name}\" in the running client");
-                    }
                 }
                 // On its own task, never awaited here: the snapshot probes the
                 // destination's custom relays over HTTP (~3s worst case), and
