@@ -354,6 +354,10 @@ struct StatusFields {
     last_error: Option<String>,
     server_routes: Option<ServerRoutes>,
     server_routes_error: Option<String>,
+    /// Counts the connections whose server routes were asked for: a read
+    /// answers only while its connection is still the latest asked, so a
+    /// slow read on an older connection never overwrites a newer answer.
+    server_routes_generation: u64,
 }
 
 /// The manager's memory of the current outage. Survives idle periods, so a
@@ -766,13 +770,22 @@ impl Destination {
     /// rule of this destination's that the server does not route is logged:
     /// the server refuses what is sent under it. The read opens a stream of
     /// its own on the connection without leasing it, so it neither keeps the
-    /// connection from idling out nor survives its close.
+    /// connection from idling out nor survives its close. The answer is kept
+    /// after the connection closes, until a later connection reads another.
     fn check_server_routes(self: &Arc<Self>, connection: &Connection) {
         let this = self.clone();
         let connection = connection.clone();
+        let generation = {
+            let mut fields = self.status_fields();
+            fields.server_routes_generation += 1;
+            fields.server_routes_generation
+        };
         tokio::spawn(async move {
             let read = server_routes::read_routes(&connection).await;
             let mut fields = this.status_fields();
+            if fields.server_routes_generation != generation {
+                return;
+            }
             match read {
                 Ok(routes) => {
                     if fields.server_routes.as_ref() != Some(&routes) {

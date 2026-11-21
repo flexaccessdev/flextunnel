@@ -41,6 +41,7 @@ use anyhow::Result;
 use askama::Template;
 use iroh::endpoint::Connection;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -165,10 +166,20 @@ fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
         })
         .collect();
     let refer = |row: &TableRow| RuleRef { rule: row.rule.to_string(), destination: host(row.dest) };
+    // Each row's overlaps, in the table's overlap order: the broader rules it
+    // sits within, and the narrower rules inside it.
+    let mut within: HashMap<&TableRow, Vec<RuleRef>> = HashMap::new();
+    let mut narrower: HashMap<&TableRow, Vec<RuleRef>> = HashMap::new();
+    for overlap in table.overlaps() {
+        within.entry(&overlap.inner).or_default().push(refer(&overlap.outer));
+        narrower.entry(&overlap.outer).or_default().push(refer(&overlap.inner));
+    }
     table
         .rows()
         .into_iter()
         .map(|row| {
+            let within = within.remove(&row).unwrap_or_default();
+            let narrower = narrower.remove(&row).unwrap_or_default();
             let (kind, server) = match &row.rule {
                 TableRule::Host(_) => ("host", "loopback"),
                 TableRule::Routed(rule) => {
@@ -185,8 +196,6 @@ fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
                     (kind, server)
                 }
             };
-            let within = table.overlaps().iter().filter(|o| o.inner == row).map(|o| refer(&o.outer)).collect();
-            let narrower = table.overlaps().iter().filter(|o| o.outer == row).map(|o| refer(&o.inner)).collect();
             RouteView { rule: row.rule.to_string(), kind, destination: host(row.dest), server, within, narrower }
         })
         .collect()

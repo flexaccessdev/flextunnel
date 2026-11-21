@@ -67,7 +67,7 @@ pub struct RouteTable {
 
 /// What one row of the table routes: a destination's own host, or one of its
 /// routed rules.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TableRule {
     /// The destination's own name: its server's loopback.
     Host(String),
@@ -85,7 +85,7 @@ impl std::fmt::Display for TableRule {
 
 /// One row of the table: a rule and the destination (an index into the
 /// table) it sends its matches to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableRow {
     pub dest: usize,
     pub rule: TableRule,
