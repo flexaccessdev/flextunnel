@@ -1,19 +1,23 @@
 //! The client's routing table: which destination, if any, a requested target
 //! is tunneled to.
 //!
-//! A client holds several *destinations*, each a hostname mapped to one
-//! server. A destination's own name means that server's loopback
-//! (`machine1.internal:22` is port 22 on the machine itself); each destination
-//! may also carry a [`RoutedSet`] of further domains and networks to send
-//! through its server. The table is static configuration, validated once at
+//! A client holds several *destinations*, each a name (one DNS label) mapped
+//! to one server. `<name>.localhost.flextunnel.internal` means that server's
+//! loopback (`machine1.localhost.flextunnel.internal:22` is port 22 on the
+//! machine itself); each destination may also carry a [`RoutedSet`] of
+//! further domains and networks to send through its server. The name itself
+//! is not a host: everything the table answers without a rule lives in the
+//! reserved `flextunnel.internal` namespace, so no configured name can shadow
+//! a real host. The table is static configuration, validated once at
 //! load — nothing about it is learned from a server — so a request is routed
 //! without any connection being open.
 //!
 //! Precedence, most specific first:
 //!
-//! 1. the reserved `flextunnel.internal` namespace, answered by the client
-//!    itself (see [`super::reserved`]);
-//! 2. a destination's own host name → that server's loopback;
+//! 1. a destination's loopback name, `<name>.localhost.flextunnel.internal`
+//!    → that server's loopback;
+//! 2. the rest of the reserved `flextunnel.internal` namespace, answered by
+//!    the client itself (see [`super::reserved`]);
 //! 3. the routed-set rule that matches most specifically across all
 //!    destinations — an exact domain, then the longest `*.suffix`, then `*`;
 //!    for IP targets the longest network prefix (see [`Specificity`]);
@@ -33,7 +37,6 @@ use crate::proxy::routed_set::{RoutedSet, Rule, Specificity, routing_key};
 use crate::proxy::signaling::{StreamRequest, Target};
 use anyhow::{Result, bail};
 use std::collections::HashMap;
-use std::net::IpAddr;
 
 /// Where a requested target goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,8 +55,8 @@ pub enum Route {
 /// One destination as the table sees it.
 #[derive(Debug, Clone)]
 struct Entry {
-    /// The destination's host name, lowercased.
-    host: String,
+    /// The destination's name, lowercased.
+    name: String,
     routed: RoutedSet,
 }
 
@@ -65,19 +68,20 @@ pub struct RouteTable {
     overlaps: Vec<Overlap>,
 }
 
-/// What one row of the table routes: a destination's own host, or one of its
-/// routed rules.
+/// What one row of the table routes: a destination's loopback name, or one
+/// of its routed rules.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TableRule {
-    /// The destination's own name: its server's loopback.
-    Host(String),
+    /// The destination's name: `<name>.localhost.flextunnel.internal` is its
+    /// server's loopback. Displayed as that host.
+    Loopback(String),
     Routed(Rule),
 }
 
 impl std::fmt::Display for TableRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Host(host) => f.write_str(host),
+            Self::Loopback(name) => f.write_str(&reserved::loopback_host(name)),
             Self::Routed(rule) => rule.fmt(f),
         }
     }
@@ -105,33 +109,33 @@ impl std::fmt::Display for Overlap {
     }
 }
 
-/// One destination's routing input: its host name and the raw routed-set
-/// rules, exactly as configured.
+/// One destination's routing input: its name and the raw routed-set rules,
+/// exactly as configured.
 pub struct RouteSpec<'a> {
-    pub host: &'a str,
+    pub name: &'a str,
     pub routed_domains: &'a [String],
     pub routed_cidrs: &'a [String],
 }
 
 impl RouteTable {
     /// Build and validate the table. Errors name the destination(s) at fault:
-    /// an invalid or duplicate host, a malformed rule, a rule shared by two
-    /// destinations, or a destination's host listed as a routed domain.
+    /// an invalid or duplicate name, a malformed rule, or a rule shared by two
+    /// destinations.
     pub fn new(specs: &[RouteSpec<'_>]) -> Result<Self> {
         let mut entries: Vec<Entry> = Vec::with_capacity(specs.len());
         for spec in specs {
-            let host = validate_destination_host(spec.host).map_err(anyhow::Error::msg)?;
-            if entries.iter().any(|e| e.host == host) {
-                bail!("destination {host:?} is configured more than once");
+            let name = validate_destination_name(spec.name).map_err(anyhow::Error::msg)?;
+            if entries.iter().any(|e| e.name == name) {
+                bail!("destination {name:?} is configured more than once");
             }
             for raw in spec.routed_domains {
                 validate_routed_domain(raw).map_err(|e| {
-                    anyhow::anyhow!("destination {host:?}: routed_domains entry {raw:?}: {e}")
+                    anyhow::anyhow!("destination {name:?}: routed_domains entry {raw:?}: {e}")
                 })?;
             }
             let routed = RoutedSet::new(spec.routed_domains, spec.routed_cidrs)
-                .map_err(|e| anyhow::anyhow!("destination {host:?}: {e:#}"))?;
-            entries.push(Entry { host, routed });
+                .map_err(|e| anyhow::anyhow!("destination {name:?}: {e:#}"))?;
+            entries.push(Entry { name, routed });
         }
 
         // A rule on two destinations is a tie no precedence can break.
@@ -139,24 +143,13 @@ impl RouteTable {
         for entry in &entries {
             for rule in entry.routed.rules() {
                 let rule = rule.to_string();
-                if let Some(other) = owners.insert(rule.clone(), &entry.host) {
+                if let Some(other) = owners.insert(rule.clone(), &entry.name) {
                     bail!(
                         "destinations {other:?} and {:?} both route {rule:?}; \
                          a rule can belong to only one destination",
-                        entry.host
+                        entry.name
                     );
                 }
-            }
-        }
-        // A destination's name is its server's loopback, so routing it as an
-        // ordinary domain — on its own destination or another — contradicts it.
-        for entry in &entries {
-            if let Some(owner) = owners.get(&entry.host) {
-                bail!(
-                    "destination {owner:?} routes {:?}, which is a destination's own host \
-                     (it always means that server's loopback)",
-                    entry.host
-                );
             }
         }
         let overlaps = find_overlaps(&entries);
@@ -165,8 +158,7 @@ impl RouteTable {
 
     /// Every place two destinations' rules match the same targets, broadest
     /// rule first: a routed rule inside another destination's (`*.dev.corp`
-    /// within `*.corp`, `10.1.0.0/16` within `10.0.0.0/8`), or a destination's
-    /// own host under another's wildcard. Never an error — the narrower rule
+    /// within `*.corp`, `10.1.0.0/16` within `10.0.0.0/8`). Never an error — the narrower rule
     /// wins where they meet — but worth showing, since the broad one stops
     /// covering what the narrow one takes.
     pub fn overlaps(&self) -> &[Overlap] {
@@ -174,7 +166,7 @@ impl RouteTable {
     }
 
     /// Every row of the table, in the order a target is tried against them:
-    /// the destinations' own hosts, then the hostname rules (exact names, the
+    /// the destinations' loopback names, then the hostname rules (exact names, the
     /// longer zone first, the catch-all last), then the networks (the longer
     /// prefix first). Ties within a kind keep destination order, then the
     /// rule's spelling.
@@ -183,7 +175,7 @@ impl RouteTable {
             .entries
             .iter()
             .enumerate()
-            .map(|(dest, e)| TableRow { dest, rule: TableRule::Host(e.host.clone()) })
+            .map(|(dest, e)| TableRow { dest, rule: TableRule::Loopback(e.name.clone()) })
             .collect();
         let mut routed: Vec<(usize, Rule)> = self
             .entries
@@ -206,18 +198,16 @@ impl RouteTable {
         self.entries.get(dest).map(|e| e.routed.rules()).unwrap_or_default()
     }
 
-    /// The destination host names, in table order.
-    pub fn hosts(&self) -> impl Iterator<Item = &str> {
-        self.entries.iter().map(|e| e.host.as_str())
+    /// The destination names, in table order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|e| e.name.as_str())
     }
 
-    /// The index of the destination named `host` (case-insensitive, with or
-    /// without the DNS root dot).
-    pub fn index_of(&self, host: &str) -> Option<usize> {
-        let host = routing_key(host);
+    /// The index of the destination called `name` (case-insensitive).
+    pub fn index_of(&self, name: &str) -> Option<usize> {
         self.entries
             .iter()
-            .position(|e| e.host.eq_ignore_ascii_case(host))
+            .position(|e| e.name.eq_ignore_ascii_case(name))
     }
 
     /// Route `target` (see the module docs for the precedence).
@@ -226,14 +216,14 @@ impl RouteTable {
             if reserved::is_status_host(host) {
                 return Route::ClientStatus;
             }
-            if reserved::is_reserved_host(host) {
-                return Route::Reserved;
-            }
-            if let Some(dest) = self.index_of(host) {
+            if let Some(dest) = reserved::loopback_name(host).and_then(|name| self.index_of(&name)) {
                 return Route::Tunnel {
                     dest,
                     request: StreamRequest::Loopback(*port),
                 };
+            }
+            if reserved::is_reserved_host(host) {
+                return Route::Reserved;
             }
         }
         let best: Option<(Specificity, usize)> = self
@@ -262,19 +252,16 @@ fn find_overlaps(entries: &[Entry]) -> Vec<Overlap> {
     if entries.len() < 2 {
         return Vec::new();
     }
-    // Each destination's rows: its host first, then its routed rules.
+    // Each destination's routed rules. Its loopback name is in the reserved
+    // namespace, which no rule covers, so it never overlaps anything.
     let groups: Vec<Vec<(TableRow, Rule)>> = entries
         .iter()
         .enumerate()
         .map(|(dest, e)| {
-            let host = (
-                TableRow { dest, rule: TableRule::Host(e.host.clone()) },
-                Rule::Exact(e.host.clone()),
-            );
-            std::iter::once(host)
-                .chain(e.routed.rules().into_iter().map(|rule| {
-                    (TableRow { dest, rule: TableRule::Routed(rule.clone()) }, rule)
-                }))
+            e.routed
+                .rules()
+                .into_iter()
+                .map(|rule| (TableRow { dest, rule: TableRule::Routed(rule.clone()) }, rule))
                 .collect()
         })
         .collect();
@@ -285,11 +272,6 @@ fn find_overlaps(entries: &[Entry]) -> Vec<Overlap> {
         for second in &groups[a + 1..] {
             for (outer_group, inner_group) in [(first, second), (second, first)] {
                 for (outer, outer_rule) in outer_group {
-                    // A host is the narrowest thing there is: nothing nests
-                    // inside it.
-                    if matches!(outer.rule, TableRule::Host(_)) {
-                        continue;
-                    }
                     for (inner, inner_rule) in inner_group {
                         if outer_rule.contains(inner_rule) {
                             overlaps.push(Overlap { outer: outer.clone(), inner: inner.clone() });
@@ -303,7 +285,7 @@ fn find_overlaps(entries: &[Entry]) -> Vec<Overlap> {
     overlaps.sort_by_key(|o| {
         let (is_net, specificity) = match &o.outer.rule {
             TableRule::Routed(rule) => (matches!(rule, Rule::Cidr(_)), rule.specificity()),
-            TableRule::Host(_) => (false, Specificity::Exact),
+            TableRule::Loopback(_) => (false, Specificity::Exact),
         };
         (is_net, specificity, o.outer.dest, o.inner.dest, o.inner.rule.to_string())
     });
@@ -327,36 +309,28 @@ fn validate_routed_domain(raw: &str) -> Result<(), String> {
         .map_err(|e| e.replace("Remote host", "the name"))
 }
 
-/// Validate a destination's host name, returning the lowercased form to store.
-/// It follows the same hostname rules as a forward's remote host
-/// ([`crate::forwards::validate_remote_host`]) and additionally must be a name
-/// the table can own: not an IP literal, not `localhost` (which every client
-/// app resolves itself), and not in the reserved `flextunnel.internal`
-/// namespace.
-pub fn validate_destination_host(input: &str) -> Result<String, String> {
-    let host = input.trim();
-    if host.is_empty() {
-        return Err("Destination host is required".into());
+/// Validate a destination's name, returning the lowercased form to store. A
+/// name is one DNS label (RFC 1123): 1–63 ASCII letters, digits and hyphens,
+/// not starting or ending with a hyphen — it becomes the first label of
+/// `<name>.localhost.flextunnel.internal`.
+pub fn validate_destination_name(input: &str) -> Result<String, String> {
+    let name = input.trim();
+    if name.is_empty() {
+        return Err("Destination name is required".into());
     }
-    let host = crate::forwards::validate_remote_host(host)
-        .map_err(|e| e.replace("Remote host", "Destination host"))?;
-    if host.parse::<IpAddr>().is_ok() {
+    if name.len() > 63 {
+        return Err(format!("Destination name {name:?} is longer than 63 characters"));
+    }
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
         return Err(format!(
-            "Destination host {host:?} is an IP address; use a host name"
+            "Destination name {name:?} may only contain letters, digits and hyphens \
+             (one DNS label, no dots)"
         ));
     }
-    let host = host.to_ascii_lowercase();
-    if host == "localhost" || host.ends_with(".localhost") {
-        return Err(format!(
-            "Destination host {host:?} is this machine's own loopback name; pick another"
-        ));
+    if name.starts_with('-') || name.ends_with('-') {
+        return Err(format!("Destination name {name:?} can't start or end with a hyphen"));
     }
-    if reserved::is_reserved_host(&host) {
-        return Err(format!(
-            "Destination host {host:?} is in the reserved flextunnel.internal namespace"
-        ));
-    }
-    Ok(host)
+    Ok(name.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -367,16 +341,16 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
-    /// Build a table from `(host, domains, cidrs)` triples.
+    /// Build a table from `(name, domains, cidrs)` triples.
     fn table(specs: &[(&str, &[&str], &[&str])]) -> Result<RouteTable> {
         let owned: Vec<(String, Vec<String>, Vec<String>)> = specs
             .iter()
-            .map(|(host, domains, cidrs)| (host.to_string(), strings(domains), strings(cidrs)))
+            .map(|(name, domains, cidrs)| (name.to_string(), strings(domains), strings(cidrs)))
             .collect();
         let specs: Vec<RouteSpec<'_>> = owned
             .iter()
-            .map(|(host, domains, cidrs)| RouteSpec {
-                host,
+            .map(|(name, domains, cidrs)| RouteSpec {
+                name,
                 routed_domains: domains,
                 routed_cidrs: cidrs,
             })
@@ -396,35 +370,44 @@ mod tests {
     }
 
     #[test]
-    fn own_host_is_the_servers_loopback() {
-        let t = table(&[("machine1.internal", &[], &[]), ("machine2.internal", &[], &[])]).unwrap();
+    fn loopback_name_is_the_servers_loopback() {
+        let t = table(&[("machine1", &[], &[]), ("machine2", &[], &[])]).unwrap();
         assert_eq!(
-            t.route(&domain("machine1.internal", 22)),
+            t.route(&domain("machine1.localhost.flextunnel.internal", 22)),
             Route::Tunnel { dest: 0, request: StreamRequest::Loopback(22) }
         );
         assert_eq!(
-            t.route(&domain("Machine2.Internal", 8080)),
+            t.route(&domain("Machine2.LocalHost.FlexTunnel.Internal", 8080)),
             Route::Tunnel { dest: 1, request: StreamRequest::Loopback(8080) }
         );
-        // A subdomain of a destination is not the destination.
-        assert_eq!(t.route(&domain("a.machine1.internal", 22)), Route::Direct);
+        // The bare name is no host of flextunnel's: it goes where any other
+        // name would.
+        assert_eq!(t.route(&domain("machine1", 22)), Route::Direct);
+        // A name no destination has, or more than one label, is reserved.
+        assert_eq!(t.route(&domain("other.localhost.flextunnel.internal", 22)), Route::Reserved);
+        assert_eq!(t.route(&domain("a.machine1.localhost.flextunnel.internal", 22)), Route::Reserved);
     }
 
     #[test]
     fn reserved_namespace_is_answered_by_the_client() {
         // Even a catch-all route never captures the reserved names.
-        let t = table(&[("m1.internal", &["*"], &["0.0.0.0/0"])]).unwrap();
+        let t = table(&[("m1", &["*"], &["0.0.0.0/0"])]).unwrap();
         assert_eq!(t.route(&domain("flextunnel.internal", 80)), Route::ClientStatus);
         assert_eq!(t.route(&domain("FlexTunnel.Internal", 80)), Route::ClientStatus);
         assert_eq!(t.route(&domain("x.flextunnel.internal", 80)), Route::Reserved);
         assert_eq!(t.route(&domain("localhost.flextunnel.internal", 80)), Route::Reserved);
+        // A destination's loopback name still is its loopback.
+        assert_eq!(
+            t.route(&domain("m1.localhost.flextunnel.internal", 80)),
+            Route::Tunnel { dest: 0, request: StreamRequest::Loopback(80) }
+        );
     }
 
     #[test]
     fn routed_rules_pick_their_destination() {
         let t = table(&[
-            ("m1.internal", &["*.corp.example", "db.internal"], &["10.0.0.0/8"]),
-            ("m2.internal", &["wiki.example"], &["192.168.7.0/24"]),
+            ("m1", &["*.corp.example", "db.internal"], &["10.0.0.0/8"]),
+            ("m2", &["wiki.example"], &["192.168.7.0/24"]),
         ])
         .unwrap();
         let api = domain("api.corp.example", 443);
@@ -446,8 +429,8 @@ mod tests {
     #[test]
     fn the_most_specific_rule_wins_across_destinations() {
         let t = table(&[
-            ("m1.internal", &["*", "*.corp.example"], &["10.0.0.0/8"]),
-            ("m2.internal", &["*.dev.corp.example", "exact.corp.example"], &["10.1.0.0/16"]),
+            ("m1", &["*", "*.corp.example"], &["10.0.0.0/8"]),
+            ("m2", &["*.dev.corp.example", "exact.corp.example"], &["10.1.0.0/16"]),
         ])
         .unwrap();
         for (host, dest) in [
@@ -468,13 +451,12 @@ mod tests {
     }
 
     #[test]
-    fn own_host_beats_a_wildcard_that_covers_it() {
-        let t = table(&[("m1.internal", &[], &[]), ("m2.internal", &["*.internal"], &[])]).unwrap();
-        assert_eq!(
-            t.route(&domain("m1.internal", 22)),
-            Route::Tunnel { dest: 0, request: StreamRequest::Loopback(22) }
-        );
-        let other = domain("nas.internal", 22);
+    fn a_name_never_shadows_a_routed_host() {
+        // `m1` is only a label: a host spelled the same is routed by the rules.
+        let t = table(&[("m1", &[], &[]), ("m2", &["m1", "*.internal"], &[])]).unwrap();
+        let same = domain("m1", 22);
+        assert_eq!(t.route(&same), connect_to(1, same.clone()));
+        let other = domain("m1.internal", 22);
         assert_eq!(t.route(&other), connect_to(1, other.clone()));
     }
 
@@ -493,9 +475,9 @@ mod tests {
     #[test]
     fn overlaps_between_destinations_are_found() {
         let t = table(&[
-            ("m1.internal", &["*", "*.corp.example", "api.corp.example"], &["10.0.0.0/8"]),
-            ("m2.internal", &["*.Dev.Corp.Example."], &["10.1.0.1/16", "192.168.0.0/16"]),
-            ("nas.corp.example", &[], &[]),
+            ("m1", &["*", "*.corp.example", "api.corp.example"], &["10.0.0.0/8"]),
+            ("m2", &["*.Dev.Corp.Example."], &["10.1.0.1/16", "192.168.0.0/16"]),
+            ("nas", &["nas.corp.example"], &[]),
         ])
         .unwrap();
         let s = |v: &str| v.to_string();
@@ -504,7 +486,6 @@ mod tests {
             [
                 // The catch-all first: everything named elsewhere is within it.
                 (s("*.dev.corp.example"), 1, s("*"), 0),
-                (s("m2.internal"), 1, s("*"), 0),
                 (s("nas.corp.example"), 2, s("*"), 0),
                 // Then the zone: another's inner zone, and a host in it.
                 (s("*.dev.corp.example"), 1, s("*.corp.example"), 0),
@@ -515,12 +496,12 @@ mod tests {
         );
         // None of these meet another destination's rule.
         let apart = table(&[
-            ("m1.internal", &["*.corp.example", "api.corp.example"], &["10.0.0.0/8", "10.1.0.0/16"]),
-            ("m2.internal", &["corp.example", "*.notcorp.example"], &["11.0.0.0/8"]),
+            ("m1", &["*.corp.example", "api.corp.example"], &["10.0.0.0/8", "10.1.0.0/16"]),
+            ("m2", &["corp.example", "*.notcorp.example"], &["11.0.0.0/8"]),
         ])
         .unwrap();
         assert!(apart.overlaps().is_empty(), "{:?}", overlaps(&apart));
-        let overlap = &t.overlaps()[3];
+        let overlap = &t.overlaps()[2];
         assert_eq!(overlap.to_string(), "*.dev.corp.example is within *.corp.example");
     }
 
@@ -528,14 +509,14 @@ mod tests {
     #[test]
     fn rows_run_most_specific_first() {
         let t = table(&[
-            ("m1.internal", &["*", "*.corp.example"], &["10.0.0.0/8", "fd00::/8"]),
-            ("m2.internal", &["*.dev.corp.example", "wiki.example"], &["10.1.0.0/16"]),
+            ("m1", &["*", "*.corp.example"], &["10.0.0.0/8", "fd00::/8"]),
+            ("m2", &["*.dev.corp.example", "wiki.example"], &["10.1.0.0/16"]),
         ])
         .unwrap();
         let rows: Vec<(String, usize)> = t.rows().iter().map(|r| (r.rule.to_string(), r.dest)).collect();
         let expected: Vec<(String, usize)> = [
-            ("m1.internal", 0),
-            ("m2.internal", 1),
+            ("m1.localhost.flextunnel.internal", 0),
+            ("m2.localhost.flextunnel.internal", 1),
             ("wiki.example", 1),
             ("*.dev.corp.example", 1),
             ("*.corp.example", 0),
@@ -548,7 +529,7 @@ mod tests {
         .map(|(r, d)| (r.to_string(), *d))
         .collect();
         assert_eq!(rows, expected);
-        assert!(matches!(t.rows()[0].rule, TableRule::Host(_)));
+        assert!(matches!(t.rows()[0].rule, TableRule::Loopback(_)));
         // Each row routes as the table does.
         for row in t.rows() {
             if let TableRule::Routed(Rule::Exact(name)) = &row.rule {
@@ -561,8 +542,7 @@ mod tests {
     fn invalid_tables_are_rejected() {
         let err = |specs: &[(&str, &[&str], &[&str])]| table(specs).unwrap_err().to_string();
 
-        assert!(err(&[("m1.internal", &[], &[]), ("M1.Internal", &[], &[])])
-            .contains("more than once"));
+        assert!(err(&[("m1", &[], &[]), ("M1", &[], &[])]).contains("more than once"));
         // The same rule on two destinations, in each rule form.
         for (domains, cidrs) in [
             (&["shared.example"][..], &[][..]),
@@ -570,25 +550,22 @@ mod tests {
             (&["*"][..], &[][..]),
             (&[][..], &["10.0.0.0/8"][..]),
         ] {
-            let message = err(&[("m1.internal", domains, cidrs), ("m2.internal", domains, cidrs)]);
+            let message = err(&[("m1", domains, cidrs), ("m2", domains, cidrs)]);
             assert!(message.contains("both route"), "{message}");
         }
         // A bare IP and its /32 are the same rule.
         assert!(err(&[
-            ("m1.internal", &[], &["10.0.0.5"]),
-            ("m2.internal", &[], &["10.0.0.5/32"]),
+            ("m1", &[], &["10.0.0.5"]),
+            ("m2", &[], &["10.0.0.5/32"]),
         ])
         .contains("both route"));
-        // A destination's host as a routed domain, on itself or another.
-        assert!(err(&[("m1.internal", &["m1.internal"], &[])]).contains("own host"));
-        assert!(err(&[("m1.internal", &[], &[]), ("m2.internal", &["m1.internal"], &[])])
-            .contains("own host"));
-        // Reserved-namespace rules.
-        assert!(err(&[("m1.internal", &["flextunnel.internal"], &[])]).contains("reserved"));
-        assert!(err(&[("m1.internal", &["*.flextunnel.internal"], &[])]).contains("reserved"));
+        // Reserved-namespace rules, a loopback name included.
+        assert!(err(&[("m1", &["flextunnel.internal"], &[])]).contains("reserved"));
+        assert!(err(&[("m1", &["*.flextunnel.internal"], &[])]).contains("reserved"));
+        assert!(err(&[("m1", &["m1.localhost.flextunnel.internal"], &[])]).contains("reserved"));
         // Malformed rules name their destination.
-        assert!(err(&[("m1.internal", &["*.*.example"], &[])]).contains("m1.internal"));
-        assert!(err(&[("m1.internal", &[], &["not-a-cidr"])]).contains("m1.internal"));
+        assert!(err(&[("m1", &["*.*.example"], &[])]).contains("\"m1\""));
+        assert!(err(&[("m1", &[], &["not-a-cidr"])]).contains("\"m1\""));
     }
 
     /// A routed domain must be a name a request could carry; the error says
@@ -596,9 +573,9 @@ mod tests {
     #[test]
     fn malformed_routed_domains_are_rejected() {
         for bad in ["has space.example", "*.has space.example", "a..b", "", "*.", "-x.example", "ex*mple.com"] {
-            let message = table(&[("m1.internal", &[bad], &[])]).unwrap_err().to_string();
+            let message = table(&[("m1", &[bad], &[])]).unwrap_err().to_string();
             assert!(
-                message.contains("\"m1.internal\"")
+                message.contains("\"m1\"")
                     && message.contains("routed_domains")
                     && message.contains(&format!("{bad:?}")),
                 "{bad:?}: {message}"
@@ -607,7 +584,7 @@ mod tests {
         // Every accepted form still is: the catch-all, exact names (internal
         // ones with underscores included) and wildcards.
         table(&[(
-            "m1.internal",
+            "m1",
             &["*", "db.internal", "my_host", "*.corp.example", " Padded.Example ", "fqdn.example."],
             &[],
         )])
@@ -620,7 +597,7 @@ mod tests {
     #[test]
     fn an_address_is_not_a_routed_domain() {
         for address in ["10.20.30.40", " 10.20.30.40 ", "2001:db8::1", "[2001:db8::1]"] {
-            let message = table(&[("m1.internal", &[address], &[])]).unwrap_err().to_string();
+            let message = table(&[("m1", &[address], &[])]).unwrap_err().to_string();
             assert!(
                 message.contains("routed_domains")
                     && message.contains(&format!("{address:?}"))
@@ -629,7 +606,7 @@ mod tests {
             );
         }
         // Where it belongs, it routes the address in either target form.
-        let t = table(&[("m1.internal", &[], &["10.20.30.40"])]).unwrap();
+        let t = table(&[("m1", &[], &["10.20.30.40"])]).unwrap();
         let literal = domain("10.20.30.40", 443);
         assert_eq!(t.route(&literal), connect_to(0, literal.clone()));
         let ip = Target::Ip("10.20.30.40:443".parse().unwrap());
@@ -637,17 +614,17 @@ mod tests {
     }
 
     /// A name with the DNS root dot is the same name: it takes the same route
-    /// — a destination's own host, an exact rule, the reserved namespace —
+    /// — a destination's loopback name, an exact rule, the reserved namespace —
     /// instead of falling through to another destination's catch-all. The
     /// target itself is forwarded as it was spelled.
     #[test]
     fn the_root_dot_selects_the_same_route() {
-        let t = table(&[("a.internal", &["db.example"], &[]), ("b.internal", &["*"], &[])]).unwrap();
+        let t = table(&[("a", &["db.example"], &[]), ("b", &["*"], &[])]).unwrap();
         for host in ["db.example", "db.example.", "DB.Example."] {
             let target = domain(host, 5432);
             assert_eq!(t.route(&target), connect_to(0, target.clone()), "{host}");
         }
-        for host in ["a.internal", "a.internal."] {
+        for host in ["a.localhost.flextunnel.internal", "a.localhost.flextunnel.internal."] {
             assert_eq!(
                 t.route(&domain(host, 22)),
                 Route::Tunnel { dest: 0, request: StreamRequest::Loopback(22) },
@@ -661,24 +638,27 @@ mod tests {
     }
 
     #[test]
-    fn destination_host_validation() {
-        assert_eq!(validate_destination_host(" Machine1.Internal ").unwrap(), "machine1.internal");
-        assert_eq!(validate_destination_host("nas").unwrap(), "nas");
+    fn destination_name_validation() {
+        assert_eq!(validate_destination_name(" Machine1 ").unwrap(), "machine1");
+        assert_eq!(validate_destination_name("nas-2").unwrap(), "nas-2");
+        assert_eq!(validate_destination_name("0").unwrap(), "0");
+        assert!(validate_destination_name(&"a".repeat(63)).is_ok());
         for bad in [
             "",
+            "   ",
+            "machine1.internal",
             "10.0.0.1",
             "::1",
             "[::1]",
-            "localhost",
-            "app.localhost",
-            "flextunnel.internal",
-            "x.flextunnel.internal",
-            "a..b",
+            "my_host",
+            "-x",
+            "x-",
             "*",
-            "*.example.com",
-            "has space.example",
+            "has space",
+            "caf\u{e9}",
+            &"a".repeat(64),
         ] {
-            assert!(validate_destination_host(bad).is_err(), "{bad:?} should be rejected");
+            assert!(validate_destination_name(bad).is_err(), "{bad:?} should be rejected");
         }
     }
 }

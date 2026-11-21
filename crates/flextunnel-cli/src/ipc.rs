@@ -80,11 +80,11 @@ const MAX_FRAME: usize = 64 * 1024;
 pub enum Request {
     Status,
     /// On-demand connection-path + custom-relay-health snapshot of the
-    /// destination named `host` (mirrors the desktop modal / iOS sheet). Kept
+    /// destination called `name` (mirrors the desktop modal / iOS sheet). Kept
     /// off the polled `Status` because the custom-relay `/healthz` probe does
     /// on-demand HTTP. Empty for a destination that is not connected; asking
     /// never connects it.
-    ConnPath { host: String },
+    ConnPath { name: String },
     /// Open a tunnel to `host:port` through the destination that routes
     /// `host`, like a port forward: the destination connects if it is idle
     /// (the request is held while it does), and its server enforces its
@@ -168,8 +168,9 @@ impl From<DestinationState> for DestState {
 /// One destination of the client as the panel sees it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DestinationRow {
-    /// The destination's name; `host:<port>` is the server's own loopback.
-    pub host: String,
+    /// The destination's name; `<name>.localhost.flextunnel.internal:<port>`
+    /// is the server's own loopback.
+    pub name: String,
     pub server_node_id: String,
     pub state: DestState,
     /// Uptime of the current connection, if connected.
@@ -252,7 +253,7 @@ pub enum ForwardRowState {
 pub struct ForwardRow {
     #[serde(flatten)]
     pub forward: WireForward,
-    /// The host of the destination that carries this forward.
+    /// The name of the destination that carries this forward.
     pub destination: String,
     pub state: ForwardRowState,
     /// Bind-failure reason — including the retained reason of a forward that
@@ -270,7 +271,7 @@ pub struct ForwardRow {
 /// What a connection task asks of the client session loop.
 pub enum IpcCmd {
     Status(oneshot::Sender<StatusSnapshot>),
-    /// Connection snapshot of the destination with this host.
+    /// Connection snapshot of the destination with this name.
     ConnPath(String, oneshot::Sender<WireConnSnapshot>),
 }
 
@@ -674,9 +675,9 @@ fn build_cmd(request: Request) -> Option<(IpcCmd, PendingReply)> {
             let (reply, rx) = oneshot::channel();
             (IpcCmd::Status(reply), PendingReply::Status(rx))
         }
-        Request::ConnPath { host } => {
+        Request::ConnPath { name } => {
             let (reply, rx) = oneshot::channel();
-            (IpcCmd::ConnPath(host, reply), PendingReply::ConnPath(rx))
+            (IpcCmd::ConnPath(name, reply), PendingReply::ConnPath(rx))
         }
         Request::Connect { .. } => return None,
     })
@@ -894,7 +895,7 @@ mod tests {
             idle_timeout_secs: Some(300),
             destinations: vec![
                 DestinationRow {
-                    host: "machine1.internal".into(),
+                    name: "machine1".into(),
                     server_node_id: "server1".into(),
                     state: DestState::Connected,
                     connected_secs: Some(61),
@@ -909,7 +910,7 @@ mod tests {
                     relay_urls: vec![],
                 },
                 DestinationRow {
-                    host: "machine2.internal".into(),
+                    name: "machine2".into(),
                     server_node_id: "server2".into(),
                     state: DestState::Idle,
                     connected_secs: None,
@@ -926,7 +927,7 @@ mod tests {
             ],
             forwards: vec![ForwardRow {
                 forward: wire_forward(),
-                destination: "machine1.internal".into(),
+                destination: "machine1".into(),
                 state: ForwardRowState::Listening,
                 error: None,
                 active: 2,
@@ -942,7 +943,7 @@ mod tests {
             port: 22,
         };
         let conn_path = Request::ConnPath {
-            host: "machine1.internal".into(),
+            name: "machine1".into(),
         };
         for request in [Request::Status, conn_path, connect] {
             let json = serde_json::to_string(&request).unwrap();
@@ -959,7 +960,7 @@ mod tests {
                 assert!(s.destinations[1].client_node_id.is_none());
                 assert_eq!(s.forwards.len(), 1);
                 assert_eq!(s.forwards[0].forward.local_port, 5432);
-                assert_eq!(s.forwards[0].destination, "machine1.internal");
+                assert_eq!(s.forwards[0].destination, "machine1");
                 assert_eq!(s.forwards[0].state, ForwardRowState::Listening);
             }
             other => panic!("expected Status, got {other:?}"),
@@ -976,7 +977,7 @@ mod tests {
                         let _ = reply.send(snapshot());
                     }
                     // Only the connected destination has a path to show.
-                    IpcCmd::ConnPath(host, reply) if host != "machine1.internal" => {
+                    IpcCmd::ConnPath(name, reply) if name != "machine1" => {
                         let _ = reply.send(WireConnSnapshot::default());
                     }
                     IpcCmd::ConnPath(_, reply) => {
@@ -1040,16 +1041,16 @@ mod tests {
         match client.request(&Request::Status).await.unwrap() {
             Response::Status(s) => {
                 assert_eq!(s.name, "work");
-                assert_eq!(s.destinations[0].host, "machine1.internal");
+                assert_eq!(s.destinations[0].name, "machine1");
             }
             other => panic!("expected Status, got {other:?}"),
         }
 
         // The on-demand snapshot, per destination...
-        for (host, paths) in [("machine1.internal", 1), ("machine2.internal", 0)] {
-            let request = Request::ConnPath { host: host.into() };
+        for (name, paths) in [("machine1", 1), ("machine2", 0)] {
+            let request = Request::ConnPath { name: name.into() };
             match client.request(&request).await.unwrap() {
-                Response::ConnPath(s) => assert_eq!(s.paths.len(), paths, "{host}"),
+                Response::ConnPath(s) => assert_eq!(s.paths.len(), paths, "{name}"),
                 other => panic!("expected ConnPath, got {other:?}"),
             }
         }

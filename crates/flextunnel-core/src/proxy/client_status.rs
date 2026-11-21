@@ -17,8 +17,10 @@
 //! when a later read failed), or "unchecked" for one not yet used.
 //!
 //! On `/` (and `/servers/<destination>/`) an `Accept: application/json` or
-//! `text/plain` header picks the format, as the path suffix does. Any other
-//! `*.flextunnel.internal` name is reserved and answers 404.
+//! `text/plain` header picks the format, as the path suffix does. A
+//! destination's `<name>.localhost.flextunnel.internal` is its server's
+//! loopback; any other `*.flextunnel.internal` name is reserved and answers
+//! 404.
 //!
 //! A server's page is content from another machine shown under this
 //! endpoint's own name, so it is never passed through as the server sent it:
@@ -31,6 +33,7 @@ use super::client::{
     ClientStatus, HoldBudget, LocalProto, LocalStream, Router, TUNNEL_OPEN_TIMEOUT, open_tunnel,
 };
 use super::destination::{DestinationState, DestinationStatus};
+use super::reserved;
 use super::route_table::{RouteTable, TableRow, TableRule};
 use super::routed_set::{Coverage, Rule};
 use super::signaling::{self, StreamRequest};
@@ -59,21 +62,23 @@ const SERVER_STATUS_LIMIT: usize = 1024 * 1024;
 const ISOLATION_HEADERS: &str =
     "Content-Security-Policy: sandbox\r\nX-Content-Type-Options: nosniff\r\n";
 
-/// The path of `host`'s server status page in `format`, relative to
-/// `http://flextunnel.internal`.
-pub fn server_status_path(host: &str, format: StatusFormat) -> String {
+/// The path of the server status page of the destination called `name` in
+/// `format`, relative to `http://flextunnel.internal`.
+pub fn server_status_path(name: &str, format: StatusFormat) -> String {
     let tail = match format {
         StatusFormat::Html => "/",
         StatusFormat::Text => STATUS_TEXT_PATH,
         StatusFormat::Json => STATUS_JSON_PATH,
     };
-    format!("{SERVERS_PATH_PREFIX}{host}{tail}")
+    format!("{SERVERS_PATH_PREFIX}{name}{tail}")
 }
 
 /// One destination as the JSON status reports it.
 #[derive(Serialize)]
 struct DestinationJson<'a> {
-    host: &'a str,
+    name: &'a str,
+    /// `<name>.localhost.flextunnel.internal`: the server's own loopback.
+    loopback_host: String,
     server_node_id: &'a str,
     /// `idle`, `connecting`, `connected`, `backoff` or `failed`.
     state: &'static str,
@@ -127,7 +132,7 @@ struct RuleRef {
 /// What a row's server makes of it ([`RouteView::server`] says it in words).
 #[derive(Clone, Copy)]
 enum ServerCheck {
-    /// A destination's own host: its server's loopback, always served.
+    /// A destination's loopback name: its server's loopback, always served.
     Loopback,
     /// Graded against the server's lists as last read.
     Graded(Coverage),
@@ -149,7 +154,7 @@ impl ServerCheck {
 #[derive(Serialize)]
 struct RouteView {
     rule: String,
-    /// `host` (the server's loopback), `exact`, `wildcard`, `catch-all` or
+    /// `loopback` (the server's loopback), `exact`, `wildcard`, `catch-all` or
     /// `network`.
     kind: &'static str,
     destination: String,
@@ -188,8 +193,8 @@ impl RouteView {
 /// order, as `table`'s), with each server's answer about its own lists, as
 /// the destination graded it when it read them.
 fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
-    let host = |dest: usize| table.hosts().nth(dest).unwrap_or_default().to_string();
-    let refer = |row: &TableRow| RuleRef { rule: row.rule.to_string(), destination: host(row.dest) };
+    let name = |dest: usize| table.names().nth(dest).unwrap_or_default().to_string();
+    let refer = |row: &TableRow| RuleRef { rule: row.rule.to_string(), destination: name(row.dest) };
     // Each row's overlaps, in the table's overlap order: the broader rules it
     // sits within, and the narrower rules inside it.
     let mut within: HashMap<&TableRow, Vec<RuleRef>> = HashMap::new();
@@ -206,7 +211,7 @@ fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
             let narrower = narrower.remove(&row).unwrap_or_default();
             let destination = status.destinations.get(row.dest);
             let (kind, check) = match &row.rule {
-                TableRule::Host(_) => ("host", ServerCheck::Loopback),
+                TableRule::Loopback(_) => ("loopback", ServerCheck::Loopback),
                 TableRule::Routed(rule) => {
                     let kind = match rule {
                         Rule::CatchAll => "catch-all",
@@ -232,7 +237,7 @@ fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
             RouteView {
                 rule: row.rule.to_string(),
                 kind,
-                destination: host(row.dest),
+                destination: name(row.dest),
                 server: check.as_str(),
                 check,
                 server_last_known,
@@ -281,6 +286,8 @@ struct Row<'a> {
     /// What the server routes, as [`server_routes_line`] says it.
     server_routes: String,
     server_status_path: String,
+    /// `<name>.localhost.flextunnel.internal`.
+    loopback_host: String,
 }
 
 #[derive(Template)]
@@ -355,7 +362,8 @@ fn rows(status: &ClientStatus, now: Instant) -> Vec<Row<'_>> {
                 state: d.state.as_str(),
                 detail,
                 server_routes: server_routes_line(d),
-                server_status_path: server_status_path(&d.host, StatusFormat::Html),
+                server_status_path: server_status_path(&d.name, StatusFormat::Html),
+                loopback_host: reserved::loopback_host(&d.name),
             }
         })
         .collect()
@@ -418,7 +426,8 @@ fn render_at(
                     .destinations
                     .iter()
                     .map(|d| DestinationJson {
-                        host: &d.host,
+                        name: &d.name,
+                        loopback_host: reserved::loopback_host(&d.name),
                         server_node_id: &d.server_node_id,
                         state: d.state.as_str(),
                         connected_secs: secs_since(d.connected_since, now),
@@ -434,7 +443,7 @@ fn render_at(
                         server_routes: d.server_routes.as_ref(),
                         server_routes_error: d.server_routes_error.as_deref(),
                         server_routes_pending: d.server_routes_pending,
-                        server_status: server_status_path(&d.host, StatusFormat::Json),
+                        server_status: server_status_path(&d.name, StatusFormat::Json),
                     })
                     .collect(),
             };
@@ -515,7 +524,7 @@ pub(super) async fn serve<P: LocalProto, S: LocalStream>(
     }
 }
 
-/// Serve `/servers/<host>[/status.txt|/status.json]`: fetch that destination
+/// Serve `/servers/<name>[/status.txt|/status.json]`: fetch that destination
 /// server's own status page over a [`StreamRequest::Status`] stream — which
 /// connects to the server if it is not connected — and answer with its body
 /// under headers of our own (see the module docs).
@@ -531,15 +540,15 @@ async fn serve_server_status<S: LocalStream>(
     accept: Option<StatusFormat>,
     holds: &HoldBudget,
 ) -> Result<()> {
-    let (host, tail) = match rest.split_once('/') {
-        Some((host, tail)) => (host, format!("/{tail}")),
+    let (name, tail) = match rest.split_once('/') {
+        Some((name, tail)) => (name, format!("/{tail}")),
         None => (rest, "/".to_string()),
     };
     if !matches!(tail.as_str(), "/" | STATUS_TEXT_PATH | STATUS_JSON_PATH) {
         return not_found(tcp, &format!("no such page: {SERVERS_PATH_PREFIX}{rest}")).await;
     }
-    let Some(dest) = router.table.index_of(host) else {
-        return not_found(tcp, &format!("no destination named {host:?}")).await;
+    let Some(dest) = router.table.index_of(name) else {
+        return not_found(tcp, &format!("no destination named {name:?}")).await;
     };
     let destination = &router.destinations[dest];
 
@@ -564,7 +573,7 @@ async fn serve_server_status<S: LocalStream>(
             Ok(())
         }
         Err(detail) => {
-            let body = format!("{}: {detail}\n", destination.host());
+            let body = format!("{}: {detail}\n", destination.name());
             respond(tcp, "502 Bad Gateway", CONTENT_TYPE_TEXT, &body).await
         }
     }
@@ -717,7 +726,7 @@ mod tests {
             .destinations
             .iter()
             .map(|d| RouteSpec {
-                host: &d.host,
+                name: &d.name,
                 routed_domains: &d.routed_domains,
                 routed_cidrs: &d.routed_cidrs,
             })
@@ -725,9 +734,9 @@ mod tests {
         RouteTable::new(&specs).unwrap()
     }
 
-    fn destination(host: &str, state: DestinationState) -> DestinationStatus {
+    fn destination(name: &str, state: DestinationState) -> DestinationStatus {
         DestinationStatus {
-            host: host.to_string(),
+            name: name.to_string(),
             server_node_id: "serverid".to_string(),
             state,
             connected_since: None,
@@ -765,7 +774,7 @@ mod tests {
         // the machine has been up).
         let connected_at = Instant::now();
         let now = connected_at + Duration::from_secs(125);
-        let mut connected = destination("m1.internal", DestinationState::Connected);
+        let mut connected = destination("m1", DestinationState::Connected);
         connected.connected_since = Some(connected_at);
         connected.open_streams = 2;
         connected.client_node_id = Some("clientid".to_string());
@@ -776,7 +785,7 @@ mod tests {
                 routed_cidrs: strings(&["10.0.0.0/9"]),
             },
         );
-        let mut backoff = destination("m2.internal", DestinationState::Backoff);
+        let mut backoff = destination("m2", DestinationState::Backoff);
         backoff.routed_domains = strings(&["*.dev.corp.example"]);
         backoff.routed_cidrs = strings(&["10.1.0.0/16"]);
         answered(&mut backoff, ServerRoutes::default());
@@ -784,7 +793,7 @@ mod tests {
         backoff.last_error = Some("Signaling error: timed out".to_string());
         backoff.next_attempt_at = Some(now + Duration::from_secs(30));
         backoff.waiting = 1;
-        let mut idle = destination("m3.internal", DestinationState::Idle);
+        let mut idle = destination("m3", DestinationState::Idle);
         idle.routed_domains = strings(&["wiki.example"]);
         idle.routed_cidrs.clear();
         let status = ClientStatus {
@@ -812,12 +821,13 @@ mod tests {
         assert_eq!(json["idle_timeout_secs"], 300);
         let d = json["destinations"].as_array().unwrap();
         assert_eq!(d.len(), 3);
-        assert_eq!(d[0]["host"], "m1.internal");
+        assert_eq!(d[0]["name"], "m1");
+        assert_eq!(d[0]["loopback_host"], "m1.localhost.flextunnel.internal");
         assert_eq!(d[0]["state"], "connected");
         assert_eq!(d[0]["connected_secs"], 125);
         assert_eq!(d[0]["open_streams"], 2);
         assert_eq!(d[0]["client_node_id"], "clientid");
-        assert_eq!(d[0]["server_status"], "/servers/m1.internal/status.json");
+        assert_eq!(d[0]["server_status"], "/servers/m1/status.json");
         assert_eq!(d[1]["state"], "backoff");
         assert_eq!(d[1]["failed_attempts"], 3);
         assert_eq!(d[1]["waiting"], 1);
@@ -836,9 +846,9 @@ mod tests {
     fn html_and_text_render_states_and_links() {
         let (line, content_type, html) = render_fixed(StatusFormat::Html);
         assert_eq!((line, content_type), ("200 OK", CONTENT_TYPE_HTML));
-        assert!(html.contains("m1.internal"));
+        assert!(html.contains("m1.localhost.flextunnel.internal:&lt;port&gt;"));
         assert!(html.contains("for 2m 05s"));
-        assert!(html.contains("href=\"/servers/m1.internal/\""));
+        assert!(html.contains("href=\"/servers/m1/\""));
         assert!(html.contains("3 failed attempts, next in 30s"));
         assert!(html.contains("connects on first use"));
 
@@ -846,7 +856,7 @@ mod tests {
         assert_eq!((line, content_type), ("200 OK", CONTENT_TYPE_TEXT));
         assert!(text.contains("socks5: 127.0.0.1:1080"));
         assert!(text.contains("http: off"));
-        assert!(text.contains("m2.internal"));
+        assert!(text.contains("m2"));
         assert!(text.contains("state: backoff"));
         assert!(text.contains("last error: Signaling error: timed out"));
     }
@@ -873,29 +883,29 @@ mod tests {
         assert_eq!(
             summary,
             [
-                ("m1.internal", "host", "m1.internal", "loopback"),
-                ("m2.internal", "host", "m2.internal", "loopback"),
-                ("m3.internal", "host", "m3.internal", "loopback"),
-                ("wiki.example", "exact", "m3.internal", "unchecked"),
-                ("*.dev.corp.example", "wildcard", "m2.internal", "not allowed"),
-                ("*.corp.example", "wildcard", "m1.internal", "allowed"),
-                ("10.1.0.0/16", "network", "m2.internal", "not allowed"),
-                ("10.0.0.0/8", "network", "m1.internal", "partly allowed"),
+                ("m1.localhost.flextunnel.internal", "loopback", "m1", "loopback"),
+                ("m2.localhost.flextunnel.internal", "loopback", "m2", "loopback"),
+                ("m3.localhost.flextunnel.internal", "loopback", "m3", "loopback"),
+                ("wiki.example", "exact", "m3", "unchecked"),
+                ("*.dev.corp.example", "wildcard", "m2", "not allowed"),
+                ("*.corp.example", "wildcard", "m1", "allowed"),
+                ("10.1.0.0/16", "network", "m2", "not allowed"),
+                ("10.0.0.0/8", "network", "m1", "partly allowed"),
             ]
         );
         let dev = &routes[4];
         assert_eq!(dev["within"][0]["rule"], "*.corp.example");
-        assert_eq!(dev["within"][0]["destination"], "m1.internal");
+        assert_eq!(dev["within"][0]["destination"], "m1");
         let corp = &routes[5];
         assert_eq!(corp["narrower"][0]["rule"], "*.dev.corp.example");
-        assert_eq!(corp["narrower"][0]["destination"], "m2.internal");
+        assert_eq!(corp["narrower"][0]["destination"], "m2");
         assert!(corp["within"].as_array().unwrap().is_empty());
 
         let (_, _, text) = render_fixed(StatusFormat::Text);
-        assert!(text.contains("*.dev.corp.example (wildcard) -> m2.internal, server: not allowed"), "{text}");
-        assert!(text.contains("inside m1.internal's broader *.corp.example"), "{text}");
-        assert!(text.contains("contains m2.internal's narrower 10.1.0.0/16"), "{text}");
-        assert!(text.contains("*.flextunnel.internal -> this client (reserved, answers 404)"), "{text}");
+        assert!(text.contains("*.dev.corp.example (wildcard) -> m2, server: not allowed"), "{text}");
+        assert!(text.contains("inside m1's broader *.corp.example"), "{text}");
+        assert!(text.contains("contains m2's narrower 10.1.0.0/16"), "{text}");
+        assert!(text.contains("any other *.flextunnel.internal -> this client (reserved, answers 404)"), "{text}");
         assert!(text.contains("anything else -> direct"), "{text}");
         assert!(text.contains("server routes: *.corp.example, 10.0.0.0/9"), "{text}");
         assert!(text.contains("server routes: unchecked"), "{text}");
@@ -903,7 +913,7 @@ mod tests {
         let (_, _, html) = render_fixed(StatusFormat::Html);
         assert!(html.contains("Routing"));
         assert!(html.contains("partly allowed"));
-        assert!(html.contains("contains <span class=\"mono\">m2.internal</span>'s narrower"), "{html}");
+        assert!(html.contains("contains <span class=\"mono\">m2</span>'s narrower"), "{html}");
         assert!(html.contains("*.flextunnel.internal"), "{html}");
     }
 
@@ -923,7 +933,7 @@ mod tests {
         assert_eq!(dev["server_last_known"], false);
 
         let (_, _, text) = render_at(&status, &table, StatusFormat::Text, now);
-        assert!(text.contains("-> m1.internal, server: allowed (last known)"), "{text}");
+        assert!(text.contains("-> m1, server: allowed (last known)"), "{text}");
         assert!(
             text.contains("server routes: *.corp.example, 10.0.0.0/9 (last known; reading them again failed: timed out)"),
             "{text}"
@@ -937,7 +947,7 @@ mod tests {
         status.destinations[0].server_routes_error = None;
         status.destinations[0].server_routes_pending = true;
         let (_, _, text) = render_at(&status, &table, StatusFormat::Text, now);
-        assert!(text.contains("-> m1.internal, server: allowed (last known)"), "{text}");
+        assert!(text.contains("-> m1, server: allowed (last known)"), "{text}");
         assert!(text.contains("10.0.0.0/9 (last known; reading them again)"), "{text}");
 
         // With nothing read yet, a read in progress says so — a first one, or
@@ -1076,10 +1086,10 @@ mod tests {
 
     #[test]
     fn server_status_paths() {
-        assert_eq!(server_status_path("m1.internal", StatusFormat::Html), "/servers/m1.internal/");
+        assert_eq!(server_status_path("m1", StatusFormat::Html), "/servers/m1/");
         assert_eq!(
-            server_status_path("m1.internal", StatusFormat::Text),
-            "/servers/m1.internal/status.txt"
+            server_status_path("m1", StatusFormat::Text),
+            "/servers/m1/status.txt"
         );
     }
 }

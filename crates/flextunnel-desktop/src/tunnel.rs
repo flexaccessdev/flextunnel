@@ -143,11 +143,11 @@ enum Command {
     /// Replace the desired forward list (the UI sends the full list after
     /// every add/edit/delete/toggle); applied live mid-session.
     SetForwards(Vec<PortForward>),
-    /// Ask the destination named by this host for one connection attempt now,
+    /// Ask the destination with this name for one connection attempt now,
     /// instead of waiting for its first use.
     ConnectNow(String),
     /// One-shot request for a destination's current iroh connection path(s),
-    /// by host, answered on the reply channel (the UI's connection-path CTA).
+    /// by name, answered on the reply channel (the UI's connection-path CTA).
     /// Empty when no session is running or the destination is not connected.
     /// A `std` channel (not tokio `oneshot`) so the GUI caller can wait with a
     /// bounded [`std::sync::mpsc::Receiver::recv_timeout`].
@@ -287,8 +287,8 @@ impl Controller {
         let _ = self.tx.blocking_send(Command::SetForwards(forwards));
     }
 
-    pub fn connect_now(&self, host: &str) {
-        let _ = self.tx.blocking_send(Command::ConnectNow(host.into()));
+    pub fn connect_now(&self, name: &str) {
+        let _ = self.tx.blocking_send(Command::ConnectNow(name.into()));
     }
 
     /// Fetch a destination's current iroh connection path(s), once. Returns
@@ -297,11 +297,11 @@ impl Controller {
     /// [`CONN_PATH_TIMEOUT`]. The round-trip is a channel hop (normally
     /// sub-millisecond), but the deadline is what guarantees a wedged session
     /// can never freeze the GUI thread calling this from `App::update`.
-    pub fn query_conn_path(&self, host: &str) -> ConnectionSnapshot {
+    pub fn query_conn_path(&self, name: &str) -> ConnectionSnapshot {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         if self
             .tx
-            .blocking_send(Command::QueryConnPath(host.into(), reply_tx))
+            .blocking_send(Command::QueryConnPath(name.into(), reply_tx))
             .is_err()
         {
             return ConnectionSnapshot::default();
@@ -533,14 +533,14 @@ async fn run_loop(
                 // No session: nothing to do — the next start carries them.
                 (None, None) => {}
             },
-            Some(Command::ConnectNow(host)) => {
+            Some(Command::ConnectNow(name)) => {
                 if let Some(handle) = live_client {
-                    let _ = handle.tx.send(SessionCmd::ConnectNow(host)).await;
+                    let _ = handle.tx.send(SessionCmd::ConnectNow(name)).await;
                 }
             }
-            Some(Command::QueryConnPath(host, reply)) => {
+            Some(Command::QueryConnPath(name, reply)) => {
                 if let Some(handle) = live_client {
-                    let _ = handle.tx.send(SessionCmd::QueryConnPath(host, reply)).await;
+                    let _ = handle.tx.send(SessionCmd::QueryConnPath(name, reply)).await;
                 }
                 // No session: `reply` drops, and the caller gets an empty one.
             }
@@ -634,21 +634,21 @@ fn reset_server_snapshot(shared: &SharedServerSnapshot) {
 /// corrupted keychain entry can still surface here.
 fn destination_config(spec: &DestinationSpec) -> Result<DestinationConfig, String> {
     let destination = &spec.destination;
-    let host = &destination.host;
+    let name = &destination.name;
     let relay = RelayConfig::from_urls_with_token(
         &destination.relay_urls,
         destination.relay_auth_token.clone(),
     )
-    .map_err(|e| format!("Destination \"{host}\": invalid relay configuration: {e:#}"))?;
+    .map_err(|e| format!("Destination \"{name}\": invalid relay configuration: {e:#}"))?;
     let client_key = flextunnel_core::auth::ClientKey::from_secret_str(spec.auth_secret.trim())
-        .map_err(|e| format!("Destination \"{host}\": invalid client auth key: {e:#}"))?;
+        .map_err(|e| format!("Destination \"{name}\": invalid client auth key: {e:#}"))?;
     let server_id = destination
         .server_node_id
         .trim()
         .parse()
-        .map_err(|e| format!("Destination \"{host}\": invalid server node id: {e}"))?;
+        .map_err(|e| format!("Destination \"{name}\": invalid server node id: {e}"))?;
     Ok(DestinationConfig {
-        host: host.clone(),
+        name: name.clone(),
         server_id,
         auth: ClientAuth::Key(Box::new(client_key)),
         relay,
@@ -682,7 +682,7 @@ async fn run_client(
         Ok(destinations) => destinations,
         Err(reason) => return slot.fail(reason),
     };
-    // Building the client validates the hosts and routes together and dials
+    // Building the client validates the names and routes together and dials
     // nothing.
     // Shared, so a connection-path probe can run on a task of its own.
     let client = match ProxyClient::new(ClientConfig {
@@ -755,19 +755,19 @@ async fn run_client(
                     let statuses = fwd_mgr.statuses();
                     slot.update(|s| s.forwards = statuses);
                 }
-                Some(SessionCmd::ConnectNow(host)) => {
-                    if !client.dialer().warm(&host) {
-                        log::warn!("No destination \"{host}\" in the running client");
+                Some(SessionCmd::ConnectNow(name)) => {
+                    if !client.dialer().warm(&name) {
+                        log::warn!("No destination \"{name}\" in the running client");
                     }
                 }
                 // On its own task, never awaited here: the snapshot probes the
                 // destination's custom relays over HTTP (~3s worst case), and
                 // this loop is what drives the client — its accept loops and
                 // every destination's manager would stand still meanwhile.
-                Some(SessionCmd::QueryConnPath(host, reply)) => {
+                Some(SessionCmd::QueryConnPath(name, reply)) => {
                     let client = Arc::clone(&client);
                     tokio::spawn(async move {
-                        let _ = reply.send(client.connection_snapshot(&host).await);
+                        let _ = reply.send(client.connection_snapshot(&name).await);
                     });
                 }
                 Some(SessionCmd::Stop) | None => {
@@ -827,7 +827,7 @@ mod tests {
     fn destination(host: &str, auth_key_id: &str) -> Destination {
         Destination {
             id: host.into(),
-            host: host.into(),
+            name: host.into(),
             server_node_id: format!("node-{host}"),
             routed_domains: Vec::new(),
             routed_cidrs: Vec::new(),
@@ -843,7 +843,7 @@ mod tests {
         let client = ClientSettings {
             socks_port: Some(1085),
             http_port: None,
-            destinations: vec![destination("a.internal", "k2"), destination("b.internal", "k1")],
+            destinations: vec![destination("a", "k2"), destination("b", "k1")],
             ..ClientSettings::default()
         };
         let spec = ClientSpec::resolve(&client, &keys).expect("every key resolves");
@@ -862,7 +862,7 @@ mod tests {
     fn a_spec_changes_with_what_a_session_keeps() {
         let keys = [key("k1", "secret-1")];
         let client = ClientSettings {
-            destinations: vec![destination("a.internal", "k1")],
+            destinations: vec![destination("a", "k1")],
             ..ClientSettings::default()
         };
         let spec = ClientSpec::resolve(&client, &keys).unwrap();
@@ -872,7 +872,7 @@ mod tests {
             id: "f".into(),
             label: String::new(),
             local_port: 8080,
-            remote_host: "a.internal".into(),
+            remote_host: "a.localhost.flextunnel.internal".into(),
             remote_port: 80,
             enabled: true,
         });
@@ -896,12 +896,12 @@ mod tests {
         };
         let secret = flextunnel_core::auth::ClientKey::generate().unwrap().secret_str();
         let server_id = flextunnel_core::iroh::SecretKey::generate().public().to_string();
-        let mut good = destination("a.internal", "k1");
+        let mut good = destination("a", "k1");
         good.server_node_id = server_id.clone();
         assert!(destination_config(&spec(good.clone(), &secret)).is_ok());
 
         let err = |spec: DestinationSpec| destination_config(&spec).err().expect("rejected");
-        assert!(err(spec(good.clone(), "not-a-key")).contains("\"a.internal\": invalid client auth key"));
+        assert!(err(spec(good.clone(), "not-a-key")).contains("\"a\": invalid client auth key"));
         let mut bad_server = good.clone();
         bad_server.server_node_id = "nope".into();
         assert!(err(spec(bad_server, &secret)).contains("invalid server node id"));

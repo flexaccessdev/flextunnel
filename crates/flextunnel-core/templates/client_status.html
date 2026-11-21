@@ -76,8 +76,11 @@
     <table class="routes">
       <tr><th>Rule</th><th>Goes to</th><th>Server</th></tr>
       <tr><td class="mono">flextunnel.internal</td><td>this client <span class="muted">status page</span></td><td></td></tr>
+      {% for r in routes %}{% if r.kind == "loopback" %}
+      <tr><td><span class="mono">{{ r.rule }}</span> <span class="muted">loopback</span></td><td class="mono">{{ r.destination }}</td><td class="connected">server's loopback</td></tr>
+      {% endif %}{% endfor %}
       <tr><td class="mono">*.flextunnel.internal</td><td>this client <span class="muted">reserved, answers 404</span></td><td></td></tr>
-      {% for r in routes %}
+      {% for r in routes %}{% if r.kind != "loopback" %}
       <tr>
         <td><span class="mono">{{ r.rule }}</span> <span class="muted">{{ r.kind }}</span>
           {% for o in r.within %}<span class="note">inside <span class="mono">{{ o.destination }}</span>'s broader <span class="mono">{{ o.rule }}</span></span>{% endfor %}
@@ -86,7 +89,7 @@
         <td class="mono">{{ r.destination }}</td>
         <td class="{{ r.server_class() }}">{{ r.server }}{% if r.server_last_known %} <span class="muted">last known</span>{% endif %}</td>
       </tr>
-      {% endfor %}
+      {% endif %}{% endfor %}
       <tr><td class="muted">anything else</td><td>direct <span class="muted">from this device</span></td><td></td></tr>
     </table>
   </section>
@@ -99,13 +102,13 @@
   {% endif %}
   {% for row in rows %}
   <section>
-    <div class="dest-name mono">{{ row.status.host }}
+    <div class="dest-name mono">{{ row.status.name }}
       <span class="{{ row.state }}">{{ row.state }}</span>
       {% if !row.detail.is_empty() %}<span class="muted">{{ row.detail }}</span>{% endif %}
     </div>
     <table>
       <tr><td>Server node id</td><td class="mono">{{ row.status.server_node_id }}</td></tr>
-      <tr><td>Reaches</td><td><span class="mono">{{ row.status.host }}:&lt;port&gt;</span> <span class="muted">the server's own loopback</span></td></tr>
+      <tr><td>Reaches</td><td><span class="mono">{{ row.loopback_host }}:&lt;port&gt;</span> <span class="muted">the server's own loopback</span></td></tr>
       <tr><td>Open streams</td><td>{{ row.status.open_streams }}{% if row.status.waiting > 0 %} <span class="muted">({{ row.status.waiting }} waiting)</span>{% endif %}</td></tr>
       {% if let Some(id) = row.status.client_node_id %}
       <tr><td>Client node id</td><td class="mono">{{ id }}</td></tr>

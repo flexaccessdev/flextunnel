@@ -377,7 +377,7 @@ mod tests {
     fn destination(host: &str) -> crate::config::Destination {
         crate::config::Destination {
             id: host.into(),
-            host: host.into(),
+            name: host.into(),
             server_node_id: format!("node-{host}"),
             routed_domains: Vec::new(),
             routed_cidrs: Vec::new(),
@@ -399,7 +399,7 @@ mod tests {
     fn client_snapshot(phase: ClientPhase, states: &[DestinationState]) -> ClientSnapshot {
         let status = |(i, state): (usize, &DestinationState)| {
             flextunnel_core::proxy::DestinationStatus {
-                host: format!("d{i}.internal"),
+                name: format!("d{i}"),
                 server_node_id: String::new(),
                 state: *state,
                 connected_since: None,
@@ -510,7 +510,7 @@ mod tests {
         // No destinations: the menu leaves the client out.
         assert_eq!(line(&client(true, &[]), ClientPhase::Stopped, &[]), None);
 
-        let two = client(true, &["a.internal", "b.internal"]);
+        let two = client(true, &["a", "b"]);
         assert_eq!(
             line(&two, ClientPhase::Running, &[Connected, Idle]).as_deref(),
             Some("Client running · 1 of 2 connected")
@@ -520,7 +520,7 @@ mod tests {
             Some("Client running · 0 of 2 connected"),
             "idle is the resting state of a running client, not a fault"
         );
-        let one = client(true, &["a.internal"]);
+        let one = client(true, &["a"]);
         assert_eq!(
             line(&one, ClientPhase::Running, &[Connected]).as_deref(),
             Some("Client running · connected")
@@ -534,7 +534,7 @@ mod tests {
         assert_eq!(client_toggle(&one, ClientPhase::Running), ("Disable Client", true));
         assert_eq!(client_toggle(&one, ClientPhase::Stopping), ("Disable Client", false));
 
-        let off = client(false, &["a.internal"]);
+        let off = client(false, &["a"]);
         assert_eq!(line(&off, ClientPhase::Stopped, &[]).as_deref(), Some("Client disabled"));
         assert_eq!(client_toggle(&off, ClientPhase::Stopped), ("Enable Client", true));
     }

@@ -71,23 +71,25 @@ pub struct ForwardConfig {
     pub label: String,
     /// Loopback port to listen on (binds `127.0.0.1`/`::1` only).
     pub local_port: u16,
-    /// Host to connect to: a destination's own host (that server's loopback),
-    /// or an IP literal or name on a destination's routed list, which its
+    /// Host to connect to: a destination's
+    /// `<name>.localhost.flextunnel.internal` (that server's loopback), or an
+    /// IP literal or name on a destination's routed list, which its
     /// server resolves (host aliases apply). A host no destination routes is
     /// a startup error — a forward never connects directly.
     pub remote_host: String,
     pub remote_port: u16,
 }
 
-/// One `[[destinations]]` entry in the client config: a host name and the
-/// server it stands for. Config-file only.
+/// One `[[destinations]]` entry in the client config: a name and the server
+/// it stands for. Config-file only.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DestinationEntry {
-    /// The destination's name. `host:<port>` through the client reaches that
-    /// port on the server's own loopback. Any host name that is not an IP
-    /// address, `localhost`, or under `flextunnel.internal`.
-    pub host: String,
+    /// The destination's name, unique within the client: one DNS label
+    /// (letters, digits and inner hyphens, up to 63; case-insensitive).
+    /// `<name>.localhost.flextunnel.internal:<port>` through the client
+    /// reaches that port on the server's own loopback.
+    pub name: String,
     /// EndpointId of the server (from `flextunnel show-iroh-id`).
     pub server_node_id: String,
     /// Further domains sent through this server — an exact name, a
@@ -158,7 +160,7 @@ pub struct ClientConfig {
     /// one for idleness. Connections are opened on first use either way.
     pub idle_timeout_secs: Option<u64>,
     /// The servers this client reaches (`[[destinations]]` tables), each under
-    /// its own host name. Config-file only — there is no CLI flag.
+    /// its own name. Config-file only — there is no CLI flag.
     pub destinations: Option<Vec<DestinationEntry>>,
     /// Port forwards (`[[forwards]]` tables). Config-file only — there is no
     /// CLI flag.
@@ -235,7 +237,7 @@ impl ResolvedClient {
 
         let mut destinations = Vec::with_capacity(self.destinations.len());
         for entry in &self.destinations {
-            let context = || format!("destination {:?}", entry.host);
+            let context = || format!("destination {:?}", entry.name);
             let server_id = entry
                 .server_node_id
                 .trim()
@@ -283,7 +285,7 @@ impl ResolvedClient {
             };
 
             destinations.push(DestinationConfig {
-                host: entry.host.clone(),
+                name: entry.name.clone(),
                 server_id,
                 auth: ClientAuth::Key(Box::new(key)),
                 relay,
@@ -571,13 +573,13 @@ mod tests {
             idle_timeout_secs = 60
 
             [[destinations]]
-            host = "machine1.internal"
+            name = "machine1"
             server_node_id = "abc123"
             routed_domains = ["*.corp.example"]
             routed_cidrs = ["10.0.0.0/8"]
 
             [[destinations]]
-            host = "machine2.internal"
+            name = "machine2"
             server_node_id = "def456"
             auth_key_file = "~/other.key"
             relay_urls = ["https://relay.example"]
@@ -589,7 +591,7 @@ mod tests {
         assert_eq!(cfg.idle_timeout_secs, Some(60));
         let destinations = cfg.destinations.as_deref().expect("destinations parsed");
         assert_eq!(destinations.len(), 2);
-        assert_eq!(destinations[0].host, "machine1.internal");
+        assert_eq!(destinations[0].name, "machine1");
         assert_eq!(destinations[0].server_node_id, "abc123");
         assert_eq!(destinations[0].routed_domains, vec!["*.corp.example"]);
         assert_eq!(destinations[0].routed_cidrs, vec!["10.0.0.0/8"]);
@@ -611,7 +613,7 @@ mod tests {
     #[test]
     fn single_server_keys_are_gone() {
         // The one-server schema is not accepted: its keys are unknown fields,
-        // and a destination needs both a host and a server id.
+        // and a destination needs both a name and a server id.
         for stale in [
             "server_node_id = \"abc123\"",
             "auto_reconnect = false",
@@ -620,12 +622,12 @@ mod tests {
             let err = toml::from_str::<ClientConfig>(stale).unwrap_err();
             assert!(err.to_string().contains("unknown field"), "{stale}: {err}");
         }
-        assert!(toml::from_str::<ClientConfig>("[[destinations]]\nhost = \"m1.internal\"").is_err());
+        assert!(toml::from_str::<ClientConfig>("[[destinations]]\nname = \"m1\"").is_err());
         assert!(
             toml::from_str::<ClientConfig>("[[destinations]]\nserver_node_id = \"abc\"").is_err()
         );
         let err = toml::from_str::<ClientConfig>(
-            "[[destinations]]\nhost = \"m1.internal\"\nserver_node_id = \"abc\"\nrouted = []",
+            "[[destinations]]\nname = \"m1\"\nserver_node_id = \"abc\"\nrouted = []",
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
@@ -648,9 +650,9 @@ mod tests {
         }
     }
 
-    fn entry(host: &str, seed: u8) -> DestinationEntry {
+    fn entry(name: &str, seed: u8) -> DestinationEntry {
         DestinationEntry {
-            host: host.to_string(),
+            name: name.to_string(),
             server_node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public().to_string(),
             routed_domains: Vec::new(),
             routed_cidrs: Vec::new(),
@@ -662,14 +664,14 @@ mod tests {
 
     #[test]
     fn proxy_config_builds_every_destination() {
-        let mut second = entry("m2.internal", 2);
+        let mut second = entry("m2", 2);
         second.routed_domains = vec!["*.corp.example".to_string()];
         second.relay_urls = Some(vec![
             "https://relay-a.example".to_string(),
             "https://relay-b.example".to_string(),
         ]);
         second.relay_auth_token = Some("token".to_string());
-        let config = resolved_with(vec![entry("m1.internal", 1), second])
+        let config = resolved_with(vec![entry("m1", 1), second])
             .proxy_config()
             .unwrap();
         assert_eq!(config.idle_timeout, Some(DEFAULT_IDLE_TIMEOUT));
@@ -692,29 +694,29 @@ mod tests {
 
         assert!(err(resolved_with(Vec::new())).contains("no destinations"));
 
-        let mut bad_id = entry("m1.internal", 1);
+        let mut bad_id = entry("m1", 1);
         bad_id.server_node_id = "not-an-id".to_string();
         let message = err(resolved_with(vec![bad_id]));
-        assert!(message.contains("m1.internal") && message.contains("server_node_id"), "{message}");
+        assert!(message.contains("m1") && message.contains("server_node_id"), "{message}");
 
-        let mut stray_token = entry("m1.internal", 1);
+        let mut stray_token = entry("m1", 1);
         stray_token.relay_auth_token = Some("t".to_string());
         let message = err(resolved_with(vec![stray_token]));
-        assert!(message.contains("m1.internal") && message.contains("relay_urls"), "{message}");
+        assert!(message.contains("m1") && message.contains("relay_urls"), "{message}");
 
-        let mut no_key = resolved_with(vec![entry("m1.internal", 1)]);
+        let mut no_key = resolved_with(vec![entry("m1", 1)]);
         no_key.auth_key = None;
         let message = err(no_key);
-        assert!(message.contains("m1.internal") && message.contains("no client key"), "{message}");
+        assert!(message.contains("m1") && message.contains("no client key"), "{message}");
 
-        let mut both = resolved_with(vec![entry("m1.internal", 1)]);
+        let mut both = resolved_with(vec![entry("m1", 1)]);
         both.auth_key_file = Some(PathBuf::from("/nonexistent.key"));
         assert!(err(both).contains("use one"));
 
-        let mut missing_file = entry("m1.internal", 1);
+        let mut missing_file = entry("m1", 1);
         missing_file.auth_key_file = Some(PathBuf::from("/nonexistent/flextunnel.key"));
         let message = err(resolved_with(vec![missing_file]));
-        assert!(message.contains("m1.internal") && message.contains("flextunnel.key"), "{message}");
+        assert!(message.contains("m1") && message.contains("flextunnel.key"), "{message}");
     }
 
     #[test]
@@ -956,7 +958,7 @@ mod tests {
             idle_timeout_secs = 300
 
             [[destinations]]
-            host = "machine1.internal"
+            name = "machine1"
             server_node_id = "<server endpoint id>"
             routed_domains = ["*.corp.example"]
             routed_cidrs = ["10.0.0.0/8"]

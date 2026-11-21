@@ -31,7 +31,7 @@ use crate::tunnel::{
 };
 use crate::view;
 use flextunnel_core::proxy::{
-    DestinationStatus, RouteSpec, RouteTable, ServerRoutes, validate_destination_host,
+    DestinationStatus, RouteSpec, RouteTable, ServerRoutes, validate_destination_name,
 };
 use flextunnel_core::transport::paths::ConnectionSnapshot;
 use iced::futures::Stream;
@@ -151,7 +151,7 @@ pub enum Message {
     /// now, instead of waiting for its first use.
     ConnectNow(DestinationId),
     // Destination form
-    DestinationHostChanged(String),
+    DestinationNameChanged(String),
     ServerNodeIdChanged(String),
     DestinationRoutedDomainsChanged(String),
     DestinationRoutedCidrsChanged(String),
@@ -321,7 +321,7 @@ pub struct ImportSummary {
     /// Imported forwards left out: their local port is one of this computer's
     /// proxy ports.
     pub forwards_skipped: usize,
-    /// The hosts of replaced destinations whose relay auth token was dropped:
+    /// The names of replaced destinations whose relay auth token was dropped:
     /// the import changed their relays, and a token is for the relays it was
     /// entered with.
     pub relay_tokens_needed: Vec<String>,
@@ -355,8 +355,8 @@ impl std::fmt::Display for ImportSummary {
 
 /// The client with an imported set of destinations and forwards merged in, or
 /// why they do not fit. An import is all or nothing: the file's destinations
-/// are checked first, every one of them, the way the form checks one — a host,
-/// server node id or relay list the client could not start with, or a host or
+/// are checked first, every one of them, the way the form checks one — a name,
+/// server node id or relay list the client could not start with, or a name or
 /// server the file names twice, rejects the import before anything is merged,
 /// rather than quietly leaving an entry out or saving one that stops every
 /// destination from starting.
@@ -369,34 +369,34 @@ impl std::fmt::Display for ImportSummary {
 /// imports never carry them. A forward on a local port already forwarded
 /// replaces that forward (stopped, like any imported one); any other is
 /// added. The merged destinations must still make one valid routing table — a
-/// host or a route claimed twice rejects the whole import, leaving the client
+/// name or a route claimed twice rejects the whole import, leaving the client
 /// as it was.
 fn merge_imported(
     client: &ClientSettings,
     imported: Portable,
 ) -> Result<(ClientSettings, ImportSummary), String> {
     let mut incoming_destinations = imported.destinations;
-    let (mut hosts, mut servers) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+    let (mut names, mut servers) = (std::collections::HashSet::new(), std::collections::HashSet::new());
     for destination in &mut incoming_destinations {
         // Stored the way the core spells them, like what is typed into the
         // form: one server is one id, so the match against the destinations
         // already here (and the duplicate check below) is on that spelling.
-        destination.host = validate_destination_host(&destination.host)?;
-        let named = |e: String| format!("destination \"{}\": {e}", destination.host);
+        destination.name = validate_destination_name(&destination.name)?;
+        let named = |e: String| format!("destination \"{}\": {e}", destination.name);
         destination.server_node_id =
             parse_server_node_id(&destination.server_node_id).map_err(named)?;
         // An import carries no token, so its relays stand on their own.
         check_relays(&destination.relay_urls, None).map_err(named)?;
-        if !hosts.insert(destination.host.clone()) {
+        if !names.insert(destination.name.clone()) {
             return Err(format!(
                 "the file has destination \"{}\" more than once",
-                destination.host
+                destination.name
             ));
         }
         if !servers.insert(destination.server_node_id.clone()) {
             return Err(format!(
                 "the file has more than one destination for server {} (\"{}\" is one)",
-                destination.server_node_id, destination.host
+                destination.server_node_id, destination.name
             ));
         }
     }
@@ -419,7 +419,7 @@ fn merge_imported(
                     // Worth a word only where a token was lost and there are
                     // relays that may want one.
                     if current.relay_auth_token.is_some() && !incoming.relay_urls.is_empty() {
-                        summary.relay_tokens_needed.push(incoming.host.clone());
+                        summary.relay_tokens_needed.push(incoming.name.clone());
                     }
                     None
                 };
@@ -512,8 +512,10 @@ pub enum RoutesFetch {
 #[derive(Default)]
 pub struct DestinationForm {
     editing_id: Option<DestinationId>,
-    /// The destination's name: `<host>:<port>` is the server's own loopback.
-    pub host: String,
+    /// The destination's name (one DNS label):
+    /// `<name>.localhost.flextunnel.internal:<port>` is the server's own
+    /// loopback.
+    pub name: String,
     pub server_node_id: String,
     /// Comma-separated further domains sent through the server.
     pub routed_domains: String,
@@ -530,13 +532,13 @@ pub struct DestinationForm {
     routing: RefCell<FormRouting>,
 }
 
-/// The form's host and routes checked with the other destinations' (see
+/// The form's name and routes checked with the other destinations' (see
 /// [`DestinationForm::routing`]), and what that was made from.
 #[derive(Default)]
 struct FormRouting {
-    /// Every destination's host and routes, the form's last, as checked.
+    /// Every destination's name and routes, the form's last, as checked.
     built_from: Vec<(String, Vec<String>, Vec<String>)>,
-    /// The form's host as the table stores it and its overlap lines, or why
+    /// The form's name as the table stores it and its overlap lines, or why
     /// the routes do not make a table; `None` before the first check.
     made: Option<Result<(String, Vec<String>), String>>,
 }
@@ -548,7 +550,7 @@ impl DestinationForm {
 
     /// What it takes to ask the form's server for its routes — the server, the
     /// picked key and the relays, as the form has them now — or what is still
-    /// missing. The host and the routed fields play no part: asking is how the
+    /// missing. The name and the routed fields play no part: asking is how the
     /// latter get filled.
     pub fn routes_query(&self, keys: &[AuthKey]) -> Result<RoutesQuery, String> {
         let server_id = self
@@ -640,7 +642,7 @@ impl DestinationForm {
     fn edit(destination: &Destination) -> Self {
         Self {
             editing_id: Some(destination.id.clone()),
-            host: destination.host.clone(),
+            name: destination.name.clone(),
             server_node_id: destination.server_node_id.clone(),
             routed_domains: destination.routed_domains.join(", "),
             routed_cidrs: destination.routed_cidrs.join(", "),
@@ -655,50 +657,50 @@ impl DestinationForm {
 
     /// Where this destination's routes, as the form has them — typed in, or
     /// filled from the server — overlap the other destinations', one line
-    /// each (see [`config::overlap_lines`]). Empty while the host and routes
+    /// each (see [`config::overlap_lines`]). Empty while the name and routes
     /// do not make a table with the others; the form's error says why.
     pub fn overlaps(&self, destinations: &[Destination]) -> Vec<String> {
         self.routing(destinations).map(|(_, lines)| lines).unwrap_or_default()
     }
 
-    /// The form's host and routes checked with the other destinations' by
-    /// the core's routing table — the same check the session makes: the host
+    /// The form's name and routes checked with the other destinations' by
+    /// the core's routing table — the same check the session makes: the name
     /// as the table stores it and the form's overlap lines (see
     /// [`config::overlap_lines`]), or why they do not fit. The view asks on
-    /// every redraw, so the table is built only when a host or routes changed.
+    /// every redraw, so the table is built only when a name or routes changed.
     fn routing(&self, destinations: &[Destination]) -> Result<(String, Vec<String>), String> {
         let editing = self.editing_id.as_deref();
         let routed_domains = split_list(&self.routed_domains);
         let routed_cidrs = split_list(&self.routed_cidrs);
-        // This destination goes last, so its stored host is the table's last.
+        // This destination goes last, so its stored name is the table's last.
         let mut specs: Vec<RouteSpec<'_>> = destinations
             .iter()
             .filter(|d| Some(d.id.as_str()) != editing)
             .map(|d| RouteSpec {
-                host: &d.host,
+                name: &d.name,
                 routed_domains: &d.routed_domains,
                 routed_cidrs: &d.routed_cidrs,
             })
             .collect();
         specs.push(RouteSpec {
-            host: &self.host,
+            name: &self.name,
             routed_domains: &routed_domains,
             routed_cidrs: &routed_cidrs,
         });
         let mut memo = self.routing.borrow_mut();
         let fresh = memo.made.is_some()
             && memo.built_from.len() == specs.len()
-            && memo.built_from.iter().zip(&specs).all(|((host, domains, cidrs), spec)| {
-                host == spec.host && domains[..] == *spec.routed_domains && cidrs[..] == *spec.routed_cidrs
+            && memo.built_from.iter().zip(&specs).all(|((name, domains, cidrs), spec)| {
+                name == spec.name && domains[..] == *spec.routed_domains && cidrs[..] == *spec.routed_cidrs
             });
         if !fresh {
             let made = RouteTable::new(&specs).map_err(|e| format!("{e:#}")).map(|table| {
-                let host = table.hosts().last().map(String::from).expect("the table has this destination");
-                (host, config::overlap_lines(&table, specs.len() - 1))
+                let name = table.names().last().map(String::from).expect("the table has this destination");
+                (name, config::overlap_lines(&table, specs.len() - 1))
             });
             memo.built_from = specs
                 .iter()
-                .map(|spec| (spec.host.to_string(), spec.routed_domains.to_vec(), spec.routed_cidrs.to_vec()))
+                .map(|spec| (spec.name.to_string(), spec.routed_domains.to_vec(), spec.routed_cidrs.to_vec()))
                 .collect();
             memo.made = Some(made);
         }
@@ -706,7 +708,7 @@ impl DestinationForm {
     }
 
     /// The destination this form describes, checked against the others: the
-    /// host and routes are validated by the core's own routing table over
+    /// name and routes are validated by the core's own routing table over
     /// every destination — the same check the session makes — so what saves
     /// here starts.
     pub fn validate(
@@ -716,8 +718,8 @@ impl DestinationForm {
     ) -> Result<Destination, String> {
         let editing = self.editing_id.as_deref();
         let others = || destinations.iter().filter(|d| Some(d.id.as_str()) != editing);
-        if self.host.trim().is_empty() {
-            return Err("Host is required — a name for this server, e.g. nas.internal".into());
+        if self.name.trim().is_empty() {
+            return Err("Name is required — one DNS label for this server, e.g. nas".into());
         }
         let server_node_id = self.server_node_id.trim();
         if server_node_id.is_empty() {
@@ -729,10 +731,10 @@ impl DestinationForm {
         if let Some(other) = others().find(|d| d.server_node_id == server_node_id) {
             return Err(format!(
                 "Destination \"{}\" already reaches this server",
-                other.host
+                other.name
             ));
         }
-        let (host, _) = self.routing(destinations)?;
+        let (name, _) = self.routing(destinations)?;
         let routed_domains = split_list(&self.routed_domains);
         let routed_cidrs = split_list(&self.routed_cidrs);
         if config::find_key(keys, &self.auth_key_id).is_none() {
@@ -743,7 +745,7 @@ impl DestinationForm {
         check_relays(&relay_urls, relay_auth_token.clone())?;
         Ok(Destination {
             id: self.editing_id.clone().unwrap_or_else(Destination::new_id),
-            host,
+            name,
             server_node_id,
             routed_domains,
             routed_cidrs,
@@ -1270,7 +1272,7 @@ pub struct App {
     /// showing why; cleared when the forward is started again or removed.
     pub forward_errors: HashMap<String, String>,
     /// The forwards' advisory routing table (which destination carries each,
-    /// if any) by the saved settings: rebuilt only when a destination's host
+    /// if any) by the saved settings: rebuilt only when a destination's name
     /// or routes change.
     pub routed_cache: view::RoutedCache,
     /// The same by what the client session is running with — where a forward
@@ -1453,7 +1455,7 @@ impl App {
         let task = self.handle(message);
         // The view reads the saved destinations' table from here, so it is
         // brought up to date after anything that may have changed them —
-        // rebuilt only when a host or routes did.
+        // rebuilt only when a name or routes did.
         view::refresh_routed_cache(&mut self.routed_cache, &self.client.destinations);
         task
     }
@@ -1524,7 +1526,7 @@ impl App {
                 if let Selection::Destination(id) = &self.selection
                     && let Some(destination) = self.client.destination(id)
                 {
-                    let snapshot = self.controller.query_conn_path(&destination.host);
+                    let snapshot = self.controller.query_conn_path(&destination.name);
                     self.conn_path_modal = Some(snapshot);
                 }
                 Task::none()
@@ -1647,13 +1649,13 @@ impl App {
             }
             Message::ConnectNow(id) => {
                 if let Some(destination) = self.client.destination(&id) {
-                    self.controller.connect_now(&destination.host);
+                    self.controller.connect_now(&destination.name);
                 }
                 Task::none()
             }
-            Message::DestinationHostChanged(value) => {
+            Message::DestinationNameChanged(value) => {
                 if let Some(form) = &mut self.destination_form {
-                    form.host = value;
+                    form.name = value;
                 }
                 Task::none()
             }
@@ -2081,7 +2083,7 @@ impl App {
             .client_snapshot
             .destinations
             .iter()
-            .find(|status| status.host == destination.host)
+            .find(|status| status.name == destination.name)
         {
             Some(status) => DestinationLive::Live(status),
             // Running, with its first status a poll away.
@@ -2716,7 +2718,7 @@ impl App {
             self.notice = Some(format!(
                 "This key is used by destination \"{}\" — repoint or delete that destination \
                  first.",
-                user.host
+                user.name
             ));
             self.confirm_delete_key = None;
             return;
@@ -2964,7 +2966,7 @@ mod tests {
     fn valid_form() -> DestinationForm {
         DestinationForm {
             editing_id: None,
-            host: " Prod.Internal ".into(),
+            name: " Prod ".into(),
             server_node_id: format!(" {} ", node_id("form")),
             routed_domains: " *.corp.example ,, db.internal ".into(),
             routed_cidrs: " 10.0.0.0/8 ".into(),
@@ -2999,11 +3001,11 @@ mod tests {
         }
     }
 
-    /// A destination `<id>.internal` on server `node_id(id)`, with no routes.
+    /// A destination called `<id>` on server `node_id(id)`, with no routes.
     fn existing_destination(id: &str) -> Destination {
         Destination {
             id: id.into(),
-            host: format!("{id}.internal"),
+            name: id.to_string(),
             server_node_id: node_id(id),
             routed_domains: Vec::new(),
             routed_cidrs: Vec::new(),
@@ -3107,7 +3109,7 @@ mod tests {
 
     #[test]
     fn import_merges_destinations_by_server_and_forwards_by_port() {
-        // "p1.internal" (with a key and a relay token) and "p2.internal", one
+        // "p1" (with a key and a relay token) and "p2", one
         // forward on 5000, SOCKS on 1080.
         let mut current = client(1080, vec![existing_forward("f1", 5000)]);
         current.destinations.push(existing_destination("p2"));
@@ -3120,14 +3122,14 @@ mod tests {
         // it); pretend a hand-edited one slipped through to prove that.
         let mut same_server = existing_destination("x");
         same_server.server_node_id = node_id("p1");
-        same_server.host = "renamed.internal".into();
+        same_server.name = "renamed".into();
         same_server.routed_domains = vec!["*.corp.example".into()];
         same_server.relay_auth_token = Some("imported-psk".into());
         let mut new_server = existing_destination("y");
         new_server.relay_auth_token = Some("imported-psk".into());
 
         let mut replacing = existing_forward("f2", 5000);
-        replacing.remote_host = "renamed.internal".into();
+        replacing.remote_host = "renamed.localhost.flextunnel.internal".into();
         replacing.enabled = true;
         let imported = Portable {
             destinations: vec![same_server, new_server],
@@ -3160,12 +3162,12 @@ mod tests {
             Some("relay-psk"),
             "existing relay token kept, not overwritten by the import"
         );
-        assert_eq!(p1.host, "renamed.internal");
+        assert_eq!(p1.name, "renamed");
         assert_eq!(p1.routed_domains, ["*.corp.example"]);
         assert_eq!(merged.destinations[1], current.destinations[1], "untouched");
 
         let new = &merged.destinations[2];
-        assert_eq!(new.host, "y.internal");
+        assert_eq!(new.name, "y");
         assert!(new.auth_key_id.is_empty(), "no key reference in imports");
         assert_eq!(new.relay_auth_token, None, "no relay secret in imports");
         assert_ne!(new.id, "y", "imported destination ids are fresh");
@@ -3174,7 +3176,7 @@ mod tests {
         assert_eq!((merged.socks_port, merged.http_port), (Some(1080), None));
         assert_eq!(merged.forwards.len(), 2);
         assert_eq!(merged.forwards[0].id, "f1", "a replaced forward keeps its id");
-        assert_eq!(merged.forwards[0].remote_host, "renamed.internal");
+        assert_eq!(merged.forwards[0].remote_host, "renamed.localhost.flextunnel.internal");
         assert!(!merged.forwards[0].enabled);
         assert_eq!(merged.forwards[1].local_port, 6000);
         assert_ne!(merged.forwards[1].id, "f3", "imported forward ids are fresh");
@@ -3208,9 +3210,9 @@ mod tests {
         assert_eq!(merged.destinations[1].relay_urls, relays(&["https://c.example", "https://d.example"]));
         assert_eq!(merged.destinations[2].relay_auth_token, None);
         // Only the one that now has relays to authenticate to is called out.
-        assert_eq!(summary.relay_tokens_needed, ["p2.internal"]);
+        assert_eq!(summary.relay_tokens_needed, ["p2"]);
         let notice = summary.to_string();
-        assert!(notice.contains("relays of p2.internal changed"), "{notice}");
+        assert!(notice.contains("relays of p2 changed"), "{notice}");
         assert!(notice.contains("relay auth token was cleared"), "{notice}");
     }
 
@@ -3227,18 +3229,18 @@ mod tests {
         };
 
         let mut same_host = existing_destination("b");
-        same_host.host = "a.internal".into();
+        same_host.name = "a".into();
         let err = import(vec![existing_destination("a"), same_host]).unwrap_err();
-        assert!(err.contains("\"a.internal\" more than once"), "{err}");
+        assert!(err.contains("\"a\" more than once"), "{err}");
 
         let mut same_server = existing_destination("b");
         same_server.server_node_id = node_id("a");
         let err = import(vec![existing_destination("a"), same_server]).unwrap_err();
         assert!(err.contains("more than one destination for server"), "{err}");
 
-        for bad_host in ["10.0.0.1", "flextunnel.internal", "bad..host", ""] {
+        for bad_host in ["10.0.0.1", "flextunnel.internal", "bad..name", ""] {
             let mut bad = existing_destination("b");
-            bad.host = bad_host.into();
+            bad.name = bad_host.into();
             // A valid entry before it does not get the import through.
             assert!(import(vec![existing_destination("a"), bad]).is_err(), "{bad_host:?}");
         }
@@ -3250,13 +3252,13 @@ mod tests {
             let mut bad = existing_destination("b");
             bad.server_node_id = bad_id.into();
             let err = import(vec![existing_destination("a"), bad]).unwrap_err();
-            assert!(err.contains("\"b.internal\"") && err.contains("not an endpoint id"), "{bad_id:?}: {err}");
+            assert!(err.contains("\"b\"") && err.contains("not an endpoint id"), "{bad_id:?}: {err}");
         }
         for bad_relays in [&["not a url", "https://b.example"][..], &["https://only.example"][..]] {
             let mut bad = existing_destination("b");
             bad.relay_urls = bad_relays.iter().map(|u| u.to_string()).collect();
             let err = import(vec![existing_destination("a"), bad]).unwrap_err();
-            assert!(err.contains("\"b.internal\"") && err.contains("relay"), "{bad_relays:?}: {err}");
+            assert!(err.contains("\"b\"") && err.contains("relay"), "{bad_relays:?}: {err}");
         }
         // Replacing a working destination is held to the same: its relays
         // are not swapped for ones that would stop the client starting.
@@ -3275,9 +3277,9 @@ mod tests {
 
         // A host spelled another way is stored the way the core spells it.
         let mut shouting = existing_destination("b");
-        shouting.host = " B.Internal ".into();
+        shouting.name = " B ".into();
         let (merged, summary) = import(vec![shouting]).expect("a valid host");
-        assert_eq!(merged.destinations[1].host, "b.internal");
+        assert_eq!(merged.destinations[1].name, "b");
         assert_eq!((summary.destinations_added, summary.forwards_added), (1, 1));
     }
 
@@ -3290,7 +3292,7 @@ mod tests {
 
         // Another server under a host already taken.
         let mut same_host = existing_destination("z");
-        same_host.host = "p1.internal".into();
+        same_host.name = "p1".into();
         let clash = Portable { destinations: vec![same_host], forwards: Vec::new() };
         assert!(merge_imported(&current, clash).unwrap_err().contains("more than once"));
 
@@ -3314,7 +3316,7 @@ mod tests {
     fn validate_trims_and_parses() {
         let destination = valid_form().validate(&[], &test_keys()).expect("valid");
         assert_eq!(destination.server_node_id, node_id("form"), "stored as the parser spells it");
-        assert_eq!(destination.host, "prod.internal", "stored trimmed and lowercased");
+        assert_eq!(destination.name, "prod", "stored trimmed and lowercased");
         assert_eq!(destination.routed_domains, ["*.corp.example", "db.internal"]);
         assert_eq!(destination.routed_cidrs, ["10.0.0.0/8"]);
         assert_eq!(destination.auth_key_id, "k1");
@@ -3355,12 +3357,12 @@ mod tests {
             assert!(err.contains("not an endpoint id"), "{bad:?}: {err}");
         }
 
-        // The host is required and must be a name the core accepts; the
-        // routes must parse and must not contradict it.
-        for host in ["  ", "10.0.0.1", "localhost", "flextunnel.internal", "bad..host"] {
+        // The name is required and must be one DNS label; the routes must
+        // parse and stay out of the reserved namespace.
+        for name in ["  ", "10.0.0.1", "nas.home", "flextunnel.internal", "my_host", "-nas"] {
             let mut form = valid_form();
-            form.host = host.into();
-            assert!(form.validate(&[], &keys).is_err(), "host {host:?}");
+            form.name = name.into();
+            assert!(form.validate(&[], &keys).is_err(), "name {name:?}");
         }
         let mut form = valid_form();
         form.routed_domains = "*.*.example".into();
@@ -3369,9 +3371,13 @@ mod tests {
         form.routed_cidrs = "not-a-cidr".into();
         assert!(form.validate(&[], &keys).is_err());
         let mut form = valid_form();
-        form.routed_domains = "prod.internal".into();
-        assert!(form.validate(&[], &keys).unwrap_err().contains("own host"));
-        // No extra routes at all is fine: the host alone reaches the server.
+        form.routed_domains = "prod.localhost.flextunnel.internal".into();
+        assert!(form.validate(&[], &keys).unwrap_err().contains("reserved"));
+        // The bare name is just a name: as a routed domain it is another host.
+        let mut form = valid_form();
+        form.routed_domains = "prod".into();
+        assert!(form.validate(&[], &keys).is_ok());
+        // No extra routes at all is fine: the loopback name alone reaches the server.
         let mut form = valid_form();
         form.routed_domains = String::new();
         form.routed_cidrs = String::new();
@@ -3399,7 +3405,7 @@ mod tests {
             ..test_keys().remove(0)
         }];
         let form = || DestinationForm {
-            host: String::new(),
+            name: String::new(),
             routed_domains: "*.*.unparseable".into(),
             ..valid_form()
         };
@@ -3437,7 +3443,7 @@ mod tests {
     fn the_form_shows_its_overlaps() {
         let saved = Destination {
             id: "nas".into(),
-            host: "nas.internal".into(),
+            name: "nas".into(),
             server_node_id: "node-nas".into(),
             routed_domains: vec!["*".into()],
             routed_cidrs: Vec::new(),
@@ -3446,15 +3452,14 @@ mod tests {
             relay_auth_token: None,
         };
         let mut form = DestinationForm {
-            host: "lab.internal".into(),
+            name: "lab".into(),
             routed_domains: "*.corp.example".into(),
             ..DestinationForm::default()
         };
         assert_eq!(
             form.overlaps(std::slice::from_ref(&saved)),
             [
-                "*.corp.example is inside nas.internal's broader *",
-                "lab.internal is inside nas.internal's broader *",
+                "*.corp.example is inside nas's broader *",
             ]
         );
         // The same rule twice is an error, which the form says elsewhere.
@@ -3588,22 +3593,19 @@ mod tests {
         };
         assert!(fresh().validate(&existing, &keys).is_ok());
 
-        // Another destination's host…
+        // Another destination's name, in any case…
         let mut form = fresh();
-        form.host = " P1.internal ".into();
+        form.name = " P1 ".into();
         assert!(form.validate(&existing, &keys).unwrap_err().contains("more than once"));
         // …or its server, however the id is typed…
         let mut form = fresh();
         form.server_node_id = format!("  {}\t", node_id("p1"));
         let err = form.validate(&existing, &keys).unwrap_err();
-        assert!(err.contains("\"p1.internal\" already reaches this server"), "{err}");
-        // …or one of its rules, or its host as a routed domain.
+        assert!(err.contains("\"p1\" already reaches this server"), "{err}");
+        // …or one of its rules.
         let mut form = fresh();
         form.routed_cidrs = "10.0.0.0/8".into();
         assert!(form.validate(&existing, &keys).unwrap_err().contains("both route"));
-        let mut form = fresh();
-        form.routed_domains = "p1.internal".into();
-        assert!(form.validate(&existing, &keys).unwrap_err().contains("own host"));
         // A narrower rule inside another destination's is fine: it wins.
         let mut form = fresh();
         form.routed_domains = "db.corp.example".into();
@@ -3613,7 +3615,7 @@ mod tests {
         // None of it applies to the destination being edited itself.
         let mut form = DestinationForm::edit(&existing[0]);
         form.routed_domains = "*.corp.example, extra.example".into();
-        let edited = form.validate(&existing, &keys).expect("own host, server and rules");
+        let edited = form.validate(&existing, &keys).expect("own name, server and rules");
         assert_eq!(edited.id, "p1");
     }
 

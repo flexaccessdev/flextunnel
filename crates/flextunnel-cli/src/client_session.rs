@@ -60,7 +60,7 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
     // socket safe (see ipc.rs).
     let _lock = lock::acquire_client(&name)?;
 
-    // Validates the destinations (hosts, routes, one entry per server).
+    // Validates the destinations (names, routes, one entry per server).
     // Nothing is bound or dialed by this.
     let client = Arc::new(
         ProxyClient::new(proxy_config).map_err(|e| anyhow::anyhow!("Invalid client config: {e}"))?,
@@ -94,7 +94,7 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
 /// The one destination of a quick session. Its name is fixed — there is no
 /// config to choose one in — and reaches the quick server's own loopback like
 /// any destination's.
-pub const QUICK_HOST: &str = "quick.internal";
+pub const QUICK_NAME: &str = "quick";
 
 /// What a `client start --quick` session connects to and serves.
 pub struct QuickSession {
@@ -116,7 +116,7 @@ pub struct QuickSession {
 /// than detaching.
 ///
 /// A quick session is the one that is **not** lazy: its single destination
-/// ([`QUICK_HOST`]) routes everything — the quick server is a full tunnel —
+/// ([`QUICK_NAME`]) routes everything — the quick server is a full tunnel —
 /// and is dialed at once and kept connected, because the quick server exits
 /// unless its client shows up soon after it starts.
 ///
@@ -130,7 +130,7 @@ pub async fn run_quick(quick: QuickSession, client_secret: SecretKey) -> Result<
     let client = Arc::new(
         ProxyClient::new(ClientConfig {
             destinations: vec![DestinationConfig {
-                host: QUICK_HOST.to_string(),
+                name: QUICK_NAME.to_string(),
                 server_id: quick.server_id,
                 auth: ClientAuth::Quick(Box::new(client_secret)),
                 relay,
@@ -298,10 +298,10 @@ async fn drive_session(
                 // never awaited in-loop) because the health probe does on-demand
                 // HTTP; ~3s worst case would otherwise stall the client run,
                 // ticker, and shutdown futures this select is also driving.
-                Some(IpcCmd::ConnPath(host, reply)) => {
+                Some(IpcCmd::ConnPath(name, reply)) => {
                     let client = Arc::clone(&client);
                     tokio::spawn(async move {
-                        let snap = client.connection_snapshot(&host).await;
+                        let snap = client.connection_snapshot(&name).await;
                         let _ = reply.send(WireConnSnapshot {
                             paths: snap.paths.iter().map(wire_conn_path).collect(),
                             custom_relays: snap
@@ -466,7 +466,7 @@ impl SessionState {
 
 fn destination_row(d: &DestinationStatus, now: Instant) -> DestinationRow {
     DestinationRow {
-        host: d.host.clone(),
+        name: d.name.clone(),
         server_node_id: d.server_node_id.clone(),
         state: d.state.into(),
         connected_secs: d
@@ -535,8 +535,9 @@ fn forwards_from_config(
         };
         if dialer.destination_for(&forward_target(&forward)).is_none() {
             return Err(format!(
-                "forward #{n}: no destination routes {} — use a destination's host, or add \
-                 the host to a destination's routed_domains / routed_cidrs",
+                "forward #{n}: no destination routes {} — use a destination's \
+                 <name>.localhost.flextunnel.internal, or add the host to a destination's \
+                 routed_domains / routed_cidrs",
                 forward.remote_host
             ));
         }
@@ -571,12 +572,12 @@ fn wire_conn_path(p: &ConnPath) -> WireConnPath {
 mod tests {
     use super::*;
 
-    /// A dialer over two destinations: `m1.internal` routing `*.internal` and
-    /// `2001:db8::/32`, `m2.internal` routing `10.0.0.0/8`. Building it
+    /// A dialer over two destinations: `m1` routing `*.internal` and
+    /// `2001:db8::/32`, `m2` routing `10.0.0.0/8`. Building it
     /// connects nothing.
     fn dialer() -> TunnelDialer {
-        let destination = |host: &str, seed: u8, domains: &[&str], cidrs: &[&str]| DestinationConfig {
-            host: host.to_string(),
+        let destination = |name: &str, seed: u8, domains: &[&str], cidrs: &[&str]| DestinationConfig {
+            name: name.to_string(),
             server_id: SecretKey::from_bytes(&[seed; 32]).public(),
             auth: ClientAuth::Quick(Box::new(SecretKey::from_bytes(&[seed + 100; 32]))),
             relay: RelayConfig::default(),
@@ -586,8 +587,8 @@ mod tests {
         };
         ProxyClient::new(ClientConfig {
             destinations: vec![
-                destination("m1.internal", 1, &["*.internal"], &["2001:db8::/32"]),
-                destination("m2.internal", 2, &[], &["10.0.0.0/8"]),
+                destination("m1", 1, &["*.internal"], &["2001:db8::/32"]),
+                destination("m2", 2, &[], &["10.0.0.0/8"]),
             ],
             idle_timeout: None,
         })
@@ -642,8 +643,8 @@ mod tests {
     }
 
     /// A forward is carried by the destination that routes its host: a
-    /// destination's own name (the server's loopback), a routed domain, or a
-    /// routed network. A host nobody routes is refused at startup.
+    /// destination's loopback name (the server's loopback), a routed domain,
+    /// or a routed network. A host nobody routes is refused at startup.
     #[tokio::test]
     async fn a_forward_needs_a_destination_that_routes_it() {
         let dialer = dialer();
@@ -654,17 +655,24 @@ mod tests {
             disabled_reasons: HashMap::new(),
         };
         for (host, destination) in [
-            ("m2.internal", "m2.internal"),
-            ("db.internal", "m1.internal"),
-            ("10.1.2.3", "m2.internal"),
-            ("2001:db8::7", "m1.internal"),
+            ("m2.localhost.flextunnel.internal", "m2"),
+            ("db.internal", "m1"),
+            ("10.1.2.3", "m2"),
+            ("2001:db8::7", "m1"),
         ] {
             let forward = forwards_from_config(&[entry(5000, host)], &dialer)
                 .unwrap_or_else(|e| panic!("{host}: {e}"))
                 .remove(0);
             assert_eq!(state.forward_row(&forward, &[], &dialer).destination, destination, "{host}");
         }
-        for unrouted in ["example.org", "192.168.1.1", "localhost", "flextunnel.internal"] {
+        for unrouted in [
+            "example.org",
+            "192.168.1.1",
+            "localhost",
+            "m2",
+            "flextunnel.internal",
+            "nope.localhost.flextunnel.internal",
+        ] {
             let err = forwards_from_config(&[entry(5000, unrouted)], &dialer).unwrap_err();
             assert!(err.contains("forward #1") && err.contains("no destination routes"), "{err}");
         }
@@ -675,7 +683,7 @@ mod tests {
     async fn snapshot_lists_the_destinations() {
         let client = ProxyClient::new(ClientConfig {
             destinations: vec![DestinationConfig {
-                host: "m1.internal".to_string(),
+                name: "m1".to_string(),
                 server_id: SecretKey::from_bytes(&[1; 32]).public(),
                 auth: ClientAuth::Quick(Box::new(SecretKey::from_bytes(&[9; 32]))),
                 relay: RelayConfig::default(),
@@ -700,7 +708,7 @@ mod tests {
         assert_eq!(snapshot.idle_timeout_secs, Some(300));
         assert!(snapshot.socks_addr.is_none() && snapshot.forwards.is_empty());
         let row = &snapshot.destinations[0];
-        assert_eq!(row.host, "m1.internal");
+        assert_eq!(row.name, "m1");
         assert_eq!(row.state, crate::ipc::DestState::Idle);
         assert_eq!(row.routed_domains, ["*.corp.example"]);
         assert!(row.client_node_id.is_none() && row.connected_secs.is_none());

@@ -210,7 +210,8 @@ enum ClientAction {
         /// file).
         #[arg(short = 'n', long)]
         name: Option<String>,
-        /// Target host: a destination's host, or one a destination routes.
+        /// Target host: a destination's <name>.localhost.flextunnel.internal,
+        /// or one a destination routes.
         host: String,
         /// Target port.
         port: u16,
@@ -527,7 +528,7 @@ async fn run_server(
         None => log::info!(
             "Clients reach this server with a destination in their config:\n\
              [[destinations]]\n\
-             host = \"<a name for this machine>\"\n\
+             name = \"<a name for this machine: one DNS label, e.g. machine1>\"\n\
              server_node_id = \"{}\"",
             running.endpoint().id()
         ),
@@ -702,12 +703,12 @@ mod cli_tests {
         ));
         // `nc` with no selector uses the default client; HOST and PORT follow.
         let args =
-            Args::try_parse_from(["flextunnel", "client", "nc", "machine1.internal", "22"]).unwrap();
+            Args::try_parse_from(["flextunnel", "client", "nc", "machine1.localhost.flextunnel.internal", "22"]).unwrap();
         assert!(matches!(
             args.command,
             Command::Client {
                 action: ClientAction::Nc { name: None, config: None, host, port: 22 }
-            } if host == "machine1.internal"
+            } if host == "machine1.localhost.flextunnel.internal"
         ));
         let args = Args::try_parse_from([
             "flextunnel", "client", "nc", "-c", "work.toml", "machine1.internal", "22",

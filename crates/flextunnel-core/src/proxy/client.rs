@@ -199,8 +199,8 @@ impl HoldBudget {
 
 /// Configuration for the proxy client.
 pub struct ClientConfig {
-    /// The servers this client can reach, each under its own host name. At
-    /// least one; hosts and server ids must be unique and the routing rules
+    /// The servers this client can reach, each under its own name. At
+    /// least one; names and server ids must be unique and the routing rules
     /// unambiguous (see [`RouteTable`]).
     pub destinations: Vec<DestinationConfig>,
     /// Close a destination's connection after this long with no stream open
@@ -278,8 +278,8 @@ impl Router {
         }
     }
 
-    fn destination(&self, host: &str) -> Option<&Arc<Destination>> {
-        self.table.index_of(host).map(|dest| &self.destinations[dest])
+    fn destination(&self, name: &str) -> Option<&Arc<Destination>> {
+        self.table.index_of(name).map(|dest| &self.destinations[dest])
     }
 
     /// Stop reporting the front-end addresses: nothing listens on them now.
@@ -349,12 +349,12 @@ pub struct TunnelDialer {
 }
 
 impl TunnelDialer {
-    /// The host of the destination that would carry `target`, or `None` when
+    /// The name of the destination that would carry `target`, or `None` when
     /// no destination routes it (including the reserved `flextunnel.internal`
     /// names, which the client answers itself).
     pub fn destination_for(&self, target: &Target) -> Option<&str> {
         match self.router.table.route(target) {
-            Route::Tunnel { dest, .. } => Some(self.router.destinations[dest].host()),
+            Route::Tunnel { dest, .. } => Some(self.router.destinations[dest].name()),
             Route::ClientStatus | Route::Reserved | Route::Direct => None,
         }
     }
@@ -373,15 +373,15 @@ impl TunnelDialer {
         let lease = destination
             .acquire(None)
             .await
-            .map_err(|e| anyhow::anyhow!("{}: {e}", destination.host()))?;
+            .map_err(|e| anyhow::anyhow!("{}: {e}", destination.name()))?;
         let (conn, stream) = lease.into_parts();
         let (send, recv, rep) = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, open_tunnel(&conn, &request))
             .await
-            .map_err(|_| anyhow::anyhow!("timed out opening a stream to {}", destination.host()))??;
+            .map_err(|_| anyhow::anyhow!("timed out opening a stream to {}", destination.name()))??;
         if rep != signaling::REP_SUCCESS {
             anyhow::bail!(
                 "{} rejected target: {}",
-                destination.host(),
+                destination.name(),
                 socks5::describe_reply(rep)
             );
         }
@@ -401,11 +401,11 @@ impl TunnelDialer {
         Ok(())
     }
 
-    /// Ask the destination named `host` to connect now, without waiting for
+    /// Ask the destination called `name` to connect now, without waiting for
     /// it: one attempt in the background, after which the connection lives or
     /// idles out like any other. Returns whether there is such a destination.
-    pub fn warm(&self, host: &str) -> bool {
-        match self.router.destination(host) {
+    pub fn warm(&self, name: &str) -> bool {
+        match self.router.destination(name) {
             Some(destination) => {
                 destination.kick();
                 true
@@ -488,7 +488,7 @@ impl ProxyClient {
         let specs: Vec<RouteSpec<'_>> = destinations
             .iter()
             .map(|d| RouteSpec {
-                host: &d.host,
+                name: &d.name,
                 routed_domains: &d.routed_domains,
                 routed_cidrs: &d.routed_cidrs,
             })
@@ -496,20 +496,20 @@ impl ProxyClient {
         let table = RouteTable::new(&specs).map_err(|e| ProxyError::config(format!("{e:#}")))?;
         // Nesting is allowed, but say where: a broad rule gives up whatever a
         // narrower one on another destination takes.
-        let host = |dest: usize| table.hosts().nth(dest).unwrap_or_default().to_string();
+        let name = |dest: usize| table.names().nth(dest).unwrap_or_default().to_string();
         for overlap in table.overlaps() {
             log::info!(
                 "Routing: {} ({}) is within {} ({}); the most specific rule that matches a target takes it",
                 overlap.inner.rule,
-                host(overlap.inner.dest),
+                name(overlap.inner.dest),
                 overlap.outer.rule,
-                host(overlap.outer.dest)
+                name(overlap.outer.dest)
             );
         }
-        // Store each host the way the table spells it (trimmed, lowercased).
-        let hosts: Vec<String> = table.hosts().map(str::to_owned).collect();
-        for (destination, host) in destinations.iter_mut().zip(hosts) {
-            destination.host = host;
+        // Store each name the way the table spells it (trimmed, lowercased).
+        let names: Vec<String> = table.names().map(str::to_owned).collect();
+        for (destination, name) in destinations.iter_mut().zip(names) {
+            destination.name = name;
         }
         // Two names for one server would be two connections to it from one
         // process, each with its own endpoint and no reason to exist.
@@ -520,7 +520,7 @@ impl ProxyClient {
             {
                 return Err(ProxyError::config(format!(
                     "destinations {:?} and {:?} name the same server ({})",
-                    earlier.host, destination.host, destination.server_id
+                    earlier.name, destination.name, destination.server_id
                 )));
             }
         }
@@ -589,11 +589,11 @@ impl ProxyClient {
     }
 
     /// The iroh paths (relay/direct) of the connection to the destination
-    /// named `host`, plus an on-demand `/healthz` probe of its custom relays —
-    /// for a status UI. Empty when `host` is not a destination or is not
+    /// called `name`, plus an on-demand `/healthz` probe of its custom relays
+    /// — for a status UI. Empty when `name` is not a destination or is not
     /// connected right now; asking never connects it.
-    pub async fn connection_snapshot(&self, host: &str) -> ConnectionSnapshot {
-        match self.router.destination(host) {
+    pub async fn connection_snapshot(&self, name: &str) -> ConnectionSnapshot {
+        match self.router.destination(name) {
             Some(destination) => destination.connection_snapshot().await,
             None => ConnectionSnapshot::default(),
         }
@@ -656,7 +656,7 @@ impl ProxyClient {
         log::info!(
             "{} destination(s), connected on demand: {}",
             self.router.destinations.len(),
-            self.router.table.hosts().collect::<Vec<_>>().join(", ")
+            self.router.table.names().collect::<Vec<_>>().join(", ")
         );
 
         let router = &self.router;
@@ -1262,7 +1262,7 @@ async fn handle_local_conn<P: LocalProto, S: LocalStream>(
     let lease = match destination.acquire(Some(hold_limiter.for_destination(dest))).await {
         Ok(lease) => lease,
         Err(e) => {
-            log::debug!("{}: {e}; refusing {target:?}", destination.host());
+            log::debug!("{}: {e}; refusing {target:?}", destination.name());
             let rep = match e {
                 // The server turned this client away: no point in the app
                 // retrying as it would an unreachable network.
@@ -1275,7 +1275,7 @@ async fn handle_local_conn<P: LocalProto, S: LocalStream>(
             return Ok(());
         }
     };
-    log::debug!("Tunneling via {}: {target:?}", destination.host());
+    log::debug!("Tunneling via {}: {target:?}", destination.name());
 
     // Open the tunnel stream and read the server's reply. If any step fails the
     // local app hasn't been answered yet, so send a general-failure reply
@@ -1382,11 +1382,11 @@ mod tests {
     #[cfg(unix)]
     use tokio::net::UnixStream;
 
-    /// A destination named `host` whose server id derives from `seed`, routing
-    /// the given rules. Its key is throwaway: these tests never connect.
-    fn test_destination(host: &str, seed: u8, domains: &[&str], cidrs: &[&str]) -> DestinationConfig {
+    /// A destination called `name` whose server id derives from `seed`,
+    /// routing the given rules. Its key is throwaway: these tests never connect.
+    fn test_destination(name: &str, seed: u8, domains: &[&str], cidrs: &[&str]) -> DestinationConfig {
         DestinationConfig {
-            host: host.to_string(),
+            name: name.to_string(),
             server_id: SecretKey::from_bytes(&[seed; 32]).public(),
             auth: ClientAuth::Key(Box::new(crate::auth::ClientKey::generate().unwrap())),
             relay: RelayConfig::default(),
@@ -1401,7 +1401,7 @@ mod tests {
     fn test_client() -> ProxyClient {
         ProxyClient::new(ClientConfig {
             destinations: vec![test_destination(
-                "m1.internal",
+                "m1",
                 1,
                 &["nothing.internal"],
                 &["10.0.0.0/8"],
@@ -1431,29 +1431,29 @@ mod tests {
         assert!(config_error(Vec::new()).contains("no destinations"));
         // One server under two names.
         let message = config_error(vec![
-            test_destination("m1.internal", 1, &[], &[]),
-            test_destination("m2.internal", 1, &[], &[]),
+            test_destination("m1", 1, &[], &[]),
+            test_destination("m2", 1, &[], &[]),
         ]);
         assert!(message.contains("same server"), "{message}");
-        assert!(message.contains("m1.internal") && message.contains("m2.internal"), "{message}");
+        assert!(message.contains("m1") && message.contains("m2"), "{message}");
         // Routing-table errors surface as configuration errors too.
-        assert!(config_error(vec![test_destination("10.0.0.1", 1, &[], &[])]).contains("IP address"));
+        assert!(config_error(vec![test_destination("10.0.0.1", 1, &[], &[])]).contains("one DNS label"));
         assert!(
             config_error(vec![
-                test_destination("m1.internal", 1, &["*.corp.example"], &[]),
-                test_destination("m2.internal", 2, &["*.corp.example"], &[]),
+                test_destination("m1", 1, &["*.corp.example"], &[]),
+                test_destination("m2", 2, &["*.corp.example"], &[]),
             ])
             .contains("both route")
         );
     }
 
-    /// A built client is entirely idle, and its hosts are stored normalized.
+    /// A built client is entirely idle, and its names are stored normalized.
     #[test]
     fn a_new_client_is_idle() {
         let client = ProxyClient::new(ClientConfig {
             destinations: vec![
-                test_destination(" Machine1.Internal ", 1, &["*.corp.example"], &[]),
-                test_destination("m2.internal", 2, &[], &["10.0.0.0/8"]),
+                test_destination(" Machine1 ", 1, &["*.corp.example"], &[]),
+                test_destination("m2", 2, &[], &["10.0.0.0/8"]),
             ],
             idle_timeout: Some(Duration::from_secs(300)),
         })
@@ -1461,8 +1461,8 @@ mod tests {
         let status = client.status();
         assert_eq!(status.idle_timeout, Some(Duration::from_secs(300)));
         assert!(status.socks_listen.is_none() && status.http_listen.is_none());
-        let hosts: Vec<&str> = status.destinations.iter().map(|d| d.host.as_str()).collect();
-        assert_eq!(hosts, ["machine1.internal", "m2.internal"]);
+        let names: Vec<&str> = status.destinations.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["machine1", "m2"]);
         for destination in &status.destinations {
             assert_eq!(destination.state, crate::proxy::DestinationState::Idle);
             assert!(destination.client_node_id.is_none());
@@ -1475,17 +1475,17 @@ mod tests {
     async fn dialer_refuses_what_no_destination_routes() {
         let client = ProxyClient::new(ClientConfig {
             destinations: vec![
-                test_destination("m1.internal", 1, &["*.corp.example"], &[]),
-                test_destination("m2.internal", 2, &[], &["10.0.0.0/8"]),
+                test_destination("m1", 1, &["*.corp.example"], &[]),
+                test_destination("m2", 2, &[], &["10.0.0.0/8"]),
             ],
             idle_timeout: None,
         })
         .unwrap();
         let dialer = client.dialer();
         let domain = |host: &str| Target::Domain(host.to_string(), 80);
-        assert_eq!(dialer.destination_for(&domain("M1.internal")), Some("m1.internal"));
-        assert_eq!(dialer.destination_for(&domain("api.corp.example")), Some("m1.internal"));
-        assert_eq!(dialer.destination_for(&domain("10.2.3.4")), Some("m2.internal"));
+        assert_eq!(dialer.destination_for(&domain("M1.localhost.flextunnel.internal")), Some("m1"));
+        assert_eq!(dialer.destination_for(&domain("api.corp.example")), Some("m1"));
+        assert_eq!(dialer.destination_for(&domain("10.2.3.4")), Some("m2"));
         assert_eq!(dialer.destination_for(&domain("example.org")), None);
         assert_eq!(dialer.destination_for(&domain("flextunnel.internal")), None);
 
@@ -1496,8 +1496,8 @@ mod tests {
         // Refusing never asked a destination to connect.
         assert!(client.status().destinations.iter().all(|d| d.waiting == 0));
 
-        assert!(dialer.warm("m2.internal"));
-        assert!(!dialer.warm("nope.internal"));
+        assert!(dialer.warm("m2"));
+        assert!(!dialer.warm("nope"));
     }
 
     /// fd exhaustion must be retried without ever rebinding; aborted/reset
@@ -1545,7 +1545,7 @@ mod tests {
     fn an_oversized_idle_timeout_is_refused_at_construction() {
         let build = |idle_timeout| {
             ProxyClient::new(ClientConfig {
-                destinations: vec![test_destination("m1.internal", 1, &[], &[])],
+                destinations: vec![test_destination("m1", 1, &[], &[])],
                 idle_timeout,
             })
         };
@@ -1915,7 +1915,7 @@ mod tests {
         let response = exchange(Socks5Proto, router.clone(), socks_request("flextunnel.internal", get)).await;
         let body = response.split_once("\r\n\r\n").expect("an HTTP response").1;
         let json: serde_json::Value = serde_json::from_str(body).expect("JSON status");
-        assert_eq!(json["destinations"][0]["host"], "m1.internal");
+        assert_eq!(json["destinations"][0]["name"], "m1");
         assert_eq!(json["destinations"][0]["state"], "idle");
         assert_eq!(json["destinations"][0]["routed_cidrs"][0], "10.0.0.0/8");
 
@@ -1926,20 +1926,20 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 Connection Established\r\n\r\n"), "{response:.80}");
         assert!(response.contains("Content-Type: text/plain"), "{response}");
         assert!(response.contains("flextunnel client status"));
-        assert!(response.contains("m1.internal"));
+        assert!(response.contains("m1"));
 
         // A plain absolute-URI GET: the response is the page itself.
         let forward = "GET http://flextunnel.internal/ HTTP/1.1\r\nHost: flextunnel.internal\r\n\r\n";
         let response = exchange(HttpProto, router.clone(), forward.as_bytes().to_vec()).await;
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response:.80}");
         assert!(response.contains("Content-Type: text/html"));
-        assert!(response.contains("href=\"/servers/m1.internal/\""));
+        assert!(response.contains("href=\"/servers/m1/\""));
 
         // Unknown pages and destinations, other methods, other reserved names.
         for (request, status) in [
             ("GET http://flextunnel.internal/nope HTTP/1.1\r\n\r\n", "404 Not Found"),
-            ("GET http://flextunnel.internal/servers/nope.internal/ HTTP/1.1\r\n\r\n", "404 Not Found"),
-            ("GET http://flextunnel.internal/servers/m1.internal/x HTTP/1.1\r\n\r\n", "404 Not Found"),
+            ("GET http://flextunnel.internal/servers/nope/ HTTP/1.1\r\n\r\n", "404 Not Found"),
+            ("GET http://flextunnel.internal/servers/m1/x HTTP/1.1\r\n\r\n", "404 Not Found"),
             ("POST http://flextunnel.internal/ HTTP/1.1\r\nContent-Length: 0\r\n\r\n", "405 Method Not Allowed"),
             ("GET http://localhost.flextunnel.internal/ HTTP/1.1\r\n\r\n", "404 Not Found"),
         ] {

@@ -5,8 +5,9 @@ and `::1`. An external TCP adapter can expose a forward on another local
 address, for example to give two remote databases the same local port or to
 share one service with another machine.
 
-Start with built-in forwards. A forward to a destination's own host — say
-`nas.internal:5432`, the server machine itself — needs nothing more: it works
+Start with built-in forwards. A forward to a destination's loopback name — say
+`nas.localhost.flextunnel.internal:5432`, the server machine itself — needs
+nothing more: it works
 with empty route lists on both sides. Any other target, like the two below,
 must be on a destination's routes in the client config and allowed by that
 server's routed set:

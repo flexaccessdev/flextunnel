@@ -6,15 +6,16 @@ idle timeout: {{ idle_timeout }}
 
 routing (most specific first; a request takes the first rule that matches it):
   flextunnel.internal -> this client (status page)
-  *.flextunnel.internal -> this client (reserved, answers 404)
-{% for r in routes %}  {{ r.rule }} ({{ r.kind }}) -> {{ r.destination }}, server: {{ r.server }}{% if r.server_last_known %} (last known){% endif %}
+{% for r in routes %}{% if r.kind == "loopback" %}  {{ r.rule }} -> {{ r.destination }}'s server loopback
+{% endif %}{% endfor %}  any other *.flextunnel.internal -> this client (reserved, answers 404)
+{% for r in routes %}{% if r.kind != "loopback" %}  {{ r.rule }} ({{ r.kind }}) -> {{ r.destination }}, server: {{ r.server }}{% if r.server_last_known %} (last known){% endif %}
 {% for o in r.within %}      inside {{ o.destination }}'s broader {{ o.rule }}
 {% endfor %}{% for o in r.narrower %}      contains {{ o.destination }}'s narrower {{ o.rule }}
-{% endfor %}{% endfor %}  anything else -> direct from this device
+{% endfor %}{% endif %}{% endfor %}  anything else -> direct from this device
 
 destinations:
 {% if rows.is_empty() %}  none
-{% else %}{% for row in rows %}  {{ row.status.host }}:
+{% else %}{% for row in rows %}  {{ row.status.name }}:
     state: {{ row.state }}{% if !row.detail.is_empty() %} ({{ row.detail }}){% endif %}
     server node id: {{ row.status.server_node_id }}
     open streams: {{ row.status.open_streams }}
