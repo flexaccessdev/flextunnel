@@ -312,7 +312,10 @@ fn validate_routed_domain(raw: &str) -> Result<(), String> {
 /// Validate a destination's name, returning the lowercased form to store. A
 /// name is one DNS label (RFC 1123): 1–63 ASCII letters, digits and hyphens,
 /// not starting or ending with a hyphen — it becomes the first label of
-/// `<name>.localhost.flextunnel.internal`.
+/// `<name>.localhost.flextunnel.internal`. Hyphens in the third and fourth
+/// places make a reserved label (RFC 5891 §4.2.3.1), `xn--` among them, and
+/// are refused: browsers refuse a host whose `xn--` label is not a valid IDNA
+/// name, so its loopback host could not be opened.
 pub fn validate_destination_name(input: &str) -> Result<String, String> {
     let name = input.trim();
     if name.is_empty() {
@@ -329,6 +332,12 @@ pub fn validate_destination_name(input: &str) -> Result<String, String> {
     }
     if name.starts_with('-') || name.ends_with('-') {
         return Err(format!("Destination name {name:?} can't start or end with a hyphen"));
+    }
+    if name.get(2..4) == Some("--") {
+        return Err(format!(
+            "Destination name {name:?} can't have hyphens as its third and fourth characters \
+             (reserved for internationalized names, like xn--)"
+        ));
     }
     Ok(name.to_ascii_lowercase())
 }
@@ -643,6 +652,7 @@ mod tests {
         assert_eq!(validate_destination_name("nas-2").unwrap(), "nas-2");
         assert_eq!(validate_destination_name("0").unwrap(), "0");
         assert!(validate_destination_name(&"a".repeat(63)).is_ok());
+        assert_eq!(validate_destination_name("a-b--c").unwrap(), "a-b--c");
         for bad in [
             "",
             "   ",
@@ -656,6 +666,9 @@ mod tests {
             "*",
             "has space",
             "caf\u{e9}",
+            "xn--a",
+            "XN--nxasmq6b",
+            "ab--c",
             &"a".repeat(64),
         ] {
             assert!(validate_destination_name(bad).is_err(), "{bad:?} should be rejected");

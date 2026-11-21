@@ -292,8 +292,8 @@ It prints `flextunnel server Node ID: <ENDPOINT_ID>` — give that to clients.
 ### 3. Configure and run the client (no root needed)
 
 The client's config names each server as a destination. `name` is one DNS
-label of your choosing (letters, digits and inner hyphens, unique within the
-client); `<name>.localhost.flextunnel.internal:<port>` then reaches that port
+label of your choosing (letters, digits and inner hyphens, but not `--` as the
+third and fourth characters, as in `xn--`; unique within the client); `<name>.localhost.flextunnel.internal:<port>` then reaches that port
 on the server machine itself.
 
 ```toml
