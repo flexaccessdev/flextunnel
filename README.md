@@ -387,9 +387,14 @@ quick client reads no config, so it has no port forwards.
 #### Status pages
 
 `flextunnel.internal` is reserved by flextunnel and answered by the **client
-itself**, through either proxy listener. It shows the client's destinations and
-what each is doing — idle, connecting, connected, retrying — without connecting
-to anything. The browser view is HTML; `/status.txt` is plain text and
+itself**, through either proxy listener. It shows the client's routing across
+all its destinations and what each destination is doing — idle, connecting,
+connected, retrying — without connecting to anything. The routing is the whole
+table, most specific rule first: each rule, the destination it goes to, where
+it nests with another destination's rule (and so which one wins), and whether
+that destination's server routes it too. A destination reads its server's
+lists each time it connects, so until a destination's first use its rules show
+as `unchecked`. The browser view is HTML; `/status.txt` is plain text and
 `/status.json` is structured JSON for scripts:
 
 ```sh
@@ -404,11 +409,19 @@ curl -sS -x http://127.0.0.1:8081 http://flextunnel.internal/status.json
 ```
 
 The JSON response includes `version`, `socks_listen`, `http_listen`,
-`idle_timeout_secs`, and one entry per destination under `destinations`:
-`host`, `server_node_id`, `state` (`idle`, `connecting`, `connected`,
-`backoff` or `failed`), `connected_secs`, `open_streams`, `waiting`,
-`client_node_id`, `failed_attempts`, `next_attempt_secs`, `last_error`,
-`routed_domains`, `routed_cidrs`, `relay_urls`, and `server_status`.
+`idle_timeout_secs`, the table under `routes`, and one entry per destination
+under `destinations`. Each `routes` entry has `rule`, `kind` (`host`, `exact`,
+`wildcard`, `catch-all` or `network`), `destination`, `server` (`loopback`,
+`allowed`, `partly allowed`, `not allowed` or `unchecked`), `within` (other
+destinations' broader rules it takes over from) and `narrower` (their
+narrower rules that take part of it), each a list of `{rule, destination}`. A
+destination entry has `host`, `server_node_id`, `state` (`idle`,
+`connecting`, `connected`, `backoff` or `failed`), `connected_secs`,
+`open_streams`, `waiting`, `client_node_id`, `failed_attempts`,
+`next_attempt_secs`, `last_error`, `routed_domains`, `routed_cidrs`,
+`relay_urls`, `server_routes` (the server's `routed_domains` and
+`routed_cidrs` as read on its latest connection, `null` before one),
+`server_routes_error`, and `server_status`.
 
 Each **server's** own status page is under `/servers/<destination>/`, with the
 same `/status.txt` and `/status.json` variants. Fetching it connects to that
@@ -737,7 +750,11 @@ For each request, the most specific match wins:
 So with the config above, `api.corp.example` goes to server 1 and
 `x.dev.corp.example` to server 2. Destinations may nest like that, but the
 *same* rule on two destinations is ambiguous and rejected at startup, as is
-listing a destination's `host` under `routed_domains`.
+listing a destination's `host` under `routed_domains`. Every nesting between
+two destinations is logged at startup and shown on the
+[status page](#status-pages) and the desktop app's destination pane and form.
+That includes lists filled in with *Fetch from server*, where one server's
+broad rule can sit over another's.
 
 This suits a client that must send *all* its traffic to the local proxy (for
 example a WebView with a global proxy config) when only some hosts should be
@@ -769,7 +786,11 @@ is not an isolation boundary for untrusted clients.
 Nothing keeps the two sides' lists in step, but a client can read the server's:
 they are on its [status page](#status-pages)
 (`/servers/<destination>/status.json`), and the desktop app's destination form
-fills its routed fields from the server with *Fetch from server*.
+fills its routed fields from the server with *Fetch from server*. A running
+client also checks on its own: each time a destination connects, it reads the
+server's lists over that connection, logs each of its rules the server routes
+only in part or not at all, and shows the result per rule on the client's
+status page and the desktop app's destination pane.
 
 Two things reach a server **outside** its lists: its own loopback, under the
 destination's `host`, and its [status page](#status-pages). So a server with

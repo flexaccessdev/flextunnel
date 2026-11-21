@@ -46,8 +46,11 @@ they reach. It is one session for all of them.
   and replaces what the two fields held — review the result, then save. It is
   a copy as of that moment; a later change on the server is not followed.
   Where two destinations overlap, the more specific rule wins; the same
-  rule on two destinations is refused. Anything no destination routes connects
-  directly from this computer.
+  rule on two destinations is refused. The form and the destination's pane
+  list each such overlap, and which destination takes it. Once a destination
+  has connected, its pane also marks each rule the server routes only in part,
+  or not at all, as the server said on that connection. Anything no
+  destination routes connects directly from this computer.
 - **Connects on demand** — a running client only listens. A destination is
   connected when something is first sent to it — the request waits while it
   connects — and disconnected again once nothing has used it for five minutes,

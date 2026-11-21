@@ -155,18 +155,20 @@ async fn ask(
         return Err(ProxyError::AuthenticationFailed(reason));
     }
 
+    read_routes(connection).await.map_err(ProxyError::Signaling)
+}
+
+/// Read the routes off the JSON status page of the server on `connection`,
+/// which is already authenticated. Bounded like any status fetch.
+pub(crate) async fn read_routes(connection: &Connection) -> Result<ServerRoutes, String> {
     let response =
         client_status::fetch_server_status(connection, STATUS_JSON_PATH, Some(StatusFormat::Json))
-            .await
-            .map_err(ProxyError::Signaling)?;
-    let (content_type, body) =
-        client_status::parse_server_status(&response).map_err(ProxyError::Signaling)?;
+            .await?;
+    let (content_type, body) = client_status::parse_server_status(&response)?;
     if content_type != CONTENT_TYPE_JSON {
-        return Err(ProxyError::Signaling(format!(
-            "the server answered its JSON status with {content_type}"
-        )));
+        return Err(format!("the server answered its JSON status with {content_type}"));
     }
-    ServerRoutes::from_status_json(body).map_err(ProxyError::Signaling)
+    ServerRoutes::from_status_json(body)
 }
 
 #[cfg(test)]

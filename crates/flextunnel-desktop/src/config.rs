@@ -36,7 +36,10 @@
 //! the account's keychain and `profiles.json` are never read or written.
 
 use flextunnel_core::forwards::{PortForward, validate_label, validate_remote_host};
-use flextunnel_core::proxy::{RouteSpec, RouteTable, validate_destination_host};
+use flextunnel_core::proxy::routed_set::Coverage;
+use flextunnel_core::proxy::{
+    DestinationStatus, RouteSpec, RouteTable, RoutedSet, validate_destination_host,
+};
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit};
 use anyhow::{Context, Result};
@@ -278,6 +281,49 @@ pub fn route_table_of<'a>(
         })
         .collect();
     RouteTable::new(&specs).map_err(|e| format!("{e:#}"))
+}
+
+/// Where the destination at `dest` of `table` overlaps the others, one line
+/// each: a rule of another destination's that takes part of one of its own,
+/// or one of its own that takes part of another's. The narrower rule wins.
+pub fn overlap_lines(table: &RouteTable, dest: usize) -> Vec<String> {
+    let host = |i: usize| table.hosts().nth(i).unwrap_or_default().to_string();
+    table
+        .overlaps()
+        .iter()
+        .filter_map(|o| {
+            if o.outer.dest == dest {
+                Some(format!(
+                    "{} goes to {} instead: it is narrower than {}",
+                    o.inner.rule,
+                    host(o.inner.dest),
+                    o.outer.rule
+                ))
+            } else if o.inner.dest == dest {
+                Some(format!(
+                    "{} takes over from {}'s {}: it is narrower",
+                    o.inner.rule,
+                    host(o.outer.dest),
+                    o.outer.rule
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// How much of one configured rule — a `routed_domains` entry, or a
+/// `routed_cidrs` one when `cidr` — its server routes, as the server said on
+/// the destination's latest connection (`status`). `None` while that is not
+/// known: never connected, or the server's lists could not be read.
+pub fn server_coverage(status: Option<&DestinationStatus>, raw: &str, cidr: bool) -> Option<Coverage> {
+    let routes = status?.server_routes.as_ref()?;
+    let server = RoutedSet::new(&routes.routed_domains, &routes.routed_cidrs).ok()?;
+    let one = vec![raw.to_string()];
+    let own = if cidr { RoutedSet::new(&[], &one) } else { RoutedSet::new(&one, &[]) }.ok()?;
+    let rule = own.rules().into_iter().next()?;
+    Some(server.coverage(&rule))
 }
 
 /// The server's entry in the sealed id → secret map. Key ids are 16 hex
@@ -1386,6 +1432,83 @@ mod tests {
         overlap.destinations[1].routed_cidrs.clear();
         assert_eq!(overlap.start_blocker(&keys), None, "a host alone is enough");
         assert_eq!(overlap.route_table().unwrap().hosts().count(), 2);
+    }
+
+    /// Each destination sees the overlaps it takes part in, from its own
+    /// side: what another destination takes from it, or what it takes.
+    #[test]
+    fn overlaps_are_told_from_each_side() {
+        let dest = |host: &str, domains: &[&str], cidrs: &[&str]| Destination {
+            id: host.into(),
+            host: host.into(),
+            server_node_id: format!("node-{host}"),
+            routed_domains: domains.iter().map(|d| d.to_string()).collect(),
+            routed_cidrs: cidrs.iter().map(|c| c.to_string()).collect(),
+            auth_key_id: String::new(),
+            relay_urls: Vec::new(),
+            relay_auth_token: None,
+        };
+        let destinations = [
+            dest("nas.internal", &["*.corp.example"], &["10.0.0.0/8"]),
+            dest("lab.internal", &["*.dev.corp.example"], &["10.1.0.0/16"]),
+            dest("wiki.internal", &["wiki.example"], &[]),
+        ];
+        let table = route_table_of(&destinations).unwrap();
+        assert_eq!(
+            overlap_lines(&table, 0),
+            [
+                "*.dev.corp.example goes to lab.internal instead: it is narrower than *.corp.example",
+                "10.1.0.0/16 goes to lab.internal instead: it is narrower than 10.0.0.0/8",
+            ]
+        );
+        assert_eq!(
+            overlap_lines(&table, 1),
+            [
+                "*.dev.corp.example takes over from nas.internal's *.corp.example: it is narrower",
+                "10.1.0.0/16 takes over from nas.internal's 10.0.0.0/8: it is narrower",
+            ]
+        );
+        assert!(overlap_lines(&table, 2).is_empty());
+    }
+
+    /// A rule's server check comes from what the server said on the
+    /// destination's latest connection, and is unknown until one has.
+    #[test]
+    fn a_rule_is_checked_against_the_servers_routes() {
+        let mut status = DestinationStatus {
+            host: "nas.internal".into(),
+            server_node_id: String::new(),
+            state: flextunnel_core::proxy::DestinationState::Connected,
+            connected_since: None,
+            open_streams: 0,
+            waiting: 0,
+            client_node_id: None,
+            failed_attempts: 0,
+            next_attempt_at: None,
+            last_error: None,
+            routed_domains: Vec::new(),
+            routed_cidrs: Vec::new(),
+            relay_urls: Vec::new(),
+            server_routes: None,
+            server_routes_error: None,
+        };
+        assert_eq!(server_coverage(Some(&status), "*.corp.example", false), None);
+        assert_eq!(server_coverage(None, "*.corp.example", false), None);
+        status.server_routes = Some(flextunnel_core::proxy::ServerRoutes {
+            routed_domains: vec!["*.corp.example".into()],
+            routed_cidrs: vec!["10.0.0.0/16".into()],
+        });
+        for (rule, cidr, coverage) in [
+            ("*.corp.example", false, Coverage::Full),
+            ("api.corp.example", false, Coverage::Full),
+            ("*", false, Coverage::Partial),
+            ("wiki.example", false, Coverage::None),
+            ("10.0.0.0/8", true, Coverage::Partial),
+            ("10.0.1.0/24", true, Coverage::Full),
+            ("192.168.0.0/16", true, Coverage::None),
+        ] {
+            assert_eq!(server_coverage(Some(&status), rule, cidr), Some(coverage), "{rule}");
+        }
     }
 
     #[test]

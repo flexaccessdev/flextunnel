@@ -494,6 +494,18 @@ impl ProxyClient {
             })
             .collect();
         let table = RouteTable::new(&specs).map_err(|e| ProxyError::config(format!("{e:#}")))?;
+        // Nesting is allowed, but say where: a broad rule gives up whatever a
+        // narrower one on another destination takes.
+        let host = |dest: usize| table.hosts().nth(dest).unwrap_or_default().to_string();
+        for overlap in table.overlaps() {
+            log::info!(
+                "Routing: {} ({}) is within {} ({}); the narrower rule wins there",
+                overlap.inner.rule,
+                host(overlap.inner.dest),
+                overlap.outer.rule,
+                host(overlap.outer.dest)
+            );
+        }
         // Store each host the way the table spells it (trimmed, lowercased).
         let hosts: Vec<String> = table.hosts().map(str::to_owned).collect();
         for (destination, host) in destinations.iter_mut().zip(hosts) {

@@ -4,6 +4,13 @@ socks5: {{ socks_listen }}
 http: {{ http_listen }}
 idle timeout: {{ idle_timeout }}
 
+routing (most specific first):
+  flextunnel.internal -> this client (status page)
+{% for r in routes %}  {{ r.rule }} ({{ r.kind }}) -> {{ r.destination }}, server: {{ r.server }}
+{% for o in r.within %}      within {{ o.rule }} of {{ o.destination }}, which this takes over
+{% endfor %}{% for o in r.narrower %}      except {{ o.rule }}, which goes to {{ o.destination }}
+{% endfor %}{% endfor %}  anything else -> direct from this device
+
 destinations:
 {% if rows.is_empty() %}  none
 {% else %}{% for row in rows %}  {{ row.status.host }}:
@@ -17,7 +24,8 @@ destinations:
 {% for d in row.status.routed_domains %}      - {{ d }}
 {% endfor %}{% endif %}{% if !row.status.routed_cidrs.is_empty() %}    routed cidrs:
 {% for c in row.status.routed_cidrs %}      - {{ c }}
-{% endfor %}{% endif %}{% if !row.status.relay_urls.is_empty() %}    relays:
+{% endfor %}{% endif %}    server routes: {{ row.server_routes }}
+{% if !row.status.relay_urls.is_empty() %}    relays:
 {% for r in row.status.relay_urls %}      - {{ r }}
 {% endfor %}{% endif %}    server status: http://flextunnel.internal{{ row.server_status_path }}
 {% endfor %}{% endif %}

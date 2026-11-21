@@ -753,6 +753,54 @@ async fn a_route_the_server_does_not_list_is_refused() {
     assert_eq!(client.state("m1.internal"), DestinationState::Connected);
 }
 
+/// A destination reads what its server routes when it first connects, and
+/// keeps it: the client's status page then says which of the destination's
+/// rules the server refuses — `unchecked` until then, since looking connects
+/// nothing.
+#[tokio::test]
+async fn a_destination_checks_its_routes_with_the_server_on_first_use() {
+    let (server_ep, server_addr) = server_endpoint(SecretKey::generate()).await;
+    let server_id = spawn_server_full(
+        server_ep,
+        temp_blocklist("route-check"),
+        HashMap::new(),
+        strings(&["*.corp.test"]),
+    );
+    let mut m1 = destination("m1.internal", server_id);
+    m1.routed_domains = strings(&["*.corp.test", "*.other.test"]);
+    let client = start_client(vec![m1], None, MemoryLookup::from_endpoint_info(vec![server_addr])).await;
+
+    let routes = |page: &str| -> Vec<(String, String)> {
+        let body = page.split_once("\r\n\r\n").unwrap().1;
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        json["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["rule"].as_str().unwrap().to_string(), r["server"].as_str().unwrap().to_string()))
+            .collect()
+    };
+    let pair = |rule: &str, server: &str| (rule.to_string(), server.to_string());
+    assert_eq!(
+        routes(&status_get(client.socks, "/status.json").await),
+        [pair("m1.internal", "loopback"), pair("*.other.test", "unchecked"), pair("*.corp.test", "unchecked")]
+    );
+    assert_eq!(client.built(), 0, "the status page connects nothing");
+
+    // Any use connects; this one the server refuses.
+    let (_app, rep) = socks_connect(client.socks, "x.other.test", 443).await;
+    assert_eq!(rep, signaling::REP_NOT_ALLOWED);
+    wait_until("the server's routes are read", || client.status("m1.internal").server_routes.is_some()).await;
+    assert_eq!(
+        client.status("m1.internal").server_routes,
+        Some(ServerRoutes { routed_domains: strings(&["*.corp.test"]), routed_cidrs: Vec::new() })
+    );
+    assert_eq!(
+        routes(&status_get(client.socks, "/status.json").await),
+        [pair("m1.internal", "loopback"), pair("*.other.test", "not allowed"), pair("*.corp.test", "allowed")]
+    );
+}
+
 /// Port forwards and `nc` go through the dialer, which holds a request while
 /// its destination connects — here across a server that is not up yet, then
 /// comes up: a failed first attempt is retried for the request still waiting.

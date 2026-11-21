@@ -29,6 +29,11 @@
 //! * A permanent failure (a rejected key) answers every request at once until
 //!   its retry time, instead of making each one wait out a doomed dial.
 //!
+//! * Each time it connects, it reads what its server routes (the server's own
+//!   lists, off its status page) and keeps the answer past the connection, so
+//!   a status display can say which of this destination's rules the server
+//!   will refuse — without connecting a destination that has not been used.
+//!
 //! Each destination has its own endpoint, built on first use and closed when
 //! the destination goes idle: relay settings are endpoint-wide, and the
 //! reconnect escalation that rebuilds a wedged endpoint must not sever the
@@ -39,6 +44,8 @@ use crate::proxy::client::{
     HANDSHAKE_TIMEOUT, TUNNEL_RECOVERY_HOLD, calculate_backoff, client_heartbeat_loop,
     connect_with_timeout, rebuild_due,
 };
+use crate::proxy::routed_set::{Coverage, RoutedSet};
+use crate::proxy::server_routes::{self, ServerRoutes};
 use crate::proxy::signaling::{self, Hello, HelloResponse};
 use crate::transport::endpoint::{
     ClientEndpoint, PendingCloses, RelayConfig, create_client_endpoint,
@@ -256,6 +263,12 @@ pub struct DestinationStatus {
     /// The custom relays configured for this destination; empty for the
     /// default iroh relays.
     pub relay_urls: Vec<String>,
+    /// What the server said it routes, read on the latest connection that
+    /// could read it; kept while idle. `None` until a connection has.
+    pub server_routes: Option<ServerRoutes>,
+    /// Why reading the server's routes on the latest connection failed;
+    /// cleared by a read that succeeds.
+    pub server_routes_error: Option<String>,
 }
 
 /// State every destination of one client shares.
@@ -339,6 +352,8 @@ struct StatusFields {
     failed_attempts: u32,
     next_attempt_at: Option<Instant>,
     last_error: Option<String>,
+    server_routes: Option<ServerRoutes>,
+    server_routes_error: Option<String>,
 }
 
 /// The manager's memory of the current outage. Survives idle periods, so a
@@ -684,6 +699,8 @@ impl Destination {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            server_routes: fields.server_routes.clone(),
+            server_routes_error: fields.server_routes_error.clone(),
         }
     }
 
@@ -725,6 +742,7 @@ impl Destination {
                     // Publishing the connection wakes every request held in
                     // [`Self::acquire`].
                     self.set_link(Link::Connected(connection.clone()));
+                    self.check_server_routes(&connection);
                     let end = self.serve(&connection, ctrl_send, ctrl_recv).await;
                     match end {
                         ConnEnd::Idle => {
@@ -739,6 +757,62 @@ impl Destination {
                     }
                 }
                 Err(e) => self.record_failure(e, &mut outage),
+            }
+        }
+    }
+
+    /// Read what the server on the fresh `connection` routes, on a task of its
+    /// own so no request waits for it, and keep the answer for the status. A
+    /// rule of this destination's that the server does not route is logged:
+    /// the server refuses what is sent under it. The read opens a stream of
+    /// its own on the connection without leasing it, so it neither keeps the
+    /// connection from idling out nor survives its close.
+    fn check_server_routes(self: &Arc<Self>, connection: &Connection) {
+        let this = self.clone();
+        let connection = connection.clone();
+        tokio::spawn(async move {
+            let read = server_routes::read_routes(&connection).await;
+            let mut fields = this.status_fields();
+            match read {
+                Ok(routes) => {
+                    if fields.server_routes.as_ref() != Some(&routes) {
+                        this.log_refused_rules(&routes);
+                    }
+                    fields.server_routes = Some(routes);
+                    fields.server_routes_error = None;
+                }
+                Err(e) => {
+                    log::warn!("{}: could not read what the server routes: {e}", this.host());
+                    fields.server_routes_error = Some(e);
+                }
+            }
+        });
+    }
+
+    /// Log each of this destination's routed rules that `routes` (the
+    /// server's) does not route in full.
+    fn log_refused_rules(&self, routes: &ServerRoutes) {
+        let (server, own) = match (
+            RoutedSet::new(&routes.routed_domains, &routes.routed_cidrs),
+            RoutedSet::new(&self.cfg.routed_domains, &self.cfg.routed_cidrs),
+        ) {
+            (Ok(server), Ok(own)) => (server, own),
+            (Err(e), _) | (_, Err(e)) => {
+                log::warn!("{}: cannot compare routes with the server's: {e:#}", self.host());
+                return;
+            }
+        };
+        for rule in own.rules() {
+            match server.coverage(&rule) {
+                Coverage::Full => {}
+                Coverage::Partial => log::warn!(
+                    "{}: the server routes only part of {rule}; the rest is refused when sent",
+                    self.host()
+                ),
+                Coverage::None => log::warn!(
+                    "{}: the server does not route {rule}; what is sent under it is refused",
+                    self.host()
+                ),
             }
         }
     }

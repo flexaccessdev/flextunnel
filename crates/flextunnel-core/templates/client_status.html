@@ -40,10 +40,15 @@
   td { padding: 0.2rem 0.5rem 0.2rem 0; vertical-align: top; }
   td:first-child { white-space: nowrap; color: #444d56; }
   .dest-name { font-weight: 600; margin-bottom: 0.35rem; }
+  table.routes th { text-align: left; font-weight: 600; color: #444d56; padding: 0.2rem 0.5rem 0.2rem 0; border-bottom: 1px solid #e1e4e8; }
+  table.routes td { border-bottom: 1px solid #f0f2f4; }
+  table.routes td:first-child { color: inherit; white-space: normal; }
+  .note { display: block; color: #6a737d; font-size: 0.85em; }
   @media (prefers-color-scheme: dark) {
     body { background: #0d1117; color: #c9d1d9; }
     section { background: #161b22; border-color: #30363d; }
-    .sub, h2, td:first-child, .idle, .muted, .empty { color: #8b949e; }
+    .sub, h2, td:first-child, .idle, .muted, .empty, .note, table.routes th { color: #8b949e; }
+    table.routes th, table.routes td { border-color: #30363d; }
     a { color: #58a6ff; }
     .connected { color: #3fb950; }
     .connecting, .backoff { color: #d29922; }
@@ -62,6 +67,26 @@
       <tr><td>SOCKS5 proxy</td><td class="mono">{{ socks_listen }}</td></tr>
       <tr><td>HTTP proxy</td><td class="mono">{{ http_listen }}</td></tr>
       <tr><td>Idle timeout</td><td>{{ idle_timeout }}</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>Routing</h2>
+    <p class="muted">Most specific first: a request goes to the first rule that matches it.</p>
+    <table class="routes">
+      <tr><th>Rule</th><th>Goes to</th><th>Server</th></tr>
+      <tr><td class="mono">flextunnel.internal</td><td>this client <span class="muted">status page</span></td><td></td></tr>
+      {% for r in routes %}
+      <tr>
+        <td><span class="mono">{{ r.rule }}</span> <span class="muted">{{ r.kind }}</span>
+          {% for o in r.within %}<span class="note">within <span class="mono">{{ o.rule }}</span> of <span class="mono">{{ o.destination }}</span>, which this takes over</span>{% endfor %}
+          {% for o in r.narrower %}<span class="note">except <span class="mono">{{ o.rule }}</span>, which goes to <span class="mono">{{ o.destination }}</span></span>{% endfor %}
+        </td>
+        <td class="mono">{{ r.destination }}</td>
+        <td class="{{ r.server_class() }}">{{ r.server }}</td>
+      </tr>
+      {% endfor %}
+      <tr><td class="muted">anything else</td><td>direct <span class="muted">from this device</span></td><td></td></tr>
     </table>
   </section>
 
@@ -93,6 +118,7 @@
       {% if !row.status.routed_cidrs.is_empty() %}
       <tr><td>Routed CIDRs</td><td><ul>{% for c in row.status.routed_cidrs %}<li class="mono">{{ c }}</li>{% endfor %}</ul></td></tr>
       {% endif %}
+      <tr><td>Server routes</td><td class="mono">{{ row.server_routes }}</td></tr>
       {% if !row.status.relay_urls.is_empty() %}
       <tr><td>Relays</td><td><ul>{% for r in row.status.relay_urls %}<li class="mono">{{ r }}</li>{% endfor %}</ul></td></tr>
       {% endif %}

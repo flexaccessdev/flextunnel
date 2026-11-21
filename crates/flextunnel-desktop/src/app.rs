@@ -638,6 +638,34 @@ impl DestinationForm {
         }
     }
 
+    /// Where this destination's routes, as the form has them — typed in, or
+    /// filled from the server — overlap the other destinations', one line
+    /// each (see [`config::overlap_lines`]). Empty while the host and routes
+    /// do not make a table with the others; the form's error says why.
+    pub fn overlaps(&self, destinations: &[Destination]) -> Vec<String> {
+        let editing = self.editing_id.as_deref();
+        let routed_domains = split_list(&self.routed_domains);
+        let routed_cidrs = split_list(&self.routed_cidrs);
+        let mut specs: Vec<RouteSpec<'_>> = destinations
+            .iter()
+            .filter(|d| Some(d.id.as_str()) != editing)
+            .map(|d| RouteSpec {
+                host: &d.host,
+                routed_domains: &d.routed_domains,
+                routed_cidrs: &d.routed_cidrs,
+            })
+            .collect();
+        specs.push(RouteSpec {
+            host: &self.host,
+            routed_domains: &routed_domains,
+            routed_cidrs: &routed_cidrs,
+        });
+        match RouteTable::new(&specs) {
+            Ok(table) => config::overlap_lines(&table, specs.len() - 1),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// The destination this form describes, checked against the others: the
     /// host and routes are validated by the core's own routing table over
     /// every destination — the same check the session makes — so what saves
@@ -3373,6 +3401,41 @@ mod tests {
 
     /// The server's answer replaces the routed fields — with what then saves
     /// as the lists it sent — and only the answer the form is waiting for.
+    /// The form shows where its routes — typed, or filled from the server —
+    /// nest with another destination's, and nothing while they do not
+    /// validate.
+    #[test]
+    fn the_form_shows_its_overlaps() {
+        let saved = Destination {
+            id: "nas".into(),
+            host: "nas.internal".into(),
+            server_node_id: "node-nas".into(),
+            routed_domains: vec!["*".into()],
+            routed_cidrs: Vec::new(),
+            auth_key_id: String::new(),
+            relay_urls: Vec::new(),
+            relay_auth_token: None,
+        };
+        let mut form = DestinationForm {
+            host: "lab.internal".into(),
+            routed_domains: "*.corp.example".into(),
+            ..DestinationForm::default()
+        };
+        assert_eq!(
+            form.overlaps(std::slice::from_ref(&saved)),
+            [
+                "*.corp.example takes over from nas.internal's *: it is narrower",
+                "lab.internal takes over from nas.internal's *: it is narrower",
+            ]
+        );
+        // The same rule twice is an error, which the form says elsewhere.
+        form.routed_domains = "*".into();
+        assert!(form.overlaps(std::slice::from_ref(&saved)).is_empty());
+        // Editing the saved destination itself compares it with no one.
+        let edit = DestinationForm::edit(&saved);
+        assert!(edit.overlaps(std::slice::from_ref(&saved)).is_empty());
+    }
+
     #[test]
     fn fetched_routes_fill_the_form() {
         let keys = test_keys();

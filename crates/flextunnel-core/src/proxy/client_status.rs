@@ -6,8 +6,14 @@
 //!
 //! | Path | Serves |
 //! | --- | --- |
-//! | `/`, `/status.txt`, `/status.json` | This client: its destinations and each one's connection state. Answered locally — **no connection is opened**, so looking never wakes an idle destination. |
+//! | `/`, `/status.txt`, `/status.json` | This client: its routing across all destinations, and each destination's connection state. Answered locally — **no connection is opened**, so looking never wakes an idle destination. |
 //! | `/servers/<destination>/`, `…/status.txt`, `…/status.json` | That destination server's own status page, fetched from the server on demand (which connects to it, like any other use). |
+//!
+//! The routing is the whole table in the order a target is tried against it
+//! (see [`super::route_table`]): every rule, the destination it goes to, the
+//! other destinations' rules it sits within or that carve pieces out of it,
+//! and whether its server routes it too — as the server said on the
+//! destination's latest connection, or "unchecked" for one not yet used.
 //!
 //! On `/` (and `/servers/<destination>/`) an `Accept: application/json` or
 //! `text/plain` header picks the format, as the path suffix does. Any other
@@ -24,6 +30,8 @@ use super::client::{
     ClientStatus, HoldBudget, LocalProto, LocalStream, Router, TUNNEL_OPEN_TIMEOUT, open_tunnel,
 };
 use super::destination::{DestinationState, DestinationStatus};
+use super::route_table::{RouteTable, TableRow, TableRule};
+use super::routed_set::{RoutedSet, Rule};
 use super::signaling::{self, StreamRequest};
 use super::status_page::{
     self, CONTENT_TYPE_HTML, CONTENT_TYPE_JSON, CONTENT_TYPE_TEXT, STATUS_JSON_PATH,
@@ -82,6 +90,10 @@ struct DestinationJson<'a> {
     routed_domains: &'a [String],
     routed_cidrs: &'a [String],
     relay_urls: &'a [String],
+    /// What the server said it routes on the latest connection that read
+    /// it; `null` until one has (see `server_routes_error`).
+    server_routes: Option<&'a super::server_routes::ServerRoutes>,
+    server_routes_error: Option<&'a str>,
     /// Path of this server's own status page (fetching it connects).
     server_status: String,
 }
@@ -94,7 +106,108 @@ struct ClientStatusJson<'a> {
     /// Seconds an unused connection is kept; `null` when one is never closed
     /// for idleness.
     idle_timeout_secs: Option<u64>,
+    /// The table, most specific first; a target no rule matches connects
+    /// directly.
+    routes: &'a [RouteView],
     destinations: Vec<DestinationJson<'a>>,
+}
+
+/// One rule of another destination, next to a [`RouteView`].
+#[derive(Serialize)]
+struct RuleRef {
+    rule: String,
+    destination: String,
+}
+
+/// One row of the routing table as the pages show it.
+#[derive(Serialize)]
+struct RouteView {
+    rule: String,
+    /// `host` (the server's loopback), `exact`, `wildcard`, `catch-all` or
+    /// `network`.
+    kind: &'static str,
+    destination: String,
+    /// `loopback` (always served), `allowed`, `partly allowed`, `not allowed`
+    /// (by the server's own lists), or `unchecked` (not read from the server
+    /// yet).
+    server: &'static str,
+    /// Other destinations' broader rules this one sits within: it wins over
+    /// them for what it matches.
+    within: Vec<RuleRef>,
+    /// Other destinations' narrower rules inside this one: they take what
+    /// they match.
+    narrower: Vec<RuleRef>,
+}
+
+impl RouteView {
+    /// A CSS class for the server check.
+    fn server_class(&self) -> &'static str {
+        match self.server {
+            "loopback" | "allowed" => "connected",
+            "partly allowed" => "backoff",
+            "not allowed" => "failed",
+            _ => "idle",
+        }
+    }
+}
+
+/// The routing table over `status`'s destinations (the same, in the same
+/// order, as `table`'s), with each server's answer about its own lists.
+fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
+    let host = |dest: usize| table.hosts().nth(dest).unwrap_or_default().to_string();
+    // The server's lists, where a connection has read them.
+    let servers: Vec<Option<RoutedSet>> = status
+        .destinations
+        .iter()
+        .map(|d| {
+            let routes = d.server_routes.as_ref()?;
+            RoutedSet::new(&routes.routed_domains, &routes.routed_cidrs).ok()
+        })
+        .collect();
+    let refer = |row: &TableRow| RuleRef { rule: row.rule.to_string(), destination: host(row.dest) };
+    table
+        .rows()
+        .into_iter()
+        .map(|row| {
+            let (kind, server) = match &row.rule {
+                TableRule::Host(_) => ("host", "loopback"),
+                TableRule::Routed(rule) => {
+                    let kind = match rule {
+                        Rule::CatchAll => "catch-all",
+                        Rule::Suffix(_) => "wildcard",
+                        Rule::Exact(_) => "exact",
+                        Rule::Cidr(_) => "network",
+                    };
+                    let server = match servers.get(row.dest).and_then(Option::as_ref) {
+                        Some(server) => server.coverage(rule).as_str(),
+                        None => "unchecked",
+                    };
+                    (kind, server)
+                }
+            };
+            let within = table.overlaps().iter().filter(|o| o.inner == row).map(|o| refer(&o.outer)).collect();
+            let narrower = table.overlaps().iter().filter(|o| o.outer == row).map(|o| refer(&o.inner)).collect();
+            RouteView { rule: row.rule.to_string(), kind, destination: host(row.dest), server, within, narrower }
+        })
+        .collect()
+}
+
+/// A destination's server routes as one line for the pages: the lists the
+/// server sent, `unchecked`, or why they could not be read.
+fn server_routes_line(d: &DestinationStatus) -> String {
+    match (&d.server_routes, &d.server_routes_error) {
+        (Some(routes), _) => {
+            let all: Vec<&str> = routes
+                .routed_domains
+                .iter()
+                .chain(&routes.routed_cidrs)
+                .map(String::as_str)
+                .collect();
+            if all.is_empty() { "none (loopback only)".to_string() } else { all.join(", ") }
+        }
+        (None, Some(error)) => format!("unreadable: {error}"),
+        (None, None) => "unchecked (read on the first connection)".to_string(),
+    }
 }
 
 /// One destination as the HTML and text pages show it.
@@ -103,6 +216,8 @@ struct Row<'a> {
     state: &'static str,
     /// What goes next to the state: an uptime, or the retry outlook.
     detail: String,
+    /// What the server routes, as [`server_routes_line`] says it.
+    server_routes: String,
     server_status_path: String,
 }
 
@@ -113,6 +228,7 @@ struct ClientStatusHtml<'a> {
     socks_listen: String,
     http_listen: String,
     idle_timeout: String,
+    routes: Vec<RouteView>,
     rows: Vec<Row<'a>>,
 }
 
@@ -123,6 +239,7 @@ struct ClientStatusText<'a> {
     socks_listen: String,
     http_listen: String,
     idle_timeout: String,
+    routes: Vec<RouteView>,
     rows: Vec<Row<'a>>,
 }
 
@@ -175,27 +292,32 @@ fn rows(status: &ClientStatus, now: Instant) -> Vec<Row<'_>> {
                 status: d,
                 state: d.state.as_str(),
                 detail,
+                server_routes: server_routes_line(d),
                 server_status_path: server_status_path(&d.host, StatusFormat::Html),
             }
         })
         .collect()
 }
 
-/// Render the client status in `format`. Returns
+/// Render the client status in `format`, its routing from `table` (the
+/// client's, whose destinations `status` lists). Returns
 /// `(http_status_line, content_type, body)`.
 pub(crate) fn render(
     status: &ClientStatus,
+    table: &RouteTable,
     format: StatusFormat,
 ) -> (&'static str, &'static str, String) {
-    render_at(status, format, Instant::now())
+    render_at(status, table, format, Instant::now())
 }
 
 /// [`render`] as of `now`: every uptime and retry delay is measured to it.
 fn render_at(
     status: &ClientStatus,
+    table: &RouteTable,
     format: StatusFormat,
     now: Instant,
 ) -> (&'static str, &'static str, String) {
+    let routes = routes(status, table);
     let version = env!("CARGO_PKG_VERSION");
     let addr = |a: Option<std::net::SocketAddr>| a.map_or_else(|| "off".to_string(), |a| a.to_string());
     let idle_timeout = match status.idle_timeout {
@@ -208,6 +330,7 @@ fn render_at(
             socks_listen: addr(status.socks_listen),
             http_listen: addr(status.http_listen),
             idle_timeout,
+            routes,
             rows: rows(status, now),
         }
         .render()
@@ -217,6 +340,7 @@ fn render_at(
             socks_listen: addr(status.socks_listen),
             http_listen: addr(status.http_listen),
             idle_timeout,
+            routes,
             rows: rows(status, now),
         }
         .render()
@@ -227,6 +351,7 @@ fn render_at(
                 socks_listen: status.socks_listen.map(|a| a.to_string()),
                 http_listen: status.http_listen.map(|a| a.to_string()),
                 idle_timeout_secs: status.idle_timeout.map(|idle| idle.as_secs()),
+                routes: &routes,
                 destinations: status
                     .destinations
                     .iter()
@@ -244,6 +369,8 @@ fn render_at(
                         routed_domains: &d.routed_domains,
                         routed_cidrs: &d.routed_cidrs,
                         relay_urls: &d.relay_urls,
+                        server_routes: d.server_routes.as_ref(),
+                        server_routes_error: d.server_routes_error.as_deref(),
                         server_status: server_status_path(&d.host, StatusFormat::Json),
                     })
                     .collect(),
@@ -318,7 +445,7 @@ pub(super) async fn serve<P: LocalProto, S: LocalStream>(
     match request.path.as_str() {
         "/" | STATUS_TEXT_PATH | STATUS_JSON_PATH => {
             let format = status_page::status_format_for(&request.path, request.accept);
-            let (status_line, content_type, body) = render(&router.status(), format);
+            let (status_line, content_type, body) = render(&router.status(), &router.table, format);
             respond(tcp, status_line, content_type, &body).await
         }
         other => not_found(tcp, &format!("no such page: {other}")).await,
@@ -512,7 +639,27 @@ async fn respond<S: LocalStream>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::route_table::RouteSpec;
+    use crate::proxy::server_routes::ServerRoutes;
     use std::time::Duration;
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The table `status`'s destinations make with their own routes.
+    fn table_of(status: &ClientStatus) -> RouteTable {
+        let specs: Vec<RouteSpec<'_>> = status
+            .destinations
+            .iter()
+            .map(|d| RouteSpec {
+                host: &d.host,
+                routed_domains: &d.routed_domains,
+                routed_cidrs: &d.routed_cidrs,
+            })
+            .collect();
+        RouteTable::new(&specs).unwrap()
+    }
 
     fn destination(host: &str, state: DestinationState) -> DestinationStatus {
         DestinationStatus {
@@ -529,11 +676,15 @@ mod tests {
             routed_domains: vec!["*.corp.example".to_string()],
             routed_cidrs: vec!["10.0.0.0/8".to_string()],
             relay_urls: Vec::new(),
+            server_routes: None,
+            server_routes_error: None,
         }
     }
 
     /// A status as of [`now`]: `m1` connected 125s earlier, `m2` retrying in
-    /// 30s, `m3` idle.
+    /// 30s, `m3` idle. `m2`'s routes nest inside `m1`'s; `m1`'s server routes
+    /// all of its wildcard and half its network, `m2`'s server nothing it
+    /// lists, and `m3` has never connected.
     fn status() -> (ClientStatus, Instant) {
         // The connection is the fixed point and "now" is counted on from it,
         // so nothing depends on the clock while the test runs (or on how long
@@ -544,23 +695,33 @@ mod tests {
         connected.connected_since = Some(connected_at);
         connected.open_streams = 2;
         connected.client_node_id = Some("clientid".to_string());
+        connected.server_routes = Some(ServerRoutes {
+            routed_domains: strings(&["*.corp.example"]),
+            routed_cidrs: strings(&["10.0.0.0/9"]),
+        });
         let mut backoff = destination("m2.internal", DestinationState::Backoff);
+        backoff.routed_domains = strings(&["*.dev.corp.example"]);
+        backoff.routed_cidrs = strings(&["10.1.0.0/16"]);
+        backoff.server_routes = Some(ServerRoutes::default());
         backoff.failed_attempts = 3;
         backoff.last_error = Some("Signaling error: timed out".to_string());
         backoff.next_attempt_at = Some(now + Duration::from_secs(30));
         backoff.waiting = 1;
+        let mut idle = destination("m3.internal", DestinationState::Idle);
+        idle.routed_domains = strings(&["wiki.example"]);
+        idle.routed_cidrs.clear();
         let status = ClientStatus {
             socks_listen: Some("127.0.0.1:1080".parse().unwrap()),
             http_listen: None,
             idle_timeout: Some(Duration::from_secs(300)),
-            destinations: vec![connected, backoff, destination("m3.internal", DestinationState::Idle)],
+            destinations: vec![connected, backoff, idle],
         };
         (status, now)
     }
 
     fn render_fixed(format: StatusFormat) -> (&'static str, &'static str, String) {
         let (status, now) = status();
-        render_at(&status, format, now)
+        render_at(&status, &table_of(&status), format, now)
     }
 
     #[test]
@@ -589,7 +750,9 @@ mod tests {
         assert!(d[2]["connected_secs"].is_null());
         assert!(d[2]["client_node_id"].is_null());
         assert!(d[2]["next_attempt_secs"].is_null());
-        assert_eq!(d[2]["routed_domains"][0], "*.corp.example");
+        assert_eq!(d[2]["routed_domains"][0], "wiki.example");
+        assert!(d[2]["server_routes"].is_null());
+        assert_eq!(d[0]["server_routes"]["routed_cidrs"][0], "10.0.0.0/9");
     }
 
     #[test]
@@ -611,14 +774,69 @@ mod tests {
         assert!(text.contains("last error: Signaling error: timed out"));
     }
 
+    /// The routing is the whole table, most specific first, each rule with
+    /// the destination it goes to, the other destinations' rules it nests
+    /// with, and what its server said of it — without connecting anything.
+    #[test]
+    fn routing_is_shown_across_all_destinations() {
+        let (_, _, body) = render_fixed(StatusFormat::Json);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let routes = json["routes"].as_array().unwrap();
+        let summary: Vec<(&str, &str, &str, &str)> = routes
+            .iter()
+            .map(|r| {
+                (
+                    r["rule"].as_str().unwrap(),
+                    r["kind"].as_str().unwrap(),
+                    r["destination"].as_str().unwrap(),
+                    r["server"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("m1.internal", "host", "m1.internal", "loopback"),
+                ("m2.internal", "host", "m2.internal", "loopback"),
+                ("m3.internal", "host", "m3.internal", "loopback"),
+                ("wiki.example", "exact", "m3.internal", "unchecked"),
+                ("*.dev.corp.example", "wildcard", "m2.internal", "not allowed"),
+                ("*.corp.example", "wildcard", "m1.internal", "allowed"),
+                ("10.1.0.0/16", "network", "m2.internal", "not allowed"),
+                ("10.0.0.0/8", "network", "m1.internal", "partly allowed"),
+            ]
+        );
+        let dev = &routes[4];
+        assert_eq!(dev["within"][0]["rule"], "*.corp.example");
+        assert_eq!(dev["within"][0]["destination"], "m1.internal");
+        let corp = &routes[5];
+        assert_eq!(corp["narrower"][0]["rule"], "*.dev.corp.example");
+        assert_eq!(corp["narrower"][0]["destination"], "m2.internal");
+        assert!(corp["within"].as_array().unwrap().is_empty());
+
+        let (_, _, text) = render_fixed(StatusFormat::Text);
+        assert!(text.contains("*.dev.corp.example (wildcard) -> m2.internal, server: not allowed"), "{text}");
+        assert!(text.contains("within *.corp.example of m1.internal"), "{text}");
+        assert!(text.contains("except 10.1.0.0/16, which goes to m2.internal"), "{text}");
+        assert!(text.contains("anything else -> direct"), "{text}");
+        assert!(text.contains("server routes: *.corp.example, 10.0.0.0/9"), "{text}");
+        assert!(text.contains("server routes: unchecked"), "{text}");
+
+        let (_, _, html) = render_fixed(StatusFormat::Html);
+        assert!(html.contains("Routing"));
+        assert!(html.contains("partly allowed"));
+        assert!(html.contains("which goes to <span class=\"mono\">m2.internal</span>"), "{html}");
+    }
+
     #[test]
     fn never_idle_is_reported() {
         let (mut status, _) = status();
         status.idle_timeout = None;
-        let (_, _, body) = render(&status, StatusFormat::Json);
+        let table = table_of(&status);
+        let (_, _, body) = render(&status, &table, StatusFormat::Json);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(json["idle_timeout_secs"].is_null());
-        let (_, _, text) = render(&status, StatusFormat::Text);
+        let (_, _, text) = render(&status, &table, StatusFormat::Text);
         assert!(text.contains("idle timeout: never"));
     }
 

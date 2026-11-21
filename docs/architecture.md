@@ -256,6 +256,23 @@ rule in the reserved namespace, and a host that is an IP literal, `localhost`
 or reserved. `ProxyClient::new` additionally rejects two destinations for one
 server.
 
+What precedence does resolve is recorded too: `RouteTable::overlaps` lists
+every rule of one destination strictly inside another's (`Rule::contains` —
+zones and networks nest or are apart, so containment is the whole test),
+including a destination's host under another's wildcard. The client logs them
+at startup; the status endpoint shows them against `RouteTable::rows`, the
+table in the order a target is tried.
+
+Each time a destination connects (`Destination::run`), a task reads the
+server's routed set off its JSON status page over the new connection — a
+stream of its own, not a lease, so it neither keeps the connection from idling
+nor outlives it — and keeps the answer in the destination's status past the
+connection. `RoutedSet::coverage` then grades each client rule against it:
+`Full` (one server rule contains it, or for a network, server networks tile
+it), `Partial` (some server rule lies inside it), or `None`. A rule not graded
+`Full` is logged when the server's answer changes, since the server refuses
+what is sent under it.
+
 The proxy listeners act on all four outcomes. The `TunnelDialer` used by port
 forwards and `nc` accepts only the tunnel outcomes: an unrouted target is an
 error there, never a direct connection.
