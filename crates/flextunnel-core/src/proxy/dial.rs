@@ -25,7 +25,12 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// `forwarder` is the server's conditional-DNS-forwarding table; the client's
 /// split-tunnel path passes `None`.
+///
+/// An address in domain form (`127.0.0.1.`, `[fd00::1]`) is dialed as that
+/// address, the way the routing read it ([`Target::into_numeric`]), never
+/// looked up by name — on the client's direct path as on a server's.
 pub async fn dial_target(target: &Target, forwarder: Option<&DnsForwarder>) -> io::Result<TcpStream> {
+    let target = &target.clone().into_numeric();
     if let Some(port) = loopback_port(target) {
         return connect_any(&loopback_addrs(port)).await;
     }
@@ -35,23 +40,23 @@ pub async fn dial_target(target: &Target, forwarder: Option<&DnsForwarder>) -> i
     }
 }
 
-/// The port of a loopback target (a loopback literal IP, or the literal
-/// `localhost` host), or `None` for anything that must be resolved/dialed as
-/// given. Both loopback families are distinct sockets, so a loopback target is
-/// dialed on both — a service told `localhost` may bind only `::1`, and an alias
-/// pointing at `127.0.0.1` may front a service that only listens on `::1`.
+/// The port of a loopback target — the `localhost` host, or one of the two
+/// canonical loopback addresses `127.0.0.1` and `::1` — or `None` for
+/// anything that must be resolved/dialed as given. Both loopback families are
+/// distinct sockets, so such a target is dialed on both — a service told
+/// `localhost` may bind only `::1`, and an alias pointing at `127.0.0.1` may
+/// front a service that only listens on `::1`. Any other loopback address
+/// (`127.0.0.2`) is a socket of its own, and is dialed as given.
 fn loopback_port(target: &Target) -> Option<u16> {
+    let canonical = |ip: IpAddr| ip == Ipv4Addr::LOCALHOST || ip == Ipv6Addr::LOCALHOST;
     match target {
-        Target::Ip(sa) if sa.ip().is_loopback() => Some(sa.port()),
+        Target::Ip(sa) if canonical(sa.ip()) => Some(sa.port()),
         Target::Ip(_) => None,
         Target::Domain(host, port) => {
             if host.eq_ignore_ascii_case("localhost") {
                 return Some(*port);
             }
-            host.parse::<IpAddr>()
-                .ok()
-                .filter(IpAddr::is_loopback)
-                .map(|_| *port)
+            host.parse::<IpAddr>().ok().filter(|ip| canonical(*ip)).map(|_| *port)
         }
     }
 }
@@ -186,12 +191,41 @@ mod tests {
         );
         assert_eq!(loopback_port(&Target::Domain("::1".into(), 85)), Some(85));
 
+        // Another loopback address is its own socket: dialed as given.
+        assert_eq!(loopback_port(&Target::Ip("127.0.0.2:86".parse().unwrap())), None);
+        assert_eq!(loopback_port(&Target::Domain("127.0.0.2".into(), 87)), None);
+
         // Non-loopback targets are dialed as given.
         assert_eq!(
             loopback_port(&Target::Ip("93.184.216.34:443".parse().unwrap())),
             None
         );
         assert_eq!(loopback_port(&Target::Domain("example.com".into(), 443)), None);
+    }
+
+    /// A loopback address other than `127.0.0.1` names a socket of its own: a
+    /// target for it — as an address, or as a name with the root dot —
+    /// reaches the service bound there, not one on `127.0.0.1` at the same
+    /// port. (Skipped where only `127.0.0.1` is configured, as on macOS.)
+    #[tokio::test]
+    async fn another_loopback_address_is_dialed_as_given() {
+        let Ok(listener) = TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).await else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        // A decoy on 127.0.0.1 at the same port, where the dual-stack
+        // shortcut would land.
+        let decoy = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await.ok();
+        for target in [
+            Target::Ip(SocketAddr::from((Ipv4Addr::new(127, 0, 0, 2), port))),
+            Target::Domain("127.0.0.2".into(), port),
+            Target::Domain("127.0.0.2.".into(), port),
+        ] {
+            let stream = dial_target(&target, None).await.unwrap_or_else(|e| panic!("{target:?}: {e}"));
+            assert_eq!(stream.peer_addr().unwrap().ip(), Ipv4Addr::new(127, 0, 0, 2), "{target:?}");
+            listener.accept().await.unwrap();
+        }
+        drop(decoy);
     }
 
     /// A service bound only on `::1` must still be reachable when the target is a
@@ -212,6 +246,10 @@ mod tests {
         for target in [
             Target::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
             Target::Domain("127.0.0.1".into(), port),
+            // With the root dot it is the same address, dialed as one, not
+            // looked up by name.
+            Target::Domain("127.0.0.1.".into(), port),
+            Target::Domain("[::1].".into(), port),
             Target::Domain("localhost".into(), port),
         ] {
             dial_target(&target, None)

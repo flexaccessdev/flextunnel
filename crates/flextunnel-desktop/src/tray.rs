@@ -412,6 +412,10 @@ mod tests {
                 routed_domains: Vec::new(),
                 routed_cidrs: Vec::new(),
                 relay_urls: Vec::new(),
+                server_routes: None,
+                server_routes_error: None,
+                server_coverage: Default::default(),
+                server_routes_pending: false,
             }
         };
         ClientSnapshot {

@@ -22,12 +22,16 @@
 //!
 //! Two destinations may nest (`*.corp` on one, `*.dev.corp` on the other) —
 //! the more specific rule wins — but may not carry the *same* rule, which
-//! would be a tie; that is rejected at load.
+//! would be a tie; that is rejected at load. Every nesting between two
+//! destinations is found at load too ([`RouteTable::overlaps`]), so the client
+//! can say which destination a shared stretch of names or addresses goes to
+//! — the rules may have been typed in or filled in from each server's own
+//! lists, and a fill can carry a server's broad rule over another's.
 
 use crate::proxy::reserved;
-use crate::proxy::routed_set::{RoutedSet, Specificity, routing_key};
+use crate::proxy::routed_set::{RoutedSet, Rule, Specificity, routing_key};
 use crate::proxy::signaling::{StreamRequest, Target};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::net::IpAddr;
 
@@ -58,6 +62,47 @@ struct Entry {
 #[derive(Debug, Clone, Default)]
 pub struct RouteTable {
     entries: Vec<Entry>,
+    overlaps: Vec<Overlap>,
+}
+
+/// What one row of the table routes: a destination's own host, or one of its
+/// routed rules.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TableRule {
+    /// The destination's own name: its server's loopback.
+    Host(String),
+    Routed(Rule),
+}
+
+impl std::fmt::Display for TableRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Host(host) => f.write_str(host),
+            Self::Routed(rule) => rule.fmt(f),
+        }
+    }
+}
+
+/// One row of the table: a rule and the destination (an index into the
+/// table) it sends its matches to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableRow {
+    pub dest: usize,
+    pub rule: TableRule,
+}
+
+/// Two destinations' rules that match some of the same targets. Where both
+/// match, `inner` — the narrower rule — wins; `outer` keeps the rest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Overlap {
+    pub outer: TableRow,
+    pub inner: TableRow,
+}
+
+impl std::fmt::Display for Overlap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} is within {}", self.inner.rule, self.outer.rule)
+    }
 }
 
 /// One destination's routing input: its host name and the raw routed-set
@@ -85,7 +130,7 @@ impl RouteTable {
                 })?;
             }
             let routed = RoutedSet::new(spec.routed_domains, spec.routed_cidrs)
-                .with_context(|| format!("destination {host:?}"))?;
+                .map_err(|e| anyhow::anyhow!("destination {host:?}: {e:#}"))?;
             entries.push(Entry { host, routed });
         }
 
@@ -93,6 +138,7 @@ impl RouteTable {
         let mut owners: HashMap<String, &str> = HashMap::new();
         for entry in &entries {
             for rule in entry.routed.rules() {
+                let rule = rule.to_string();
                 if let Some(other) = owners.insert(rule.clone(), &entry.host) {
                     bail!(
                         "destinations {other:?} and {:?} both route {rule:?}; \
@@ -113,20 +159,51 @@ impl RouteTable {
                 );
             }
         }
-        // The reserved namespace is the client's own; a rule naming it is dead.
-        for entry in &entries {
-            for rule in entry.routed.rules() {
-                let name = rule.strip_prefix("*.").unwrap_or(&rule);
-                if reserved::is_reserved_host(name) {
-                    bail!(
-                        "destination {:?} routes {rule:?}, which is in the reserved \
-                         flextunnel.internal namespace",
-                        entry.host
-                    );
-                }
-            }
-        }
-        Ok(Self { entries })
+        let overlaps = find_overlaps(&entries);
+        Ok(Self { entries, overlaps })
+    }
+
+    /// Every place two destinations' rules match the same targets, broadest
+    /// rule first: a routed rule inside another destination's (`*.dev.corp`
+    /// within `*.corp`, `10.1.0.0/16` within `10.0.0.0/8`), or a destination's
+    /// own host under another's wildcard. Never an error — the narrower rule
+    /// wins where they meet — but worth showing, since the broad one stops
+    /// covering what the narrow one takes.
+    pub fn overlaps(&self) -> &[Overlap] {
+        &self.overlaps
+    }
+
+    /// Every row of the table, in the order a target is tried against them:
+    /// the destinations' own hosts, then the hostname rules (exact names, the
+    /// longer zone first, the catch-all last), then the networks (the longer
+    /// prefix first). Ties within a kind keep destination order, then the
+    /// rule's spelling.
+    pub fn rows(&self) -> Vec<TableRow> {
+        let mut rows: Vec<TableRow> = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(dest, e)| TableRow { dest, rule: TableRule::Host(e.host.clone()) })
+            .collect();
+        let mut routed: Vec<(usize, Rule)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .flat_map(|(dest, e)| e.routed.rules().into_iter().map(move |rule| (dest, rule)))
+            .collect();
+        // Hostname rules before networks; within each, the more specific first.
+        routed.sort_by_key(|(dest, rule)| {
+            let is_net = matches!(rule, Rule::Cidr(_));
+            (is_net, std::cmp::Reverse(rule.specificity()), *dest, rule.to_string())
+        });
+        rows.extend(routed.into_iter().map(|(dest, rule)| TableRow { dest, rule: TableRule::Routed(rule) }));
+        rows
+    }
+
+    /// The routed rules of the destination at `dest`, as [`RoutedSet::rules`]
+    /// normalizes them.
+    pub fn rules_of(&self, dest: usize) -> Vec<Rule> {
+        self.entries.get(dest).map(|e| e.routed.rules()).unwrap_or_default()
     }
 
     /// The destination host names, in table order.
@@ -176,6 +253,63 @@ impl RouteTable {
     }
 }
 
+/// The overlaps of validated `entries` (see [`RouteTable::overlaps`]): for
+/// each pair of destinations, each rule of one inside a rule of the other.
+/// Identical rules are refused before this runs, so containment is strict.
+fn find_overlaps(entries: &[Entry]) -> Vec<Overlap> {
+    // An overlap takes two destinations; one alone would only be compared
+    // with itself, rule by rule, for nothing.
+    if entries.len() < 2 {
+        return Vec::new();
+    }
+    // Each destination's rows: its host first, then its routed rules.
+    let groups: Vec<Vec<(TableRow, Rule)>> = entries
+        .iter()
+        .enumerate()
+        .map(|(dest, e)| {
+            let host = (
+                TableRow { dest, rule: TableRule::Host(e.host.clone()) },
+                Rule::Exact(e.host.clone()),
+            );
+            std::iter::once(host)
+                .chain(e.routed.rules().into_iter().map(|rule| {
+                    (TableRow { dest, rule: TableRule::Routed(rule.clone()) }, rule)
+                }))
+                .collect()
+        })
+        .collect();
+    let mut overlaps = Vec::new();
+    // Each pair of destinations once, each way round: one destination's rules
+    // are never compared with each other.
+    for (a, first) in groups.iter().enumerate() {
+        for second in &groups[a + 1..] {
+            for (outer_group, inner_group) in [(first, second), (second, first)] {
+                for (outer, outer_rule) in outer_group {
+                    // A host is the narrowest thing there is: nothing nests
+                    // inside it.
+                    if matches!(outer.rule, TableRule::Host(_)) {
+                        continue;
+                    }
+                    for (inner, inner_rule) in inner_group {
+                        if outer_rule.contains(inner_rule) {
+                            overlaps.push(Overlap { outer: outer.clone(), inner: inner.clone() });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Broadest outer rule first: hostname rules, then networks.
+    overlaps.sort_by_key(|o| {
+        let (is_net, specificity) = match &o.outer.rule {
+            TableRule::Routed(rule) => (matches!(rule, Rule::Cidr(_)), rule.specificity()),
+            TableRule::Host(_) => (false, Specificity::Exact),
+        };
+        (is_net, specificity, o.outer.dest, o.inner.dest, o.inner.rule.to_string())
+    });
+    overlaps
+}
+
 /// Check one `routed_domains` entry: `*`, a hostname, or `*.` and a hostname.
 /// [`RoutedSet::new`] only parses the rule's shape; a name no request could
 /// ever carry — one with a space, say — would sit there as a dead rule, so it
@@ -185,16 +319,8 @@ fn validate_routed_domain(raw: &str) -> Result<(), String> {
     if entry == "*" {
         return Ok(());
     }
-    // An address here would be a rule that never matches: an IP target is
-    // routed by the networks alone, so the traffic it was meant to tunnel
-    // would connect directly instead.
-    let unbracketed = entry
-        .strip_prefix('[')
-        .and_then(|e| e.strip_suffix(']'))
-        .unwrap_or(entry);
-    if unbracketed.parse::<IpAddr>().is_ok() {
-        return Err("it is an IP address, which routed_cidrs routes — list it there".into());
-    }
+    // An IP address or a reserved name is refused by [`RoutedSet::new`]
+    // itself, on a server's lists as well as here.
     let name = entry.strip_prefix("*.").unwrap_or(entry);
     crate::forwards::validate_remote_host(name)
         .map(|_| ())
@@ -350,6 +476,85 @@ mod tests {
         );
         let other = domain("nas.internal", 22);
         assert_eq!(t.route(&other), connect_to(1, other.clone()));
+    }
+
+    /// `(inner rule, inner destination, outer rule, outer destination)` for
+    /// every overlap of `t`, in its order.
+    fn overlaps(t: &RouteTable) -> Vec<(String, usize, String, usize)> {
+        t.overlaps()
+            .iter()
+            .map(|o| (o.inner.rule.to_string(), o.inner.dest, o.outer.rule.to_string(), o.outer.dest))
+            .collect()
+    }
+
+    /// Every nesting between two destinations is found, whichever way round
+    /// and however the rules are spelled; rules that nest within one
+    /// destination, or do not meet, are not overlaps.
+    #[test]
+    fn overlaps_between_destinations_are_found() {
+        let t = table(&[
+            ("m1.internal", &["*", "*.corp.example", "api.corp.example"], &["10.0.0.0/8"]),
+            ("m2.internal", &["*.Dev.Corp.Example."], &["10.1.0.1/16", "192.168.0.0/16"]),
+            ("nas.corp.example", &[], &[]),
+        ])
+        .unwrap();
+        let s = |v: &str| v.to_string();
+        assert_eq!(
+            overlaps(&t),
+            [
+                // The catch-all first: everything named elsewhere is within it.
+                (s("*.dev.corp.example"), 1, s("*"), 0),
+                (s("m2.internal"), 1, s("*"), 0),
+                (s("nas.corp.example"), 2, s("*"), 0),
+                // Then the zone: another's inner zone, and a host in it.
+                (s("*.dev.corp.example"), 1, s("*.corp.example"), 0),
+                (s("nas.corp.example"), 2, s("*.corp.example"), 0),
+                // Then the networks.
+                (s("10.1.0.0/16"), 1, s("10.0.0.0/8"), 0),
+            ]
+        );
+        // None of these meet another destination's rule.
+        let apart = table(&[
+            ("m1.internal", &["*.corp.example", "api.corp.example"], &["10.0.0.0/8", "10.1.0.0/16"]),
+            ("m2.internal", &["corp.example", "*.notcorp.example"], &["11.0.0.0/8"]),
+        ])
+        .unwrap();
+        assert!(apart.overlaps().is_empty(), "{:?}", overlaps(&apart));
+        let overlap = &t.overlaps()[3];
+        assert_eq!(overlap.to_string(), "*.dev.corp.example is within *.corp.example");
+    }
+
+    /// The rows are the table in the order a target is tried against it.
+    #[test]
+    fn rows_run_most_specific_first() {
+        let t = table(&[
+            ("m1.internal", &["*", "*.corp.example"], &["10.0.0.0/8", "fd00::/8"]),
+            ("m2.internal", &["*.dev.corp.example", "wiki.example"], &["10.1.0.0/16"]),
+        ])
+        .unwrap();
+        let rows: Vec<(String, usize)> = t.rows().iter().map(|r| (r.rule.to_string(), r.dest)).collect();
+        let expected: Vec<(String, usize)> = [
+            ("m1.internal", 0),
+            ("m2.internal", 1),
+            ("wiki.example", 1),
+            ("*.dev.corp.example", 1),
+            ("*.corp.example", 0),
+            ("*", 0),
+            ("10.1.0.0/16", 1),
+            ("10.0.0.0/8", 0),
+            ("fd00::/8", 0),
+        ]
+        .iter()
+        .map(|(r, d)| (r.to_string(), *d))
+        .collect();
+        assert_eq!(rows, expected);
+        assert!(matches!(t.rows()[0].rule, TableRule::Host(_)));
+        // Each row routes as the table does.
+        for row in t.rows() {
+            if let TableRule::Routed(Rule::Exact(name)) = &row.rule {
+                assert_eq!(t.route(&domain(name, 443)), connect_to(row.dest, domain(name, 443)));
+            }
+        }
     }
 
     #[test]

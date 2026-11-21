@@ -16,6 +16,7 @@ use flextunnel_core::forwards::{ForwardState, ForwardStatus, PortForward};
 use crate::style::{self, AMBER, GRAY, GREEN, RED};
 use crate::tunnel::ClientPhase;
 use flextunnel_core::proxy::signaling::Target;
+use flextunnel_core::proxy::routed_set::Coverage;
 use flextunnel_core::proxy::{DestinationState, Route, RouteTable, reserved};
 use flextunnel_core::transport::paths::{ConnPathKind, ConnectionSnapshot, CustomRelayStatus};
 use iced::widget::{
@@ -38,6 +39,8 @@ pub struct RoutedCache {
     /// `None` when the destinations do not make a valid table: the client
     /// then cannot start, and no badge is shown.
     pub table: Option<RouteTable>,
+    /// Why they do not, when they do not.
+    pub error: Option<String>,
 }
 
 /// Rebuild the advisory routing table over `destinations` only when their
@@ -55,9 +58,12 @@ where
             })
     });
     if !fresh {
-        cache.table = config::route_table_of(destinations.clone())
-            .inspect_err(|e| log::debug!("Routes unusable for the forward badges: {e}"))
-            .ok();
+        let table = config::route_table_of(destinations.clone())
+            .inspect_err(|e| log::debug!("Routes unusable for the forward badges: {e}"));
+        (cache.table, cache.error) = match table {
+            Ok(table) => (Some(table), None),
+            Err(e) => (None, Some(e)),
+        };
         cache.built_from = Some(
             destinations
                 .map(|d| (d.host.clone(), d.routed_domains.clone(), d.routed_cidrs.clone()))
@@ -786,9 +792,11 @@ fn client_detail(app: &App) -> Element<'_, Message> {
                 .style(style::dim_text),
         );
     }
+    // The routes' check comes from the saved table's cache, which every
+    // message brings up to date: a redraw builds no table.
     if client.enabled
         && !running
-        && let Some(blocker) = client.start_blocker(&app.keys)
+        && let Some(blocker) = client.start_blocker_with(&app.keys, || app.routed_cache.error.clone())
     {
         let add = client
             .destinations
@@ -1317,8 +1325,54 @@ fn routes_section<'a>(app: &'a App, destination: &'a Destination) -> Element<'a,
             .size(12),
         );
     }
-    for rule in domains.iter().chain(cidrs) {
-        col = col.push(route_row(rule.clone(), None));
+    // Each rule with what its server said of it on the latest connection;
+    // nothing is shown for a destination not connected yet.
+    let status = match app.destination_live(destination) {
+        DestinationLive::Live(status) => Some(status),
+        _ => None,
+    };
+    let rules = domains.iter().map(|r| (r, false)).chain(cidrs.iter().map(|r| (r, true)));
+    for (rule, cidr) in rules {
+        let badge = config::server_coverage(status, rule, cidr).and_then(|coverage| {
+            let color = match coverage {
+                Coverage::Full => return None,
+                Coverage::Partial => AMBER,
+                Coverage::None => RED,
+            };
+            Some(text(format!("server: {}", coverage.as_str())).size(11).color(color).into())
+        });
+        col = col.push(route_row(rule.clone(), badge));
+    }
+    if let Some(status) = status {
+        let earlier = "The marks above are from an earlier connection.";
+        let message = match (&status.server_routes, status.server_routes_error.as_deref()) {
+            (Some(_), _) if status.server_routes_pending => {
+                Some(format!("Reading the server's routes again. {earlier}"))
+            }
+            // A read in progress after none succeeded: not yet a failure.
+            (None, _) if status.server_routes_pending => Some("Reading the server's routes…".to_string()),
+            (Some(_), Some(error)) => {
+                Some(format!("Could not read the server's routes again: {error}. {earlier}"))
+            }
+            (None, Some(error)) => Some(format!("Could not read the server's routes: {error}")),
+            (_, None) => None,
+        };
+        if let Some(message) = message {
+            col = col.push(text(message).size(11).style(style::faint_text));
+        }
+    }
+
+    // Where another destination's rules nest with these.
+    let index = app.client.destinations.iter().position(|d| d.id == destination.id);
+    if let (Some(table), Some(index)) = (app.routed_cache.table.as_ref(), index) {
+        let lines = config::overlap_lines(table, index);
+        if !lines.is_empty() {
+            col = col.push(space().height(8));
+            col = col.push(text("Overlaps with other destinations (the most specific rule that matches a target takes it):").size(12));
+            for line in lines {
+                col = col.push(text(line).size(11).style(style::dim_text));
+            }
+        }
     }
 
     // The server's own status page — its tunnel set, host aliases and DNS
@@ -1371,6 +1425,11 @@ fn destination_form_view<'a>(app: &'a App, form: &'a DestinationForm) -> Element
         routes_fetch_row(app, form),
     ]
     .spacing(10);
+    // Where these routes nest with another destination's — worth seeing
+    // before saving, above all after a fill from the server.
+    for line in form.overlaps(&app.client.destinations) {
+        card = card.push(form_row("", text(line).size(11).style(style::dim_text).width(Fill)));
+    }
     if let Some(new_name) = &form.new_key_name {
         // The "New key" prompt replaces the picker and public-key rows while
         // open, so the form shows exactly one key flow at a time: name the
@@ -2840,6 +2899,10 @@ mod tests {
             routed_domains: Vec::new(),
             routed_cidrs: Vec::new(),
             relay_urls: Vec::new(),
+            server_routes: None,
+            server_routes_error: None,
+            server_coverage: Default::default(),
+            server_routes_pending: false,
         };
         let word = |status: &flextunnel_core::proxy::DestinationStatus| {
             destination_state(&DestinationLive::Live(status))

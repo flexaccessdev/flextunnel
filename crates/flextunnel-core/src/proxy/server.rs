@@ -691,7 +691,9 @@ async fn handle_socks_stream(
     server: &Arc<ProxyServer>,
 ) -> io::Result<()> {
     let requested = match signaling::read_request(&mut recv).await? {
-        StreamRequest::Connect(target) => target,
+        // An address in domain form is that address, as the routed set reads
+        // it: from here on it is an IP, past the aliases and the resolver.
+        StreamRequest::Connect(target) => target.into_numeric(),
         // A destination's own name on the client side. Dialed exactly like
         // `localhost` (dual-stack), outside the routed-set whitelist and host
         // aliases: no operator config is needed to reach the machine the

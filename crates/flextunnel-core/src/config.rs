@@ -440,6 +440,15 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
                  cannot be used as a [host_aliases] name"
             );
         }
+        // A target that is an address — in either form, `10.0.0.1.` included
+        // — is dialed as that address and never aliased, so an address as a
+        // key could never match.
+        if crate::proxy::routed_set::parse_ip_literal(key).is_some() {
+            anyhow::bail!(
+                "alias '{key}' is an IP address, which is never aliased; \
+                 a [host_aliases] name must be a hostname"
+            );
+        }
     }
 
     // Fixed at the default (~/.config/flextunnel/blocklist.json) and NOT
@@ -856,6 +865,18 @@ mod tests {
             let file: ServerConfig = toml::from_str(&toml).unwrap();
             let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
             assert!(err.to_string().contains(table), "key {key:?}: {err}");
+        }
+    }
+
+    /// An address is dialed as itself, never aliased: as a key it would
+    /// never match, so it is refused in either spelling.
+    #[test]
+    fn numeric_alias_is_rejected() {
+        for key in ["10.0.0.1", "10.0.0.1.", "fd00::1", "[fd00::1]"] {
+            let toml = format!("[host_aliases]\n\"{key}\" = \"127.0.0.1\"\n");
+            let file: ServerConfig = toml::from_str(&toml).unwrap();
+            let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
+            assert!(err.to_string().contains("IP address"), "{key}: {err}");
         }
     }
 

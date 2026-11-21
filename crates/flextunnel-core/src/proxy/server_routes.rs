@@ -13,6 +13,7 @@
 //! follows the server's config afterwards.
 
 use super::client_status;
+use super::routed_set::{Coverage, RoutedSet, Rule};
 use super::destination::{ClientAuth, dial_server, exchange_hello};
 use super::status_page::{CONTENT_TYPE_JSON, STATUS_JSON_PATH, StatusFormat};
 use crate::auth::ClientKey;
@@ -22,6 +23,7 @@ use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointId};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::future::Future;
 use tokio::sync::oneshot;
 
@@ -34,6 +36,14 @@ pub struct ServerRoutes {
 }
 
 impl ServerRoutes {
+    /// Each of `own`'s rules with how much of it these routes cover: whether
+    /// the server accepts what is sent under it. Fails when the server's lists
+    /// are not a routed set this client can read.
+    pub fn coverage_of(&self, own: &RoutedSet) -> anyhow::Result<HashMap<Rule, Coverage>> {
+        let server = RoutedSet::new(&self.routed_domains, &self.routed_cidrs)?;
+        Ok(own.rules().into_iter().map(|rule| { let coverage = server.coverage(&rule); (rule, coverage) }).collect())
+    }
+
     /// Read the routes out of a server's JSON status page
     /// ([`super::status_page`]), which lists them among the rest.
     fn from_status_json(body: &str) -> Result<Self, String> {
@@ -155,18 +165,20 @@ async fn ask(
         return Err(ProxyError::AuthenticationFailed(reason));
     }
 
+    read_routes(connection).await.map_err(ProxyError::Signaling)
+}
+
+/// Read the routes off the JSON status page of the server on `connection`,
+/// which is already authenticated. Bounded like any status fetch.
+pub(crate) async fn read_routes(connection: &Connection) -> Result<ServerRoutes, String> {
     let response =
         client_status::fetch_server_status(connection, STATUS_JSON_PATH, Some(StatusFormat::Json))
-            .await
-            .map_err(ProxyError::Signaling)?;
-    let (content_type, body) =
-        client_status::parse_server_status(&response).map_err(ProxyError::Signaling)?;
+            .await?;
+    let (content_type, body) = client_status::parse_server_status(&response)?;
     if content_type != CONTENT_TYPE_JSON {
-        return Err(ProxyError::Signaling(format!(
-            "the server answered its JSON status with {content_type}"
-        )));
+        return Err(format!("the server answered its JSON status with {content_type}"));
     }
-    ServerRoutes::from_status_json(body).map_err(ProxyError::Signaling)
+    ServerRoutes::from_status_json(body)
 }
 
 #[cfg(test)]
