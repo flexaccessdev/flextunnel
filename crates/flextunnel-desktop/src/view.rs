@@ -6,8 +6,8 @@
 
 use crate::app::{
     format_duration, App, ClientForm, DestinationForm, DestinationLive, ForwardForm,
-    IdentityChoice, KeyChoice, KeyForm, LogFilter, Message, ProxyForm, Selection, ServerForm,
-    StoreReset,
+    IdentityChoice, KeyChoice, KeyForm, LogFilter, Message, ProxyForm, RoutesFetch, Selection,
+    ServerForm, StoreReset,
 };
 use crate::config::{self, AuthKey, AuthorizedClient, Destination, ServerConfig};
 use crate::server_session::ServerPhase;
@@ -1368,6 +1368,7 @@ fn destination_form_view<'a>(app: &'a App, form: &'a DestinationForm) -> Element
                 Message::DestinationRoutedCidrsChanged,
             ),
         ),
+        routes_fetch_row(app, form),
     ]
     .spacing(10);
     if let Some(new_name) = &form.new_key_name {
@@ -1501,6 +1502,38 @@ fn destination_form_view<'a>(app: &'a App, form: &'a DestinationForm) -> Element
     ]
     .spacing(10)
     .into()
+}
+
+/// Under the routed fields: the button that fills them with what the server
+/// itself routes, and where that fetch stands. The server enforces its own
+/// lists, so its answer is what this destination can usefully send it.
+fn routes_fetch_row<'a>(app: &'a App, form: &'a DestinationForm) -> Element<'a, Message> {
+    // What asking takes: the server's id and a key, with relays that parse.
+    let askable = form.routes_query(&app.keys).map(|_| ());
+    let fetching = matches!(form.routes_fetch, RoutesFetch::Fetching(_));
+    let status = match (&form.routes_fetch, &askable) {
+        (RoutesFetch::Fetching(_), _) => text("Asking the server…").style(style::dim_text),
+        (RoutesFetch::Filled(filled), _) => text(filled.as_str()).style(style::dim_text),
+        (RoutesFetch::Failed(reason), _) => text(reason.as_str()).color(AMBER),
+        (RoutesFetch::Idle, Err(missing)) => text(missing.clone()).style(style::faint_text),
+        (RoutesFetch::Idle, Ok(())) => {
+            text("Fills the two fields above with what the server routes.").style(style::faint_text)
+        }
+    };
+    form_row(
+        "",
+        row![
+            button(text("Fetch from server").size(12))
+                .padding([4, 10])
+                .style(style::outlined)
+                .on_press_maybe(
+                    (!fetching && askable.is_ok()).then_some(Message::FetchServerRoutes)
+                ),
+            status.size(12).width(Fill),
+        ]
+        .spacing(8)
+        .align_y(Center),
+    )
 }
 
 // ---------------------------------------------------------------------------

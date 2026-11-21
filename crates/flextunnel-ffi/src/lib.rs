@@ -29,6 +29,9 @@
 //! 9. [`flextunnel_stop`] — stop the client, close its endpoints, free the
 //!    handle.
 //!
+//! Apart from a session, [`flextunnel_fetch_server_routes`] asks a server what
+//! it routes, for the app to offer while a destination is set up.
+//!
 //! Unlike the ezvpn FFI there is **no VPN / Network Extension and no `utun` fd**:
 //! flextunnel is pure-userspace proxying and forwarding over QUIC, so its
 //! optional proxy and forwarding listeners run entirely inside the app
@@ -52,8 +55,8 @@
 //! client reaches that port on the server's own loopback. Its optional
 //! `routed_domains` / `routed_cidrs` are further targets sent through that
 //! server (which must route them too — its own routed set is the allowlist).
-//! Routing is entirely this config's: nothing is learned from a server, and a
-//! target on no destination's list is connected directly from the device.
+//! Routing is entirely this config's: a session learns nothing from a server,
+//! and a target on no destination's list is connected directly from the device.
 //!
 //! `idle_timeout_secs` is how long a destination's connection is kept with no
 //! stream open on it: absent means the default (300), `0` means never close
@@ -162,6 +165,18 @@ struct FfiDestination {
     /// Further networks or bare IPs sent through this server.
     #[serde(default)]
     routed_cidrs: Vec<String>,
+}
+
+/// Input of [`flextunnel_fetch_server_routes`]: a server, and the key and
+/// relays a destination for it would use.
+#[derive(Deserialize)]
+struct FfiRoutesRequest {
+    auth_key: String,
+    server_node_id: String,
+    #[serde(default)]
+    relay_urls: Vec<String>,
+    #[serde(default)]
+    relay_auth_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -418,6 +433,93 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
         },
         result_json,
     ))
+}
+
+/// Ask a server what it routes — its own `routed_domains` and `routed_cidrs`
+/// — so a destination being set up can be filled in to match. One connection
+/// made for the question and closed again, on an endpoint and a runtime of its
+/// own: it needs no handle and touches no running session.
+///
+/// `request_json` names the server and how to reach it, as a destination for
+/// it would:
+///
+/// ```json
+/// { "auth_key": "ed25519-sec:...", "server_node_id": "<iroh endpoint id>",
+///   "relay_urls": [], "relay_auth_token": null }
+/// ```
+///
+/// `relay_urls` and `relay_auth_token` are optional. The server must already
+/// authorize the key's public half. On success returns 1 and writes
+///
+/// ```json
+/// { "routed_domains": ["*.corp.example"], "routed_cidrs": ["10.0.0.0/8"] }
+/// ```
+///
+/// to `out_buf`; both lists are empty for a server that routes nothing beyond
+/// itself. Returns 0 with an error message in `out_buf` for an invalid
+/// request, an unreachable server or a key it refuses. A too-small `out_buf`
+/// also returns 0, but then holds the truncated output rather than a
+/// diagnostic.
+///
+/// **Blocks** until the server has answered or an attempt has failed — a few
+/// seconds as a rule, about a minute against a server that never answers — so
+/// call it off the main thread. Nothing is retried.
+///
+/// # Safety
+/// - `request_json` must be a valid, NUL-terminated UTF-8 C string.
+/// - `out_buf` must point to at least `out_len` writable bytes (may be null
+///   only if `out_len` is 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flextunnel_fetch_server_routes(
+    request_json: *const c_char,
+    out_buf: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    if request_json.is_null() {
+        write_cstr(out_buf, out_len, "request_json is null");
+        return 0;
+    }
+    let json = match unsafe { CStr::from_ptr(request_json) }.to_str() {
+        Ok(json) => json,
+        Err(_) => {
+            write_cstr(out_buf, out_len, "request_json is not valid UTF-8");
+            return 0;
+        }
+    };
+    match fetch_server_routes_inner(json) {
+        Ok(routes) => {
+            if write_cstr(out_buf, out_len, &routes) { 1 } else { 0 }
+        }
+        Err(message) => {
+            write_cstr(out_buf, out_len, &message);
+            0
+        }
+    }
+}
+
+fn fetch_server_routes_inner(json: &str) -> Result<String, String> {
+    let request: FfiRoutesRequest =
+        serde_json::from_str(json).map_err(|e| format!("invalid request JSON: {e}"))?;
+    let relay = RelayConfig::from_urls_with_token(&request.relay_urls, request.relay_auth_token)
+        .map_err(|e| format!("invalid relay configuration: {e}"))?;
+    let key = flextunnel_core::auth::ClientKey::from_secret_str(request.auth_key.trim())
+        .map_err(|e| format!("invalid auth key: {e:#}"))?;
+    let server_id = request
+        .server_node_id
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid server_node_id: {e}"))?;
+
+    // The calling thread drives the one connection; it is blocked on the
+    // answer either way.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
+    let routes = runtime
+        .block_on(flextunnel_core::proxy::fetch_server_routes(server_id, &key, &relay))
+        .map_err(|e| e.to_string())?;
+    serde_json::to_string(&routes).map_err(|e| format!("failed to encode the routes: {e}"))
 }
 
 /// Replace the complete desired forward set.
@@ -1014,6 +1116,32 @@ mod tests {
             serde_json::from_str(&status_json(&handle.client.status(), Instant::now())).unwrap();
         assert!(status["idle_timeout_secs"].is_null());
         stop_handle(handle);
+    }
+
+    /// A routes request that cannot be acted on is refused before anything is
+    /// bound or dialed.
+    #[test]
+    fn invalid_routes_requests_are_rejected() {
+        let key = flextunnel_core::auth::ClientKey::generate().unwrap().secret_str();
+        let request = |value: serde_json::Value| fetch_server_routes_inner(&value.to_string());
+        let err = |value: serde_json::Value| request(value).expect_err("rejected");
+
+        assert!(fetch_server_routes_inner("{").unwrap_err().contains("invalid request JSON"));
+        assert!(err(serde_json::json!({ "auth_key": key })).contains("server_node_id"));
+        assert!(
+            err(serde_json::json!({ "auth_key": key, "server_node_id": "nope" }))
+                .contains("invalid server_node_id")
+        );
+        assert!(
+            err(serde_json::json!({ "auth_key": "nope", "server_node_id": node_id(1) }))
+                .contains("invalid auth key")
+        );
+        let one_relay = serde_json::json!({
+            "auth_key": key,
+            "server_node_id": node_id(1),
+            "relay_urls": ["https://relay.example"],
+        });
+        assert!(err(one_relay).contains("invalid relay configuration"));
     }
 
     #[test]

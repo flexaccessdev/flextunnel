@@ -81,7 +81,9 @@ auth_key_file = "~/.config/flextunnel/client.key"
 # The server enforces its own routed_domains / routed_cidrs (see
 # server.toml.example) as an allowlist, so list a route here only if the
 # server lists it too — otherwise the server answers "connection not allowed".
-# Nothing about routing is exchanged between the two.
+# Neither side applies the other's lists; the server's can be read through a
+# running client, at
+# http://flextunnel.internal/servers/<host>/status.json.
 #
 # When destinations overlap, the most specific rule wins: a destination's own
 # host, then an exact domain, then the longest `*.suffix`, then `*`; for IPs

@@ -18,9 +18,11 @@
 use crate::config::{self, AuthKey, ClientSettings, Destination, ServerConfig};
 use crate::server_session::{self, ServerCmd, ServerHandle, ServerSnapshot, SharedServerSnapshot};
 use flextunnel_core::config::DEFAULT_IDLE_TIMEOUT;
+use flextunnel_core::error::ProxyError;
 use flextunnel_core::forwards::{ForwardManager, ForwardStatus, PortForward};
 use flextunnel_core::proxy::{
     ClientAuth, ClientConfig, DestinationConfig, DestinationStatus, LocalListeners, ProxyClient,
+    ServerRoutes,
 };
 use flextunnel_core::transport::endpoint::RelayConfig;
 use flextunnel_core::transport::paths::ConnectionSnapshot;
@@ -315,6 +317,61 @@ impl Controller {
             let _ = thread.join();
         }
     }
+}
+
+/// A server to ask for its routes: its id, and the key and relays a
+/// destination for it would use.
+pub struct RoutesQuery {
+    pub server_id: flextunnel_core::iroh::EndpointId,
+    pub key: flextunnel_core::auth::ClientKey,
+    pub relay: RelayConfig,
+}
+
+/// Ask a server what it routes (see
+/// [`flextunnel_core::proxy::fetch_server_routes`]): one connection made for
+/// the question, whatever the client session is doing — it need not be
+/// running, nor know the server. The answer arrives on the returned channel.
+///
+/// The request runs on a thread and runtime of its own, named like the client
+/// session's so its log lines are filed with the client's. It always runs to
+/// its end — the endpoint it binds is closed there — even when nobody waits
+/// for the answer any more.
+pub fn fetch_server_routes(
+    query: RoutesQuery,
+) -> tokio::sync::oneshot::Receiver<Result<ServerRoutes, String>> {
+    let (answer_tx, answer) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name(CLIENT_THREAD_NAME.into())
+        .spawn(move || {
+            let fetched = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("Failed to build a runtime to ask the server: {e:#}"))
+                .and_then(|rt| {
+                    rt.block_on(flextunnel_core::proxy::fetch_server_routes(
+                        query.server_id,
+                        &query.key,
+                        &query.relay,
+                    ))
+                    .map_err(|e| match e {
+                        ProxyError::AuthenticationFailed(reason) => format!(
+                            "The server refused this client ({reason}): it must authorize the \
+                             auth key's public half before it answers."
+                        ),
+                        e => e.to_string(),
+                    })
+                });
+            if let Err(reason) = &fetched {
+                log::warn!("Asking server {} for its routes failed: {reason}", query.server_id);
+            }
+            let _ = answer_tx.send(fetched);
+        });
+    if let Err(e) = spawned {
+        // The sender went down with the closure, so the receiver reports a
+        // dropped request; say why here.
+        log::error!("Failed to spawn the thread asking the server for its routes: {e:#}");
+    }
+    answer
 }
 
 /// Bind a local listener, mapping the common taken-port case to a clear

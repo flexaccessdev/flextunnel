@@ -58,6 +58,7 @@ Core paths below are relative to `crates/flextunnel-core/src/`.
 | `proxy/socks5.rs`, `proxy/http.rs` | Local proxy protocol parsing and replies |
 | `proxy/routed_set.rs` | Domain/CIDR matching on client and server |
 | `proxy/server.rs`, `proxy/dial.rs` | Connection handling, routed-set checks and outbound TCP connections |
+| `proxy/server_routes.rs` | One-shot read of a server's routed set, for setting up a destination |
 | `proxy/reserved.rs`, `proxy/status_page.rs` | The reserved `flextunnel.internal` namespace; the server status page and shared HTTP plumbing |
 | `proxy/dns_forward.rs` | Conditional DNS resolution on the server |
 | `forwards.rs`, `proxy/forward.rs` | Forward definitions and loopback forward listeners |
@@ -258,6 +259,16 @@ The proxy listeners act on all four outcomes. The `TunnelDialer` used by port
 forwards and `nc` accepts only the tunnel outcomes: an unrouted target is an
 error there, never a direct connection.
 
+The table is the client's configuration alone; nothing fills it from a server.
+What a server routes can be read, though, to set a destination up to match:
+`proxy::fetch_server_routes` takes a server id, a client key and a relay
+config, and makes one connection of its own — endpoint, dial, auth handshake,
+a status stream for `/status.json`, close — returning the two lists from the
+server's status page. It is a single attempt outside any `ProxyClient`, so it
+works before the destination exists. The desktop app's destination form
+(*Fetch from server*) and the FFI (`flextunnel_fetch_server_routes`) offer the
+result for the user to save; the wire protocol is unchanged.
+
 ## Connection policy (client)
 
 `proxy/destination.rs` gives each destination a small state machine, driven by
@@ -367,8 +378,9 @@ catches accidental identity reuse.
   and its status page, whatever the routed set says. Authorize keys
   accordingly.
 - A server only ever sees the targets a client chose to send it. The client's
-  routes are local configuration; the server's routed set is its own
-  whitelist. Neither is transmitted.
+  routes are local configuration and are never transmitted. The server's
+  routed set is its own whitelist; every admitted client can read it, with the
+  host aliases and DNS forwards, on the server's status page.
 - Proxy listeners are unauthenticated and bind only to `127.0.0.1`;
   forwards bind `127.0.0.1` and `::1`. Local callers share the
   authenticated client's access.

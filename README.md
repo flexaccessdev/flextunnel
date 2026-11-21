@@ -766,6 +766,11 @@ simply never sent — it connects directly. The server's whitelist enforces
 routing policy for trusted clients and catches accidental misconfiguration; it
 is not an isolation boundary for untrusted clients.
 
+Nothing keeps the two sides' lists in step, but a client can read the server's:
+they are on its [status page](#status-pages)
+(`/servers/<destination>/status.json`), and the desktop app's destination form
+fills its routed fields from the server with *Fetch from server*.
+
 Two things reach a server **outside** its lists: its own loopback, under the
 destination's `host`, and its [status page](#status-pages). So a server with
 both lists omitted is valid — clients reach just the machine itself through it.

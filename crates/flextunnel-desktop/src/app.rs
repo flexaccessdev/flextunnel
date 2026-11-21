@@ -26,10 +26,13 @@ use crate::logging;
 use crate::server_session::{self, ServerPhase, ServerSnapshot};
 use crate::tray::{self, Tray};
 use crate::tunnel::{
-    ClientPhase, ClientSnapshot, ClientSpec, Controller, DestinationId, CLIENT_THREAD_NAME,
+    self, ClientPhase, ClientSnapshot, ClientSpec, Controller, DestinationId, RoutesQuery,
+    CLIENT_THREAD_NAME,
 };
 use crate::view;
-use flextunnel_core::proxy::{DestinationStatus, RouteSpec, RouteTable, validate_destination_host};
+use flextunnel_core::proxy::{
+    DestinationStatus, RouteSpec, RouteTable, ServerRoutes, validate_destination_host,
+};
 use flextunnel_core::transport::paths::ConnectionSnapshot;
 use iced::futures::Stream;
 use iced::{window, Element, Size, Subscription, Task};
@@ -151,6 +154,10 @@ pub enum Message {
     ServerNodeIdChanged(String),
     DestinationRoutedDomainsChanged(String),
     DestinationRoutedCidrsChanged(String),
+    /// Ask the form's server what it routes, to fill the two routed fields.
+    FetchServerRoutes,
+    /// The server's answer to the fetch numbered so (see [`RoutesFetch`]).
+    ServerRoutesFetched(u64, Result<ServerRoutes, String>),
     /// Pick a shared auth key for the destination being edited.
     AuthKeyPicked(KeyChoice),
     /// Open the destination form's "New key" prompt (a name field next to the
@@ -485,6 +492,20 @@ fn runs_saved_settings(snapshot: &ClientSnapshot, client: &ClientSettings, keys:
     snapshot.spec.as_deref() == ClientSpec::resolve(client, keys).as_ref()
 }
 
+/// Where the destination form's "Fetch from server" stands.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RoutesFetch {
+    #[default]
+    Idle,
+    /// The server was asked; this is the request's number, so that only its
+    /// own answer is taken — not one to an earlier request, or for a server
+    /// the form has since been pointed away from.
+    Fetching(u64),
+    /// The routed fields were filled from the server's answer; what to say.
+    Filled(String),
+    Failed(String),
+}
+
 /// Editable destination buffers (the add/edit form). `editing_id` is `None`
 /// when adding.
 #[derive(Default)]
@@ -503,11 +524,74 @@ pub struct DestinationForm {
     pub new_key_name: Option<String>,
     pub relay_urls: String,
     pub relay_auth_token: String,
+    pub routes_fetch: RoutesFetch,
 }
 
 impl DestinationForm {
     pub fn is_edit(&self) -> bool {
         self.editing_id.is_some()
+    }
+
+    /// What it takes to ask the form's server for its routes — the server, the
+    /// picked key and the relays, as the form has them now — or what is still
+    /// missing. The host and the routed fields play no part: asking is how the
+    /// latter get filled.
+    pub fn routes_query(&self, keys: &[AuthKey]) -> Result<RoutesQuery, String> {
+        let server_id = self
+            .server_node_id
+            .trim()
+            .parse()
+            .map_err(|_| "Enter the server node id first".to_string())?;
+        let key = config::find_key(keys, &self.auth_key_id)
+            .filter(|key| !key.secret.is_empty())
+            .ok_or("Pick an auth key the server authorizes first")?;
+        let key = flextunnel_core::auth::ClientKey::from_secret_str(key.secret.trim())
+            .map_err(|e| format!("Auth key \"{}\" is not usable: {e:#}", key.name))?;
+        let relay = flextunnel_core::transport::endpoint::RelayConfig::from_urls_with_token(
+            &split_list(&self.relay_urls),
+            self.relay_auth_token(),
+        )
+        .map_err(|e| format!("{e:#}"))?;
+        Ok(RoutesQuery {
+            server_id,
+            key,
+            relay,
+        })
+    }
+
+    /// The relay token as stored: trimmed, and absent when left empty.
+    fn relay_auth_token(&self) -> Option<String> {
+        let token = self.relay_auth_token.trim();
+        (!token.is_empty()).then(|| token.to_string())
+    }
+
+    /// Take the server's answer to fetch `id`: fill the two routed fields with
+    /// its lists, replacing what they held, or keep them and say why not. An
+    /// answer the form is not waiting for is dropped.
+    fn routes_fetched(&mut self, id: u64, fetched: Result<ServerRoutes, String>) {
+        if self.routes_fetch != RoutesFetch::Fetching(id) {
+            return;
+        }
+        self.routes_fetch = match fetched {
+            Ok(routes) => {
+                let filled = match (routes.routed_domains.len(), routes.routed_cidrs.len()) {
+                    (0, 0) => "The server routes nothing beyond itself.".to_string(),
+                    (domains, cidrs) => {
+                        format!("Filled in the server's {domains} domain(s) and {cidrs} CIDR(s).")
+                    }
+                };
+                self.routed_domains = routes.routed_domains.join(", ");
+                self.routed_cidrs = routes.routed_cidrs.join(", ");
+                RoutesFetch::Filled(filled)
+            }
+            Err(reason) => RoutesFetch::Failed(reason),
+        };
+    }
+
+    /// The server, key or relays changed: a fetch in flight was for what they
+    /// were, and its outcome no longer describes the form.
+    fn server_changed(&mut self) {
+        self.routes_fetch = RoutesFetch::Idle;
     }
 
     fn edit(destination: &Destination) -> Self {
@@ -521,6 +605,7 @@ impl DestinationForm {
             new_key_name: None,
             relay_urls: destination.relay_urls.join(", "),
             relay_auth_token: destination.relay_auth_token.clone().unwrap_or_default(),
+            routes_fetch: RoutesFetch::Idle,
         }
     }
 
@@ -576,10 +661,7 @@ impl DestinationForm {
             return Err("Pick an auth key (or create one with New key)".into());
         }
         let relay_urls = split_list(&self.relay_urls);
-        let relay_auth_token = {
-            let token = self.relay_auth_token.trim();
-            (!token.is_empty()).then(|| token.to_string())
-        };
+        let relay_auth_token = self.relay_auth_token();
         check_relays(&relay_urls, relay_auth_token.clone())?;
         Ok(Destination {
             id: self.editing_id.clone().unwrap_or_else(Destination::new_id),
@@ -1060,6 +1142,9 @@ pub struct App {
     pub selection: Selection,
     /// The open destination add/edit form (replaces the detail pane).
     pub destination_form: Option<DestinationForm>,
+    /// The number of the last "Fetch from server" request (see
+    /// [`RoutesFetch::Fetching`]).
+    routes_fetch_seq: u64,
     /// The client pane's open proxy-ports form.
     pub proxy_form: Option<ProxyForm>,
     /// The Keys pane's open add/edit form.
@@ -1174,6 +1259,7 @@ impl App {
             server: store.server,
             selection,
             destination_form: None,
+            routes_fetch_seq: 0,
             proxy_form: None,
             key_form: None,
             server_form: None,
@@ -1487,6 +1573,7 @@ impl App {
             Message::ServerNodeIdChanged(value) => {
                 if let Some(form) = &mut self.destination_form {
                     form.server_node_id = value;
+                    form.server_changed();
                 }
                 Task::none()
             }
@@ -1502,9 +1589,17 @@ impl App {
                 }
                 Task::none()
             }
+            Message::FetchServerRoutes => self.fetch_server_routes(),
+            Message::ServerRoutesFetched(id, fetched) => {
+                if let Some(form) = &mut self.destination_form {
+                    form.routes_fetched(id, fetched);
+                }
+                Task::none()
+            }
             Message::AuthKeyPicked(choice) => {
                 if let Some(form) = &mut self.destination_form {
                     form.auth_key_id = choice.id;
+                    form.server_changed();
                 }
                 Task::none()
             }
@@ -1537,12 +1632,14 @@ impl App {
             Message::RelayUrlsChanged(value) => {
                 if let Some(form) = &mut self.destination_form {
                     form.relay_urls = value;
+                    form.server_changed();
                 }
                 Task::none()
             }
             Message::RelayAuthTokenChanged(value) => {
                 if let Some(form) = &mut self.destination_form {
                     form.relay_auth_token = value;
+                    form.server_changed();
                 }
                 Task::none()
             }
@@ -2401,6 +2498,42 @@ impl App {
         }
     }
 
+    /// The destination form's "Fetch from server": ask the server the form
+    /// names what it routes, with the key and relays the form has, and fill
+    /// the routed fields from the answer (see
+    /// [`DestinationForm::routes_fetched`]). It is one connection of its own,
+    /// so it works for a destination not saved yet and with the client off;
+    /// the form stays editable meanwhile.
+    fn fetch_server_routes(&mut self) -> Task<Message> {
+        let Some(form) = &mut self.destination_form else {
+            return Task::none();
+        };
+        if matches!(form.routes_fetch, RoutesFetch::Fetching(_)) {
+            return Task::none();
+        }
+        // The view disables the button until there is enough to ask with;
+        // this is the backstop.
+        let query = match form.routes_query(&self.keys) {
+            Ok(query) => query,
+            Err(missing) => {
+                form.routes_fetch = RoutesFetch::Failed(missing);
+                return Task::none();
+            }
+        };
+        self.routes_fetch_seq += 1;
+        let id = self.routes_fetch_seq;
+        form.routes_fetch = RoutesFetch::Fetching(id);
+        let answer = tunnel::fetch_server_routes(query);
+        Task::perform(
+            async move {
+                answer
+                    .await
+                    .unwrap_or_else(|_| Err("The request to the server could not be made".into()))
+            },
+            move |fetched| Message::ServerRoutesFetched(id, fetched),
+        )
+    }
+
     /// Whether a save just now left a running client on the settings from
     /// before. Asks the controller rather than the polled snapshot, which a
     /// start made a moment ago has not reached yet.
@@ -2461,6 +2594,7 @@ impl App {
         if let Some(form) = &mut self.destination_form {
             form.auth_key_id = id;
             form.new_key_name = None;
+            form.server_changed();
         }
     }
 
@@ -2755,6 +2889,7 @@ mod tests {
             new_key_name: None,
             relay_urls: " https://a.example ,, https://b.example ".into(),
             relay_auth_token: String::new(),
+            routes_fetch: RoutesFetch::Idle,
         }
     }
 
@@ -3168,6 +3303,93 @@ mod tests {
         assert!(form.validate(&[], &keys).is_ok(), "the default relays");
         form.relay_auth_token = "psk".into();
         assert!(form.validate(&[], &keys).is_err(), "token without relays");
+    }
+
+    /// Asking a server for its routes takes its id, a usable key and relays
+    /// that parse — not a host, nor routes: those are what is being filled.
+    #[test]
+    fn a_routes_query_needs_the_server_and_a_key() {
+        let secret = flextunnel_core::auth::ClientKey::generate().unwrap().secret_str();
+        let keys = vec![AuthKey {
+            secret,
+            ..test_keys().remove(0)
+        }];
+        let form = || DestinationForm {
+            host: String::new(),
+            routed_domains: "*.*.unparseable".into(),
+            ..valid_form()
+        };
+
+        let query = form().routes_query(&keys).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(query.server_id.to_string(), node_id("form"));
+        assert_eq!(query.relay.custom_urls().len(), 2);
+
+        let missing = |form: DestinationForm, keys: &[AuthKey]| match form.routes_query(keys) {
+            Ok(_) => panic!("expected the query to be refused"),
+            Err(missing) => missing,
+        };
+        let mut no_server = form();
+        no_server.server_node_id = "nope".into();
+        assert!(missing(no_server, &keys).contains("server node id"));
+        let mut no_key = form();
+        no_key.auth_key_id = "gone".into();
+        assert!(missing(no_key, &keys).contains("auth key"));
+        // A key that lost its secret, or holds something that is no key.
+        let lost = [AuthKey {
+            secret: String::new(),
+            ..keys[0].clone()
+        }];
+        assert!(missing(form(), &lost).contains("auth key"));
+        assert!(missing(form(), &test_keys()).contains("not usable"));
+        let mut one_relay = form();
+        one_relay.relay_urls = "https://only.example".into();
+        assert!(form().routes_query(&keys).is_ok() && one_relay.routes_query(&keys).is_err());
+    }
+
+    /// The server's answer replaces the routed fields — with what then saves
+    /// as the lists it sent — and only the answer the form is waiting for.
+    #[test]
+    fn fetched_routes_fill_the_form() {
+        let keys = test_keys();
+        let routes = || ServerRoutes {
+            routed_domains: vec!["*.lab.example".into(), "nas.example".into()],
+            routed_cidrs: vec!["192.168.0.0/16".into()],
+        };
+
+        let mut form = valid_form();
+        form.routes_fetch = RoutesFetch::Fetching(7);
+        form.routes_fetched(7, Ok(routes()));
+        assert_eq!(form.routed_domains, "*.lab.example, nas.example");
+        assert_eq!(form.routed_cidrs, "192.168.0.0/16");
+        assert!(matches!(&form.routes_fetch, RoutesFetch::Filled(said) if said.contains("2 domain(s) and 1 CIDR(s)")));
+        let saved = form.validate(&[], &keys).unwrap();
+        assert_eq!(saved.routed_domains, routes().routed_domains);
+        assert_eq!(saved.routed_cidrs, routes().routed_cidrs);
+
+        // A server with no lists empties the fields, and says so.
+        form.routes_fetch = RoutesFetch::Fetching(8);
+        form.routes_fetched(8, Ok(ServerRoutes::default()));
+        assert_eq!((form.routed_domains.as_str(), form.routed_cidrs.as_str()), ("", ""));
+        assert!(matches!(&form.routes_fetch, RoutesFetch::Filled(said) if said.contains("nothing beyond itself")));
+
+        // A failure keeps what was typed.
+        let mut form = valid_form();
+        let typed = (form.routed_domains.clone(), form.routed_cidrs.clone());
+        form.routes_fetch = RoutesFetch::Fetching(9);
+        form.routes_fetched(9, Err("unreachable".into()));
+        assert_eq!((form.routed_domains.clone(), form.routed_cidrs.clone()), typed);
+        assert_eq!(form.routes_fetch, RoutesFetch::Failed("unreachable".into()));
+
+        // An answer to another request, or after the form was pointed at
+        // another server, changes nothing.
+        let mut form = valid_form();
+        form.routes_fetch = RoutesFetch::Fetching(11);
+        form.routes_fetched(10, Ok(routes()));
+        assert_eq!(form.routes_fetch, RoutesFetch::Fetching(11));
+        form.server_changed();
+        form.routes_fetched(11, Ok(routes()));
+        assert_eq!(form.routes_fetch, RoutesFetch::Idle);
+        assert_eq!((form.routed_domains, form.routed_cidrs), typed);
     }
 
     /// A destination is checked against the others, with the core's own

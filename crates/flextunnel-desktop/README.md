@@ -41,7 +41,11 @@ they reach. It is one session for all of them.
   proxy, or as a forward's remote host, reaches that port on the server
   machine itself. *Routed domains* and *Routed CIDRs* are optional further
   targets to send through that server (which must allow them in its own tunnel
-  set). Where two destinations overlap, the more specific rule wins; the same
+  set). *Fetch from server* fills both with the server's own tunnel set: it
+  connects once to ask, so the server must already authorize the picked key,
+  and replaces what the two fields held — review the result, then save. It is
+  a copy as of that moment; a later change on the server is not followed.
+  Where two destinations overlap, the more specific rule wins; the same
   rule on two destinations is refused. Anything no destination routes connects
   directly from this computer.
 - **Connects on demand** — a running client only listens. A destination is
