@@ -1249,6 +1249,56 @@ async fn a_servers_routes_are_fetched_in_one_connection() {
     endpoint.close().await;
 }
 
+/// A peer that takes the connection but grants no stream to say `Hello` on
+/// holds the handshake for its timeout and no longer: opening the stream waits
+/// on the peer, and has no bound of its own.
+#[tokio::test]
+async fn a_peer_granting_no_stream_times_the_handshake_out() {
+    let no_streams = iroh::endpoint::QuicTransportConfig::builder()
+        .max_concurrent_bidi_streams(0u32.into())
+        .build();
+    let server = server_setup(
+        loopback_base(MemoryLookup::new()).transport_config(no_streams),
+        SecretKey::generate(),
+        HashSet::new(),
+    )
+    .bind()
+    .await
+    .unwrap();
+    let server_addr = EndpointAddr::new(server.id()).with_ip_addr(server.bound_sockets()[0]);
+    // Accepts, then only holds the connection open.
+    let accepted = tokio::spawn({
+        let server = server.clone();
+        async move { server.accept().await.expect("an incoming connection").await }
+    });
+
+    let client = loopback_endpoint(SecretKey::generate(), false).await;
+    let connection = with_timeout(client.connect(server_addr, ALPN)).await.unwrap();
+    let _held = with_timeout(accepted).await.unwrap().expect("the server accepts");
+
+    // Waited out for real (the timeout is 10s): an endpoint's own tasks keep
+    // a paused clock from running ahead.
+    let handshake_timeout = crate::proxy::client::HANDSHAKE_TIMEOUT;
+    let started = Instant::now();
+    let auth = ClientAuth::Key(Box::new(test_client_key().clone()));
+    let result = tokio::time::timeout(
+        handshake_timeout + Duration::from_secs(10),
+        crate::proxy::destination::exchange_hello(&connection, &auth, client.id(), 1, false),
+    )
+    .await
+    .expect("the handshake gives up by itself");
+    match result {
+        Err(ProxyError::Signaling(reason)) => assert!(reason.contains("timed out"), "{reason}"),
+        Err(other) => panic!("expected the handshake to time out: {other}"),
+        Ok(_) => panic!("a handshake with no stream to run on succeeded"),
+    }
+    assert!(started.elapsed() >= handshake_timeout, "{:?}", started.elapsed());
+
+    connection.close(0u32.into(), b"done");
+    client.close().await;
+    server.close().await;
+}
+
 /// The front-end addresses are part of the status only while something
 /// listens on them: closing the listeners withdraws them — with the
 /// destinations still served, to the dialer — and so does the end of the

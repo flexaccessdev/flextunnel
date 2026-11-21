@@ -154,6 +154,11 @@ pub(crate) async fn dial_server(
 ///
 /// `own_id` is the client's endpoint id, which a keypair client signs into its
 /// credential so the server can bind the signature to this very connection.
+///
+/// The whole exchange has [`HANDSHAKE_TIMEOUT`], the stream's opening
+/// included: `open_bi` waits for the peer to grant a stream, with no bound of
+/// its own, so a peer that grants none would otherwise hold the caller for as
+/// long as it keeps the connection up.
 pub(crate) async fn exchange_hello(
     connection: &Connection,
     auth: &ClientAuth,
@@ -161,11 +166,6 @@ pub(crate) async fn exchange_hello(
     instance_nonce: u128,
     duplicate_server_observed: bool,
 ) -> ProxyResult<(SendStream, RecvStream, HelloResponse)> {
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|e| ProxyError::Signaling(format!("Failed to open handshake stream: {e}")))?;
-
     let auth = match auth {
         ClientAuth::Key(key) => Some(signaling::ClientAuthPayload {
             public_key: key.public_str(),
@@ -178,15 +178,20 @@ pub(crate) async fn exchange_hello(
     };
     let mut hello = Hello::new(auth, instance_nonce);
     hello.duplicate_server_observed = duplicate_server_observed;
-    signaling::write_message(&mut send, &signaling::encode_hello(&hello)?).await?;
-    send.flush().await?;
+    let hello = signaling::encode_hello(&hello)?;
 
-    let data = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        signaling::read_message(&mut recv, signaling::MAX_HANDSHAKE_SIZE),
-    )
-    .await
-    .map_err(|_| ProxyError::Signaling("timed out waiting for server handshake response".into()))??;
+    let exchange = async {
+        let (mut send, mut recv) = connection.open_bi().await.map_err(|e| {
+            ProxyError::Signaling(format!("Failed to open handshake stream: {e}"))
+        })?;
+        signaling::write_message(&mut send, &hello).await?;
+        send.flush().await?;
+        let data = signaling::read_message(&mut recv, signaling::MAX_HANDSHAKE_SIZE).await?;
+        ProxyResult::Ok((send, recv, data))
+    };
+    let (send, recv, data) = tokio::time::timeout(HANDSHAKE_TIMEOUT, exchange)
+        .await
+        .map_err(|_| ProxyError::Signaling("timed out waiting for server handshake response".into()))??;
     let response = signaling::decode_hello_response(&data)?;
     Ok((send, recv, response))
 }

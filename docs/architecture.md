@@ -113,7 +113,8 @@ is a client advisory. The handshake bi-stream stays open after the exchange to
 carry heartbeats (§6).
 
 The server bounds accepting/reading the client `Hello` with a 10s timeout, and
-the client bounds waiting for the server `HelloResponse` with the same timeout
+the client bounds its whole side of the exchange — opening the stream, sending
+the `Hello`, waiting for the `HelloResponse` — with the same timeout
 (`HANDSHAKE_TIMEOUT` in `client.rs` / `server.rs`), so a peer that connects but
 never speaks is dropped promptly instead of holding a task until the 180s QUIC
 idle timeout (heartbeats only start after the handshake).

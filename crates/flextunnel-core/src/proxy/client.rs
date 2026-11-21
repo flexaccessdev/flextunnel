@@ -64,10 +64,12 @@ const REBUILD_ENDPOINT_ATTEMPTS: u32 = 3;
 const REBUILD_ENDPOINT_MIN_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Max jitter (ms) added to each backoff to avoid thundering reconnects.
 const RECONNECT_JITTER_MAX_MS: u64 = 500;
-/// Deadline for the server's handshake response. Heartbeats only start after
+/// Deadline for the auth handshake: opening the control stream, sending the
+/// `Hello` and reading the server's response. Heartbeats only start after
 /// the handshake, so without this a server that accepts the connection but
-/// never replies on the stream would stall the client until the QUIC idle
-/// timeout, or indefinitely if the server keeps the connection alive.
+/// never grants the stream, or never replies on it, would stall the client
+/// until the QUIC idle timeout, or indefinitely if the server keeps the
+/// connection alive.
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Deadline for `Endpoint::connect` (address discovery + QUIC handshake). The
 /// discovery phase awaits DNS/pkarr/mDNS lookups with no deadline of its own,
