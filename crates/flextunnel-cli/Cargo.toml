@@ -18,7 +18,8 @@ log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-ratatui.workspace = true
+# `Paragraph::line_count`, to bound the scroll of wrapped panes.
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 
 # Owner-only control pipes (see src/pipe_security.rs).
 [target.'cfg(windows)'.dependencies]

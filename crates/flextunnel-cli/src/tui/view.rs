@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::ipc::{
     DestState, DestinationRow, ForwardRow, ForwardRowState, StatusSnapshot, WireConnSnapshot,
@@ -63,9 +63,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ),
         None => ("Destination".to_string(), Vec::new()),
     };
-    let max_scroll = (details.len() as u16).saturating_sub(details_area.height.saturating_sub(2));
+    // Wrapped, so a long line — a 63-character name's loopback host — stays
+    // readable in full; the scroll is bounded by the rows the wrap makes.
+    let details = Paragraph::new(details).wrap(Wrap { trim: false });
+    let rows = details.line_count(details_area.width.saturating_sub(2));
+    let max_scroll = u16::try_from(rows)
+        .unwrap_or(u16::MAX)
+        .saturating_sub(details_area.height.saturating_sub(2));
     frame.render_widget(
-        Paragraph::new(details)
+        details
             .scroll((app.details_scroll.min(max_scroll), 0))
             .block(titled_block(&details_title)),
         details_area,
@@ -498,5 +504,48 @@ mod tests {
         assert!(all.contains("https://relay.example/"));
         assert!(all.contains("http://flextunnel.internal/servers/m1/"));
     }
-}
 
+    /// The details pane wraps instead of clipping, and scrolls to the last
+    /// wrapped row: the loopback host of a 63-character name — the longest
+    /// there is — reads in full in an 80-column terminal.
+    #[test]
+    fn a_long_loopback_host_wraps_and_scrolls_into_view() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let name = "a".repeat(63);
+        let mut app = App::new(StatusSnapshot {
+            name: "work".into(),
+            socks_addr: None,
+            http_addr: None,
+            status_page_host: "flextunnel.internal".into(),
+            idle_timeout_secs: Some(300),
+            destinations: vec![destination(&name, DestState::Idle)],
+            forwards: Vec::new(),
+        });
+        // Past the end: the render clamps to the last wrapped row.
+        app.details_scroll = u16::MAX;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_matches(|c: char| c == '│' || c.is_whitespace())
+                    .to_string()
+            })
+            .collect();
+        let host = format!("{}:<port>", reserved::loopback_host(&name));
+        assert!(host.len() > 78, "longer than the pane is wide");
+        assert!(
+            rows.windows(2).any(|pair| pair.concat().contains(&host)),
+            "{host} not readable in:\n{}",
+            rows.join("\n")
+        );
+        // The last row of the details, the status page link, shows too.
+        assert!(rows.iter().any(|row| row.contains("/servers/")), "{}", rows.join("\n"));
+    }
+}
