@@ -22,6 +22,15 @@ use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointId};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::time::Duration;
+
+/// Bound wait on the graceful close of a routes request's endpoint. The close
+/// waits for the peer to acknowledge it and for the endpoint's own tasks, with
+/// no deadline of its own, and the answer — the routes, or why there are none
+/// — is already in hand by then: it must not be held back by a slow teardown.
+/// The close runs as its own task and is never cancelled by this wait.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What a server routes: its `routed_domains` and `routed_cidrs` as
 /// configured, in the syntax a destination's own lists use.
@@ -47,8 +56,9 @@ impl ServerRoutes {
 /// a server that is unreachable, or that does not authorize `key`
 /// ([`ProxyError::AuthenticationFailed`]), is an error and nothing is
 /// retried. Each step is bounded (the endpoint's relay probe, the connect,
-/// the handshake, the status exchange), so the whole can take about a minute
-/// against a server that never answers.
+/// the handshake, the status exchange, and the wait for the endpoint's close
+/// — [`CLOSE_TIMEOUT`], after which the close is left to finish by itself),
+/// so the whole can take about a minute against a server that never answers.
 pub async fn fetch_server_routes(
     server_id: EndpointId,
     key: &ClientKey,
@@ -63,12 +73,27 @@ pub async fn fetch_server_routes(
             ProxyError::Signaling(format!("Failed to create the iroh endpoint: {e:#}"))
         })?;
         let routes = fetch_over(&endpoint.endpoint(), server_id, &relay, &auth).await;
-        endpoint.close().await;
+        // On every outcome. A close cut short by the caller's runtime going
+        // away has still begun, which is what keeps the endpoint's drop from
+        // tearing it down ungracefully.
+        if !closed_within(CLOSE_TIMEOUT, async move { endpoint.close().await }).await {
+            log::warn!(
+                "The routes request's endpoint is slow to close; leaving it to finish in the \
+                 background"
+            );
+        }
         routes
     });
     fetch
         .await
         .map_err(|e| ProxyError::Signaling(format!("the routes request did not finish: {e}")))?
+}
+
+/// Run `close` on a task of its own and wait up to `limit` for it. Returns
+/// whether it finished in time; when it did not, it keeps running.
+async fn closed_within(limit: Duration, close: impl Future<Output = ()> + Send + 'static) -> bool {
+    let mut close = tokio::spawn(close);
+    tokio::time::timeout(limit, &mut close).await.is_ok()
 }
 
 /// [`fetch_server_routes`] from a bound `endpoint`, which stays the caller's
@@ -159,6 +184,28 @@ mod tests {
             ServerRoutes::from_status_json(&page(&[], &[])).unwrap(),
             ServerRoutes::default()
         );
+    }
+
+    /// A close that takes its time holds the answer back for the limit and no
+    /// longer — and goes on by itself, rather than being cut off.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_close_is_waited_for_only_so_long() {
+        assert!(closed_within(CLOSE_TIMEOUT, async {}).await);
+
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let (done, mut finished) = tokio::sync::oneshot::channel::<()>();
+        let started = tokio::time::Instant::now();
+        let in_time = closed_within(CLOSE_TIMEOUT, async move {
+            let _ = released.await;
+            let _ = done.send(());
+        })
+        .await;
+        assert!(!in_time);
+        assert_eq!(started.elapsed(), CLOSE_TIMEOUT);
+        assert!(finished.try_recv().is_err(), "still closing");
+
+        release.send(()).unwrap();
+        finished.await.expect("the close ran to its end");
     }
 
     /// JSON that is no status page — a list missing, or of the wrong shape —

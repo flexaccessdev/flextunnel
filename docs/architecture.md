@@ -398,6 +398,7 @@ catches accidental identity reuse.
 | `liveness_window(interval)` / server `LIVENESS_WINDOW` | 3 × interval + 3s / 183s | `transport/mod.rs` |
 | `REBUILD_CLOSE_TIMEOUT` (client endpoint rebuild, old endpoint close) | 5s | `transport/endpoint.rs` |
 | `IDLE_CLOSE_TIMEOUT` (idle destination, endpoint close) | 5s | `proxy/destination.rs` |
+| `CLOSE_TIMEOUT` (routes request, endpoint close) | 5s | `proxy/server_routes.rs` |
 | `DEFAULT_IDLE_TIMEOUT` (unused connection kept) | 300s | `config.rs` |
 | `CONNECT_TIMEOUT` (client server connect) | 30s | `proxy/client.rs` |
 | `HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs`, `proxy/server.rs` |
