@@ -1823,7 +1823,7 @@ fn server_detail<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
         "this machine's localhost, on any port",
     ));
     tunnel = tunnel.push(indented_note_item(
-        "flextunnel.internal/servers/<name>/",
+        "http://flextunnel.internal/servers/<name>/",
         "this server's status page, through a proxy the client has enabled",
     ));
     let relays = if server.relay_urls.is_empty() {
@@ -2231,7 +2231,7 @@ fn server_form_view<'a>(app: &'a App, form: &'a ServerForm) -> Element<'a, Messa
             "The tunnel set decides what else clients may reach through this server; \
              both lists are optional, since this machine's localhost (at \
              <name>.localhost.flextunnel.internal, <name> being the client's name for \
-             this server) and its status page (flextunnel.internal/servers/<name>/, \
+             this server) and its status page (http://flextunnel.internal/servers/<name>/, \
              through a proxy the client has enabled) are always reachable. A client must list a route itself to send it here. Clients \
              are authorized on the server pane.",
         ),
