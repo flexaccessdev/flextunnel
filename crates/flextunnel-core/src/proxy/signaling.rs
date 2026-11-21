@@ -133,51 +133,6 @@ impl Hello {
     }
 }
 
-/// Bridge → server handshake (first bi-stream of a [`BRIDGE_ALPN`] connection).
-///
-/// Carries only the protocol version: the bridge's role rides the ALPN, and its
-/// sole credential is its TLS-authenticated endpoint id, checked natively
-/// against the server's allowlist before the connection ever reaches the
-/// accept loop (see `transport::endpoint::AllowlistHook`). The server
-/// replies with a [`HelloResponse`] and the stream stays open for heartbeats.
-///
-/// [`BRIDGE_ALPN`]: crate::transport::BRIDGE_ALPN
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BridgeHello {
-    pub version: u16,
-}
-
-impl BridgeHello {
-    pub fn new() -> Self {
-        Self {
-            version: PROTOCOL_VERSION,
-        }
-    }
-}
-
-impl Default for BridgeHello {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Encode a `BridgeHello` to JSON bytes.
-pub fn encode_bridge_hello(hello: &BridgeHello) -> io::Result<Vec<u8>> {
-    serde_json::to_vec(hello).map_err(io::Error::other)
-}
-
-/// Decode a `BridgeHello` from JSON bytes, validating the protocol version.
-pub fn decode_bridge_hello(data: &[u8]) -> io::Result<BridgeHello> {
-    let hello: BridgeHello = serde_json::from_slice(data).map_err(io::Error::other)?;
-    if hello.version != PROTOCOL_VERSION {
-        return Err(io::Error::other(format!(
-            "Unsupported protocol version: {} (expected {})",
-            hello.version, PROTOCOL_VERSION
-        )));
-    }
-    Ok(hello)
-}
-
 impl HelloResponse {
     pub fn accepted(server_instance_nonce: u128) -> Self {
         Self {
@@ -238,11 +193,11 @@ pub enum Target {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamRequest {
     /// Connect to `Target` from the server's network. The server enforces its
-    /// routed set, then applies bridges, host aliases and DNS forwards.
+    /// routed set, then applies host aliases and DNS forwards.
     Connect(Target),
     /// Connect to this port on the server's own loopback — what a client
-    /// destination's own name means. Outside the routed set, bridges and
-    /// aliases: every admitted client can reach the server's loopback.
+    /// destination's own name means. Outside the routed set and aliases:
+    /// every admitted client can reach the server's loopback.
     Loopback(u16),
     /// Serve the server's status page: an HTTP response to the HTTP request
     /// the client writes next.
@@ -520,17 +475,6 @@ mod tests {
         let mut resp = HelloResponse::rejected(7, "nope");
         resp.version = PROTOCOL_VERSION - 1;
         assert!(decode_hello_response(&serde_json::to_vec(&resp).unwrap()).is_err());
-    }
-
-    #[test]
-    fn bridge_hello_roundtrip() {
-        let hello = BridgeHello::new();
-        let decoded = decode_bridge_hello(&encode_bridge_hello(&hello).unwrap()).unwrap();
-        assert_eq!(decoded.version, PROTOCOL_VERSION);
-
-        // A version mismatch is rejected at decode.
-        let stale = serde_json::to_vec(&BridgeHello { version: 1 }).unwrap();
-        assert!(decode_bridge_hello(&stale).is_err());
     }
 
     #[test]

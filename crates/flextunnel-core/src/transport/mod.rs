@@ -82,25 +82,17 @@ pub const LIVENESS_WINDOW: Duration = liveness_window(HEARTBEAT_INTERVAL_IDLE);
 /// the keypair auth handshake, not by this value.
 pub const ALPN: &[u8] = b"flextunnel/1";
 
-/// QUIC ALPN protocol identifier for server-to-server **bridge** connections.
-///
-/// The ALPN carries the peer's *role* (bridge vs client) so the two paths can
-/// be told apart at the transport layer; like [`ALPN`] it is not a credential.
-/// Bridge access control is the receiving server's endpoint-id allowlist,
-/// enforced natively at the TLS handshake (see
-/// [`endpoint::AllowlistHook`]) — the id needs no further proof because
-/// iroh's handshake authenticates it.
-pub const BRIDGE_ALPN: &[u8] = b"flextunnel-bridge/1";
-
 /// QUIC ALPN protocol identifier for **quick-mode** client connections
 /// (`client start --quick` ↔ `server start --quick`).
 ///
-/// Same trust model as [`BRIDGE_ALPN`]: the ALPN only carries the peer's role;
-/// the credential is the server's endpoint-id allowlist (the single client id
-/// entered on the quick server), enforced natively at the TLS handshake by
-/// [`endpoint::AllowlistHook`]. No auth keypair is involved — the
-/// TLS-authenticated endpoint id needs no further proof. After the handshake a
-/// quick client is served exactly like a keypair client.
+/// The ALPN carries the peer's *role* (quick client vs keypair client) so the
+/// two paths can be told apart at the transport layer; like [`ALPN`] it is not
+/// a credential. The credential is the server's endpoint-id allowlist (the
+/// single client id entered on the quick server), enforced natively at the TLS
+/// handshake by [`endpoint::AllowlistHook`]. No auth keypair is involved —
+/// iroh's handshake authenticates the endpoint id, so it needs no further
+/// proof. After the handshake a quick client is served exactly like a keypair
+/// client.
 pub const QUICK_ALPN: &[u8] = b"flextunnel-quick/1";
 
 /// Build a QUIC transport config with the idle timeout and a larger initial

@@ -15,31 +15,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// One `[bridges.<name>]` entry: a split-tunnel route forwarding matching
-/// targets to **another flextunnel server** over a persistent server-to-server
-/// connection. The map key is a friendly label used in logs and status
-/// displays. Matched targets are forwarded verbatim — the target server
-/// applies its own routed set, host aliases, and DNS forwards, and resolves
-/// domain targets on its side. Bridge rules must be covered by this server's
-/// routed set (validated at startup), since off-list targets are rejected
-/// before routing. Single hop: a stream that arrived over a bridge is never
-/// bridged again.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BridgeConfig {
-    /// The target server's iroh endpoint id. No credential accompanies it:
-    /// this server authenticates to the target by its own TLS-authenticated
-    /// endpoint id, which must be on the target's `allowed_bridge_servers`.
-    pub endpoint_id: String,
-    /// Domain rules forwarded to the target server (routed-set syntax: exact,
-    /// `*.x`, or `*`).
-    #[serde(default)]
-    pub domains: Vec<String>,
-    /// CIDR / bare-IP rules forwarded to the target server.
-    #[serde(default)]
-    pub cidrs: Vec<String>,
-}
-
 /// Server config file schema. Every field is optional; CLI flags override these.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,14 +60,6 @@ pub struct ServerConfig {
     /// system resolver; everything else uses the system resolver. Keys are
     /// matched most-specific-first. See [`crate::proxy::DnsForwarder`].
     pub dns_forwards: Option<HashMap<String, Vec<String>>>,
-    /// Outbound bridge routes: targets matching a bridge's rules are forwarded
-    /// to that bridge's server instead of dialed locally. See [`BridgeConfig`].
-    pub bridges: Option<HashMap<String, BridgeConfig>>,
-    /// Endpoint ids of servers allowed to connect **to this server** as
-    /// bridges — the sole, mandatory bridge credential (the id is
-    /// TLS-authenticated by iroh's handshake; the allowlist is enforced
-    /// natively there). Empty/absent = inbound bridging disabled.
-    pub allowed_bridge_servers: Option<Vec<String>>,
 }
 
 /// One `[[forwards]]` entry in the client config: a port forward
@@ -221,12 +188,6 @@ pub struct ResolvedServer {
     /// Conditional DNS-forwarding rules, suffix keys lowercased for
     /// case-insensitive matching (parsed into a `DnsForwarder` at startup).
     pub dns_forwards: HashMap<String, Vec<String>>,
-    /// Outbound bridge routes keyed by their friendly label, shape-validated
-    /// (non-empty rules, unique endpoint ids). See [`BridgeConfig`].
-    pub bridges: HashMap<String, BridgeConfig>,
-    /// Endpoint ids of servers allowed to bridge into this server (parsed and
-    /// checked against `own_id` at startup).
-    pub allowed_bridge_servers: Vec<String>,
     /// Path to the duplicate-id blocklist file. Always the fixed default
     /// (`~/.config/flextunnel/blocklist.json`); it is deliberately **not**
     /// configurable, since relocating this security guard rail would let it be
@@ -481,27 +442,6 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
         }
     }
 
-    // Bridges are file-only (no CLI flag). Shape-validate each entry here so
-    // bad bridge config fails at startup with the offending name; I/O-dependent
-    // validation (endpoint-id parsing, routed-set coverage) happens at server
-    // startup.
-    let bridges = cli.bridges.or(file.bridges).unwrap_or_default();
-    let mut seen_endpoint_ids: HashMap<&str, &str> = HashMap::new();
-    let mut names: Vec<&String> = bridges.keys().collect();
-    names.sort();
-    for name in names {
-        let b = &bridges[name];
-        if b.domains.is_empty() && b.cidrs.is_empty() {
-            anyhow::bail!("bridge '{name}' has no domains and no cidrs; it would never match");
-        }
-        if let Some(other) = seen_endpoint_ids.insert(b.endpoint_id.as_str(), name) {
-            anyhow::bail!(
-                "bridges '{other}' and '{name}' target the same endpoint_id; \
-                 merge their domains/cidrs into one entry"
-            );
-        }
-    }
-
     // Fixed at the default (~/.config/flextunnel/blocklist.json) and NOT
     // overridable via CLI or config: the blocklist is a security guard rail, and
     // letting it be pointed elsewhere would let it be bypassed. Fail fast if the
@@ -524,11 +464,6 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
             .unwrap_or_default(),
         routed_cidrs: cli.routed_cidrs.or(file.routed_cidrs).unwrap_or_default(),
         dns_forwards,
-        bridges,
-        allowed_bridge_servers: cli
-            .allowed_bridge_servers
-            .or(file.allowed_bridge_servers)
-            .unwrap_or_default(),
         blocklist_file,
     })
 }
@@ -982,61 +917,6 @@ mod tests {
     }
 
     #[test]
-    fn bridges_parsed_and_validated() {
-        let toml = r#"
-            allowed_bridge_servers = ["endpointid_a"]
-
-            [bridges.lab]
-            endpoint_id = "endpointid_b"
-            domains = ["*.svc"]
-            cidrs = ["fd34::/64"]
-
-            [bridges.other]
-            endpoint_id = "endpointid_c"
-            cidrs = ["10.9.0.0/16"]
-        "#;
-        let file: ServerConfig = toml::from_str(toml).unwrap();
-        let r = resolve_server(ServerConfig::default(), Some(file)).unwrap();
-        let lab = &r.bridges["lab"];
-        assert_eq!(lab.endpoint_id, "endpointid_b");
-        assert_eq!(lab.domains, vec!["*.svc"]);
-        assert_eq!(lab.cidrs, vec!["fd34::/64"]);
-        assert_eq!(r.bridges["other"].endpoint_id, "endpointid_c");
-        assert_eq!(r.allowed_bridge_servers, vec!["endpointid_a".to_string()]);
-        // Defaults to empty when unset.
-        let empty = resolve_server(ServerConfig::default(), None).unwrap();
-        assert!(empty.bridges.is_empty());
-        assert!(empty.allowed_bridge_servers.is_empty());
-    }
-
-    #[test]
-    fn bridge_with_no_rules_is_rejected() {
-        let toml = r#"
-            [bridges.lab]
-            endpoint_id = "e"
-        "#;
-        let file: ServerConfig = toml::from_str(toml).unwrap();
-        let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
-        assert!(err.to_string().contains("never match"), "{err}");
-    }
-
-    #[test]
-    fn bridges_with_duplicate_endpoint_id_are_rejected() {
-        let toml = r#"
-            [bridges.a]
-            endpoint_id = "same"
-            domains = ["*.svc"]
-
-            [bridges.b]
-            endpoint_id = "same"
-            cidrs = ["10.0.0.0/8"]
-        "#;
-        let file: ServerConfig = toml::from_str(toml).unwrap();
-        let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
-        assert!(err.to_string().contains("same endpoint_id"), "{err}");
-    }
-
-    #[test]
     fn client_defaults_applied() {
         let r = resolve_client(ClientConfig::default(), None);
         assert_eq!(r.socks_port, None);
@@ -1085,7 +965,6 @@ mod tests {
             secret_file = "./server.key"
             authorized_keys_file = "/etc/flextunnel/authorized_keys"
             relay_urls = ["https://relay.example"]
-            allowed_bridge_servers = ["<endpoint id>"]
             routed_domains = ["*.example.com"]
             routed_cidrs = ["10.0.0.0/8"]
 
@@ -1094,14 +973,9 @@ mod tests {
 
             [dns_forwards]
             "corp.example.com" = ["10.1.0.10:5353"]
-
-            [bridges.lab]
-            endpoint_id = "<endpoint id>"
-            domains = ["*.svc"]
-            cidrs = ["fd34::/64"]
         "#;
         let s: ServerConfig = toml::from_str(server).expect("maximal server config parses");
-        assert!(s.secret_file.is_some() && s.dns_forwards.is_some() && s.bridges.is_some());
+        assert!(s.secret_file.is_some() && s.dns_forwards.is_some());
 
         let client = r#"
             name = "work"

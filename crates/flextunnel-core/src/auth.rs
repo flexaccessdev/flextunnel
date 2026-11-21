@@ -9,10 +9,9 @@
 //! context, the key-file loaders, and the authorization decision in the
 //! server's handshake.
 //!
-//! Keypairs authenticate **clients** only. Bridges (a server connecting to
-//! another server) and quick-mode clients carry no keypair: their credential is
-//! their TLS-authenticated iroh endpoint id, checked against the receiving
-//! server's allowlist at the handshake.
+//! A quick-mode client carries no keypair: its credential is its
+//! TLS-authenticated iroh endpoint id, checked against the quick server's
+//! allowlist at the handshake.
 //!
 //! Generate client keys with `flexaccess-keys generate-auth-key`.
 

@@ -723,7 +723,7 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
 /// for display: the local SOCKS proxy owns the split — a target a destination
 /// routes uses that destination's tunnel, everything else connects directly
 /// from the device — so the caller has nothing to enforce. A server's own view
-/// (its routed set, host aliases, DNS forwards, bridges) is its status page,
+/// (its routed set, host aliases, DNS forwards) is its status page,
 /// reachable through the SOCKS proxy at
 /// `http://flextunnel.internal/servers/<host>/status.json`.
 ///

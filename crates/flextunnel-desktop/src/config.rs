@@ -310,7 +310,7 @@ pub struct AuthorizedClient {
 
 /// The app's one server — the desktop equivalent of a `server.toml`, core
 /// settings only: an iroh identity, the authorized clients, the tunnel set
-/// and relays (no host aliases, DNS forwards or bridges). Runs in-process.
+/// and relays (no host aliases or DNS forwards). Runs in-process.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// The endpoint id clients connect to. Derived from the secret, but stored

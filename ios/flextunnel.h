@@ -230,7 +230,7 @@ int flextunnel_health(const FlextunnelHandle *handle);
  * display. The local SOCKS proxy owns the split: a target a destination routes
  * uses that destination's tunnel, everything else connects directly from the
  * device, so the caller has nothing to enforce. A server's own view (its
- * routed set, host aliases, DNS forwards, bridges) is its status page,
+ * routed set, host aliases, DNS forwards) is its status page,
  * reachable through the SOCKS proxy at
  *   http://flextunnel.internal/servers/<host>/status.json
  * and the client's own at http://flextunnel.internal/status.json.

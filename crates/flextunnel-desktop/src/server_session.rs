@@ -134,8 +134,6 @@ fn options(server: &ServerConfig) -> anyhow::Result<ServerOptions> {
         routed_domains: server.routed_domains.clone(),
         routed_cidrs: server.routed_cidrs.clone(),
         dns_forwards: HashMap::new(),
-        bridges: HashMap::new(),
-        allowed_bridge_servers: Vec::new(),
         blocklist_file,
     })
 }

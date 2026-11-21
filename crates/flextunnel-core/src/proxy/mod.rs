@@ -1,7 +1,6 @@
 //! The proxy over QUIC: signaling, SOCKS5 and HTTP front-ends, client, and
 //! server.
 
-pub mod bridge;
 pub mod client;
 pub mod client_status;
 pub mod destination;
@@ -20,7 +19,6 @@ pub mod status_page;
 #[cfg(test)]
 mod e2e_tests;
 
-pub use bridge::{BridgeUpstream, BridgeUpstreamConfig};
 pub use client::{
     ClientConfig, ClientStatus, LocalListeners, ProxyClient, TunnelDialer, TunnelStream,
 };

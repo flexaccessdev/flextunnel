@@ -80,7 +80,7 @@ they reach. It is one session for all of them.
 - **Status pages** — `http://flextunnel.internal/` through either proxy is the
   client's own status, answered locally without connecting anything;
   `http://flextunnel.internal/servers/<host>/` is that server's, with its
-  tunnel set, host aliases, DNS forwards and bridges (opening it connects the
+  tunnel set, host aliases and DNS forwards (opening it connects the
   destination). Both are listed in the window.
 - **Connection path** — a modal that reports whether a connected destination
   is reached directly (hole-punched) or via relay.

@@ -42,24 +42,6 @@ pub enum StatusFormat {
     Json,
 }
 
-/// One configured outbound bridge plus whether its upstream connection to the
-/// target server is live right now.
-#[derive(Serialize)]
-pub struct BridgeUpstreamStatus {
-    pub name: String,
-    pub endpoint_id: String,
-    pub domains: Vec<String>,
-    pub cidrs: Vec<String>,
-    pub connected: bool,
-}
-
-/// One allowlisted inbound bridge server plus whether it is connected right now.
-#[derive(Serialize)]
-pub struct BridgeInboundStatus {
-    pub endpoint_id: String,
-    pub connected: bool,
-}
-
 /// The server status page. Fields are populated from the live `ProxyServer`
 /// state; secrets are never included and the blocklist is shown as counts only.
 #[derive(Template)]
@@ -74,11 +56,6 @@ pub struct ServerStatusTemplate {
     /// Conditional DNS forwards as `(suffix, upstream servers)` pairs, sorted by
     /// suffix for stable output.
     pub dns_forwards: Vec<(String, Vec<String>)>,
-    /// Outbound bridge routes with live connected state, sorted by name.
-    pub bridges: Vec<BridgeUpstreamStatus>,
-    /// Allowlisted inbound bridge servers with live connected state, sorted by
-    /// endpoint id.
-    pub inbound_bridges: Vec<BridgeInboundStatus>,
     pub blocklist_path: String,
     pub blocked_client_count: usize,
     pub conflicted_server_count: usize,
@@ -104,8 +81,6 @@ struct ServerStatusJson<'a> {
     routed_cidrs: &'a [String],
     host_aliases: Vec<HostAliasJson<'a>>,
     dns_forwards: Vec<DnsForwardJson<'a>>,
-    bridges: &'a [BridgeUpstreamStatus],
-    inbound_bridges: &'a [BridgeInboundStatus],
     duplicate_id_blocklist: DuplicateIdBlocklistJson<'a>,
 }
 
@@ -200,8 +175,6 @@ fn render_status_json(tpl: &ServerStatusTemplate) -> Result<String, serde_json::
         routed_cidrs: &tpl.routed_cidrs,
         host_aliases,
         dns_forwards,
-        bridges: &tpl.bridges,
-        inbound_bridges: &tpl.inbound_bridges,
         duplicate_id_blocklist: DuplicateIdBlocklistJson {
             file: &tpl.blocklist_path,
             blocked_clients: tpl.blocked_client_count,

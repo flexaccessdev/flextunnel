@@ -13,16 +13,14 @@
 //! ungraceful drop panics under panic=abort).
 
 use crate::blocklist::BlockList;
-use crate::config::BridgeConfig;
 use crate::flexaccess_iroh::endpoint::CreatedEndpoint;
 use crate::flexaccess_iroh::relay_failover::fail_over_home_relay;
 use crate::lock::InstanceLock;
-use crate::proxy::{
-    BridgeUpstream, BridgeUpstreamConfig, DnsForwarder, ProxyServer, ProxyServerParams, RoutedSet,
-};
+use crate::proxy::{DnsForwarder, ProxyServer, ProxyServerParams, RoutedSet};
 use crate::secret::secret_to_endpoint_id;
-use crate::transport::endpoint::{EndpointAllowlists, RelayConfig, create_server_endpoint};
+use crate::transport::endpoint::{RelayConfig, create_server_endpoint, server_setup};
 use anyhow::{Context, Result};
+use iroh::endpoint::Builder as EndpointBuilder;
 use iroh::{Endpoint, EndpointId, RelayUrl, SecretKey};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -52,10 +50,6 @@ pub struct ServerOptions {
     pub routed_cidrs: Vec<String>,
     /// Conditional DNS-forwarding rules, suffix keys lowercased.
     pub dns_forwards: HashMap<String, Vec<String>>,
-    /// Outbound bridge routes keyed by their friendly label.
-    pub bridges: HashMap<String, BridgeConfig>,
-    /// Endpoint ids allowed to bridge into this server.
-    pub allowed_bridge_servers: Vec<String>,
     /// The duplicate-id blocklist (always
     /// [`crate::blocklist::default_blocklist_path`] outside tests).
     pub blocklist_file: PathBuf,
@@ -122,7 +116,9 @@ pub struct PreparedServer {
     secret_key: SecretKey,
     server: Arc<ProxyServer>,
     relay_config: RelayConfig,
-    allowlists: EndpointAllowlists,
+    /// Quick mode: the one entered client id, enforced natively at the TLS
+    /// handshake. Empty otherwise — the quick ALPN is then disabled.
+    quick_clients: HashSet<EndpointId>,
 }
 
 /// Validate `opts` and build the server — everything short of binding the
@@ -139,8 +135,6 @@ pub fn prepare(opts: ServerOptions) -> Result<PreparedServer> {
         routed_domains,
         routed_cidrs,
         dns_forwards,
-        bridges: bridge_configs,
-        allowed_bridge_servers,
         blocklist_file,
     } = opts;
 
@@ -189,76 +183,8 @@ pub fn prepare(opts: ServerOptions) -> Result<PreparedServer> {
         validate_dns_forwards_coverage(forwarder, &routed_set)?;
     }
 
-    // Inbound bridging: parse the allowlist — the sole bridge credential,
-    // enforced natively at the TLS handshake by the endpoint's allowlist hook.
-    let allowed_bridge_servers = allowed_bridge_servers
-        .iter()
-        .map(|raw| {
-            raw.parse::<EndpointId>()
-                .map_err(|e| anyhow::anyhow!("invalid allowed_bridge_servers entry {raw:?}: {e}"))
-        })
-        .collect::<Result<HashSet<_>>>()?;
-    if allowed_bridge_servers.contains(&own_id) {
-        anyhow::bail!(
-            "allowed_bridge_servers contains this server's own id ({own_id}); a server \
-             cannot bridge to itself — this is likely a copy-paste mistake"
-        );
-    }
-    if !allowed_bridge_servers.is_empty() {
-        log::info!(
-            "Inbound bridging enabled for {} server(s)",
-            allowed_bridge_servers.len()
-        );
-    }
-
-    // Resolve the relay config once. Its URLs are installed on the endpoint and
-    // also attached as address hints when outbound bridges dial peer servers.
-    // The relay auth token remains endpoint-level state in the relay map.
     let relay_config = RelayConfig::from_urls_with_token(&relay_urls, relay_auth_token)
         .context("Invalid relay configuration")?;
-
-    // Outbound bridges: resolve each `[bridges.<name>]` entry (endpoint id,
-    // rules) and reject rules the routed set never reaches — the server
-    // rejects off-list targets before bridge routing, so such a rule is dead
-    // config (same reasoning as the dns_forwards coverage check above).
-    let mut bridges = Vec::with_capacity(bridge_configs.len());
-    for (name, b) in &bridge_configs {
-        let endpoint_id = b.endpoint_id.parse::<EndpointId>().map_err(|e| {
-            anyhow::anyhow!("bridge '{name}' has an invalid endpoint_id {:?}: {e}", b.endpoint_id)
-        })?;
-        if endpoint_id == own_id {
-            anyhow::bail!("bridge '{name}' targets this server itself ({own_id})");
-        }
-        let bridge_routed_set = RoutedSet::new(&b.domains, &b.cidrs)
-            .with_context(|| format!("bridge '{name}' has invalid route rules"))?;
-        routed_set
-            .validate_rules_reachable(&b.domains, &b.cidrs)
-            .with_context(|| {
-                format!(
-                    "bridge '{name}' has a rule the routed set never reaches, so it would \
-                     never be used: the server rejects off-list targets before bridge \
-                     routing. Add matching routed_domains/routed_cidrs, or remove the rule"
-                )
-            })?;
-        bridges.push(BridgeUpstream::new(BridgeUpstreamConfig {
-            name: name.clone(),
-            endpoint_id,
-            relay_urls: relay_config.custom_urls().to_vec(),
-            routed_set: bridge_routed_set,
-            domains: b.domains.clone(),
-            cidrs: b.cidrs.clone(),
-        }));
-    }
-    if !bridges.is_empty() {
-        log::info!("Loaded {} bridge route(s)", bridges.len());
-    }
-
-    let allowlists = EndpointAllowlists {
-        bridge_servers: allowed_bridge_servers.clone(),
-        // Quick mode: the one entered client id, enforced natively at the TLS
-        // handshake. Empty otherwise — the quick ALPN is then disabled.
-        quick_clients: quick_client.into_iter().collect(),
-    };
 
     if !host_aliases.is_empty() {
         log::info!("Loaded {} host alias(es)", host_aliases.len());
@@ -277,13 +203,11 @@ pub fn prepare(opts: ServerOptions) -> Result<PreparedServer> {
     let server = ProxyServer::new(ProxyServerParams {
         own_id,
         authorized_keys,
-        allowed_bridge_servers,
         host_aliases,
         routed_set,
         routed_domains,
         routed_cidrs,
         dns_forwarder,
-        bridges,
         blocklist,
         first_client,
     });
@@ -292,7 +216,7 @@ pub fn prepare(opts: ServerOptions) -> Result<PreparedServer> {
         secret_key,
         server,
         relay_config,
-        allowlists,
+        quick_clients: quick_client.into_iter().collect(),
     })
 }
 
@@ -302,11 +226,18 @@ impl PreparedServer {
         self.own_id
     }
 
+    /// This server's endpoint, built on `base`: its identity, the ALPNs and
+    /// the quick-client allowlist. The only place the prepared identity and
+    /// allowlist reach an endpoint, whichever way it is bound.
+    fn endpoint_on(&self, base: EndpointBuilder) -> EndpointBuilder {
+        server_setup(base, self.secret_key.clone(), self.quick_clients.clone())
+    }
+
     /// Bind the iroh endpoint (with the relays that pass the startup probe).
     /// Can take several seconds (the relay online-wait).
     pub async fn bind(self) -> Result<RunningServer> {
         let CreatedEndpoint { endpoint, relays_left_out } =
-            create_server_endpoint(&self.relay_config, self.secret_key, self.allowlists)
+            create_server_endpoint(&self.relay_config, |base| self.endpoint_on(base))
                 .await
                 .context("Failed to create iroh endpoint")?;
         log::info!("flextunnel server Node ID: {}", endpoint.id());
@@ -318,9 +249,16 @@ impl PreparedServer {
         })
     }
 
-    /// Serve on a caller-built endpoint (hermetic loopback tests).
+    /// [`bind`](Self::bind) on a caller-built base instead of the relay
+    /// setup, which needs a network (hermetic loopback tests). Like `bind`,
+    /// the endpoint is [`endpoint_on`](Self::endpoint_on) that base.
     #[cfg(test)]
-    pub(crate) fn bind_on(self, endpoint: Endpoint) -> RunningServer {
+    pub(crate) async fn bind_with(self, base: EndpointBuilder) -> RunningServer {
+        let endpoint = self
+            .endpoint_on(base)
+            .bind()
+            .await
+            .expect("bind the test endpoint");
         RunningServer {
             endpoint,
             server: self.server,
@@ -355,8 +293,8 @@ impl RunningServer {
     /// off, clients dial by relay hint), and if that relay is lost for a minute
     /// without iroh re-homing on its own, the failover moves the endpoint onto
     /// another configured relay in place. Nothing is torn down: the identity,
-    /// the allowlists, the direct paths, the established connections and the
-    /// bridge tasks all stay. Relays the startup probe could not connect (the
+    /// the quick-client allowlist, the direct paths and the established
+    /// connections all stay. Relays the startup probe could not connect (the
     /// endpoint was bound without them) are put back by the same failover once
     /// they are. With the default relays the failover future is pending
     /// forever.
@@ -422,8 +360,6 @@ mod tests {
             routed_domains: vec!["*".into()],
             routed_cidrs: Vec::new(),
             dns_forwards: HashMap::new(),
-            bridges: HashMap::new(),
-            allowed_bridge_servers: Vec::new(),
             blocklist_file: dir.join("blocklist.json"),
         }
     }
@@ -457,15 +393,6 @@ mod tests {
         let mut opts = options(dir.path());
         opts.routed_domains.clear();
         assert!(prepare(opts).is_ok(), "loopback and status need no routed set");
-    }
-
-    #[test]
-    fn prepare_rejects_a_self_bridge_allowlist() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut opts = options(dir.path());
-        opts.allowed_bridge_servers = vec![secret_to_endpoint_id(&opts.secret_key).to_string()];
-        let err = prepare(opts).err().expect("own id allowlisted");
-        assert!(err.to_string().contains("own id"), "{err}");
     }
 
     #[test]

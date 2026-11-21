@@ -1321,9 +1321,9 @@ fn routes_section<'a>(app: &'a App, destination: &'a Destination) -> Element<'a,
         col = col.push(route_row(rule.clone(), None));
     }
 
-    // The server's own status page — its tunnel set, host aliases, DNS
-    // forwards and bridges — is fetched through the client's status endpoint,
-    // so it needs a proxy to ask through. Opening it connects the destination.
+    // The server's own status page — its tunnel set, host aliases and DNS
+    // forwards — is fetched through the client's status endpoint, so it
+    // needs a proxy to ask through. Opening it connects the destination.
     if app.client.socks_port.is_some() || app.client.http_port.is_some() {
         col = col.push(space().height(8));
         col = col.push(text("The server's status page, through the client's proxy:").size(12));
