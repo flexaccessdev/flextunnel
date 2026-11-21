@@ -49,8 +49,9 @@ they reach. It is one session for all of them.
   rule on two destinations is refused. The form and the destination's pane
   list each such overlap, and which destination takes it. Once a destination
   has connected, its pane also marks each rule the server routes only in part,
-  or not at all, as the server said on that connection. Anything no
-  destination routes connects directly from this computer.
+  or not at all, as the server said on that connection. A proxy request no
+  destination routes connects directly from this computer; a port forward
+  never does (see *Port forwards* below).
 - **Connects on demand** — a running client only listens. A destination is
   connected when something is first sent to it — the request waits while it
   connects — and disconnected again once nothing has used it for five minutes,

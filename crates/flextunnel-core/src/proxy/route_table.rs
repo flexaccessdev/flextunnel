@@ -257,6 +257,11 @@ impl RouteTable {
 /// each pair of destinations, each rule of one inside a rule of the other.
 /// Identical rules are refused before this runs, so containment is strict.
 fn find_overlaps(entries: &[Entry]) -> Vec<Overlap> {
+    // An overlap takes two destinations; one alone would only be compared
+    // with itself, rule by rule, for nothing.
+    if entries.len() < 2 {
+        return Vec::new();
+    }
     let rows: Vec<(TableRow, Rule)> = entries
         .iter()
         .enumerate()
