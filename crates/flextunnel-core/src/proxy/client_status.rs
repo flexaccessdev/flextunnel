@@ -32,7 +32,7 @@ use super::client::{
 };
 use super::destination::{DestinationState, DestinationStatus};
 use super::route_table::{RouteTable, TableRow, TableRule};
-use super::routed_set::Rule;
+use super::routed_set::{Coverage, Rule};
 use super::signaling::{self, StreamRequest};
 use super::status_page::{
     self, CONTENT_TYPE_HTML, CONTENT_TYPE_JSON, CONTENT_TYPE_TEXT, STATUS_JSON_PATH,
@@ -124,6 +124,27 @@ struct RuleRef {
     destination: String,
 }
 
+/// What a row's server makes of it ([`RouteView::server`] says it in words).
+#[derive(Clone, Copy)]
+enum ServerCheck {
+    /// A destination's own host: its server's loopback, always served.
+    Loopback,
+    /// Graded against the server's lists as last read.
+    Graded(Coverage),
+    /// Not read from the server yet.
+    Unchecked,
+}
+
+impl ServerCheck {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Loopback => "loopback",
+            Self::Graded(coverage) => coverage.as_str(),
+            Self::Unchecked => "unchecked",
+        }
+    }
+}
+
 /// One row of the routing table as the pages show it.
 #[derive(Serialize)]
 struct RouteView {
@@ -136,6 +157,9 @@ struct RouteView {
     /// (by the server's own lists), or `unchecked` (not read from the server
     /// yet).
     server: &'static str,
+    /// `server` as the pages act on it.
+    #[serde(skip)]
+    check: ServerCheck,
     /// The server's lists behind `server` are the last known ones: the
     /// latest connection is still reading them again, or failed to (the
     /// destination's `server_routes_error` says why).
@@ -151,11 +175,11 @@ struct RouteView {
 impl RouteView {
     /// A CSS class for the server check.
     fn server_class(&self) -> &'static str {
-        match self.server {
-            "loopback" | "allowed" => "connected",
-            "partly allowed" => "backoff",
-            "not allowed" => "failed",
-            _ => "idle",
+        match self.check {
+            ServerCheck::Loopback | ServerCheck::Graded(Coverage::Full) => "connected",
+            ServerCheck::Graded(Coverage::Partial) => "backoff",
+            ServerCheck::Graded(Coverage::None) => "failed",
+            ServerCheck::Unchecked => "idle",
         }
     }
 }
@@ -181,8 +205,8 @@ fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
             let within = within.remove(&row).unwrap_or_default();
             let narrower = narrower.remove(&row).unwrap_or_default();
             let destination = status.destinations.get(row.dest);
-            let (kind, server) = match &row.rule {
-                TableRule::Host(_) => ("host", "loopback"),
+            let (kind, check) = match &row.rule {
+                TableRule::Host(_) => ("host", ServerCheck::Loopback),
                 TableRule::Routed(rule) => {
                     let kind = match rule {
                         Rule::CatchAll => "catch-all",
@@ -190,20 +214,27 @@ fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
                         Rule::Exact(_) => "exact",
                         Rule::Cidr(_) => "network",
                     };
-                    let server = match destination.and_then(|d| d.server_coverage.get(rule)) {
-                        Some(coverage) => coverage.as_str(),
-                        None => "unchecked",
+                    let check = match destination.and_then(|d| d.server_coverage.get(rule)) {
+                        Some(coverage) => ServerCheck::Graded(*coverage),
+                        None => ServerCheck::Unchecked,
                     };
-                    (kind, server)
+                    (kind, check)
                 }
             };
-            let server_last_known = matches!(server, "allowed" | "partly allowed" | "not allowed")
+            // Only a grade comes from the server's lists, so only a grade can
+            // be out of date.
+            let graded = match check {
+                ServerCheck::Graded(_) => true,
+                ServerCheck::Loopback | ServerCheck::Unchecked => false,
+            };
+            let server_last_known = graded
                 && destination.is_some_and(|d| d.server_routes_pending || d.server_routes_error.is_some());
             RouteView {
                 rule: row.rule.to_string(),
                 kind,
                 destination: host(row.dest),
-                server,
+                server: check.as_str(),
+                check,
                 server_last_known,
                 within,
                 narrower,

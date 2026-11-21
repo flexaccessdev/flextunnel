@@ -707,8 +707,9 @@ can reach the server's loopback or internal hosts by a real name. Add a
 
 When a requested hostname matches a key (case-insensitive), the server rewrites
 it to the value — an IP or another hostname — keeping the requested port, then
-resolves and connects like any other target. Only domain targets are aliased;
-literal IPs pass through unchanged.
+resolves and connects like any other target. Only hostnames are aliased:
+an IP address passes through unchanged, in either form (`10.0.0.1` as an
+address or as a name, `10.0.0.1.` included), so a key must be a hostname.
 
 For the server's own loopback no alias is needed: the name a client gives the
 server as a destination (see [A server's loopback](#a-servers-loopback)) always

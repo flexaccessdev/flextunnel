@@ -370,6 +370,47 @@ struct StatusFields {
     server_routes_generation: u64,
 }
 
+/// What one connection's read of its server's routes brought: the lists,
+/// with this destination's rules graded against them, or why they could not
+/// be read or compared.
+type RoutesRead = Result<(ServerRoutes, Arc<HashMap<Rule, Coverage>>), String>;
+
+impl StatusFields {
+    /// Start a connection's read of its server's routes, returning its
+    /// generation. Whatever is kept from an earlier connection is the last
+    /// known answer until this read replaces it.
+    fn begin_routes_read(&mut self) -> u64 {
+        self.server_routes_generation += 1;
+        self.server_routes_pending = true;
+        self.server_routes_generation
+    }
+
+    /// Take the answer of the read started as `generation`. `None` when a
+    /// later connection's read has started since: this one is stale and
+    /// changes nothing. Otherwise `Some` of whether the server's lists differ
+    /// from the ones kept. A failed read keeps the last good lists and grades,
+    /// now the last known, alongside its error.
+    fn finish_routes_read(&mut self, generation: u64, read: &RoutesRead) -> Option<bool> {
+        if self.server_routes_generation != generation {
+            return None;
+        }
+        self.server_routes_pending = false;
+        Some(match read {
+            Ok((routes, coverage)) => {
+                let changed = self.server_routes.as_ref() != Some(routes);
+                self.server_routes = Some(routes.clone());
+                self.server_coverage = coverage.clone();
+                self.server_routes_error = None;
+                changed
+            }
+            Err(e) => {
+                self.server_routes_error = Some(e.clone());
+                false
+            }
+        })
+    }
+}
+
 /// The manager's memory of the current outage. Survives idle periods, so a
 /// server that stays down is probed at most once per backoff step however the
 /// requests for it arrive, and the endpoint-rebuild budget stays per outage.
@@ -788,14 +829,7 @@ impl Destination {
     fn check_server_routes(self: &Arc<Self>, connection: &Connection) {
         let this = self.clone();
         let connection = connection.clone();
-        let generation = {
-            let mut fields = self.status_fields();
-            fields.server_routes_generation += 1;
-            // Whatever is kept from an earlier connection is the last known
-            // answer until this read replaces it.
-            fields.server_routes_pending = true;
-            fields.server_routes_generation
-        };
+        let generation = self.status_fields().begin_routes_read();
         tokio::spawn(async move {
             // Graded before the status lock is taken, and off the async
             // workers: it is the work of both whole lists, and the status is
@@ -812,25 +846,8 @@ impl Destination {
                 }
                 Err(e) => Err(e),
             };
-            let changed = {
-                let mut fields = this.status_fields();
-                if fields.server_routes_generation != generation {
-                    return;
-                }
-                fields.server_routes_pending = false;
-                match &read {
-                    Ok((routes, coverage)) => {
-                        let changed = fields.server_routes.as_ref() != Some(routes);
-                        fields.server_routes = Some(routes.clone());
-                        fields.server_coverage = coverage.clone();
-                        fields.server_routes_error = None;
-                        changed
-                    }
-                    Err(e) => {
-                        fields.server_routes_error = Some(e.clone());
-                        false
-                    }
-                }
+            let Some(changed) = this.status_fields().finish_routes_read(generation, &read) else {
+                return;
             };
             match read {
                 Ok((_, coverage)) if changed => this.log_refused_rules(&coverage),
@@ -1308,6 +1325,68 @@ async fn foregrounded(background: &watch::Sender<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn routes(domains: &[&str]) -> ServerRoutes {
+        ServerRoutes {
+            routed_domains: domains.iter().map(|d| d.to_string()).collect(),
+            routed_cidrs: Vec::new(),
+        }
+    }
+
+    fn answer(domains: &[&str], coverage: Coverage) -> RoutesRead {
+        let graded = HashMap::from([(Rule::Suffix("corp.example".into()), coverage)]);
+        Ok((routes(domains), Arc::new(graded)))
+    }
+
+    /// A read a later connection's read has overtaken changes nothing, and
+    /// is not reported as a change; the newer one's answer stands.
+    #[test]
+    fn a_stale_routes_read_is_ignored() {
+        let mut fields = StatusFields::default();
+        let older = fields.begin_routes_read();
+        let newer = fields.begin_routes_read();
+        assert_eq!(fields.finish_routes_read(newer, &answer(&["*.corp.example"], Coverage::Full)), Some(true));
+        assert_eq!(fields.finish_routes_read(older, &answer(&["*.other.example"], Coverage::None)), None);
+        assert_eq!(fields.server_routes, Some(routes(&["*.corp.example"])));
+        assert!(!fields.server_routes_pending);
+        // A late failure of the older read does not mark the newer answer
+        // stale either.
+        assert_eq!(fields.finish_routes_read(older, &Err("timed out".into())), None);
+        assert_eq!(fields.server_routes_error, None);
+    }
+
+    /// A failed read after a good one keeps the good lists and grades — the
+    /// last known — with the error; a later good read clears it.
+    #[test]
+    fn a_failed_routes_read_keeps_the_last_good_answer() {
+        let mut fields = StatusFields::default();
+        let first = fields.begin_routes_read();
+        fields.finish_routes_read(first, &answer(&["*.corp.example"], Coverage::Full));
+        let second = fields.begin_routes_read();
+        assert!(fields.server_routes_pending, "kept lists are the last known while read again");
+        assert_eq!(fields.finish_routes_read(second, &Err("refused".into())), Some(false));
+        assert_eq!(fields.server_routes, Some(routes(&["*.corp.example"])));
+        assert_eq!(fields.server_coverage.get(&Rule::Suffix("corp.example".into())), Some(&Coverage::Full));
+        assert_eq!(fields.server_routes_error.as_deref(), Some("refused"));
+        assert!(!fields.server_routes_pending);
+        let third = fields.begin_routes_read();
+        assert_eq!(fields.finish_routes_read(third, &answer(&["*.corp.example"], Coverage::Full)), Some(false));
+        assert_eq!(fields.server_routes_error, None);
+    }
+
+    /// The same lists again are no change (nothing to log again); other
+    /// lists are, and replace the grades.
+    #[test]
+    fn identical_routes_are_no_change() {
+        let mut fields = StatusFields::default();
+        let first = fields.begin_routes_read();
+        assert_eq!(fields.finish_routes_read(first, &answer(&["*.corp.example"], Coverage::Full)), Some(true));
+        let second = fields.begin_routes_read();
+        assert_eq!(fields.finish_routes_read(second, &answer(&["*.corp.example"], Coverage::Full)), Some(false));
+        let third = fields.begin_routes_read();
+        assert_eq!(fields.finish_routes_read(third, &answer(&["*.example"], Coverage::Partial)), Some(true));
+        assert_eq!(fields.server_coverage.get(&Rule::Suffix("corp.example".into())), Some(&Coverage::Partial));
+    }
 
     fn shared(idle_timeout: Option<Duration>) -> Arc<Shared> {
         Arc::new(Shared {

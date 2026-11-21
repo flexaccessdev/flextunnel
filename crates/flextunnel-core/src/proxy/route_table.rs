@@ -262,28 +262,40 @@ fn find_overlaps(entries: &[Entry]) -> Vec<Overlap> {
     if entries.len() < 2 {
         return Vec::new();
     }
-    let rows: Vec<(TableRow, Rule)> = entries
+    // Each destination's rows: its host first, then its routed rules.
+    let groups: Vec<Vec<(TableRow, Rule)>> = entries
         .iter()
         .enumerate()
-        .flat_map(|(dest, e)| {
+        .map(|(dest, e)| {
             let host = (
                 TableRow { dest, rule: TableRule::Host(e.host.clone()) },
                 Rule::Exact(e.host.clone()),
             );
-            std::iter::once(host).chain(e.routed.rules().into_iter().map(move |rule| {
-                (TableRow { dest, rule: TableRule::Routed(rule.clone()) }, rule)
-            }))
+            std::iter::once(host)
+                .chain(e.routed.rules().into_iter().map(|rule| {
+                    (TableRow { dest, rule: TableRule::Routed(rule.clone()) }, rule)
+                }))
+                .collect()
         })
         .collect();
     let mut overlaps = Vec::new();
-    for (outer, outer_rule) in &rows {
-        // A host is the narrowest thing there is: nothing nests inside it.
-        if matches!(outer.rule, TableRule::Host(_)) {
-            continue;
-        }
-        for (inner, inner_rule) in &rows {
-            if inner.dest != outer.dest && outer_rule.contains(inner_rule) {
-                overlaps.push(Overlap { outer: outer.clone(), inner: inner.clone() });
+    // Each pair of destinations once, each way round: one destination's rules
+    // are never compared with each other.
+    for (a, first) in groups.iter().enumerate() {
+        for second in &groups[a + 1..] {
+            for (outer_group, inner_group) in [(first, second), (second, first)] {
+                for (outer, outer_rule) in outer_group {
+                    // A host is the narrowest thing there is: nothing nests
+                    // inside it.
+                    if matches!(outer.rule, TableRule::Host(_)) {
+                        continue;
+                    }
+                    for (inner, inner_rule) in inner_group {
+                        if outer_rule.contains(inner_rule) {
+                            overlaps.push(Overlap { outer: outer.clone(), inner: inner.clone() });
+                        }
+                    }
+                }
             }
         }
     }

@@ -3430,8 +3430,6 @@ mod tests {
         assert!(form().routes_query(&keys).is_ok() && one_relay.routes_query(&keys).is_err());
     }
 
-    /// The server's answer replaces the routed fields — with what then saves
-    /// as the lists it sent — and only the answer the form is waiting for.
     /// The form shows where its routes — typed, or filled from the server —
     /// nest with another destination's, and nothing while they do not
     /// validate.
@@ -3467,6 +3465,8 @@ mod tests {
         assert!(edit.overlaps(std::slice::from_ref(&saved)).is_empty());
     }
 
+    /// The server's answer replaces the routed fields — with what then saves
+    /// as the lists it sent — and only the answer the form is waiting for.
     #[test]
     fn fetched_routes_fill_the_form() {
         let keys = test_keys();
