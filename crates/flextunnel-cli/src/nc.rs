@@ -4,9 +4,10 @@
 //! *running* client over its control socket (see `ipc.rs`), which routes HOST
 //! like a port forward: the destination that routes it connects if it is idle
 //! (this command waits while it does), and its server enforces its routed set
-//! and resolves the host. A destination's own name is its server's loopback,
-//! so `ProxyCommand flextunnel client nc %h %p` under `Host machine1.internal`
-//! reaches that machine's sshd.
+//! and resolves the host. A destination's
+//! `<name>.localhost.flextunnel.internal` is its server's loopback, so
+//! `ProxyCommand flextunnel client nc %h %p` under a `Host` whose `HostName`
+//! is `machine1.localhost.flextunnel.internal` reaches that machine's sshd.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;

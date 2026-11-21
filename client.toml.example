@@ -10,7 +10,7 @@
 #             lock, no control socket; quitting disconnects).
 #
 # One client reaches any number of servers. Each `[[destinations]]` table below
-# gives a server a host name; the client connects to a server only when
+# gives a server a name; the client connects to a server only when
 # something is actually sent to it, and closes the connection again once it
 # has been unused for a while.
 #
@@ -61,13 +61,16 @@ auth_key_file = "~/.config/flextunnel/client.key"
 # (most likely with custom relays, which are probed before each one).
 # idle_timeout_secs = 300
 
-# A destination: a host name for one server.
+# A destination: a name for one server.
 #
-#   host            The name. `<host>:<port>` through this client — the SOCKS5
-#                   or HTTP proxy, a [[forwards]] entry, `flextunnel client nc`
-#                   — reaches that port on the *server's own loopback*, with no
-#                   server-side routing config. Any host name except an IP
-#                   address, `localhost`, or one under `flextunnel.internal`.
+#   name            One DNS label, unique within this client: letters, digits
+#                   and inner hyphens, up to 63 (case-insensitive; no dots).
+#                   `<name>.localhost.flextunnel.internal:<port>` through this
+#                   client — the SOCKS5 or HTTP proxy, a [[forwards]] entry,
+#                   `flextunnel client nc` — reaches that port on the
+#                   *server's own loopback*, with no server-side routing
+#                   config. The name alone is not a host: everything the client
+#                   answers by itself stays under `flextunnel.internal`.
 #   server_node_id  The server's EndpointId (from `flextunnel show-iroh-id`).
 #   routed_domains  Optional further names sent through this server: an exact
 #                   name, a `*.suffix` wildcard (subdomains only), or `*` for
@@ -82,17 +85,16 @@ auth_key_file = "~/.config/flextunnel/client.key"
 # server.toml.example) as an allowlist, so list a route here only if the
 # server lists it too — otherwise the server answers "connection not allowed".
 # Neither side applies the other's lists; the server's can be read at
-# http://flextunnel.internal/servers/<host>/status.json — a URL that only
+# http://flextunnel.internal/servers/<name>/status.json — a URL that only
 # this client's own proxy answers, so it needs socks_port or http_port set
 # above and a request made through that listener, e.g.
-#   curl -sS -x socks5h://127.0.0.1:1080 'http://flextunnel.internal/servers/<host>/status.json'
+#   curl -sS -x socks5h://127.0.0.1:1080 'http://flextunnel.internal/servers/<name>/status.json'
 #
-# When destinations overlap, the most specific rule wins: a destination's own
-# host, then an exact domain, then the longest `*.suffix`, then `*`; for IPs
-# the longest prefix. The same rule on two destinations is an error. Anything
+# When destinations overlap, the most specific rule wins: an exact domain,
+# then the longest `*.suffix`, then `*`; for IPs the longest prefix. The same rule on two destinations is an error. Anything
 # on no destination's list is connected directly from this machine.
 [[destinations]]
-host = "machine1.internal"
+name = "machine1"
 server_node_id = "<server endpoint id>"
 # routed_domains = ["*.corp.example", "db.internal"]
 # routed_cidrs = ["10.0.0.0/8"]
@@ -100,7 +102,7 @@ server_node_id = "<server endpoint id>"
 # A destination may override the client key and the relays above. One that
 # names its own relay_urls uses only its own relay_auth_token.
 # [[destinations]]
-# host = "machine2.internal"
+# name = "machine2"
 # server_node_id = "<another server endpoint id>"
 # auth_key_file = "~/.config/flextunnel/machine2.key"
 # relay_urls = ["https://relay-c.example", "https://relay-d.example"]
@@ -118,12 +120,12 @@ server_node_id = "<server endpoint id>"
 # row. Local ports must be unique and nonzero. label is optional (display
 # only).
 #
-# Use a destination's own host to reach the server's loopback without any
-# server-side route.
+# Use a destination's <name>.localhost.flextunnel.internal to reach the
+# server's loopback without any server-side route.
 # [[forwards]]
 # label = "local-web"
 # local_port = 8080
-# remote_host = "machine1.internal"   # port 80 on machine1 itself
+# remote_host = "machine1.localhost.flextunnel.internal"   # port 80 on machine1 itself
 # remote_port = 80
 #
 # [[forwards]]

@@ -88,14 +88,14 @@ pub enum ClientAuth {
     Quick(Box<SecretKey>),
 }
 
-/// One destination of a client: a host name and the server behind it.
+/// One destination of a client: a name and the server behind it.
 #[derive(Clone)]
 pub struct DestinationConfig {
     /// The destination's name. As a target it means the server's own
-    /// loopback; validated by [`validate_destination_host`].
+    /// loopback; validated by [`validate_destination_name`].
     ///
-    /// [`validate_destination_host`]: crate::proxy::route_table::validate_destination_host
-    pub host: String,
+    /// [`validate_destination_name`]: crate::proxy::route_table::validate_destination_name
+    pub name: String,
     /// The server's iroh endpoint id.
     pub server_id: EndpointId,
     pub auth: ClientAuth,
@@ -240,7 +240,7 @@ impl DestinationState {
 /// A point-in-time view of one destination, for status displays.
 #[derive(Clone, Debug)]
 pub struct DestinationStatus {
-    pub host: String,
+    pub name: String,
     pub server_node_id: String,
     pub state: DestinationState,
     /// When the current connection was authenticated; `None` unless connected.
@@ -572,8 +572,8 @@ impl Destination {
         })
     }
 
-    pub(crate) fn host(&self) -> &str {
-        &self.cfg.host
+    pub(crate) fn name(&self) -> &str {
+        &self.cfg.name
     }
 
     /// Whether anything wants this destination connected right now.
@@ -666,7 +666,7 @@ impl Destination {
             Some(holds) => match holds.try_acquire() {
                 Some(permit) => Some(permit),
                 None => {
-                    log::debug!("Hold capacity exhausted; not holding request for {}", self.host());
+                    log::debug!("Hold capacity exhausted; not holding request for {}", self.name());
                     self.kick();
                     return Err(AcquireError::HoldCap);
                 }
@@ -675,7 +675,7 @@ impl Destination {
         };
         log::debug!(
             "{} is not connected; holding request up to {}s while it connects",
-            self.host(),
+            self.name(),
             TUNNEL_RECOVERY_HOLD.as_secs()
         );
         let mut live = self.state.subscribe();
@@ -735,7 +735,7 @@ impl Destination {
         };
         let fields = self.status_fields();
         DestinationStatus {
-            host: self.cfg.host.clone(),
+            name: self.cfg.name.clone(),
             server_node_id: self.cfg.server_id.to_string(),
             state,
             connected_since: connected_since.map(Instant::into_std),
@@ -805,7 +805,7 @@ impl Destination {
                         ConnEnd::Idle => {
                             log::info!(
                                 "{}: no open stream for {}s; closing the idle connection",
-                                self.host(),
+                                self.name(),
                                 self.shared.idle_timeout.unwrap_or_default().as_secs()
                             );
                             connection.close(0u32.into(), b"idle");
@@ -852,7 +852,7 @@ impl Destination {
             match read {
                 Ok((_, coverage)) if changed => this.log_refused_rules(&coverage),
                 Ok(_) => {}
-                Err(e) => log::warn!("{}: could not read what the server routes: {e}", this.host()),
+                Err(e) => log::warn!("{}: could not read what the server routes: {e}", this.name()),
             }
         });
     }
@@ -881,11 +881,11 @@ impl Destination {
                 Coverage::Full => {}
                 Coverage::Partial => log::warn!(
                     "{}: the server routes only part of {rule}; the rest is refused when sent",
-                    self.host()
+                    self.name()
                 ),
                 Coverage::None => log::warn!(
                     "{}: the server does not route {rule}; what is sent under it is refused",
-                    self.host()
+                    self.name()
                 ),
             }
         }
@@ -909,7 +909,7 @@ impl Destination {
         if e.is_recoverable() {
             log::warn!(
                 "{}: {e}; next attempt in {:.1}s if still needed (attempt {})",
-                self.host(),
+                self.name(),
                 backoff.as_secs_f64(),
                 outage.attempt
             );
@@ -917,7 +917,7 @@ impl Destination {
         } else {
             log::error!(
                 "{}: {e}; refusing requests for {:.1}s",
-                self.host(),
+                self.name(),
                 backoff.as_secs_f64()
             );
             self.set_link(Link::Failed {
@@ -967,7 +967,7 @@ impl Destination {
                             }
                             let now_online = *available.borrow_and_update();
                             if now_online && !online {
-                                log::debug!("{}: network available again while idle", self.host());
+                                log::debug!("{}: network available again while idle", self.name());
                                 self.reset_backoff(outage);
                             }
                             online = now_online;
@@ -979,12 +979,12 @@ impl Destination {
             if !*available.borrow_and_update() {
                 // No usable path: park with no timers at all, and give the
                 // restored network an immediate, fresh attempt.
-                log::info!("{}: network unavailable; not dialing until a path returns", self.host());
+                log::info!("{}: network unavailable; not dialing until a path returns", self.name());
                 self.set_link(Link::Backoff);
                 tokio::select! {
                     r = available.wait_for(|a| *a) => {
                         if r.is_ok() {
-                            log::info!("{}: network available again", self.host());
+                            log::info!("{}: network available again", self.name());
                             self.reset_backoff(outage);
                         }
                     }
@@ -1005,7 +1005,7 @@ impl Destination {
                 // A backoff step sized for an unattended outage must not keep
                 // a user who is now looking waiting.
                 _ = foregrounded(&self.shared.background) => {
-                    log::info!("{}: app foregrounded; connecting now", self.host());
+                    log::info!("{}: app foregrounded; connecting now", self.name());
                     self.reset_backoff(outage);
                 }
             }
@@ -1039,14 +1039,14 @@ impl Destination {
                     // failed rebuild still counts against the interval.
                     log::warn!(
                         "{}: still failing after {} attempts; rebuilding the endpoint from scratch",
-                        self.host(),
+                        self.name(),
                         outage.attempt
                     );
                     outage.last_rebuild = Some(std::time::Instant::now());
                     if let Err(e) = endpoint.rebuild().await {
                         log::warn!(
                             "{}: endpoint rebuild failed ({e:#}); retrying with the current endpoint",
-                            self.host()
+                            self.name()
                         );
                     }
                 } else if outage.attempt > 0 || outage.nudge {
@@ -1106,7 +1106,7 @@ impl Destination {
         });
         match build.await {
             Ok(Ok(endpoint)) => {
-                log::info!("{}: client node id {}", self.host(), endpoint.id());
+                log::info!("{}: client node id {}", self.name(), endpoint.id());
                 Ok(endpoint)
             }
             // Recoverable: the usual cause is the network (no relay reachable,
@@ -1137,7 +1137,7 @@ impl Destination {
         {
             log::warn!(
                 "{}: idle endpoint's close is slow; leaving it to finish in the background",
-                self.host()
+                self.name()
             );
         }
     }
@@ -1148,12 +1148,12 @@ impl Destination {
         &self,
         endpoint: &Endpoint,
     ) -> ProxyResult<(Connection, SendStream, RecvStream)> {
-        log::info!("{}: connecting to server {}", self.host(), self.cfg.server_id);
+        log::info!("{}: connecting to server {}", self.name(), self.cfg.server_id);
         let connection =
             dial_server(endpoint, self.cfg.server_id, &self.cfg.relay, &self.cfg.auth).await?;
-        log::info!("{}: connected, authenticating...", self.host());
+        log::info!("{}: connected, authenticating...", self.name());
         let (send, recv) = self.handshake(&connection, endpoint.id()).await?;
-        log::info!("{}: authenticated", self.host());
+        log::info!("{}: authenticated", self.name());
         Ok((connection, send, recv))
     }
 
@@ -1221,14 +1221,14 @@ impl Destination {
                             "{}: duplicate server id detected: server instance nonce {nonce} \
                              reappeared after a different one — two servers appear to share \
                              this identity. Advising the server to self-block.",
-                            self.host()
+                            self.name()
                         );
                     }
                 } else {
                     log::warn!(
                         "{}: server identity nonce changed ({nonce}) — a restart, or possibly \
                          a second server sharing this id; watching for a reappearance.",
-                        self.host()
+                        self.name()
                     );
                     t.history.push(nonce);
                 }
@@ -1404,7 +1404,7 @@ mod tests {
         let secret = SecretKey::from_bytes(&[7u8; 32]);
         Destination::new(
             DestinationConfig {
-                host: "m1.internal".to_string(),
+                name: "m1".to_string(),
                 server_id: secret.public(),
                 auth: ClientAuth::Quick(Box::new(secret)),
                 relay: RelayConfig::default(),

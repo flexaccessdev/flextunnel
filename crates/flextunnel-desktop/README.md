@@ -15,10 +15,10 @@ window loses nothing — the tray owns the lifecycle and re-opens it on demand.
 │ Open flextunnel…                    │   │ CLIENT            Client ● running  │
 │ Client running · 1 of 2 connected   │   │ ● Proxy & forwards   [Enabled ◉]    │
 │ Disable Client                      │   │ DESTINATIONS  +   PROXIES           │
-│ Server running · 2 clients connected│ ⇄ │ ● nas.internal    SOCKS5 127.0.0.1… │
-│ Disable Server                      │   │ ○ lab.internal    PORT FORWARDS     │
+│ Server running · 2 clients connected│ ⇄ │ ● nas             SOCKS5 127.0.0.1… │
+│ Disable Server                      │   │ ○ lab             PORT FORWARDS     │
 │ Copy Endpoint ID                    │   │ SERVER            ● db  5432  via   │
-│ ☑ Open at Login                     │   │ ● This computer        nas.internal │
+│ ☑ Open at Login                     │   │ ● This computer        nas          │
 │ Quit flextunnel                     │   │ Keys · Logs                         │
 └─────────────────────────────────────┘   └─────────────────────────────────────┘
 ```
@@ -36,10 +36,10 @@ The app runs one client — the desktop equivalent of a `client.toml`: two
 optional local proxies, any number of port forwards, and the **destinations**
 they reach. It is one session for all of them.
 
-- **Destinations** — each is a **host** name for one server (`nas.internal`),
-  the server's `EndpointId`, and an auth key. `<host>:<port>` through the
-  proxy, or as a forward's remote host, reaches that port on the server
-  machine itself. *Routed domains* and *Routed CIDRs* are optional further
+- **Destinations** — each is a **name** for one server (`nas`: one DNS label,
+  unique among the destinations), the server's `EndpointId`, and an auth key.
+  `<name>.localhost.flextunnel.internal:<port>` through the proxy, or as a
+  forward's remote host, reaches that port on the server machine itself. *Routed domains* and *Routed CIDRs* are optional further
   targets to send through that server (which must allow them in its own tunnel
   set). *Fetch from server* fills both with the server's own tunnel set: it
   connects once to ask, so the server must already authorize the picked key,
@@ -78,16 +78,17 @@ they reach. It is one session for all of them.
   to must authorize its public half.
 - **Local SOCKS5 / HTTP proxies** — enable either or both; point any
   proxy-aware app at `127.0.0.1:<port>` and its traffic to a destination's
-  host or routes rides that destination. Use the SOCKS5 proxy with remote name
-  resolution (`socks5h://`), so the destination names reach it.
+  loopback name or routes rides that destination. Use the SOCKS5 proxy with
+  remote name resolution (`socks5h://`), so the names reach it.
 - **Port forwards** — bind a local port to a `host:port` reached through a
   destination, so tools that can't use a proxy reach private services as if
   local. A forward never connects directly, so its remote host must be a
-  destination's host or one of its routes: its row says which destination
-  carries it (**via nas.internal**), or shows a **no route** badge.
+  destination's `<name>.localhost.flextunnel.internal` or one of its routes:
+  its row says which destination carries it (**via nas**), or shows a
+  **no route** badge.
 - **Status pages** — `http://flextunnel.internal/` through either proxy is the
   client's own status, answered locally without connecting anything;
-  `http://flextunnel.internal/servers/<host>/` is that server's, with its
+  `http://flextunnel.internal/servers/<name>/` is that server's, with its
   tunnel set and host aliases (opening it connects the
   destination). Both are listed in the window.
 - **Connection path** — a modal that reports whether a connected destination
@@ -99,8 +100,9 @@ they reach. It is one session for all of them.
   here replaces that destination and keeps its key — and its relay token,
   unless the import changes its relays, in which case the token is cleared and
   the import says so. An imported forward replaces the one on the same local
-  port. An import is all or nothing: a file that names a host or a server
-  twice, or whose hosts or routes clash with the ones here, is refused whole.)
+  port. An import is all or nothing: a file that names a destination or a
+  server twice, or whose names or routes clash with the ones here, is refused
+  whole.)
 
 ## The server
 
@@ -142,7 +144,8 @@ showing the endpoint id it gives — and *Create server* goes straight on to aut
   this server, enforced here, plus custom relays; optional, and edited any
   time. Clients route by their own lists, so a client must also list a route
   to send it here. This computer's own `localhost` is always reachable by its
-  clients, under the host name each gives this server.
+  clients, under the name each gives this server
+  (`<name>.localhost.flextunnel.internal`).
 - **Restart to apply** — the server runs with the settings it started with;
   after a change (a client authorized, the tunnel set edited, a new identity)
   its pane offers *Restart now*. Removing a client applies at once: the server

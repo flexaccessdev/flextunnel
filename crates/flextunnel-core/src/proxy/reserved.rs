@@ -1,13 +1,22 @@
 //! The reserved `flextunnel.internal` namespace.
 //!
 //! `flextunnel.internal` and every `*.flextunnel.internal` subdomain belong to
-//! flextunnel itself and are answered by the **client**: `flextunnel.internal`
-//! is the running client's own status endpoint (see [`super::client_status`]);
-//! other subdomains are reserved for future use and answer with an HTTP 404.
+//! flextunnel itself and are handled by the **client**:
+//!
+//! * `flextunnel.internal` is the running client's own status endpoint (see
+//!   [`super::client_status`]);
+//! * `<name>.localhost.flextunnel.internal` is the own loopback of the server
+//!   behind the destination called `<name>` (see [`loopback_name`]) — the
+//!   one reserved name that is tunneled, as a loopback request;
+//! * every other subdomain, including a `*.localhost.flextunnel.internal`
+//!   name no destination has, is reserved for future use and answers with an
+//!   HTTP 404.
+//!
 //! The client's own status and those 404s are served locally, without opening
-//! any connection. The one exception is `/servers/<host>/` on the status
-//! endpoint, which fetches that destination server's status page and so
-//! connects to the destination if it is not connected.
+//! any connection. The exceptions are a destination's loopback name and
+//! `/servers/<name>/` on the status endpoint, which fetches that destination
+//! server's status page; both connect to the destination if it is not
+//! connected.
 //!
 //! The names never reach a server. A client destination may not use one as its
 //! host, no `routed_domains` list — a client's or a server's — may name one,
@@ -23,6 +32,25 @@ pub const STATUS_HOST: &str = "flextunnel.internal";
 
 /// The reserved subdomain suffix (matches `*.flextunnel.internal`).
 const RESERVED_SUFFIX: &str = ".flextunnel.internal";
+
+/// The suffix of the destinations' loopback names (see [`loopback_name`]).
+const LOOPBACK_SUFFIX: &str = ".localhost.flextunnel.internal";
+
+/// The host that reaches the loopback of the server behind the destination
+/// called `name`: `<name>.localhost.flextunnel.internal`.
+pub fn loopback_host(name: &str) -> String {
+    format!("{name}{LOOPBACK_SUFFIX}")
+}
+
+/// The destination name in a loopback host — `machine1` in
+/// `machine1.localhost.flextunnel.internal` (case-insensitive, with or
+/// without the DNS root dot), lowercased — or `None` for any other host. The
+/// name is a single label: `a.b.localhost.flextunnel.internal` is not one.
+pub fn loopback_name(host: &str) -> Option<String> {
+    let lower = routing_key(host).to_ascii_lowercase();
+    let name = lower.strip_suffix(LOOPBACK_SUFFIX)?;
+    (!name.is_empty() && !name.contains('.')).then(|| name.to_string())
+}
 
 /// True for `flextunnel.internal` and any `*.flextunnel.internal` subdomain
 /// (case-insensitive). A bare `.flextunnel.internal` (empty label) does not
@@ -66,6 +94,24 @@ mod tests {
         assert!(is_reserved_host("Foo.FlexTunnel.Internal"));
         assert!(is_reserved_host("localhost.flextunnel.internal"));
         assert!(!is_status_host("status.flextunnel.internal"));
+    }
+
+    #[test]
+    fn loopback_names_are_single_labels_under_localhost() {
+        assert_eq!(loopback_host("machine1"), "machine1.localhost.flextunnel.internal");
+        assert_eq!(loopback_name("machine1.localhost.flextunnel.internal").as_deref(), Some("machine1"));
+        assert_eq!(loopback_name("NAS.LocalHost.FlexTunnel.Internal.").as_deref(), Some("nas"));
+        for other in [
+            "localhost.flextunnel.internal",
+            ".localhost.flextunnel.internal",
+            "a.b.localhost.flextunnel.internal",
+            "machine1.flextunnel.internal",
+            "machine1.localhost",
+            "machine1.localhost.flextunnel.internal.evil.com",
+        ] {
+            assert_eq!(loopback_name(other), None, "{other:?}");
+        }
+        assert!(is_reserved_host(&loopback_host("machine1")));
     }
 
     #[test]

@@ -37,7 +37,8 @@ in order:
 flextunnel's whole point is that DNS and the outbound connection for **routed**
 targets happen on a **server's** network. The client sends a target to a server
 when it is on that destination's `routed_domains` / `routed_cidrs` (or is the
-destination's own `host`, the server machine itself); the server accepts it when
+destination's `<name>.localhost.flextunnel.internal`, the server machine
+itself); the server accepts it when
 it is in its own `routed_domains` / `routed_cidrs` tunnel set, and maps some
 names via `[host_aliases]` (e.g. `networking.internal` -> `127.0.0.1` on the
 server). Those names usually **do not resolve on the client at all**.
@@ -48,8 +49,9 @@ every internal hostname or alias you intend to route to that destination's
 `routed_domains` in `client.toml` **and** to the server's `routed_domains`; add
 literal IP destinations to `routed_cidrs` (both sides again) only when you
 really want those IPs tunneled. Both lists are optional on both sides: a
-destination's own `host` (the server's `localhost`) and the status pages at
-`flextunnel.internal` work whatever they hold.
+destination's `<name>.localhost.flextunnel.internal` (the server's
+`localhost`) and the status pages at `flextunnel.internal` work whatever they
+hold.
 
 The examples in this guide assume a client config along these lines:
 
@@ -59,7 +61,7 @@ http_port     = 8081
 auth_key_file = "~/.config/flextunnel/client.key"
 
 [[destinations]]
-host           = "machine1.internal"
+name           = "machine1"
 server_node_id = "<ENDPOINT_ID>"
 routed_domains = ["*.internal", "example.com"]
 ```
@@ -79,7 +81,7 @@ flextunnel resolve it. The two front-ends reach this differently:
   `h` means "resolve host at the proxy"). Never pre-resolve the name to an IP on
   the client, and don't attach a client-side resolver. A pre-resolved name
   arrives as a bare IP, which no `routed_domains` entry — and no destination's
-  `host` — can match.
+  loopback name — can match.
 
 For curl and libcurl-based tools, use `socks5h://` for proxy-side DNS;
 `socks5://` resolves locally. Scheme behavior is tool-specific: Go's HTTP
@@ -118,14 +120,14 @@ curl -x socks5h://127.0.0.1:1080 https://example.com
 curl -x socks5h://127.0.0.1:1080 http://networking.internal/
 
 # the server machine itself (port 8000 on its loopback), no server config needed
-curl -sS -x socks5h://127.0.0.1:1080 http://machine1.internal:8000/
+curl -sS -x socks5h://127.0.0.1:1080 http://machine1.localhost.flextunnel.internal:8000/
 
 # this client's status, as plain text and as JSON
 curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.txt
 curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/status.json
 
 # that server's own status
-curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/servers/machine1.internal/status.json
+curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/servers/machine1/status.json
 ```
 
 You can also set it for a whole shell session via the standard proxy env vars
@@ -140,10 +142,10 @@ curl https://example.com
 client without connecting to anything: its destinations and whether each is
 idle, connecting, connected or retrying. `/status.txt` is the script-friendly
 text form; `/status.json` is the structured JSON form, with one entry per
-destination (`host`, `server_node_id`, `state`, `connected_secs`,
+destination (`name`, `loopback_host`, `server_node_id`, `state`, `connected_secs`,
 `open_streams`, `waiting`, `failed_attempts`, `last_error`, its routes, …).
 
-`http://flextunnel.internal/servers/<destination>/` is that **server's** status
+`http://flextunnel.internal/servers/<name>/` is that **server's** status
 page, in the same three forms; fetching it connects to the server if need be.
 The client fetches the page and serves it under headers of its own, sandboxed
 (`Content-Security-Policy: sandbox`), so one server's page shares no browser
@@ -153,8 +155,10 @@ Its JSON includes `version`, `server_node_id`, `routed_domains`,
 `routed_cidrs`, `host_aliases`, and duplicate-id blocklist
 counts under `duplicate_id_blocklist`.
 
-`machine1.internal:<port>` — the destination's own host — is the server's own
-`localhost:<port>`, bypassing the server's routed set and host aliases.
+`machine1.localhost.flextunnel.internal:<port>` — the destination's loopback
+name — is the server's own `localhost:<port>`, bypassing the server's routed
+set and host aliases. The bare name `machine1` is no host of flextunnel's: it
+is routed like any other name.
 
 `flextunnel.internal` is reserved by flextunnel and never leaves the client. If
 the client is also running the HTTP proxy front-end, query the same endpoints
@@ -256,8 +260,8 @@ if an older or non-kubectl client hits it, use the HTTP proxy.
 > Note the DNS semantics: with `socks5h://`, a `server:` of
 > `https://localhost:6443` reaches a server's localhost only if `localhost` is
 > routed — on a destination and on its server. For an API server on the
-> flextunnel server's loopback, use the destination's host instead
-> (`https://machine1.internal:6443`), with a TLS certificate or
+> flextunnel server's loopback, use the destination's loopback name instead
+> (`https://machine1.localhost.flextunnel.internal:6443`), with a TLS certificate or
 > `tls-server-name` matching the API server.
 
 ### Web browsers
@@ -299,7 +303,7 @@ Then add one **Include** pattern per routed name, e.g.:
 | Include | Type | Pattern |
 |---|---|---|
 | Include | Wildcard | `*.proxkube.internal` |
-| Include | Wildcard | `machine1.internal` |
+| Include | Wildcard | `*.flextunnel.internal` |
 | Include | Wildcard | `flextunnel.internal` |
 
 Finally, **enable pattern mode**: click the FoxyProxy toolbar icon and select
@@ -308,9 +312,10 @@ Disable (or pinned to a single proxy), the patterns you just saved are not
 consulted at all.
 
 `*.example.internal` matches the subdomains; add a second bare
-`example.internal` pattern if you also browse the apex name. Add each
-destination's own host (`machine1.internal`) to browse services on that
-server's loopback, and a `flextunnel.internal` pattern to keep the status pages
+`example.internal` pattern if you also browse the apex name. The
+`*.flextunnel.internal` pattern covers every destination's loopback name
+(`machine1.localhost.flextunnel.internal`) to browse services on that server's
+loopback, and the `flextunnel.internal` pattern keeps the status pages
 (`http://flextunnel.internal/`) reachable. Requests that match no pattern
 bypass the proxy entirely, so other browsing is untouched even before
 flextunnel's own routing decision.
@@ -428,12 +433,12 @@ through the running client and relays it to ssh's stdin/stdout, so it needs no
 SOCKS or HTTP port and no external netcat (which Windows' OpenSSH lacks):
 
 ```sh
-ssh -o ProxyCommand='flextunnel client nc %h %p' user@machine1.internal
+ssh -o ProxyCommand='flextunnel client nc %h %p' user@machine1.localhost.flextunnel.internal
 ```
 
 `%h`/`%p` expand to the target host/port. The host is routed like a port
-forward. A destination's own host — `machine1.internal` here — is that server
-machine itself, so this reaches its sshd with no routing config on either side.
+forward. A destination's loopback name —
+`machine1.localhost.flextunnel.internal` here — is that server machine itself, so this reaches its sshd with no routing config on either side.
 Any other host must be routed by a destination and allowed by its server, which
 resolves it. If the destination is not connected, `nc` waits while the client
 connects to it.
@@ -442,10 +447,13 @@ connects to it.
 `~/.config/flextunnel/client.toml` (or `default`); `-c <file>` reads the name
 from another config, and `-n <name>` gives it directly.
 
-Make it permanent in `~/.ssh/config`. One block covers every destination:
+Make it permanent in `~/.ssh/config`. One block covers every destination
+(`%h` in `HostName` is the name you typed, so `ssh machine1` dials machine1's
+loopback name):
 
 ```
-Host machine1.internal machine2.internal
+Host machine1 machine2
+    HostName %h.localhost.flextunnel.internal
     User user
     ProxyCommand flextunnel client nc %h %p
 ```
@@ -499,8 +507,9 @@ remote_port = 5432
 Connect the app to `localhost:15432`. The target must be routed by a
 destination (here, `db.internal` on its `routed_domains`) and be in that
 server's routed set; a forward never connects directly from the client, so a
-target no destination routes is a startup error. Use a destination's own host
-as `remote_host` to reach a service on the server machine itself. See
+target no destination routes is a startup error. Use a destination's
+`<name>.localhost.flextunnel.internal` as `remote_host` to reach a service on
+the server machine itself. See
 [`client.toml.example`](../client.toml.example).
 
 An external adapter such as `socat` is useful for a temporary forward or a
@@ -536,7 +545,7 @@ Example — expose a server-side Postgres as a local port:
 
 ```sh
 socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork \
-      SOCKS5-CONNECT:127.0.0.1:1080:nas.internal:5432
+      SOCKS5-CONNECT:127.0.0.1:1080:nas.localhost.flextunnel.internal:5432
 # then: psql -h 127.0.0.1 -p 5432 …
 ```
 

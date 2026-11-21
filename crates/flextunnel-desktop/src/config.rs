@@ -1,11 +1,11 @@
 //! Client, server and auth-key persistence. The app runs one client
 //! ([`ClientSettings`]): its local proxy ports, its port forwards, and any
-//! number of [`Destination`]s — a host name for one flextunnel server each.
+//! number of [`Destination`]s — a name for one flextunnel server each.
 //! Client auth keys live in a shared, named list so several destinations can
 //! authenticate with the same keypair; each destination references one by
 //! [`AuthKey::id`]. The optional [`ServerConfig`] runs the one flextunnel
 //! server the app hosts in-process. The non-secret data (key names and public
-//! halves, destination hosts, server ids, routes, ports, forwards, the
+//! halves, destination names, server ids, routes, ports, forwards, the
 //! server's tunnel set and authorized clients) lives in a plaintext
 //! `profiles.json` under the local data dir — same treatment as the iOS app's
 //! `forwards.json`. The secrets (auth-key secret halves, the server's identity
@@ -38,7 +38,7 @@
 use flextunnel_core::forwards::{PortForward, validate_label, validate_remote_host};
 use flextunnel_core::proxy::routed_set::Coverage;
 use flextunnel_core::proxy::{
-    DestinationStatus, RouteSpec, RouteTable, RoutedSet, validate_destination_host,
+    DestinationStatus, RouteSpec, RouteTable, RoutedSet, validate_destination_name,
 };
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit};
@@ -144,16 +144,17 @@ pub fn is_valid_name(name: &str) -> bool {
 }
 
 /// One destination of the client — the desktop equivalent of a
-/// `[[destinations]]` table in `client.toml`: a host name for one flextunnel
+/// `[[destinations]]` table in `client.toml`: a name for one flextunnel
 /// server, the key to authenticate with, and what else to send through it.
 /// The client connects to it when something is first sent there.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Destination {
     pub id: String,
-    /// The destination's name, in the core's stored (lowercased) form:
-    /// `<host>:<port>` through the client's proxy or a forward reaches that
-    /// port on the server's own loopback.
-    pub host: String,
+    /// The destination's name — one DNS label, unique among the
+    /// destinations — in the core's stored (lowercased) form:
+    /// `<name>.localhost.flextunnel.internal:<port>` through the client's
+    /// proxy or a forward reaches that port on the server's own loopback.
+    pub name: String,
     pub server_node_id: String,
     /// Further domains sent through the server (exact, `*.suffix`, or `*`).
     /// The server must route them too.
@@ -221,7 +222,7 @@ impl ClientSettings {
         self.destinations.iter().find(|d| d.id == id)
     }
 
-    /// The client's routing as the core will see it: every destination's host
+    /// The client's routing as the core will see it: every destination's name
     /// and routes, validated together. The error names what to fix.
     pub fn route_table(&self) -> Result<RouteTable, String> {
         route_table_of(&self.destinations)
@@ -237,7 +238,7 @@ impl ClientSettings {
         self.start_blocker_with(keys, || self.route_table().err())
     }
 
-    /// [`Self::start_blocker`], with why the destinations' hosts and routes do
+    /// [`Self::start_blocker`], with why the destinations' names and routes do
     /// not make a routing table (if they don't) from `routes_error`, asked
     /// only when nothing else blocks — the view takes it from its cached
     /// table instead of building one on every redraw.
@@ -250,19 +251,19 @@ impl ClientSettings {
             return Some("Add a destination to start the client.".into());
         }
         for destination in &self.destinations {
-            let host = &destination.host;
+            let name = &destination.name;
             if destination.server_node_id.is_empty() {
-                return Some(format!("Destination \"{host}\" has no server node id — edit it."));
+                return Some(format!("Destination \"{name}\" has no server node id — edit it."));
             }
             match find_key(keys, &destination.auth_key_id) {
                 None => {
                     return Some(format!(
-                        "Destination \"{host}\" has no auth key — edit it to pick one."
+                        "Destination \"{name}\" has no auth key — edit it to pick one."
                     ));
                 }
                 Some(key) if key.secret.is_empty() => {
                     return Some(format!(
-                        "The secret of key \"{}\" (used by \"{host}\") is missing — re-enter \
+                        "The secret of key \"{}\" (used by \"{name}\") is missing — re-enter \
                          it in the Keys pane.",
                         key.name
                     ));
@@ -270,7 +271,7 @@ impl ClientSettings {
                 Some(_) => {}
             }
         }
-        routes_error().map(|e| format!("Fix the destinations' hosts and routes: {e}"))
+        routes_error().map(|e| format!("Fix the destinations' names and routes: {e}"))
     }
 
     pub fn is_ready(&self, keys: &[AuthKey]) -> bool {
@@ -285,7 +286,7 @@ pub fn route_table_of<'a>(
     let specs: Vec<RouteSpec<'_>> = destinations
         .into_iter()
         .map(|d| RouteSpec {
-            host: &d.host,
+            name: &d.name,
             routed_domains: &d.routed_domains,
             routed_cidrs: &d.routed_cidrs,
         })
@@ -297,15 +298,15 @@ pub fn route_table_of<'a>(
 /// each: a rule of another destination's that takes part of one of its own,
 /// or one of its own that takes part of another's. The narrower rule wins.
 pub fn overlap_lines(table: &RouteTable, dest: usize) -> Vec<String> {
-    let host = |i: usize| table.hosts().nth(i).unwrap_or_default().to_string();
+    let name = |i: usize| table.names().nth(i).unwrap_or_default().to_string();
     table
         .overlaps()
         .iter()
         .filter_map(|o| {
             if o.outer.dest == dest {
-                Some(format!("{} contains {}'s narrower {}", o.outer.rule, host(o.inner.dest), o.inner.rule))
+                Some(format!("{} contains {}'s narrower {}", o.outer.rule, name(o.inner.dest), o.inner.rule))
             } else if o.inner.dest == dest {
-                Some(format!("{} is inside {}'s broader {}", o.inner.rule, host(o.outer.dest), o.outer.rule))
+                Some(format!("{} is inside {}'s broader {}", o.inner.rule, name(o.outer.dest), o.outer.rule))
             } else {
                 None
             }
@@ -806,41 +807,41 @@ fn drop_invalid_keys(keys: Vec<AuthKey>) -> Vec<AuthKey> {
 
 /// Drop structurally invalid destinations from a (possibly hand-edited)
 /// store, keeping the first occurrence of duplicates: duplicate ids break the
-/// selection and the relay-token keying, a host the core would not store as
-/// written (or a duplicate one) breaks everything keyed by host, and a
+/// selection and the relay-token keying, a name the core would not store as
+/// written (or a duplicate one) breaks everything keyed by name, and a
 /// duplicate server node id means two destinations for one server, which the
 /// core refuses. The form rejects all of these; this is the backstop.
 fn drop_invalid(destinations: Vec<Destination>) -> Vec<Destination> {
     let mut ids = std::collections::HashSet::new();
-    let mut hosts = std::collections::HashSet::new();
+    let mut names = std::collections::HashSet::new();
     let mut servers = std::collections::HashSet::new();
     destinations
         .into_iter()
         .filter(|d| {
             // Every check before anything is reserved: a dropped entry must
-            // not shadow a later valid one sharing its id, host or server.
+            // not shadow a later valid one sharing its id, name or server.
             if ids.contains(&d.id) {
-                log::error!("Ignoring destination \"{}\": duplicate id {}", d.host, d.id);
+                log::error!("Ignoring destination \"{}\": duplicate id {}", d.name, d.id);
                 return false;
             }
-            if validate_destination_host(&d.host).as_deref() != Ok(d.host.as_str()) {
-                log::error!("Ignoring destination {}: invalid host {:?}", d.id, d.host);
+            if validate_destination_name(&d.name).as_deref() != Ok(d.name.as_str()) {
+                log::error!("Ignoring destination {}: invalid name {:?}", d.id, d.name);
                 return false;
             }
-            if hosts.contains(&d.host) {
-                log::error!("Ignoring a destination: duplicate host \"{}\"", d.host);
+            if names.contains(&d.name) {
+                log::error!("Ignoring a destination: duplicate name \"{}\"", d.name);
                 return false;
             }
             if servers.contains(&d.server_node_id) {
                 log::error!(
                     "Ignoring destination \"{}\": another destination already uses its server \
                      node id",
-                    d.host
+                    d.name
                 );
                 return false;
             }
             ids.insert(d.id.clone());
-            hosts.insert(d.host.clone());
+            names.insert(d.name.clone());
             servers.insert(d.server_node_id.clone());
             true
         })
@@ -970,7 +971,7 @@ pub fn load_store() -> Result<Store> {
         {
             log::warn!(
                 "Destination \"{}\" references an unknown auth key; pick one to use it",
-                destination.host
+                destination.name
             );
         }
     }
@@ -1222,7 +1223,7 @@ mod tests {
     fn destination() -> Destination {
         Destination {
             id: "00000000deadbeef".into(),
-            host: "prod.internal".into(),
+            name: "prod".into(),
             server_node_id: "node".into(),
             routed_domains: vec!["*.corp.example".into()],
             routed_cidrs: vec!["10.0.0.0/8".into()],
@@ -1256,7 +1257,7 @@ mod tests {
     #[test]
     fn optional_fields_default_when_absent() {
         let d: Destination =
-            serde_json::from_str(r#"{"id":"1","host":"n.internal","server_node_id":"abc"}"#)
+            serde_json::from_str(r#"{"id":"1","name":"n","server_node_id":"abc"}"#)
                 .unwrap();
         assert!(d.routed_domains.is_empty() && d.routed_cidrs.is_empty());
         assert!(d.relay_urls.is_empty());
@@ -1308,7 +1309,7 @@ mod tests {
         assert!(forward.get("enabled").is_none(), "forward enabled leaked: {json}");
         assert_eq!(doc["server"]["enabled"], true, "server enabled dropped: {json}");
         assert_eq!(doc["client"]["enabled"], true, "client enabled dropped: {json}");
-        assert_eq!(doc["client"]["destinations"][0]["host"], "prod.internal");
+        assert_eq!(doc["client"]["destinations"][0]["name"], "prod");
         // The relay tokens are secrets: sealed, never plaintext.
         assert!(!json.contains("relay_auth_token"), "relay token field leaked: {json}");
         assert!(!json.contains("ftc-secret-relaypsk"), "destination relay token leaked: {json}");
@@ -1422,7 +1423,7 @@ mod tests {
         let mut overlap = client();
         let mut second = destination();
         second.id = "second".into();
-        second.host = "staging.internal".into();
+        second.name = "staging".into();
         second.server_node_id = "node-2".into();
         overlap.destinations.push(second);
         let blocker = overlap.start_blocker(&keys).unwrap();
@@ -1430,7 +1431,7 @@ mod tests {
         overlap.destinations[1].routed_domains.clear();
         overlap.destinations[1].routed_cidrs.clear();
         assert_eq!(overlap.start_blocker(&keys), None, "a host alone is enough");
-        assert_eq!(overlap.route_table().unwrap().hosts().count(), 2);
+        assert_eq!(overlap.route_table().unwrap().names().count(), 2);
     }
 
     /// Each destination sees the overlaps it takes part in, from its own
@@ -1439,7 +1440,7 @@ mod tests {
     fn overlaps_are_told_from_each_side() {
         let dest = |host: &str, domains: &[&str], cidrs: &[&str]| Destination {
             id: host.into(),
-            host: host.into(),
+            name: host.into(),
             server_node_id: format!("node-{host}"),
             routed_domains: domains.iter().map(|d| d.to_string()).collect(),
             routed_cidrs: cidrs.iter().map(|c| c.to_string()).collect(),
@@ -1448,23 +1449,23 @@ mod tests {
             relay_auth_token: None,
         };
         let destinations = [
-            dest("nas.internal", &["*.corp.example"], &["10.0.0.0/8"]),
-            dest("lab.internal", &["*.dev.corp.example"], &["10.1.0.0/16"]),
-            dest("wiki.internal", &["wiki.example"], &[]),
+            dest("nas", &["*.corp.example"], &["10.0.0.0/8"]),
+            dest("lab", &["*.dev.corp.example"], &["10.1.0.0/16"]),
+            dest("wiki", &["wiki.example"], &[]),
         ];
         let table = route_table_of(&destinations).unwrap();
         assert_eq!(
             overlap_lines(&table, 0),
             [
-                "*.corp.example contains lab.internal's narrower *.dev.corp.example",
-                "10.0.0.0/8 contains lab.internal's narrower 10.1.0.0/16",
+                "*.corp.example contains lab's narrower *.dev.corp.example",
+                "10.0.0.0/8 contains lab's narrower 10.1.0.0/16",
             ]
         );
         assert_eq!(
             overlap_lines(&table, 1),
             [
-                "*.dev.corp.example is inside nas.internal's broader *.corp.example",
-                "10.1.0.0/16 is inside nas.internal's broader 10.0.0.0/8",
+                "*.dev.corp.example is inside nas's broader *.corp.example",
+                "10.1.0.0/16 is inside nas's broader 10.0.0.0/8",
             ]
         );
         assert!(overlap_lines(&table, 2).is_empty());
@@ -1476,7 +1477,7 @@ mod tests {
     #[test]
     fn a_rule_is_checked_against_the_servers_routes() {
         let mut status = DestinationStatus {
-            host: "nas.internal".into(),
+            name: "nas".into(),
             server_node_id: String::new(),
             state: flextunnel_core::proxy::DestinationState::Connected,
             connected_since: None,
@@ -1611,23 +1612,23 @@ mod tests {
         let a = destination();
         let variant = |id: &str, host: &str, server: &str| Destination {
             id: id.into(),
-            host: host.into(),
+            name: host.into(),
             server_node_id: server.into(),
             ..destination()
         };
-        let unique = variant("d", "staging.internal", "unique");
-        // Dropped for its server, "late.internal"; so neither its id nor its
+        let unique = variant("d", "staging", "unique");
+        // Dropped for its server, "late"; so neither its id nor its
         // host is taken from the entry after it.
-        let late = variant("late", "late.internal", "late-server");
+        let late = variant("late", "late", "late-server");
         let kept = drop_invalid(vec![
             a.clone(),
-            variant("b", "b.internal", "node"),
-            variant("00000000deadbeef", "c.internal", "other"),
-            variant("n", "prod.internal", "elsewhere"),
-            variant("late", "late.internal", "node"),
+            variant("b", "b", "node"),
+            variant("00000000deadbeef", "c", "other"),
+            variant("n", "prod", "elsewhere"),
+            variant("late", "late", "node"),
             late.clone(),
             // Not the form the core stores: uppercase, an address, reserved.
-            variant("u", "Upper.Internal", "upper"),
+            variant("u", "Upper", "upper"),
             variant("i", "10.0.0.1", "address"),
             variant("r", "flextunnel.internal", "reserved"),
             variant("e", "", "hostless"),
@@ -1654,7 +1655,7 @@ mod tests {
             reused_id.clone(),
             variant("aaaa", 6000, "other.internal"),
             variant("dddd", 0, "db.internal"),
-            variant("eeee", 7000, "bad..host"),
+            variant("eeee", 7000, "bad..name"),
             variant("ffff", 7001, " padded "),
             unique.clone(),
         ]);
@@ -1689,7 +1690,7 @@ mod tests {
         assert!(d.auth_key_id.is_empty());
         assert_eq!(d.relay_auth_token, None);
         assert_eq!(d.relay_urls, destination().relay_urls);
-        assert_eq!(d.host, destination().host);
+        assert_eq!(d.name, destination().name);
         assert_eq!(d.routed_domains, destination().routed_domains);
         assert_eq!(imported.forwards.len(), 1);
         assert!(!imported.forwards[0].id.is_empty(), "placeholder forward id assigned");
@@ -1704,7 +1705,7 @@ mod tests {
         let path = dir.path().join("export.json");
         std::fs::write(
             &path,
-            r#"{"destinations":[{"host":"prod.internal","server_node_id":"node",
+            r#"{"destinations":[{"name":"prod","server_node_id":"node",
                  "auth_key_id":"key1",
                  "relay_urls":["https://relay.example"],
                  "relay_auth_token":"ftc-secret-relaypsk"}]}"#,
@@ -1719,7 +1720,7 @@ mod tests {
         assert!(imported.forwards.is_empty());
 
         // A file of another shape — a bare list — is refused, not read as empty.
-        std::fs::write(&path, r#"[{"host":"prod.internal","server_node_id":"node"}]"#).unwrap();
+        std::fs::write(&path, r#"[{"name":"prod","server_node_id":"node"}]"#).unwrap();
         let e = import_client(&path).unwrap_err();
         assert!(format!("{e:#}").contains("not a flextunnel export"), "{e:#}");
         assert!(import_client(&dir.path().join("missing.json")).is_err());

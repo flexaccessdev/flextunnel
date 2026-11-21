@@ -77,11 +77,13 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 # RESERVED namespace: `flextunnel.internal` and any `*.flextunnel.internal`
 # subdomain are reserved by flextunnel and cannot be used as [host_aliases]
 # names (the server rejects such configs at startup). A client answers these
-# names itself and never sends them to a server. This server's status page is
-# reached through a client at
-# `http://flextunnel.internal/servers/<the client's host for this server>/`,
+# names itself and never sends them to a server; its
+# `<name>.localhost.flextunnel.internal` reaches this machine's own loopback
+# (no routed_domains entry needed). This server's status page is reached
+# through a client at
+# `http://flextunnel.internal/servers/<the client's name for this server>/`,
 # or in plain text with:
-#   curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/servers/machine1.internal/status.txt
+#   curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/servers/machine1/status.txt
 # HTTP-only.
 
 # Optional host aliases, resolved server-side. A requested hostname matching a

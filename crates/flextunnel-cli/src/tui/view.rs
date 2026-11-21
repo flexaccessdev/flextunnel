@@ -2,11 +2,12 @@
 //! their live state, the highlighted destination's details, and the
 //! config-declared port forwards with their live state.
 
+use flextunnel_core::proxy::reserved;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::ipc::{
     DestState, DestinationRow, ForwardRow, ForwardRowState, StatusSnapshot, WireConnSnapshot,
@@ -57,14 +58,20 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     let (details_title, details) = match app.selected_destination() {
         Some(d) => (
-            format!("{}  ([/] to scroll)", d.host),
+            format!("{}  ([/] to scroll)", d.name),
             details_lines(d, &s.status_page_host),
         ),
         None => ("Destination".to_string(), Vec::new()),
     };
-    let max_scroll = (details.len() as u16).saturating_sub(details_area.height.saturating_sub(2));
+    // Wrapped, so a long line — a 63-character name's loopback host — stays
+    // readable in full; the scroll is bounded by the rows the wrap makes.
+    let details = Paragraph::new(details).wrap(Wrap { trim: false });
+    let rows = details.line_count(details_area.width.saturating_sub(2));
+    let max_scroll = u16::try_from(rows)
+        .unwrap_or(u16::MAX)
+        .saturating_sub(details_area.height.saturating_sub(2));
     frame.render_widget(
-        Paragraph::new(details)
+        details
             .scroll((app.details_scroll.min(max_scroll), 0))
             .block(titled_block(&details_title)),
         details_area,
@@ -86,7 +93,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     match &app.mode {
         Mode::Normal => {}
-        Mode::ConnPath { host, snapshot } => draw_conn_path(frame, host, snapshot),
+        Mode::ConnPath { name, snapshot } => draw_conn_path(frame, name, snapshot),
     }
 }
 
@@ -168,12 +175,12 @@ fn state_detail(d: &DestinationRow) -> String {
     }
 }
 
-/// One row per destination: host, state, detail, and the streams in flight.
+/// One row per destination: name, state, detail, and the streams in flight.
 fn destination_lines(destinations: &[DestinationRow], selected: usize) -> Vec<Line<'static>> {
     if destinations.is_empty() {
         return vec![Line::from(Span::styled("no destinations", DIM))];
     }
-    let width = destinations.iter().map(|d| d.host.len()).max().unwrap_or(0);
+    let width = destinations.iter().map(|d| d.name.len()).max().unwrap_or(0);
     destinations
         .iter()
         .enumerate()
@@ -182,7 +189,7 @@ fn destination_lines(destinations: &[DestinationRow], selected: usize) -> Vec<Li
             let mut spans = vec![
                 Span::raw(marker),
                 Span::styled(
-                    format!("{:<width$}", d.host),
+                    format!("{:<width$}", d.name),
                     Style::new().add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
@@ -230,7 +237,7 @@ fn details_lines(d: &DestinationRow, status_host: &str) -> Vec<Line<'static>> {
     lines.push(Line::default());
     lines.push(section("Reaches through this server:".to_string()));
     lines.push(Line::from(vec![
-        Span::raw(format!("  {}:<port>", d.host)),
+        Span::raw(format!("  {}:<port>", reserved::loopback_host(&d.name))),
         Span::styled("  the server's own loopback", DIM),
     ]));
     for domain in &d.routed_domains {
@@ -250,7 +257,7 @@ fn details_lines(d: &DestinationRow, status_host: &str) -> Vec<Line<'static>> {
 
     lines.push(Line::default());
     lines.push(section("Server status page (opening it connects):".to_string()));
-    lines.push(item(format!("http://{status_host}/servers/{}/", d.host)));
+    lines.push(item(format!("http://{status_host}/servers/{}/", d.name)));
     lines
 }
 
@@ -309,14 +316,14 @@ fn conn_path_lines(snapshot: &WireConnSnapshot) -> Vec<Line<'static>> {
 
 /// The on-demand connection-path overlay (r refresh · Esc close), captured when
 /// opened — mirrors the desktop connection-path modal and the iOS sheet.
-fn draw_conn_path(frame: &mut Frame, host: &str, snapshot: &WireConnSnapshot) {
+fn draw_conn_path(frame: &mut Frame, name: &str, snapshot: &WireConnSnapshot) {
     let lines = conn_path_lines(snapshot);
     let height = (lines.len() as u16 + 2).clamp(3, frame.area().height.max(3));
     let area = centered(frame.area(), 74, height);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(titled_block(&format!(
-            "Connection path · {host}  (r refresh · Esc close)"
+            "Connection path · {name}  (r refresh · Esc close)"
         ))),
         area,
     );
@@ -410,9 +417,9 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 mod tests {
     use super::*;
 
-    fn destination(host: &str, state: DestState) -> DestinationRow {
+    fn destination(name: &str, state: DestState) -> DestinationRow {
         DestinationRow {
-            host: host.to_string(),
+            name: name.to_string(),
             server_node_id: "serverid".into(),
             state,
             connected_secs: None,
@@ -437,7 +444,7 @@ mod tests {
 
     #[test]
     fn state_detail_says_what_happens_next() {
-        let mut d = destination("m1.internal", DestState::Idle);
+        let mut d = destination("m1", DestState::Idle);
         assert_eq!(state_detail(&d), "connects on first use");
 
         d.state = DestState::Connected;
@@ -465,18 +472,18 @@ mod tests {
 
     #[test]
     fn destination_rows_mark_the_selection_and_show_activity() {
-        let mut busy = destination("machine1.internal", DestState::Connected);
+        let mut busy = destination("machine1", DestState::Connected);
         busy.connected_secs = Some(7);
         busy.open_streams = 2;
         busy.waiting = 1;
         let rows = text(&destination_lines(
-            &[busy, destination("m2.internal", DestState::Idle)],
+            &[busy, destination("m2", DestState::Idle)],
             1,
         ));
-        assert!(rows[0].starts_with("  machine1.internal  ● connected"), "{}", rows[0]);
+        assert!(rows[0].starts_with("  machine1  ● connected"), "{}", rows[0]);
         assert!(rows[0].ends_with("2 open, 1 waiting"), "{}", rows[0]);
         // The second row is selected, and hosts are padded to one column.
-        assert!(rows[1].starts_with("▸ m2.internal        ● idle"), "{}", rows[1]);
+        assert!(rows[1].starts_with("▸ m2        ● idle"), "{}", rows[1]);
         assert!(rows[1].contains("connects on first use"));
 
         assert_eq!(text(&destination_lines(&[], 0)), ["no destinations"]);
@@ -484,7 +491,7 @@ mod tests {
 
     #[test]
     fn details_list_what_the_destination_reaches() {
-        let mut d = destination("m1.internal", DestState::Failed);
+        let mut d = destination("m1", DestState::Failed);
         d.last_error = Some("Authentication failed: nope".into());
         d.relay_urls = vec!["https://relay.example/".into()];
         let lines = text(&details_lines(&d, "flextunnel.internal"));
@@ -492,10 +499,53 @@ mod tests {
         assert!(all.contains("serverid"));
         assert!(all.contains("none while idle"));
         assert!(all.contains("error: Authentication failed: nope"));
-        assert!(all.contains("m1.internal:<port>  the server's own loopback"));
+        assert!(all.contains("m1.localhost.flextunnel.internal:<port>  the server's own loopback"));
         assert!(all.contains("  *.corp.example") && all.contains("  10.0.0.0/8"));
         assert!(all.contains("https://relay.example/"));
-        assert!(all.contains("http://flextunnel.internal/servers/m1.internal/"));
+        assert!(all.contains("http://flextunnel.internal/servers/m1/"));
+    }
+
+    /// The details pane wraps instead of clipping, and scrolls to the last
+    /// wrapped row: the loopback host of a 63-character name — the longest
+    /// there is — reads in full in an 80-column terminal.
+    #[test]
+    fn a_long_loopback_host_wraps_and_scrolls_into_view() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let name = "a".repeat(63);
+        let mut app = App::new(StatusSnapshot {
+            name: "work".into(),
+            socks_addr: None,
+            http_addr: None,
+            status_page_host: "flextunnel.internal".into(),
+            idle_timeout_secs: Some(300),
+            destinations: vec![destination(&name, DestState::Idle)],
+            forwards: Vec::new(),
+        });
+        // Past the end: the render clamps to the last wrapped row.
+        app.details_scroll = u16::MAX;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_matches(|c: char| c == '│' || c.is_whitespace())
+                    .to_string()
+            })
+            .collect();
+        let host = format!("{}:<port>", reserved::loopback_host(&name));
+        assert!(host.len() > 78, "longer than the pane is wide");
+        assert!(
+            rows.windows(2).any(|pair| pair.concat().contains(&host)),
+            "{host} not readable in:\n{}",
+            rows.join("\n")
+        );
+        // The last row of the details, the status page link, shows too.
+        assert!(rows.iter().any(|row| row.contains("/servers/")), "{}", rows.join("\n"));
     }
 }
-

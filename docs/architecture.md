@@ -240,25 +240,29 @@ its connections are held the same way.
 once in `ProxyClient::new` from the configured destinations. `RouteTable::route`
 maps a target to one of:
 
-1. the client's own status endpoint (`flextunnel.internal`), or a 404 for
-   another `*.flextunnel.internal` name;
-2. a destination's loopback, for the destination's own `host` (sent as a
-   loopback stream request);
+1. a destination's loopback, for its `<name>.localhost.flextunnel.internal`
+   (sent as a loopback stream request);
+2. the client's own status endpoint (`flextunnel.internal`), or a 404 for
+   any other `*.flextunnel.internal` name — including a
+   `*.localhost.flextunnel.internal` no destination has;
 3. a destination, for the most specific routed-set match across all of them —
    exact domain, then the longest `*.suffix`, then `*`; longest prefix for IPs
    (`RoutedSet::specificity`);
 4. direct.
 
-Validation rejects what precedence cannot resolve: a duplicate host, the same
-rule on two destinations, a destination's host listed as a routed domain, a
-rule in the reserved namespace, and a host that is an IP literal, `localhost`
-or reserved. `ProxyClient::new` additionally rejects two destinations for one
+Validation rejects what precedence cannot resolve: a duplicate name
+(case-insensitive), the same rule on two destinations, a rule in the reserved
+namespace, and a name that is not one DNS label (`validate_destination_name`:
+letters, digits and inner hyphens, at most 63). A name is only a label, never a
+host: everything the table answers without a rule lives under the reserved
+`flextunnel.internal` namespace, so no configured name shadows a real host. `ProxyClient::new` additionally rejects two destinations for one
 server.
 
 What precedence does resolve is recorded too: `RouteTable::overlaps` lists
 every rule of one destination strictly inside another's (`Rule::contains` —
-zones and networks nest or are apart, so containment is the whole test),
-including a destination's host under another's wildcard. The client logs them
+zones and networks nest or are apart, so containment is the whole test). A
+loopback name is reserved, so no rule covers it and it never overlaps. The
+client logs them
 at startup; the status endpoint shows them against `RouteTable::rows`, the
 table in the order a target is tried.
 
@@ -396,7 +400,8 @@ catches accidental identity reuse.
 - Quick-mode clients authenticate through an endpoint-id allowlist. ALPN
   labels select the protocol role and carry no credential.
 - Every admitted client can reach the server's own loopback services (a
-  loopback stream request, which a client sends for a destination's own host)
+  loopback stream request, which a client sends for a destination's
+  `<name>.localhost.flextunnel.internal`)
   and its status page, whatever the routed set says. Authorize keys
   accordingly.
 - A server only ever sees the targets a client chose to send it. The client's

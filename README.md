@@ -2,8 +2,8 @@
 
 A TCP tunnel over QUIC with optional local SOCKS5/HTTP proxies and port
 forwards. A client names the servers it can reach as **destinations** —
-`machine1.internal` is one server, `machine2.internal` another — and a request
-for a destination goes through that **server**, which resolves DNS and connects
+`machine1` is one server, `machine2` another — and a request for a
+destination goes through that **server**, which resolves DNS and connects
 from its own network. Requests for anything else connect directly from the
 client. Port forwards and `flextunnel client nc` always go through a
 destination.
@@ -25,9 +25,9 @@ Transport, NAT traversal, relay fallback, and TLS 1.3 encryption are provided by
 ```
 local app ──SOCKS5/HTTP──► flextunnel client (optional listeners, e.g. 127.0.0.1:1080 / :8081)
                           │  routes each request by its own table:
-                          │    machine1.internal, *.corp.example ─► server 1
-                          │    machine2.internal, 10.0.0.0/8     ─► server 2
-                          │    anything else                     ─► direct, from the client
+                          │    machine1.localhost.flextunnel.internal, *.corp.example ─► server 1
+                          │    machine2.localhost.flextunnel.internal, 10.0.0.0/8     ─► server 2
+                          │    anything else                                          ─► direct, from the client
                           │
                           │  per server, opened on first use and closed when idle:
                           │  one iroh QUIC connection (fixed ALPN + auth handshake)
@@ -291,9 +291,10 @@ It prints `flextunnel server Node ID: <ENDPOINT_ID>` — give that to clients.
 
 ### 3. Configure and run the client (no root needed)
 
-The client's config names each server as a destination. `host` is a name of
-your choosing; `<host>:<port>` then reaches that port on the server machine
-itself.
+The client's config names each server as a destination. `name` is one DNS
+label of your choosing (letters, digits and inner hyphens, unique within the
+client); `<name>.localhost.flextunnel.internal:<port>` then reaches that port
+on the server machine itself.
 
 ```toml
 # client.toml
@@ -301,7 +302,7 @@ socks_port    = 1080          # SOCKS5 on 127.0.0.1:1080 (loopback only)
 auth_key_file = "./client.key"
 
 [[destinations]]
-host           = "machine1.internal"
+name           = "machine1"
 server_node_id = "<ENDPOINT_ID>"
 # Optional: send more than the machine itself through this server. The server
 # must allow these too (its routed_domains / routed_cidrs above).
@@ -325,8 +326,8 @@ reach flextunnel as names — that is what routes them, and routed names are the
 resolved on the server side:
 
 ```sh
-# The destination's own name is the server machine: here, its port 8000.
-curl -x socks5h://127.0.0.1:1080 http://machine1.internal:8000/
+# A destination's loopback name is the server machine: here, its port 8000.
+curl -x socks5h://127.0.0.1:1080 http://machine1.localhost.flextunnel.internal:8000/
 
 # A routed name: resolved and connected by that server.
 curl -x socks5h://127.0.0.1:1080 https://wiki.corp.example/
@@ -335,8 +336,8 @@ curl -x socks5h://127.0.0.1:1080 https://wiki.corp.example/
 curl -x socks5h://127.0.0.1:1080 https://example.com
 
 # SSH through a destination (see `client nc`; needs no proxy port): the
-# destination's name reaches that machine's own sshd.
-ssh -o ProxyCommand='flextunnel client nc -c client.toml %h %p' user@machine1.internal
+# destination's loopback name reaches that machine's own sshd.
+ssh -o ProxyCommand='flextunnel client nc -c client.toml %h %p' user@machine1.localhost.flextunnel.internal
 ```
 
 The first request to a destination waits while the client connects to it;
@@ -371,9 +372,9 @@ is entered.
 The quick server runs a full tunnel (`routed_domains = ["*"]`,
 `routed_cidrs = ["0.0.0.0/0", "::/0"]`); enter a SOCKS5/HTTP port at the client
 prompt to open a local proxy listener. The quick client has one destination,
-named `quick.internal`, which routes everything — so every proxied request goes
-through the quick server, and `quick.internal:<port>` is the server's own
-loopback. Unlike a regular client it connects at once and stays connected (the
+named `quick`, which routes everything — so every proxied request goes
+through the quick server, and `quick.localhost.flextunnel.internal:<port>` is
+the server's own loopback. Unlike a regular client it connects at once and stays connected (the
 quick server is waiting for it). Both sides are fully ephemeral: neither
 takes the single-instance lock (so a quick session can run alongside a real one,
 or another quick one), and both forget everything on exit.
@@ -412,13 +413,13 @@ curl -sS -x http://127.0.0.1:8081 http://flextunnel.internal/status.json
 
 The JSON response includes `version`, `socks_listen`, `http_listen`,
 `idle_timeout_secs`, the table under `routes`, and one entry per destination
-under `destinations`. Each `routes` entry has `rule`, `kind` (`host`, `exact`,
+under `destinations`. Each `routes` entry has `rule`, `kind` (`loopback`, `exact`,
 `wildcard`, `catch-all` or `network`), `destination`, `server` (`loopback`,
 `allowed`, `partly allowed`, `not allowed` or `unchecked`), `server_last_known`
 (`server` comes from an earlier read: the latest is still running or failed), `within`
 (other destinations' broader rules it lies inside) and `narrower` (their
 narrower rules that lie inside it), each a list of `{rule, destination}`. A
-destination entry has `host`, `server_node_id`, `state` (`idle`,
+destination entry has `name`, `loopback_host`, `server_node_id`, `state` (`idle`,
 `connecting`, `connected`, `backoff` or `failed`), `connected_secs`,
 `open_streams`, `waiting`, `client_node_id`, `failed_attempts`,
 `next_attempt_secs`, `last_error`, `routed_domains`, `routed_cidrs`,
@@ -427,25 +428,29 @@ destination entry has `host`, `server_node_id`, `state` (`idle`,
 `server_routes_error`, `server_routes_pending` (a connection is reading them
 again), and `server_status`.
 
-Each **server's** own status page is under `/servers/<destination>/`, with the
+Each **server's** own status page is under `/servers/<name>/`, with the
 same `/status.txt` and `/status.json` variants. Fetching it connects to that
 server if it is not connected:
 
 ```sh
-curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/servers/machine1.internal/status.json
+curl -sS -x socks5h://127.0.0.1:1080 http://flextunnel.internal/servers/machine1/status.json
 ```
 
 That JSON includes `version`, `server_node_id`, `routed_domains`,
 `routed_cidrs`, `host_aliases`, and duplicate-id blocklist
 counts under `duplicate_id_blocklist`.
 
-Other `*.flextunnel.internal` names are reserved and answer with an HTTP 404.
-No `routed_domains` list, a client's or a server's, may name a reserved name.
+A destination's `<name>.localhost.flextunnel.internal` is its server's
+loopback (below). Other `*.flextunnel.internal` names — including a
+`*.localhost.flextunnel.internal` no destination has — are reserved and answer
+with an HTTP 404. No `routed_domains` list, a client's or a server's, may name
+a reserved name.
 
 #### A server's loopback
 
-A destination's `host` **is** the server machine: `machine1.internal:8000` is
-port 8000 on that server's own `localhost`. No server config is needed — it
+A destination's loopback name **is** the server machine:
+`machine1.localhost.flextunnel.internal:8000` is port 8000 on that server's own
+`localhost`. No server config is needed — it
 bypasses the server's routed set and host aliases — and it is dialed
 on both `127.0.0.1` and `::1`, so a service bound to only one of them is still
 reached. It works from the proxies, as a forward's `remote_host`, and with
@@ -453,11 +458,12 @@ reached. It works from the proxies, as a forward's `remote_host`, and with
 
 ```sh
 # a web app listening on machine1's loopback port 8000
-curl -sS -x socks5h://127.0.0.1:1080 http://machine1.internal:8000/
+curl -sS -x socks5h://127.0.0.1:1080 http://machine1.localhost.flextunnel.internal:8000/
 ```
 
-Only the exact host maps to loopback: `foo.machine1.internal` is a different
-name, routed (or not) like any other.
+The loopback name lives in the reserved `flextunnel.internal` namespace, so a
+destination's name never shadows a real host: the bare `machine1` is routed
+(or not) like any other name.
 
 For more ways to use the proxy — `curl`/`git`/browser recipes, `ssh` through the
 tunnel, and putting a plain local TCP port in front of it for apps that can't
@@ -478,7 +484,7 @@ flextunnel client start -c client.toml --http-port 8081
 
 # HTTPS tunnels via CONNECT; plain HTTP is forwarded
 https_proxy=http://127.0.0.1:8081 curl https://wiki.corp.example/
-http_proxy=http://127.0.0.1:8081  curl http://machine1.internal:8000/
+http_proxy=http://127.0.0.1:8081  curl http://machine1.localhost.flextunnel.internal:8000/
 ```
 
 See [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) for remaining
@@ -544,10 +550,10 @@ right in that terminal — but with no control socket exposed, and quitting the
 panel disconnects instead of detaching. Nothing is saved.
 
 Each `[[destinations]]` table (see [`client.toml.example`](client.toml.example))
-has a `host` and a `server_node_id`, and optionally `routed_domains` /
+has a `name` (one DNS label) and a `server_node_id`, and optionally `routed_domains` /
 `routed_cidrs` (see [Routing](#routing)) and its own `auth_key_file`,
 `relay_urls` and `relay_auth_token`, which override the top-level ones for that
-destination. Hosts and server ids must each be unique. The config is validated
+destination. Names and server ids must each be unique. The config is validated
 at startup; an invalid destination or an ambiguous route stops the client
 before anything is bound.
 
@@ -564,16 +570,16 @@ one way a forward's `remote_host` is routed differently from a proxy request,
 and it makes a host that no destination routes a startup error
 (`forward #1: no destination routes example.org`).
 
-**Forwarding to a server's loopback** uses the destination's own host. With
-ssh, `-L 8080:localhost:80` reaches the remote's own port 80; the flextunnel
-equivalent is `remote_host = "machine1.internal"`, which always means that
-server's own loopback and needs no server config. Any other spelling is an
+**Forwarding to a server's loopback** uses the destination's loopback name.
+With ssh, `-L 8080:localhost:80` reaches the remote's own port 80; the
+flextunnel equivalent is `remote_host = "machine1.localhost.flextunnel.internal"`,
+which always means that server's own loopback and needs no server config. Any other spelling is an
 ordinary routed target: a destination must route it, and its server must allow
 it. What that takes depends on how `remote_host` is written:
 
 | `remote_host` | Client config needed | Server config needed |
 | --- | --- | --- |
-| a destination's `host`, e.g. `machine1.internal` | none (it is the destination) | none |
+| a destination's `<name>.localhost.flextunnel.internal`, e.g. `machine1.localhost.flextunnel.internal` | none (it is the destination) | none |
 | `127.0.0.1` / `::1` | a loopback CIDR in that destination's `routed_cidrs` | the same CIDR in the server's `routed_cidrs`, e.g. `["127.0.0.0/8", "::1"]` |
 | `localhost` | `"localhost"` (or `"*"`) in that destination's `routed_domains` (it is a hostname) | `"localhost"` (or `"*"`) in the server's `routed_domains` |
 | a server `[host_aliases]` name, e.g. `server.internal` → `127.0.0.1` | the name in that destination's `routed_domains` | the name in the server's `routed_domains` |
@@ -632,16 +638,17 @@ flextunnel client nc -n work <HOST> <PORT>        # or by client name directly
 Opens one tunnel to `<HOST>:<PORT>` through a **running** client (picked the
 same way as for `client control`, over the same control socket) and relays it
 to stdin/stdout — a built-in netcat for SSH's `ProxyCommand`. `<HOST>` is routed
-like a port forward, so a destination's own name reaches that machine itself:
+like a port forward, so a destination's loopback name reaches that machine
+itself:
 
 ```
-Host machine1.internal machine2.internal
+Host machine1 machine2
+    HostName %h.localhost.flextunnel.internal
     ProxyCommand flextunnel client nc %h %p
 ```
 
-With that, `ssh machine1.internal` reaches machine1's own sshd through its
-server, and `ssh machine2.internal` reaches machine2's — one client, one line
-of ssh config.
+With that, `ssh machine1` reaches machine1's own sshd through its server, and
+`ssh machine2` reaches machine2's — one client, three lines of ssh config.
 
 If the destination is not connected, `nc` waits while the client connects to
 it (up to 45s); otherwise the tunnel opens at once. It works with no SOCKS or
@@ -681,7 +688,7 @@ socks_port    = 1080          # SOCKS5 on 127.0.0.1:1080 (loopback only)
 auth_key_file = "~/.config/flextunnel/client.key"
 
 [[destinations]]
-host           = "machine1.internal"
+name           = "machine1"
 server_node_id = "<server endpoint id>"
 ```
 
@@ -733,21 +740,23 @@ goes without being connected to anything.
 ```toml
 # client.toml
 [[destinations]]
-host           = "machine1.internal"
+name           = "machine1"
 server_node_id = "<endpoint id 1>"
 routed_domains = ["*.corp.example", "httpbin.org"]
 routed_cidrs   = ["10.0.0.0/8", "192.168.1.5"]
 
 [[destinations]]
-host           = "machine2.internal"
+name           = "machine2"
 server_node_id = "<endpoint id 2>"
 routed_domains = ["*.dev.corp.example"]
 ```
 
 For each request, the most specific match wins:
 
-1. `flextunnel.internal` — the client's own [status pages](#status-pages).
-2. A destination's own `host` — that server's loopback.
+1. A destination's `<name>.localhost.flextunnel.internal` — that server's
+   loopback.
+2. The rest of `flextunnel.internal` — the client's own
+   [status pages](#status-pages); other reserved names answer 404.
 3. An exact `routed_domains` entry, then the longest `*.suffix`, then `*`. For
    an IP target, the `routed_cidrs` entry with the longest prefix.
 4. Nothing matches — the proxy listeners connect **directly** from the client
@@ -755,8 +764,8 @@ For each request, the most specific match wins:
 
 So with the config above, `api.corp.example` goes to server 1 and
 `x.dev.corp.example` to server 2. Destinations may nest like that, but the
-*same* rule on two destinations is ambiguous and rejected at startup, as is
-listing a destination's `host` under `routed_domains`. Every nesting between
+*same* rule on two destinations is ambiguous and rejected at startup, as are
+two destinations with the same name. Every nesting between
 two destinations is logged at startup and shown on the
 [status page](#status-pages) and the desktop app's destination pane and form.
 That includes lists filled in with *Fetch from server*, where one server's
@@ -791,7 +800,7 @@ is not an isolation boundary for untrusted clients.
 
 Nothing keeps the two sides' lists in step, but a client can read the server's:
 they are on its [status page](#status-pages)
-(`/servers/<destination>/status.json`), and the desktop app's destination form
+(`/servers/<name>/status.json`), and the desktop app's destination form
 fills its routed fields from the server with *Fetch from server*. A running
 client also checks on its own: each time a destination connects, it reads the
 server's lists over that connection, logs each of its rules the server routes
@@ -799,7 +808,7 @@ only in part or not at all, and shows the result per rule on the client's
 status page and the desktop app's destination pane.
 
 Two things reach a server **outside** its lists: its own loopback, under the
-destination's `host`, and its [status page](#status-pages). So a server with
+destination's `<name>.localhost.flextunnel.internal`, and its [status page](#status-pages). So a server with
 both lists omitted is valid — clients reach just the machine itself through it.
 An empty list never means "tunnel everything".
 

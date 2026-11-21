@@ -76,7 +76,7 @@ enum Mode {
     /// snapshot (paths + custom-relay health) captured when opened,
     /// refreshable, not polled — mirrors the desktop modal / iOS sheet.
     ConnPath {
-        host: String,
+        name: String,
         snapshot: WireConnSnapshot,
     },
 }
@@ -238,9 +238,9 @@ impl App {
             // On-demand connection-path + custom-relay-health overlay for the
             // highlighted destination (not polled).
             KeyCode::Char('p') => {
-                if let Some(host) = self.selected_destination().map(|d| d.host.clone()) {
-                    match self.request_conn_path(&host, backend)? {
-                        Ok(snapshot) => self.mode = Mode::ConnPath { host, snapshot },
+                if let Some(name) = self.selected_destination().map(|d| d.name.clone()) {
+                    match self.request_conn_path(&name, backend)? {
+                        Ok(snapshot) => self.mode = Mode::ConnPath { name, snapshot },
                         Err(message) => self.notice = Some(message),
                     }
                 }
@@ -250,16 +250,16 @@ impl App {
         Ok(false)
     }
 
-    /// Fetch an on-demand connection snapshot for the destination `host`. The
+    /// Fetch an on-demand connection snapshot for the destination `name`. The
     /// outer `Result` is a transport failure (ends the loop); the inner is a
     /// session-reported error to surface as a footer notice.
     fn request_conn_path(
         &mut self,
-        host: &str,
+        name: &str,
         backend: &mut dyn ControlBackend,
     ) -> Result<std::result::Result<WireConnSnapshot, String>> {
         let request = Request::ConnPath {
-            host: host.to_string(),
+            name: name.to_string(),
         };
         Ok(match backend.request(request)? {
             Response::ConnPath(snapshot) => Ok(snapshot),
@@ -273,15 +273,15 @@ impl App {
         code: KeyCode,
         backend: &mut dyn ControlBackend,
     ) -> Result<()> {
-        let Mode::ConnPath { host, .. } = &self.mode else {
+        let Mode::ConnPath { name, .. } = &self.mode else {
             return Ok(());
         };
         match code {
             // Re-probe in place (paths + relay /healthz).
             KeyCode::Char('r') => {
-                let host = host.clone();
-                match self.request_conn_path(&host, backend)? {
-                    Ok(snapshot) => self.mode = Mode::ConnPath { host, snapshot },
+                let name = name.clone();
+                match self.request_conn_path(&name, backend)? {
+                    Ok(snapshot) => self.mode = Mode::ConnPath { name, snapshot },
                     Err(message) => {
                         self.notice = Some(message);
                         self.mode = Mode::Normal;
@@ -300,9 +300,9 @@ mod tests {
     use super::*;
     use crate::ipc::DestState;
 
-    fn destination(host: &str) -> DestinationRow {
+    fn destination(name: &str) -> DestinationRow {
         DestinationRow {
-            host: host.to_string(),
+            name: name.to_string(),
             server_node_id: "server".into(),
             state: DestState::Idle,
             connected_secs: None,
@@ -318,36 +318,36 @@ mod tests {
         }
     }
 
-    fn app(hosts: &[&str]) -> App {
+    fn app(names: &[&str]) -> App {
         App::new(StatusSnapshot {
             name: "work".into(),
             socks_addr: None,
             http_addr: None,
             status_page_host: "flextunnel.internal".into(),
             idle_timeout_secs: Some(300),
-            destinations: hosts.iter().map(|h| destination(h)).collect(),
+            destinations: names.iter().map(|n| destination(n)).collect(),
             forwards: Vec::new(),
         })
     }
 
     #[test]
     fn selection_stops_at_both_ends_and_resets_the_details_scroll() {
-        let mut app = app(&["m1.internal", "m2.internal", "m3.internal"]);
-        assert_eq!(app.selected_destination().unwrap().host, "m1.internal");
+        let mut app = app(&["m1", "m2", "m3"]);
+        assert_eq!(app.selected_destination().unwrap().name, "m1");
         app.select(-1);
         assert_eq!(app.selected, 0, "already at the top");
 
         app.details_scroll = 6;
         app.select(1);
-        assert_eq!(app.selected_destination().unwrap().host, "m2.internal");
+        assert_eq!(app.selected_destination().unwrap().name, "m2");
         assert_eq!(app.details_scroll, 0);
         app.select(5);
-        assert_eq!(app.selected_destination().unwrap().host, "m3.internal");
+        assert_eq!(app.selected_destination().unwrap().name, "m3");
 
         // A stale index (the destination list never shrinks in practice, but
         // the panel must not panic if it did) reads as the last row.
         app.selected = 9;
-        assert_eq!(app.selected_destination().unwrap().host, "m3.internal");
+        assert_eq!(app.selected_destination().unwrap().name, "m3");
         app.select(-1);
         assert_eq!(app.selected, 1);
     }

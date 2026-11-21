@@ -213,7 +213,7 @@ pub enum StreamRequest {
     /// routed set, then applies host aliases.
     Connect(Target),
     /// Connect to this port on the server's own loopback — what a client
-    /// destination's own name means. Outside the routed set and aliases:
+    /// destination's loopback name means. Outside the routed set and aliases:
     /// every admitted client can reach the server's loopback.
     Loopback(u16),
     /// Serve the server's status page: an HTTP response to the HTTP request

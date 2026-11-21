@@ -51,8 +51,10 @@
 //! must be on each server's authorized-keys file) and at least one entry in
 //! `destinations` are required; the rest is optional.
 //!
-//! A destination gives a server a `host` name: `<host>:<port>` through the
-//! client reaches that port on the server's own loopback. Its optional
+//! A destination gives a server a `name`: one DNS label (letters, digits and
+//! inner hyphens, up to 63, case-insensitive), unique within the config.
+//! `<name>.localhost.flextunnel.internal:<port>` through the client reaches
+//! that port on the server's own loopback. Its optional
 //! `routed_domains` / `routed_cidrs` are further targets sent through that
 //! server (which must route them too — its own routed set is the allowlist).
 //! Routing is entirely this config's: a session learns nothing from a server,
@@ -70,7 +72,7 @@
 //!   "relay_auth_token": null,
 //!   "idle_timeout_secs": 300,
 //!   "destinations": [
-//!     { "host": "machine1.internal", "server_node_id": "<iroh endpoint id>",
+//!     { "name": "machine1", "server_node_id": "<iroh endpoint id>",
 //!       "routed_domains": ["*.corp.example"], "routed_cidrs": ["10.0.0.0/8"] }
 //!   ]
 //! }
@@ -160,8 +162,9 @@ struct FfiConfig {
 
 #[derive(Deserialize)]
 struct FfiDestination {
-    /// The destination's name; `<host>:<port>` is the server's own loopback.
-    host: String,
+    /// The destination's name; `<name>.localhost.flextunnel.internal:<port>`
+    /// is the server's own loopback.
+    name: String,
     server_node_id: String,
     /// Further domains sent through this server.
     #[serde(default)]
@@ -391,10 +394,10 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
     let mut destinations = Vec::with_capacity(cfg.destinations.len());
     for destination in cfg.destinations {
         let server_id = destination.server_node_id.trim().parse().map_err(|e| {
-            format!("destination {:?}: invalid server_node_id: {e}", destination.host)
+            format!("destination {:?}: invalid server_node_id: {e}", destination.name)
         })?;
         destinations.push(DestinationConfig {
-            host: destination.host,
+            name: destination.name,
             server_id,
             auth: ClientAuth::Key(Box::new(client_key.clone())),
             relay: relay.clone(),
@@ -403,7 +406,7 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
             keep_connected: false,
         });
     }
-    // Validates the destinations (hosts, routes, one entry per server).
+    // Validates the destinations (names, routes, one entry per server).
     // Nothing is dialed: a destination connects on first use.
     let client = Arc::new(
         ProxyClient::new(ClientConfig {
@@ -536,7 +539,8 @@ fn fetch_server_routes_inner(json: &str) -> Result<String, String> {
 /// bind `127.0.0.1` and `::1`; every accepted connection is sent through the
 /// destination that routes `remote_host` (connecting it first if it is idle),
 /// whose server rejects targets off its own list. `remote_host` is routed like
-/// a proxy request — a destination's own host is that server's loopback —
+/// a proxy request — a destination's `<name>.localhost.flextunnel.internal`
+/// is that server's loopback —
 /// except that a forward never connects directly: an enabled forward whose
 /// host no destination routes is invalid input.
 ///
@@ -800,7 +804,7 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
 /// ```json
 /// { "idle_timeout_secs": 300,
 ///   "destinations": [
-///     { "host": "machine1.internal", "server_node_id": "…",
+///     { "name": "machine1", "server_node_id": "…",
 ///       "state": "connected", "connected_secs": 42,
 ///       "open_streams": 1, "waiting": 0, "client_node_id": "…",
 ///       "failed_attempts": 0, "next_attempt_secs": null, "last_error": null,
@@ -833,7 +837,7 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
 /// from the device — so the caller has nothing to enforce. A server's own view
 /// (its routed set, host aliases) is its status page,
 /// reachable through the SOCKS proxy at
-/// `http://flextunnel.internal/servers/<host>/status.json`.
+/// `http://flextunnel.internal/servers/<name>/status.json`.
 ///
 /// Reading this never causes a connection.
 ///
@@ -868,7 +872,7 @@ fn status_json(status: &flextunnel_core::proxy::ClientStatus, now: Instant) -> S
         .iter()
         .map(|d| {
             serde_json::json!({
-                "host": d.host,
+                "name": d.name,
                 "server_node_id": d.server_node_id,
                 "state": d.state.as_str(),
                 "connected_secs": d
@@ -895,7 +899,7 @@ fn status_json(status: &flextunnel_core::proxy::ClientStatus, now: Instant) -> S
     .to_string()
 }
 
-/// Snapshot the iroh path(s) of the connection to the destination named `host`
+/// Snapshot the iroh path(s) of the connection to the destination called `name`
 /// as JSON into `out_buf`, mirroring `ezvpn client status` / the desktop's
 /// "connection path" readout:
 ///
@@ -918,7 +922,7 @@ fn status_json(status: &flextunnel_core::proxy::ClientStatus, now: Instant) -> S
 /// `"direct"`, `"relay"`, or `"other"` (a forward-compatible catch-all) and
 /// `selected` marks the path iroh routes over right now. The whole snapshot is
 /// **empty** while the destination is not connected — idle, connecting, or
-/// backing off — or when `host` names no destination, so callers should only
+/// backing off — or when `name` names no destination, so callers should only
 /// offer this for a destination [`flextunnel_status`] reports `"connected"`.
 /// Asking never connects it.
 ///
@@ -932,27 +936,27 @@ fn status_json(status: &flextunnel_core::proxy::ClientStatus, now: Instant) -> S
 ///
 /// Returns `1` on success (full JSON written), `0` if `out_buf` was too small
 /// (the JSON is truncated; retry with a larger buffer), and `-1` for a null
-/// handle or an unusable `host` (null or not UTF-8). `out_buf` is always
+/// handle or an unusable `name` (null or not UTF-8). `out_buf` is always
 /// NUL-terminated when usable (non-null, `out_len > 0`): the `-1` returns
 /// write an empty string.
 ///
 /// # Safety
 /// `handle` must be a valid pointer returned by [`flextunnel_start`] and not yet
-/// passed to [`flextunnel_stop`]. `host` must be a valid, NUL-terminated C
+/// passed to [`flextunnel_stop`]. `name` must be a valid, NUL-terminated C
 /// string (or null). `out_buf` must point to at least `out_len` writable bytes
 /// (may be null only if `out_len` is 0).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn flextunnel_conn_path(
     handle: *const FlextunnelHandle,
-    host: *const c_char,
+    name: *const c_char,
     out_buf: *mut c_char,
     out_len: usize,
 ) -> c_int {
-    if handle.is_null() || host.is_null() {
+    if handle.is_null() || name.is_null() {
         write_cstr(out_buf, out_len, "");
         return -1;
     }
-    let Ok(host) = unsafe { CStr::from_ptr(host) }.to_str() else {
+    let Ok(name) = unsafe { CStr::from_ptr(name) }.to_str() else {
         write_cstr(out_buf, out_len, "");
         return -1;
     };
@@ -960,7 +964,7 @@ pub unsafe extern "C" fn flextunnel_conn_path(
     // The relay health check performs on-demand HTTP, so drive the async snapshot
     // on the embedded runtime. Called from the app's own thread (never a runtime
     // worker), so `block_on` is safe and does not stall the running tunnel task.
-    let snapshot = handle.runtime.block_on(handle.client.connection_snapshot(host.trim()));
+    let snapshot = handle.runtime.block_on(handle.client.connection_snapshot(name.trim()));
     let paths: Vec<_> = snapshot
         .paths
         .into_iter()
@@ -1090,9 +1094,9 @@ mod tests {
     #[test]
     fn start_is_lazy_and_reports_idle_destinations() {
         let json = config(serde_json::json!([
-            { "host": "Machine1.Internal", "server_node_id": node_id(1),
+            { "name": "Machine1", "server_node_id": node_id(1),
               "routed_domains": ["*.corp.example"], "routed_cidrs": ["10.0.0.0/8"] },
-            { "host": "m2.internal", "server_node_id": node_id(2) },
+            { "name": "m2", "server_node_id": node_id(2) },
         ]));
         let (handle, result) = start_inner(&json).expect("starts");
         assert_eq!(result, r#"{"socks_port":null}"#);
@@ -1102,7 +1106,7 @@ mod tests {
         assert_eq!(status["idle_timeout_secs"], DEFAULT_IDLE_TIMEOUT.as_secs());
         let destinations = status["destinations"].as_array().unwrap();
         assert_eq!(destinations.len(), 2);
-        assert_eq!(destinations[0]["host"], "machine1.internal");
+        assert_eq!(destinations[0]["name"], "machine1");
         assert_eq!(destinations[0]["server_node_id"], node_id(1));
         assert_eq!(destinations[0]["routed_domains"][0], "*.corp.example");
         assert_eq!(destinations[0]["routed_cidrs"][0], "10.0.0.0/8");
@@ -1122,7 +1126,7 @@ mod tests {
         let json = serde_json::json!({
             "auth_key": key.secret_str(),
             "idle_timeout_secs": 0,
-            "destinations": [{ "host": "m1.internal", "server_node_id": node_id(1) }],
+            "destinations": [{ "name": "m1", "server_node_id": node_id(1) }],
         })
         .to_string();
         let (handle, _) = start_inner(&json).expect("starts");
@@ -1203,14 +1207,21 @@ mod tests {
         assert!(start_error(&old.to_string()).contains("destinations"));
 
         assert!(start_error(&config(serde_json::json!([]))).contains("no destinations"));
-        let bad_id = config(serde_json::json!([{ "host": "m1.internal", "server_node_id": "nope" }]));
+        let bad_id = config(serde_json::json!([{ "name": "m1", "server_node_id": "nope" }]));
         let message = start_error(&bad_id);
-        assert!(message.contains("m1.internal") && message.contains("server_node_id"), "{message}");
-        let bad_host = config(serde_json::json!([{ "host": "10.0.0.1", "server_node_id": node_id(1) }]));
-        assert!(start_error(&bad_host).contains("IP address"));
+        assert!(message.contains("\"m1\"") && message.contains("server_node_id"), "{message}");
+        for bad_name in ["m1.internal", "10.0.0.1", "my_host", "-m1"] {
+            let bad = config(serde_json::json!([{ "name": bad_name, "server_node_id": node_id(1) }]));
+            assert!(start_error(&bad).contains("Destination name"), "{bad_name:?}");
+        }
+        let same_name = config(serde_json::json!([
+            { "name": "m1", "server_node_id": node_id(1) },
+            { "name": "M1", "server_node_id": node_id(2) },
+        ]));
+        assert!(start_error(&same_name).contains("more than once"));
         let same_server = config(serde_json::json!([
-            { "host": "m1.internal", "server_node_id": node_id(1) },
-            { "host": "m2.internal", "server_node_id": node_id(1) },
+            { "name": "m1", "server_node_id": node_id(1) },
+            { "name": "m2", "server_node_id": node_id(1) },
         ]));
         assert!(start_error(&same_server).contains("same server"));
     }

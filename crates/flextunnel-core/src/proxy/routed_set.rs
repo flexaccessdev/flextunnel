@@ -34,7 +34,8 @@
 //! The routed set is a VPN-style split-tunnel "included routes" set and is
 //! **optional** — an empty routed set routes nothing, never "tunnel
 //! everything". Two things reach a server outside of it: a client destination's
-//! own name, which is that server's loopback, and the server's status page
+//! `<name>.localhost.flextunnel.internal`, which is that server's loopback,
+//! and the server's status page
 //! (see [`super::signaling::StreamRequest`]). To tunnel *all* traffic, use the
 //! catch-alls: `*` for hostnames and `0.0.0.0/0` (+ `::/0`) for IPs.
 

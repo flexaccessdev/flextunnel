@@ -397,11 +397,11 @@ fn loopback_provider(lookup: MemoryLookup) -> (EndpointProvider, Built) {
     (provider, built)
 }
 
-/// A destination named `host` for the server `server_id`, authenticating with
-/// [`test_client_key`] and routing nothing beyond its own name.
-fn destination(host: &str, server_id: EndpointId) -> DestinationConfig {
+/// A destination called `name` for the server `server_id`, authenticating
+/// with [`test_client_key`] and routing nothing beyond its loopback name.
+fn destination(name: &str, server_id: EndpointId) -> DestinationConfig {
     DestinationConfig {
-        host: host.to_string(),
+        name: name.to_string(),
         server_id,
         auth: ClientAuth::Key(Box::new(test_client_key().clone())),
         relay: RelayConfig::default(),
@@ -425,17 +425,17 @@ struct TestClient {
 }
 
 impl TestClient {
-    fn status(&self, host: &str) -> DestinationStatus {
+    fn status(&self, name: &str) -> DestinationStatus {
         self.client
             .status()
             .destinations
             .into_iter()
-            .find(|d| d.host == host)
-            .unwrap_or_else(|| panic!("no destination {host}"))
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("no destination {name}"))
     }
 
-    fn state(&self, host: &str) -> DestinationState {
-        self.status(host).state
+    fn state(&self, name: &str) -> DestinationState {
+        self.status(name).state
     }
 
     /// How many endpoints the client has built so far.
@@ -567,7 +567,7 @@ async fn server_endpoint(secret: SecretKey) -> (Endpoint, EndpointAddr) {
 }
 
 /// Nothing happens until a destination is used: no endpoint is built, the
-/// server sees no client. The first request for the destination's own name
+/// server sees no client. The first request for the destination's loopback name
 /// connects it and reaches the server's loopback; the connection then stays
 /// for the next request.
 #[tokio::test]
@@ -576,27 +576,27 @@ async fn nothing_connects_before_first_use() {
     let (server_ep, server_addr) = server_endpoint(SecretKey::generate()).await;
     let server_id = server_ep.id();
     let bl_path = temp_blocklist("lazy-first-use");
-    // An empty routed set: the destination's own name needs no server config.
+    // An empty routed set: the destination's loopback name needs no server config.
     let server = spawn_server_handle(server_ep, base_params(server_id, bl_path.clone()));
 
     let client = start_client(
-        vec![destination("m1.internal", server_id)],
+        vec![destination("m1", server_id)],
         Some(Duration::from_secs(300)),
         MemoryLookup::from_endpoint_info(vec![server_addr]),
     )
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(client.built(), 0, "no endpoint before first use");
-    assert_eq!(client.state("m1.internal"), DestinationState::Idle);
+    assert_eq!(client.state("m1"), DestinationState::Idle);
     assert!(server.connected_client_keys().is_empty(), "the server saw nobody");
     // Looking at the client's status is not a use.
     let page = status_get(client.socks, "/status.json").await;
     assert!(page.contains("\"state\": \"idle\""), "{page}");
     assert_eq!(client.built(), 0, "the status page connects nothing");
 
-    let app = socks_echo(client.socks, "m1.internal", echo_port).await;
+    let app = socks_echo(client.socks, "m1.localhost.flextunnel.internal", echo_port).await;
     assert_eq!(client.built(), 1);
-    let status = client.status("m1.internal");
+    let status = client.status("m1");
     assert_eq!(status.state, DestinationState::Connected);
     assert_eq!(status.open_streams, 1);
     assert!(status.connected_since.is_some() && status.client_node_id.is_some());
@@ -605,11 +605,11 @@ async fn nothing_connects_before_first_use() {
     // The stream ends; the connection stays for the next request.
     drop(app);
     wait_until("the stream to be released", || {
-        client.status("m1.internal").open_streams == 0
+        client.status("m1").open_streams == 0
     })
     .await;
-    assert_eq!(client.state("m1.internal"), DestinationState::Connected);
-    let _app = socks_echo(client.socks, "m1.internal", echo_port).await;
+    assert_eq!(client.state("m1"), DestinationState::Connected);
+    let _app = socks_echo(client.socks, "m1.localhost.flextunnel.internal", echo_port).await;
     assert_eq!(client.built(), 1, "the second request reused the connection");
 
     let _ = std::fs::remove_file(bl_path);
@@ -627,26 +627,26 @@ async fn each_destination_reaches_its_own_server() {
     let server2 = spawn_server_handle(ep2, base_params(id2, temp_blocklist("two-dest-2")));
 
     let client = start_client(
-        vec![destination("m1.internal", id1), destination("m2.internal", id2)],
+        vec![destination("m1", id1), destination("m2", id2)],
         None,
         MemoryLookup::from_endpoint_info(vec![addr1, addr2]),
     )
     .await;
 
-    let _app2 = socks_echo(client.socks, "m2.internal", echo_port).await;
-    assert_eq!(client.state("m2.internal"), DestinationState::Connected);
-    assert_eq!(client.state("m1.internal"), DestinationState::Idle);
+    let _app2 = socks_echo(client.socks, "m2.localhost.flextunnel.internal", echo_port).await;
+    assert_eq!(client.state("m2"), DestinationState::Connected);
+    assert_eq!(client.state("m1"), DestinationState::Idle);
     assert_eq!(client.built(), 1);
     assert_eq!(server2.connected_client_keys().len(), 1);
     assert!(server1.connected_client_keys().is_empty(), "server 1 was never dialed");
 
-    let _app1 = socks_echo(client.socks, "M1.Internal", echo_port).await;
-    assert_eq!(client.state("m1.internal"), DestinationState::Connected);
+    let _app1 = socks_echo(client.socks, "M1.LocalHost.FlexTunnel.Internal", echo_port).await;
+    assert_eq!(client.state("m1"), DestinationState::Connected);
     assert_eq!(client.built(), 2, "each destination has its own endpoint");
     assert_eq!(server1.connected_client_keys().len(), 1);
     assert_ne!(
-        client.status("m1.internal").client_node_id,
-        client.status("m2.internal").client_node_id
+        client.status("m1").client_node_id,
+        client.status("m2").client_node_id
     );
 }
 
@@ -680,9 +680,9 @@ async fn routes_pick_the_destination_and_the_rest_goes_direct() {
         server_params(id2, "routes-2", &["db.corp.test"], &["127.0.0.0/8"]),
     );
 
-    let mut m1 = destination("m1.internal", id1);
+    let mut m1 = destination("m1", id1);
     m1.routed_domains = strings(&["*.corp.test"]);
-    let mut m2 = destination("m2.internal", id2);
+    let mut m2 = destination("m2", id2);
     m2.routed_domains = strings(&["db.corp.test"]);
     m2.routed_cidrs = strings(&["127.0.0.1"]);
     let client = start_client(
@@ -696,24 +696,24 @@ async fn routes_pick_the_destination_and_the_rest_goes_direct() {
     // `localhost` is on no list: dialed from here, nothing connects.
     let direct = socks_echo(client.socks, "localhost", echo_port).await;
     assert_eq!(client.built(), 0, "a direct target builds no endpoint");
-    assert_eq!((streams("m1.internal"), streams("m2.internal")), (0, 0));
+    assert_eq!((streams("m1"), streams("m2")), (0, 0));
     drop(direct);
 
     // A wildcard route → its destination.
     let api = socks_echo(client.socks, "api.corp.test", echo_port).await;
-    assert_eq!((streams("m1.internal"), streams("m2.internal")), (1, 0));
-    assert_eq!(client.state("m2.internal"), DestinationState::Idle);
+    assert_eq!((streams("m1"), streams("m2")), (1, 0));
+    assert_eq!(client.state("m2"), DestinationState::Idle);
 
     // An exact route on the other destination beats that wildcard.
     let db = socks_echo(client.socks, "db.corp.test", echo_port).await;
-    assert_eq!((streams("m1.internal"), streams("m2.internal")), (1, 1));
+    assert_eq!((streams("m1"), streams("m2")), (1, 1));
 
     // An IP (here in domain form) is routed by network.
     let ip = socks_echo(client.socks, "127.0.0.1", echo_port).await;
-    assert_eq!((streams("m1.internal"), streams("m2.internal")), (1, 2));
+    assert_eq!((streams("m1"), streams("m2")), (1, 2));
     // With the root dot it is the same address, dialed as one by the server.
     let dotted = socks_echo(client.socks, "127.0.0.1.", echo_port).await;
-    assert_eq!((streams("m1.internal"), streams("m2.internal")), (1, 3));
+    assert_eq!((streams("m1"), streams("m2")), (1, 3));
 
     drop((api, db, ip, dotted));
 }
@@ -726,7 +726,7 @@ async fn a_route_the_server_does_not_list_is_refused() {
     let server_id = server_ep.id();
     spawn_server_params(server_ep, base_params(server_id, temp_blocklist("route-refused")));
 
-    let mut m1 = destination("m1.internal", server_id);
+    let mut m1 = destination("m1", server_id);
     m1.routed_domains = strings(&["*.corp.test"]);
     let client = start_client(
         vec![m1],
@@ -737,7 +737,7 @@ async fn a_route_the_server_does_not_list_is_refused() {
     let (_app, rep) = socks_connect(client.socks, "api.corp.test", 443).await;
     assert_eq!(rep, signaling::REP_NOT_ALLOWED);
     // The destination did connect — the refusal is the server's answer.
-    assert_eq!(client.state("m1.internal"), DestinationState::Connected);
+    assert_eq!(client.state("m1"), DestinationState::Connected);
 }
 
 /// A destination reads what its server routes when it first connects, and
@@ -753,7 +753,7 @@ async fn a_destination_checks_its_routes_with_the_server_on_first_use() {
         HashMap::new(),
         strings(&["*.corp.test"]),
     );
-    let mut m1 = destination("m1.internal", server_id);
+    let mut m1 = destination("m1", server_id);
     m1.routed_domains = strings(&["*.corp.test", "*.other.test"]);
     let client = start_client(vec![m1], None, MemoryLookup::from_endpoint_info(vec![server_addr])).await;
 
@@ -770,21 +770,21 @@ async fn a_destination_checks_its_routes_with_the_server_on_first_use() {
     let pair = |rule: &str, server: &str| (rule.to_string(), server.to_string());
     assert_eq!(
         routes(&status_get(client.socks, "/status.json").await),
-        [pair("m1.internal", "loopback"), pair("*.other.test", "unchecked"), pair("*.corp.test", "unchecked")]
+        [pair("m1.localhost.flextunnel.internal", "loopback"), pair("*.other.test", "unchecked"), pair("*.corp.test", "unchecked")]
     );
     assert_eq!(client.built(), 0, "the status page connects nothing");
 
     // Any use connects; this one the server refuses.
     let (_app, rep) = socks_connect(client.socks, "x.other.test", 443).await;
     assert_eq!(rep, signaling::REP_NOT_ALLOWED);
-    wait_until("the server's routes are read", || client.status("m1.internal").server_routes.is_some()).await;
+    wait_until("the server's routes are read", || client.status("m1").server_routes.is_some()).await;
     assert_eq!(
-        client.status("m1.internal").server_routes,
+        client.status("m1").server_routes,
         Some(ServerRoutes { routed_domains: strings(&["*.corp.test"]), routed_cidrs: Vec::new() })
     );
     assert_eq!(
         routes(&status_get(client.socks, "/status.json").await),
-        [pair("m1.internal", "loopback"), pair("*.other.test", "not allowed"), pair("*.corp.test", "allowed")]
+        [pair("m1.localhost.flextunnel.internal", "loopback"), pair("*.other.test", "not allowed"), pair("*.corp.test", "allowed")]
     );
 }
 
@@ -830,7 +830,7 @@ async fn dialer_holds_while_the_server_comes_up() {
     });
 
     let client = start_client(
-        vec![destination("m1.internal", server_id)],
+        vec![destination("m1", server_id)],
         None,
         MemoryLookup::from_endpoint_info(vec![server_addr]),
     )
@@ -852,16 +852,16 @@ async fn dialer_holds_while_the_server_comes_up() {
         let dialer = dialer.clone();
         async move {
             dialer
-                .connect(&Target::Domain("m1.internal".into(), echo_port))
+                .connect(&Target::Domain("m1.localhost.flextunnel.internal".into(), echo_port))
                 .await
         }
     });
     wait_until("the first attempt to fail", || {
-        client.status("m1.internal").failed_attempts >= 1
+        client.status("m1").failed_attempts >= 1
     })
     .await;
     assert!(!pending.is_finished(), "the request is held, not failed");
-    let status = client.status("m1.internal");
+    let status = client.status("m1");
     assert_eq!(status.waiting, 1);
     assert!(status.last_error.is_some() && status.next_attempt_at.is_some());
 
@@ -870,7 +870,7 @@ async fn dialer_holds_while_the_server_comes_up() {
     up_tx.send_replace(true);
     let mut stream = with_timeout(pending).await.unwrap().expect("held request connects");
     expect_echo(&mut stream).await;
-    let status = client.status("m1.internal");
+    let status = client.status("m1");
     assert_eq!(status.state, DestinationState::Connected);
     assert_eq!(status.failed_attempts, 0, "a connection clears the outage");
     assert!(status.last_error.is_none());
@@ -892,16 +892,16 @@ async fn idle_connection_is_closed_and_redialed_on_demand() {
 
     let idle_timeout = Duration::from_millis(300);
     let client = start_client(
-        vec![destination("m1.internal", server_id)],
+        vec![destination("m1", server_id)],
         Some(idle_timeout),
         MemoryLookup::from_endpoint_info(vec![server_addr]),
     )
     .await;
 
     // In use: well past the idle timeout, the connection is still there.
-    let mut app = socks_echo(client.socks, "m1.internal", echo_port).await;
+    let mut app = socks_echo(client.socks, "m1.localhost.flextunnel.internal", echo_port).await;
     tokio::time::sleep(idle_timeout * 3).await;
-    assert_eq!(client.state("m1.internal"), DestinationState::Connected);
+    assert_eq!(client.state("m1"), DestinationState::Connected);
     app.write_all(b"more").await.unwrap();
     let mut echoed = [0u8; 4];
     with_timeout(app.read_exact(&mut echoed)).await.unwrap();
@@ -910,7 +910,7 @@ async fn idle_connection_is_closed_and_redialed_on_demand() {
     // Unused: it closes, and so does its endpoint.
     drop(app);
     wait_until("the idle connection to close", || {
-        client.state("m1.internal") == DestinationState::Idle
+        client.state("m1") == DestinationState::Idle
     })
     .await;
     let first = client.endpoint(0);
@@ -920,15 +920,15 @@ async fn idle_connection_is_closed_and_redialed_on_demand() {
     })
     .await;
     wait_until("the endpoint to be forgotten", || {
-        client.status("m1.internal").client_node_id.is_none()
+        client.status("m1").client_node_id.is_none()
     })
     .await;
-    assert_eq!(client.status("m1.internal").failed_attempts, 0, "idling is not a failure");
+    assert_eq!(client.status("m1").failed_attempts, 0, "idling is not a failure");
 
     // The next request redials, on a new endpoint.
-    let _app = socks_echo(client.socks, "m1.internal", echo_port).await;
+    let _app = socks_echo(client.socks, "m1.localhost.flextunnel.internal", echo_port).await;
     assert_eq!(client.built(), 2);
-    assert_eq!(client.state("m1.internal"), DestinationState::Connected);
+    assert_eq!(client.state("m1"), DestinationState::Connected);
 
     let _ = std::fs::remove_file(bl_path);
 }
@@ -950,28 +950,28 @@ async fn a_dropped_connection_is_redialed_only_on_demand() {
     // The lookup is held externally so the resurrected server's fresh address
     // can be published mid-test.
     let lookup = MemoryLookup::from_endpoint_info(vec![server_addr]);
-    let client = start_client(vec![destination("m1.internal", server_id)], None, lookup.clone()).await;
-    drop(socks_echo(client.socks, "m1.internal", echo_port).await);
+    let client = start_client(vec![destination("m1", server_id)], None, lookup.clone()).await;
+    drop(socks_echo(client.socks, "m1.localhost.flextunnel.internal", echo_port).await);
     wait_until("the stream to be released", || {
-        client.status("m1.internal").open_streams == 0
+        client.status("m1").open_streams == 0
     })
     .await;
 
     // Drop the connection out from under the session.
     server_ep.close().await;
     wait_until("the destination to go idle after the drop", || {
-        let status = client.status("m1.internal");
+        let status = client.status("m1");
         status.state == DestinationState::Idle && status.client_node_id.is_none()
     })
     .await;
-    let status = client.status("m1.internal");
+    let status = client.status("m1");
     assert_eq!(status.failed_attempts, 1, "the drop is recorded");
     assert!(status.last_error.is_some());
     let built = client.built();
 
     // Well past the first backoff step, still nothing has been tried.
     tokio::time::sleep(Duration::from_millis(2500)).await;
-    let status = client.status("m1.internal");
+    let status = client.status("m1");
     assert_eq!(status.state, DestinationState::Idle);
     assert_eq!(status.failed_attempts, 1, "no attempt without a request");
     assert_eq!(client.built(), built, "no endpoint without a request");
@@ -983,8 +983,8 @@ async fn a_dropped_connection_is_redialed_only_on_demand() {
     spawn_server_params(server_ep2, base_params(server_id, bl_path.clone()));
 
     // A request brings the destination back.
-    let _app = socks_echo(client.socks, "m1.internal", echo_port).await;
-    let status = client.status("m1.internal");
+    let _app = socks_echo(client.socks, "m1.localhost.flextunnel.internal", echo_port).await;
+    let status = client.status("m1");
     assert_eq!(status.state, DestinationState::Connected);
     assert_eq!(status.failed_attempts, 0);
     assert_eq!(client.built(), built + 1);
@@ -1009,20 +1009,20 @@ async fn a_request_is_held_until_the_server_is_back() {
     spawn_server_params(server_ep.clone(), base_params(server_id, bl_path.clone()));
 
     let lookup = MemoryLookup::from_endpoint_info(vec![server_addr]);
-    let client = start_client(vec![destination("m1.internal", server_id)], None, lookup.clone()).await;
-    drop(socks_echo(client.socks, "m1.internal", echo_port).await);
+    let client = start_client(vec![destination("m1", server_id)], None, lookup.clone()).await;
+    drop(socks_echo(client.socks, "m1.localhost.flextunnel.internal", echo_port).await);
 
     // Drop the connection out from under the session and wait for it to notice.
     server_ep.close().await;
     wait_until("the client to notice the drop", || {
-        client.state("m1.internal") != DestinationState::Connected
+        client.state("m1") != DestinationState::Connected
     })
     .await;
 
     // Issue the request during the outage: the SOCKS handshake completes (the
     // listener is up), but the CONNECT reply is held while the destination
     // waits out its backoff and redials.
-    let mut app = socks_request(client.socks, "m1.internal", echo_port).await;
+    let mut app = socks_request(client.socks, "m1.localhost.flextunnel.internal", echo_port).await;
     let mut reply = [0u8; 10];
     // Peeked, not read: nothing of a reply that did arrive would be consumed,
     // and only the timeout — no byte and no close — means it is being held.
@@ -1032,7 +1032,7 @@ async fn a_request_is_held_until_the_server_is_back() {
         early.is_err(),
         "the request was answered (or the connection closed) instead of held: {early:?}"
     );
-    assert_eq!(client.status("m1.internal").waiting, 1);
+    assert_eq!(client.status("m1").waiting, 1);
 
     // Resurrect the server on the same identity and publish its new address.
     let (server_ep2, server_addr2) = server_endpoint(server_secret).await;
@@ -1069,7 +1069,7 @@ async fn a_kept_destination_reconnects_by_rebuilding_a_dead_endpoint() {
     let bl_path = temp_blocklist("rebuild-endpoint");
     spawn_server_params(server_ep, base_params(server_id, bl_path.clone()));
 
-    let mut kept = destination("m1.internal", server_id);
+    let mut kept = destination("m1", server_id);
     kept.keep_connected = true;
     let client = start_client(
         vec![kept],
@@ -1078,9 +1078,9 @@ async fn a_kept_destination_reconnects_by_rebuilding_a_dead_endpoint() {
         MemoryLookup::from_endpoint_info(vec![server_addr]),
     )
     .await;
-    let connected = || client.state("m1.internal") == DestinationState::Connected;
+    let connected = || client.state("m1") == DestinationState::Connected;
     wait_until("the kept destination to connect unasked", connected).await;
-    let first_id = client.status("m1.internal").client_node_id;
+    let first_id = client.status("m1").client_node_id;
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(connected(), "a kept destination is not closed as idle");
 
@@ -1100,7 +1100,7 @@ async fn a_kept_destination_reconnects_by_rebuilding_a_dead_endpoint() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert_ne!(
-        client.status("m1.internal").client_node_id,
+        client.status("m1").client_node_id,
         first_id,
         "recovery must have swapped in a freshly built endpoint"
     );
@@ -1134,17 +1134,17 @@ async fn a_rejected_key_fails_fast_and_spares_the_other_destination() {
     spawn_server_params(ep2, base_params(id2, temp_blocklist("rejected-2")));
 
     let client = start_client(
-        vec![destination("m1.internal", id1), destination("m2.internal", id2)],
+        vec![destination("m1", id1), destination("m2", id2)],
         None,
         MemoryLookup::from_endpoint_info(vec![addr1, addr2]),
     )
     .await;
 
     let started = Instant::now();
-    let (_app, rep) = socks_connect(client.socks, "m1.internal", echo_port).await;
+    let (_app, rep) = socks_connect(client.socks, "m1.localhost.flextunnel.internal", echo_port).await;
     assert_eq!(rep, signaling::REP_NOT_ALLOWED);
     assert!(started.elapsed() < Duration::from_secs(5), "not held for the full window");
-    let status = client.status("m1.internal");
+    let status = client.status("m1");
     assert_eq!(status.state, DestinationState::Failed);
     assert!(
         status.last_error.as_deref().unwrap_or_default().contains("Authentication failed"),
@@ -1154,14 +1154,14 @@ async fn a_rejected_key_fails_fast_and_spares_the_other_destination() {
 
     // Asked again right away: refused without another dial.
     let started = Instant::now();
-    let (_app, rep) = socks_connect(client.socks, "m1.internal", echo_port).await;
+    let (_app, rep) = socks_connect(client.socks, "m1.localhost.flextunnel.internal", echo_port).await;
     assert_eq!(rep, signaling::REP_NOT_ALLOWED);
     assert!(started.elapsed() < Duration::from_millis(500), "failed fast");
-    assert_eq!(client.status("m1.internal").failed_attempts, 1, "no second dial");
+    assert_eq!(client.status("m1").failed_attempts, 1, "no second dial");
 
     // The other destination works as if nothing happened.
-    let _app = socks_echo(client.socks, "m2.internal", echo_port).await;
-    assert_eq!(client.state("m2.internal"), DestinationState::Connected);
+    let _app = socks_echo(client.socks, "m2.localhost.flextunnel.internal", echo_port).await;
+    assert_eq!(client.state("m2"), DestinationState::Connected);
 }
 
 /// `http://flextunnel.internal/servers/<destination>/…` is that server's own
@@ -1179,7 +1179,7 @@ async fn a_servers_status_page_is_fetched_through_the_client() {
     spawn_server_params(server_ep, params);
 
     let client = start_client(
-        vec![destination("m1.internal", server_id)],
+        vec![destination("m1", server_id)],
         None,
         MemoryLookup::from_endpoint_info(vec![server_addr]),
     )
@@ -1191,18 +1191,18 @@ async fn a_servers_status_page_is_fetched_through_the_client() {
     assert_eq!(client.built(), 0);
 
     // JSON through SOCKS: the server's own view, node id and routed set.
-    let response = status_get(client.socks, "/servers/m1.internal/status.json").await;
+    let response = status_get(client.socks, "/servers/m1/status.json").await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response:.60}");
     let body = response.split_once("\r\n\r\n").expect("headers").1;
     let status: serde_json::Value = serde_json::from_str(body).expect("server JSON status");
     assert_eq!(status["server_node_id"], server_id.to_string());
     assert_eq!(status["routed_domains"], serde_json::json!(["marker.example.com"]));
     assert_eq!(client.built(), 1, "fetching it connected the destination");
-    assert_eq!(client.state("m1.internal"), DestinationState::Connected);
+    assert_eq!(client.state("m1"), DestinationState::Connected);
 
     // HTML at the bare path. It is the server's content under the client's
     // own host name, so the client sends it with an origin of its own.
-    let response = status_get(client.socks, "/servers/m1.internal/").await;
+    let response = status_get(client.socks, "/servers/m1/").await;
     assert!(response.contains("Content-Type: text/html"), "{response:.200}");
     assert!(response.contains("flextunnel server status"));
     assert!(response.contains("marker.example.com"));
@@ -1216,7 +1216,7 @@ async fn a_servers_status_page_is_fetched_through_the_client() {
     // Through the HTTP proxy as a plain GET, with `Accept` picking text.
     let mut app = TcpStream::connect(client.http).await.unwrap();
     app.write_all(
-        b"GET http://flextunnel.internal/servers/m1.internal HTTP/1.1\r\n\
+        b"GET http://flextunnel.internal/servers/m1 HTTP/1.1\r\n\
           Host: flextunnel.internal\r\nAccept: text/plain\r\n\r\n",
     )
     .await
@@ -1345,7 +1345,7 @@ async fn listener_addresses_are_reported_only_while_served() {
     let server_id = spawn_server(server_ep, temp_blocklist("listen-addrs"));
     let lookup = MemoryLookup::from_endpoint_info(vec![server_addr]);
 
-    let client = start_client(vec![destination("m1.internal", server_id)], None, lookup.clone()).await;
+    let client = start_client(vec![destination("m1", server_id)], None, lookup.clone()).await;
     // Reported once the session is serving them (it starts on its own task).
     wait_until("the listeners to be reported", || {
         let status = client.client.status();
@@ -1361,13 +1361,13 @@ async fn listener_addresses_are_reported_only_while_served() {
     .await;
     // Listener-only: the destination managers are still running.
     let dialer = client.client.dialer();
-    let target = Target::Domain("m1.internal".into(), echo_port);
+    let target = Target::Domain("m1.localhost.flextunnel.internal".into(), echo_port);
     let mut stream = with_timeout(dialer.connect(&target)).await.expect("still tunnels");
     expect_echo(&mut stream).await;
     drop(stream);
 
     // The session ending withdraws them too, without any close signal.
-    let other = start_client(vec![destination("m1.internal", server_id)], None, lookup).await;
+    let other = start_client(vec![destination("m1", server_id)], None, lookup).await;
     wait_until("the second session's listeners to be reported", || {
         other.client.status().socks_listen.is_some()
     })
@@ -1406,7 +1406,7 @@ async fn a_forward_connects_its_destination_and_relays() {
 
     // The client routes more than the server allows: loopback (allowed) and a
     // domain the server does not list.
-    let mut m1 = destination("m1.internal", server_id);
+    let mut m1 = destination("m1", server_id);
     m1.routed_cidrs = strings(&["127.0.0.0/8"]);
     m1.routed_domains = strings(&["off-list.invalid"]);
     let client = start_client(
@@ -1434,7 +1434,7 @@ async fn a_forward_connects_its_destination_and_relays() {
     // A forward that is merely listening connects nothing.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(client.built(), 0);
-    assert_eq!(client.state("m1.internal"), DestinationState::Idle);
+    assert_eq!(client.state("m1"), DestinationState::Idle);
 
     let mut local = None;
     for _ in 0..50 {
@@ -1450,8 +1450,8 @@ async fn a_forward_connects_its_destination_and_relays() {
     // The first forwarded connection brings the destination up.
     expect_echo(&mut local).await;
     assert_eq!(manager.statuses()[0].active, 1);
-    assert_eq!(client.state("m1.internal"), DestinationState::Connected);
-    assert_eq!(client.status("m1.internal").open_streams, 1);
+    assert_eq!(client.state("m1"), DestinationState::Connected);
+    assert_eq!(client.status("m1").open_streams, 1);
 
     // Routed by the client but not by the server: the server says no.
     let rejected = dialer
@@ -1789,7 +1789,7 @@ async fn open_stream(conn: &Connection, request: StreamRequest) -> (SendStream, 
 
 /// End-to-end loopback request: [`StreamRequest::Loopback`] reaches
 /// `localhost:<port>` on the server with an empty routed set (deny-all) and no
-/// host alias — what a client destination's own name asks for.
+/// host alias — what a client destination's loopback name asks for.
 #[tokio::test]
 async fn loopback_request_dials_the_servers_own_loopback() {
     let echo_port = spawn_echo().await;
@@ -1844,6 +1844,7 @@ async fn reserved_names_are_refused_as_targets() {
         "FlexTunnel.Internal",
         "sub.flextunnel.internal",
         "localhost.flextunnel.internal",
+        "m1.localhost.flextunnel.internal",
     ] {
         let request = StreamRequest::Connect(Target::Domain(host.to_string(), 80));
         let (_send, _recv, rep) = open_stream(&conn, request).await;

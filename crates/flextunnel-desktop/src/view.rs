@@ -26,11 +26,11 @@ use iced::widget::{
 use iced::{Center, Color, Element, Fill, Font};
 use std::net::SocketAddr;
 
-/// One destination's routing input: `(host, routed domains, routed CIDRs)`.
+/// One destination's routing input: `(name, routed domains, routed CIDRs)`.
 type RouteKey = (String, Vec<String>, Vec<String>);
 
 /// The forwards' advisory routing table — which destination carries each, if
-/// any — rebuilt only when a destination's host or routes change.
+/// any — rebuilt only when a destination's name or routes change.
 #[derive(Default)]
 pub struct RoutedCache {
     /// What the table was built from, per destination; `None` before the
@@ -44,7 +44,7 @@ pub struct RoutedCache {
 }
 
 /// Rebuild the advisory routing table over `destinations` only when their
-/// hosts or routes changed.
+/// names or routes changed.
 pub fn refresh_routed_cache<'a, I>(cache: &mut RoutedCache, destinations: I)
 where
     I: IntoIterator<Item = &'a Destination>,
@@ -53,8 +53,8 @@ where
     let destinations = destinations.into_iter();
     let fresh = cache.built_from.as_ref().is_some_and(|built| {
         built.len() == destinations.clone().count()
-            && built.iter().zip(destinations.clone()).all(|((host, domains, cidrs), d)| {
-                *host == d.host && *domains == d.routed_domains && *cidrs == d.routed_cidrs
+            && built.iter().zip(destinations.clone()).all(|((name, domains, cidrs), d)| {
+                *name == d.name && *domains == d.routed_domains && *cidrs == d.routed_cidrs
             })
     });
     if !fresh {
@@ -66,7 +66,7 @@ where
         };
         cache.built_from = Some(
             destinations
-                .map(|d| (d.host.clone(), d.routed_domains.clone(), d.routed_cidrs.clone()))
+                .map(|d| (d.name.clone(), d.routed_domains.clone(), d.routed_cidrs.clone()))
                 .collect(),
         );
     }
@@ -82,10 +82,10 @@ fn is_full_tunnel(domains: &[String], cidrs: &[String]) -> bool {
         && cidrs.iter().any(|c| c == "::/0")
 }
 
-/// The host of the destination that carries a forward, by the client's
+/// The name of the destination that carries a forward, by the client's
 /// routing: `Some(None)` when none does, `None` when unknown (no badge).
-/// Mirrors the core's routing decision — a destination's own host, or a host
-/// on its routed lists — and matters more for a forward than for the proxy: a
+/// Mirrors the core's routing decision — a destination's loopback name, or a
+/// host on its routed lists — and matters more for a forward than for the proxy: a
 /// forward never connects directly, so one whose host nothing routes can only
 /// fail.
 fn forward_route<'a>(
@@ -95,7 +95,7 @@ fn forward_route<'a>(
     let table = table?;
     let target = Target::Domain(forward.remote_host.clone(), forward.remote_port);
     Some(match table.route(&target) {
-        Route::Tunnel { dest, .. } => table.hosts().nth(dest),
+        Route::Tunnel { dest, .. } => table.names().nth(dest),
         _ => None,
     })
 }
@@ -113,7 +113,7 @@ fn forward_route_labels<'a>(
         return (saved, None);
     };
     let after_restart = saved.filter(|saved| *saved != running).map(|saved| match saved {
-        Some(host) => format!("after restart: via {host}"),
+        Some(name) => format!("after restart: via {name}"),
         None => "after restart: no route".to_string(),
     });
     (Some(running), after_restart)
@@ -584,7 +584,7 @@ fn sidebar_destination_row<'a>(
     let content = column![
         row![
             dot(color, 8.0),
-            text(destination.host.as_str()).size(13).font(semibold()),
+            text(destination.name.as_str()).size(13).font(semibold()),
         ]
         .spacing(7)
         .align_y(Center),
@@ -859,8 +859,9 @@ fn client_detail(app: &App) -> Element<'_, Message> {
         col = col.push(container(info).padding([12, 14]).width(Fill).style(style::card));
         col = col.push(
             text(
-                "Point a proxy-aware app at either one. A request for a destination's host \
-                 or one of its routes goes through that destination; anything else connects \
+                "Point a proxy-aware app at either one. A request for a destination's \
+                 <name>.localhost.flextunnel.internal or one of its routes goes through that \
+                 destination; anything else connects \
                  directly from this computer.",
             )
             .size(11)
@@ -920,7 +921,7 @@ fn client_detail(app: &App) -> Element<'_, Message> {
             text(
                 "Forwards listen on localhost only (127.0.0.1 and ::1) and always go \
                  through a destination, never directly — so the remote host must be a \
-                 destination's host or one of its routes. That server rejects targets \
+                 destination's <name>.localhost.flextunnel.internal or one of its routes. That server rejects targets \
                  outside its tunnel set.",
             )
             .size(11)
@@ -1003,7 +1004,7 @@ fn forward_form_view<'a>(app: &'a App, form: &'a ForwardForm) -> Element<'a, Mes
         form_row(
             "Remote host",
             input(
-                "a destination's host, or one of its routes",
+                "<name>.localhost.flextunnel.internal, or a route",
                 &form.remote_host,
                 Message::FormRemoteHostChanged,
             ),
@@ -1064,8 +1065,8 @@ fn forward_card<'a>(app: &'a App, forward: &'a PortForward) -> Element<'a, Messa
     let saved = forward_route(app.routed_cache.table.as_ref(), forward);
     let (route, after_restart) = forward_route_labels(running, saved);
     match route {
-        Some(Some(host)) => {
-            title = title.push(text(format!("via {host}")).size(11).style(style::dim_text));
+        Some(Some(name)) => {
+            title = title.push(text(format!("via {name}")).size(11).style(style::dim_text));
         }
         Some(None) => title = title.push(pill("no route".to_string(), AMBER)),
         None => {}
@@ -1131,7 +1132,7 @@ fn destination_detail<'a>(app: &'a App, destination: &'a Destination) -> Element
 
     let mut hero = row![
         dot(color, 12.0),
-        text(destination.host.as_str()).size(20).font(semibold()),
+        text(destination.name.as_str()).size(20).font(semibold()),
         pill(label.to_string(), color),
     ]
     .spacing(10)
@@ -1211,7 +1212,7 @@ fn destination_detail<'a>(app: &'a App, destination: &'a Destination) -> Element
     let node_id = destination.server_node_id.clone();
     let copy_node = (!node_id.is_empty()).then(|| node_id.clone());
     let mut info = column![
-        info_row("Host", destination.host.clone(), Some(destination.host.clone())),
+        info_row("Name", destination.name.clone(), Some(destination.name.clone())),
         // The full id never fits (and iced has no ellipsis overflow); both
         // ends stay visible for eyeballing, Copy carries the whole thing.
         info_row("Server node id", truncate_middle(&node_id, 22), copy_node),
@@ -1300,9 +1301,9 @@ fn destination_detail<'a>(app: &'a App, destination: &'a Destination) -> Element
 
 fn routes_section<'a>(app: &'a App, destination: &'a Destination) -> Element<'a, Message> {
     let mut col = column![].spacing(3);
-    // The destination's own name is always the server itself.
+    // The destination's loopback name is always the server itself.
     col = col.push(text("This server's own loopback, on any port:").size(12));
-    col = col.push(route_row(destination.host.clone(), None));
+    col = col.push(route_row(reserved::loopback_host(&destination.name), None));
 
     col = col.push(space().height(8));
     let (domains, cidrs) = (&destination.routed_domains, &destination.routed_cidrs);
@@ -1375,14 +1376,14 @@ fn routes_section<'a>(app: &'a App, destination: &'a Destination) -> Element<'a,
         }
     }
 
-    // The server's own status page — its tunnel set, host aliases and DNS
-    // forwards — is fetched through the client's status endpoint, so it
+    // The server's own status page — its tunnel set and host aliases — is
+    // fetched through the client's status endpoint, so it
     // needs a proxy to ask through. Opening it connects the destination.
     if app.client.socks_port.is_some() || app.client.http_port.is_some() {
         col = col.push(space().height(8));
         col = col.push(text("The server's status page, through the client's proxy:").size(12));
         col = col.push(route_row(
-            format!("http://{}/servers/{}/", reserved::STATUS_HOST, destination.host),
+            format!("http://{}/servers/{}/", reserved::STATUS_HOST, destination.name),
             None,
         ));
     }
@@ -1396,11 +1397,12 @@ fn destination_form_view<'a>(app: &'a App, form: &'a DestinationForm) -> Element
     let validated = form.validate(&app.client.destinations, &app.keys);
 
     let mut card = column![
-        // The name this server goes by: `<host>:<port>` reaches the server's
+        // The name this server goes by:
+        // `<name>.localhost.flextunnel.internal:<port>` reaches the server's
         // own loopback.
         form_row(
-            "Host",
-            input("a name for this server, e.g. nas.internal", &form.host, Message::DestinationHostChanged),
+            "Name",
+            input("one DNS label for this server, e.g. nas", &form.name, Message::DestinationNameChanged),
         ),
         form_row(
             "Server node id",
@@ -1550,8 +1552,10 @@ fn destination_form_view<'a>(app: &'a App, form: &'a DestinationForm) -> Element
             "NEW DESTINATION"
         }),
         container(card).padding([12, 14]).width(Fill).style(style::card),
-        text("The host is your name for this server: host:port through the proxy, or as a \
-              forward's remote host, reaches that port on the server machine itself. Auth \
+        text("The name is yours for this server, one DNS label unique among the destinations \
+              (letters, digits and hyphens): <name>.localhost.flextunnel.internal:<port> \
+              through the proxy, or as a forward's remote host, reaches that port on the \
+              server machine itself. Auth \
               keys are shared — any number of destinations can pick the same one (manage \
               them in the Keys pane). The server must authorize the key's public half: on \
               a flextunnel desktop server under Authorized clients, on a CLI server in its \
@@ -2428,7 +2432,7 @@ fn key_card<'a>(app: &'a App, key: &'a AuthKey) -> Element<'a, Message> {
         .destinations
         .iter()
         .filter(|d| d.auth_key_id == key.id)
-        .map(|d| d.host.as_str())
+        .map(|d| d.name.as_str())
         .collect();
     let confirming = app.confirm_delete_key.as_deref() == Some(key.id.as_str());
     let exporting = app.confirm_export_key.as_deref() == Some(key.id.as_str());
@@ -2805,7 +2809,7 @@ mod tests {
     #[test]
     fn full_tunnel_derivation() {
         let strings = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(!is_full_tunnel(&[], &[]), "no routes: only the host is tunneled");
+        assert!(!is_full_tunnel(&[], &[]), "no routes: only the loopback name is tunneled");
         assert!(!is_full_tunnel(&strings(&["example.com"]), &[]));
         // Each catch-all covers its own kind of target only.
         assert!(!is_full_tunnel(&strings(&["example.com", "*"]), &[]), "hostnames alone");
@@ -2818,7 +2822,7 @@ mod tests {
     /// shown as what a restart will bring, never as the running client's.
     #[test]
     fn a_forward_shows_the_running_route_and_the_pending_one() {
-        let (a, b) = (Some(Some("a.internal")), Some(Some("b.internal")));
+        let (a, b) = (Some(Some("a")), Some(Some("b")));
         // Not running: the saved destinations are what a start will use.
         assert_eq!(forward_route_labels(None, a), (a, None));
         assert_eq!(forward_route_labels(None, Some(None)), (Some(None), None));
@@ -2828,7 +2832,7 @@ mod tests {
         // Running on older settings: the running route, and the change to come.
         assert_eq!(
             forward_route_labels(a, b),
-            (a, Some("after restart: via b.internal".to_string()))
+            (a, Some("after restart: via b".to_string()))
         );
         assert_eq!(
             forward_route_labels(a, Some(None)),
@@ -2836,7 +2840,7 @@ mod tests {
         );
         assert_eq!(
             forward_route_labels(Some(None), b),
-            (Some(None), Some("after restart: via b.internal".to_string()))
+            (Some(None), Some("after restart: via b".to_string()))
         );
         // The saved destinations no longer make a table: only what runs.
         assert_eq!(forward_route_labels(a, None), (a, None));
@@ -2846,7 +2850,7 @@ mod tests {
     fn a_forward_names_the_destination_that_carries_it() {
         let spec = |host, domains: &'static [String], cidrs: &'static [String]| {
             flextunnel_core::proxy::RouteSpec {
-                host,
+                name: host,
                 routed_domains: domains,
                 routed_cidrs: cidrs,
             }
@@ -2854,8 +2858,8 @@ mod tests {
         let corp: &'static [String] = Box::leak(Box::new(["*.corp.example".to_string()]));
         let ten: &'static [String] = Box::leak(Box::new(["10.0.0.0/8".to_string()]));
         let table = RouteTable::new(&[
-            spec("nas.internal", corp, &[]),
-            spec("lab.internal", &[], ten),
+            spec("nas", corp, &[]),
+            spec("lab", &[], ten),
         ])
         .unwrap();
         let forward = |host: &str| PortForward {
@@ -2867,18 +2871,18 @@ mod tests {
             enabled: true,
         };
         for (host, via) in [
-            ("nas.internal", "nas.internal"),
-            ("db.corp.example", "nas.internal"),
-            ("lab.internal", "lab.internal"),
-            ("10.1.2.3", "lab.internal"),
+            ("nas.localhost.flextunnel.internal", "nas"),
+            ("db.corp.example", "nas"),
+            ("lab.localhost.flextunnel.internal", "lab"),
+            ("10.1.2.3", "lab"),
         ] {
             assert_eq!(forward_route(Some(&table), &forward(host)), Some(Some(via)), "{host}");
         }
-        for unrouted in ["example.org", "192.168.1.1", "localhost"] {
+        for unrouted in ["example.org", "192.168.1.1", "localhost", "nas"] {
             assert_eq!(forward_route(Some(&table), &forward(unrouted)), Some(None), "{unrouted}");
         }
         // Routes that do not validate: no verdict, no badge.
-        assert_eq!(forward_route(None, &forward("nas.internal")), None);
+        assert_eq!(forward_route(None, &forward("nas.localhost.flextunnel.internal")), None);
     }
 
     /// A destination that rests after a failed attempt (a refused key, once
@@ -2886,7 +2890,7 @@ mod tests {
     #[test]
     fn an_idle_destination_shows_its_failed_attempt() {
         let status = |state, last_error: Option<&str>| flextunnel_core::proxy::DestinationStatus {
-            host: "nas.internal".into(),
+            name: "nas".into(),
             server_node_id: String::new(),
             state,
             connected_since: None,
@@ -2926,7 +2930,7 @@ mod tests {
     fn the_route_cache_rebuilds_only_on_a_routing_change() {
         let destination = |host: &str, domains: &[&str]| Destination {
             id: host.into(),
-            host: host.into(),
+            name: host.into(),
             server_node_id: format!("node-{host}"),
             routed_domains: domains.iter().map(|d| d.to_string()).collect(),
             routed_cidrs: Vec::new(),
@@ -2935,12 +2939,12 @@ mod tests {
             relay_auth_token: None,
         };
         let mut client = ClientSettings {
-            destinations: vec![destination("nas.internal", &["*.corp.example"])],
+            destinations: vec![destination("nas", &["*.corp.example"])],
             ..ClientSettings::default()
         };
         let mut cache = RoutedCache::default();
         refresh_routed_cache(&mut cache, &client.destinations);
-        assert_eq!(cache.table.as_ref().unwrap().hosts().count(), 1);
+        assert_eq!(cache.table.as_ref().unwrap().names().count(), 1);
 
         // Not a routing change: the table is kept as it is.
         client.destinations[0].auth_key_id = "k".into();
@@ -2949,9 +2953,9 @@ mod tests {
         refresh_routed_cache(&mut cache, &client.destinations);
         assert_eq!(cache.built_from, before);
 
-        client.destinations.push(destination("lab.internal", &[]));
+        client.destinations.push(destination("lab", &[]));
         refresh_routed_cache(&mut cache, &client.destinations);
-        assert_eq!(cache.table.as_ref().unwrap().hosts().count(), 2);
+        assert_eq!(cache.table.as_ref().unwrap().names().count(), 2);
 
         // Two destinations claiming one rule: no table, so no badges.
         client.destinations[1].routed_domains = vec!["*.corp.example".into()];

@@ -8,8 +8,8 @@
  * may run a SOCKS5 listener for WKWebView; forwarding-only sessions omit it and
  * use local forward listeners owned by the Rust core.
  *
- * One client reaches any number of servers — its "destinations", each a host
- * name for one server — and connects to a server only when something is first
+ * One client reaches any number of servers — its "destinations", each a name
+ * for one server — and connects to a server only when something is first
  * sent to it, closing the connection again once it has gone unused. Starting a
  * session therefore connects nothing.
  *
@@ -23,7 +23,7 @@
  *        at a time; a second start while one is live returns NULL.
  *   3. flextunnel_health(handle) -> 1 running / 0 ended / -1 null  (poll)
  *   -  flextunnel_status(handle, buf, len)                (per-destination state; poll)
- *   -  flextunnel_conn_path(handle, host, buf, len)       (on-demand path readout)
+ *   -  flextunnel_conn_path(handle, name, buf, len)       (on-demand path readout)
  *   -  flextunnel_set_background(handle, 1|0)             (scene-phase changes)
  *   -  flextunnel_set_network_available(handle, 1|0)      (NWPathMonitor updates)
  *   -  flextunnel_close_listeners(handle)                 (just before suspension)
@@ -87,7 +87,7 @@ int flextunnel_client_public_key(const char *secret_key, char *out_buf, size_t o
  *   {"auth_key":"ed25519-sec:...","socks_port":0,
  *    "relay_urls":[],"relay_auth_token":null,"idle_timeout_secs":300,
  *    "destinations":[
- *      {"host":"machine1.internal","server_node_id":"<id>",
+ *      {"name":"machine1","server_node_id":"<id>",
  *       "routed_domains":["*.corp.example"],"routed_cidrs":["10.0.0.0/8"]}]}
  *   auth_key is this client's secret key (from flextunnel_generate_client_key
  *   or `flexaccess-keys generate-auth-key`); its public half must be on each
@@ -102,10 +102,11 @@ int flextunnel_client_public_key(const char *secret_key, char *out_buf, size_t o
  *   idle_timeout_secs is optional: how long a destination's connection is kept
  *   with no stream open on it. Omitted means 300; 0 means never close one for
  *   idleness.
- *   destinations is required, with at least one entry. host names the server:
- *   "<host>:<port>" through the client is that port on the server's own
- *   loopback. Any host name except an IP address, "localhost", or one under
- *   "flextunnel.internal"; hosts and server ids must each be unique.
+ *   destinations is required, with at least one entry. name names the server:
+ *   one DNS label (letters, digits and inner hyphens, up to 63,
+ *   case-insensitive); "<name>.localhost.flextunnel.internal:<port>" through
+ *   the client is that port on the server's own loopback. Names and server
+ *   ids must each be unique.
  *   routed_domains (exact name, "*.suffix", or "*") and routed_cidrs (network
  *   or bare IP) are optional further targets sent through that server, which
  *   must route them too — its own routed set is the allowlist. The same rule
@@ -169,7 +170,8 @@ ptrdiff_t flextunnel_fetch_server_routes(const char *request_json, char *out_buf
  * connection opens a QUIC data stream through the destination that routes
  * remote_host — connecting that destination first if it is idle; no SOCKS5
  * proxy is involved. remote_host is routed like a proxy request (a
- * destination's own host is that server's loopback), and the server enforces
+ * destination's <name>.localhost.flextunnel.internal is that server's
+ * loopback), and the server enforces
  * its routed-set whitelist. A forward never connects directly: an enabled
  * forward whose remote_host no destination routes is invalid input.
  *
@@ -243,7 +245,7 @@ int flextunnel_health(const FlextunnelHandle *handle);
  * Snapshot the client's destinations as JSON into out_buf:
  *   {"idle_timeout_secs":300,
  *    "destinations":[
- *     {"host":"machine1.internal","server_node_id":"…",
+ *     {"name":"machine1","server_node_id":"…",
  *      "state":"connected","connected_secs":42,
  *      "open_streams":1,"waiting":0,"client_node_id":"…",
  *      "failed_attempts":0,"next_attempt_secs":null,"last_error":null,
@@ -272,7 +274,7 @@ int flextunnel_health(const FlextunnelHandle *handle);
  * device, so the caller has nothing to enforce. A server's own view (its
  * routed set, host aliases) is its status page,
  * reachable through the SOCKS proxy at
- *   http://flextunnel.internal/servers/<host>/status.json
+ *   http://flextunnel.internal/servers/<name>/status.json
  * and the client's own at http://flextunnel.internal/status.json.
  *
  * Reading this never causes a connection.
@@ -285,7 +287,7 @@ int flextunnel_health(const FlextunnelHandle *handle);
 int flextunnel_status(const FlextunnelHandle *handle, char *out_buf, size_t out_len);
 
 /*
- * Snapshot the iroh path(s) of the connection to the destination named `host`
+ * Snapshot the iroh path(s) of the connection to the destination called `name`
  * as JSON into out_buf, mirroring `ezvpn client status`:
  *   {"paths":[
  *     {"kind":"direct","display":"Direct 1.2.3.4:52186 (rtt 1ms)","selected":true},
@@ -297,7 +299,7 @@ int flextunnel_status(const FlextunnelHandle *handle, char *out_buf, size_t out_
  * showing ALL discovered paths (not just the selected one). kind is "direct",
  * "relay", or "other" (forward-compatible catch-all); selected marks the path
  * iroh routes over right now. The whole snapshot is EMPTY while the destination
- * is not connected (idle, connecting, backing off) or when `host` names no
+ * is not connected (idle, connecting, backing off) or when `name` names no
  * destination, so only offer this for a destination flextunnel_status reports
  * "connected". Asking never connects it.
  *
@@ -314,11 +316,11 @@ int flextunnel_status(const FlextunnelHandle *handle, char *out_buf, size_t out_
  * interval is the cheap proxy for the tunnel's radio cost.
  *
  * Returns 1 on success (full JSON written), 0 if out_buf was too small (the JSON
- * is truncated; retry larger), and -1 for a NULL handle or an unusable `host`
+ * is truncated; retry larger), and -1 for a NULL handle or an unusable `name`
  * (NULL or not UTF-8). out_buf is always NUL-terminated when usable (non-NULL,
  * out_len > 0); the -1 returns write an empty string.
  */
-int flextunnel_conn_path(const FlextunnelHandle *handle, const char *host,
+int flextunnel_conn_path(const FlextunnelHandle *handle, const char *name,
                          char *out_buf, size_t out_len);
 
 /*

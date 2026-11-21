@@ -26,7 +26,7 @@ pub use destination::{
     ClientAuth, DestinationConfig, DestinationState, DestinationStatus, EndpointProvider,
 };
 pub use forward::{ForwardManager, ForwardSpec, ForwardState, ForwardStatus};
-pub use route_table::{Route, RouteSpec, RouteTable, validate_destination_host};
+pub use route_table::{Route, RouteSpec, RouteTable, validate_destination_name};
 pub use routed_set::RoutedSet;
 pub use server::{ProxyServer, ProxyServerParams};
 pub use server_routes::{ServerRoutes, fetch_server_routes};
