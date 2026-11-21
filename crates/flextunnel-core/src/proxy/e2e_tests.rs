@@ -727,8 +727,11 @@ async fn routes_pick_the_destination_and_the_rest_goes_direct() {
     // An IP (here in domain form) is routed by network.
     let ip = socks_echo(client.socks, "127.0.0.1", echo_port).await;
     assert_eq!((streams("m1.internal"), streams("m2.internal")), (1, 2));
+    // With the root dot it is the same address, dialed as one by the server.
+    let dotted = socks_echo(client.socks, "127.0.0.1.", echo_port).await;
+    assert_eq!((streams("m1.internal"), streams("m2.internal")), (1, 3));
 
-    drop((api, db, ip));
+    drop((api, db, ip, dotted));
 }
 
 /// A client route its server does not also list is refused by that server:

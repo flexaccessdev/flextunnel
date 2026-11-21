@@ -447,7 +447,7 @@ pub(crate) fn routing_key(host: &str) -> &str {
     }
 }
 
-fn parse_ip_literal(host: &str) -> Option<IpAddr> {
+pub(crate) fn parse_ip_literal(host: &str) -> Option<IpAddr> {
     // `10.0.0.1.` is the same address: classified as an IP, it is gated by
     // the CIDRs alike everywhere — in config and in a target.
     let host = routing_key(host);

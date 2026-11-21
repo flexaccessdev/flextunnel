@@ -214,7 +214,8 @@ fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
 
 /// A destination's server routes as one line for the pages: the lists the
 /// server sent (the last known ones while they are read again, or with why
-/// reading them again failed), `unchecked`, or why they could not be read.
+/// reading them again failed), that they are being read, `unchecked`, or why
+/// they could not be read.
 fn server_routes_line(d: &DestinationStatus) -> String {
     match (&d.server_routes, &d.server_routes_error) {
         (Some(routes), error) => {
@@ -230,6 +231,10 @@ fn server_routes_line(d: &DestinationStatus) -> String {
                 Some(error) => format!("{lists} (last known; reading them again failed: {error})"),
                 None => lists,
             }
+        }
+        (None, None) if d.server_routes_pending => "being read".to_string(),
+        (None, Some(error)) if d.server_routes_pending => {
+            format!("being read again (the last read failed: {error})")
         }
         (None, Some(error)) => format!("unreadable: {error}"),
         (None, None) => "unchecked (read on the first connection)".to_string(),
@@ -903,6 +908,20 @@ mod tests {
         let (_, _, text) = render_at(&status, &table, StatusFormat::Text, now);
         assert!(text.contains("-> m1.internal, server: allowed (last known)"), "{text}");
         assert!(text.contains("10.0.0.0/9 (last known; reading them again)"), "{text}");
+
+        // With nothing read yet, a read in progress says so — a first one, or
+        // one retrying after a failure — instead of the failure or
+        // "unchecked".
+        let idle = &mut status.destinations[2];
+        idle.server_routes_pending = true;
+        let (_, _, text) = render_at(&status, &table, StatusFormat::Text, now);
+        assert!(text.contains("server routes: being read\n"), "{text}");
+        status.destinations[2].server_routes_error = Some("refused".to_string());
+        let (_, _, text) = render_at(&status, &table, StatusFormat::Text, now);
+        assert!(text.contains("server routes: being read again (the last read failed: refused)"), "{text}");
+        status.destinations[2].server_routes_pending = false;
+        let (_, _, text) = render_at(&status, &table, StatusFormat::Text, now);
+        assert!(text.contains("server routes: unreadable: refused"), "{text}");
     }
 
     #[test]

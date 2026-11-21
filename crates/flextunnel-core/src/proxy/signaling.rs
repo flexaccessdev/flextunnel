@@ -189,6 +189,23 @@ pub enum Target {
     Domain(String, u16),
 }
 
+impl Target {
+    /// This target as the address it names when its host is an IP literal in
+    /// domain form — `10.0.0.1`, `[fd00::1]`, `10.0.0.1.` — read the way the
+    /// routed set reads one; any other target unchanged. What the CIDRs let
+    /// through is then dialed as that address, never handed to a host alias
+    /// or a resolver.
+    pub fn into_numeric(self) -> Self {
+        match self {
+            Self::Domain(host, port) => match super::routed_set::parse_ip_literal(&host) {
+                Some(ip) => Self::Ip(SocketAddr::new(ip, port)),
+                None => Self::Domain(host, port),
+            },
+            ip => ip,
+        }
+    }
+}
+
 /// What a client asks the server for on one per-connection stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamRequest {
@@ -374,6 +391,27 @@ pub fn map_io_err(e: &io::Error) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An IP literal in domain form is the address it names, however it is
+    /// spelled; a hostname, or something only a hostname can be, stays one.
+    #[test]
+    fn a_numeric_domain_target_is_an_address() {
+        let domain = |host: &str| Target::Domain(host.to_string(), 80);
+        for (host, ip) in [
+            ("127.0.0.1", "127.0.0.1:80"),
+            ("127.0.0.1.", "127.0.0.1:80"),
+            ("fd00::1", "[fd00::1]:80"),
+            ("[fd00::1]", "[fd00::1]:80"),
+            ("[fd00::1].", "[fd00::1]:80"),
+        ] {
+            assert_eq!(domain(host).into_numeric(), Target::Ip(ip.parse().unwrap()), "{host}");
+        }
+        for host in ["example.com", "example.com.", "127.0.0.1..", "10.1"] {
+            assert_eq!(domain(host).into_numeric(), domain(host), "{host}");
+        }
+        let ip = Target::Ip("10.0.0.1:22".parse().unwrap());
+        assert_eq!(ip.clone().into_numeric(), ip);
+    }
 
     #[tokio::test]
     async fn request_roundtrips_every_kind() {

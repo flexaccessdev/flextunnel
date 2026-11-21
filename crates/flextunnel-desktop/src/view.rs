@@ -39,6 +39,8 @@ pub struct RoutedCache {
     /// `None` when the destinations do not make a valid table: the client
     /// then cannot start, and no badge is shown.
     pub table: Option<RouteTable>,
+    /// Why they do not, when they do not.
+    pub error: Option<String>,
 }
 
 /// Rebuild the advisory routing table over `destinations` only when their
@@ -56,9 +58,12 @@ where
             })
     });
     if !fresh {
-        cache.table = config::route_table_of(destinations.clone())
-            .inspect_err(|e| log::debug!("Routes unusable for the forward badges: {e}"))
-            .ok();
+        let table = config::route_table_of(destinations.clone())
+            .inspect_err(|e| log::debug!("Routes unusable for the forward badges: {e}"));
+        (cache.table, cache.error) = match table {
+            Ok(table) => (Some(table), None),
+            Err(e) => (None, Some(e)),
+        };
         cache.built_from = Some(
             destinations
                 .map(|d| (d.host.clone(), d.routed_domains.clone(), d.routed_cidrs.clone()))
@@ -787,9 +792,11 @@ fn client_detail(app: &App) -> Element<'_, Message> {
                 .style(style::dim_text),
         );
     }
+    // The routes' check comes from the saved table's cache, which every
+    // message brings up to date: a redraw builds no table.
     if client.enabled
         && !running
-        && let Some(blocker) = client.start_blocker(&app.keys)
+        && let Some(blocker) = client.start_blocker_with(&app.keys, || app.routed_cache.error.clone())
     {
         let add = client
             .destinations
@@ -1342,6 +1349,8 @@ fn routes_section<'a>(app: &'a App, destination: &'a Destination) -> Element<'a,
             (Some(_), _) if status.server_routes_pending => {
                 Some(format!("Reading the server's routes again. {earlier}"))
             }
+            // A read in progress after none succeeded: not yet a failure.
+            (None, _) if status.server_routes_pending => Some("Reading the server's routes…".to_string()),
             (Some(_), Some(error)) => {
                 Some(format!("Could not read the server's routes again: {error}. {earlier}"))
             }

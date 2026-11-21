@@ -234,6 +234,18 @@ impl ClientSettings {
     /// used blocks the whole client rather than being left out: its routes
     /// would otherwise quietly connect directly.
     pub fn start_blocker(&self, keys: &[AuthKey]) -> Option<String> {
+        self.start_blocker_with(keys, || self.route_table().err())
+    }
+
+    /// [`Self::start_blocker`], with why the destinations' hosts and routes do
+    /// not make a routing table (if they don't) from `routes_error`, asked
+    /// only when nothing else blocks — the view takes it from its cached
+    /// table instead of building one on every redraw.
+    pub fn start_blocker_with(
+        &self,
+        keys: &[AuthKey],
+        routes_error: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
         if self.destinations.is_empty() {
             return Some("Add a destination to start the client.".into());
         }
@@ -258,9 +270,7 @@ impl ClientSettings {
                 Some(_) => {}
             }
         }
-        self.route_table()
-            .err()
-            .map(|e| format!("Fix the destinations' hosts and routes: {e}"))
+        routes_error().map(|e| format!("Fix the destinations' hosts and routes: {e}"))
     }
 
     pub fn is_ready(&self, keys: &[AuthKey]) -> bool {
