@@ -103,6 +103,10 @@ use flextunnel_core::proxy::{
 use flextunnel_core::transport::endpoint::RelayConfig;
 use flextunnel_core::transport::paths::ConnPathKind;
 
+/// The thread a routes request runs on (see
+/// [`flextunnel_fetch_server_routes`]).
+const ROUTES_THREAD_NAME: &str = "flextunnel-routes";
+
 /// Bound on [`flextunnel_stop`]'s graceful close of the client's endpoints.
 /// Closing waits out an endpoint still being built (see
 /// `ProxyClient::close`), which in the worst case takes as long as a relay
@@ -437,7 +441,7 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
 
 /// Ask a server what it routes — its own `routed_domains` and `routed_cidrs`
 /// — so a destination being set up can be filled in to match. One connection
-/// made for the question and closed again, on an endpoint and a runtime of its
+/// made for the question and closed again, on an endpoint and a thread of its
 /// own: it needs no handle and touches no running session.
 ///
 /// `request_json` names the server and how to reach it, as a destination for
@@ -468,7 +472,9 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
 ///
 /// **Blocks** until the server has answered or an attempt has failed — a few
 /// seconds as a rule, about a minute against a server that never answers — so
-/// call it off the main thread. Nothing is retried.
+/// call it off the main thread. Nothing is retried. The request's endpoint
+/// closes after the answer, on the request's own thread: the call does not
+/// wait for it.
 ///
 /// # Safety
 /// - `request_json` must be a valid, NUL-terminated UTF-8 C string.
@@ -513,15 +519,13 @@ fn fetch_server_routes_inner(json: &str) -> Result<String, String> {
         .parse()
         .map_err(|e| format!("invalid server_node_id: {e}"))?;
 
-    // The calling thread drives the one connection; it is blocked on the
-    // answer either way.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
-    let routes = runtime
-        .block_on(flextunnel_core::proxy::fetch_server_routes(server_id, &key, &relay))
-        .map_err(|e| e.to_string())?;
+    // The request has a thread of its own, which stays to close the endpoint
+    // once this one has the answer.
+    let routes =
+        flextunnel_core::proxy::fetch_server_routes(ROUTES_THREAD_NAME, server_id, key, relay)
+            .blocking_recv()
+            .map_err(|_| "the routes request could not be started".to_string())?
+            .map_err(|e| e.to_string())?;
     serde_json::to_string(&routes).map_err(|e| format!("failed to encode the routes: {e}"))
 }
 

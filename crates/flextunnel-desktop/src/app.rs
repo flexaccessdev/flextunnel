@@ -580,7 +580,9 @@ impl DestinationForm {
         self.routes_fetch = match fetched {
             Ok(routes) => {
                 let mut rules = routes.routed_domains.iter().chain(&routes.routed_cidrs);
-                match rules.find(|rule| split_list(rule) != [rule.as_str()]) {
+                // A server trims its entries and reports them as configured,
+                // so padding is not a second rule.
+                match rules.find(|rule| split_list(rule) != [rule.trim()]) {
                     Some(odd) => RoutesFetch::Failed(format!(
                         "The server lists {odd:?}, which these fields cannot hold as one rule. \
                          Nothing was filled in."
@@ -593,8 +595,11 @@ impl DestinationForm {
                                 "Filled in the server's {domains} domain(s) and {cidrs} CIDR(s)."
                             ),
                         };
-                        self.routed_domains = routes.routed_domains.join(", ");
-                        self.routed_cidrs = routes.routed_cidrs.join(", ");
+                        let field = |rules: &[String]| {
+                            rules.iter().map(|rule| rule.trim()).collect::<Vec<_>>().join(", ")
+                        };
+                        self.routed_domains = field(&routes.routed_domains);
+                        self.routed_cidrs = field(&routes.routed_cidrs);
                         RoutesFetch::Filled(filled)
                     }
                 }
@@ -2549,15 +2554,9 @@ impl App {
         self.routes_fetch_seq += 1;
         let id = self.routes_fetch_seq;
         form.routes_fetch = RoutesFetch::Fetching(id);
-        let answer = tunnel::fetch_server_routes(query);
-        Task::perform(
-            async move {
-                answer
-                    .await
-                    .unwrap_or_else(|_| Err("The request to the server could not be made".into()))
-            },
-            move |fetched| Message::ServerRoutesFetched(id, fetched),
-        )
+        Task::perform(tunnel::fetch_server_routes(query), move |fetched| {
+            Message::ServerRoutesFetched(id, fetched)
+        })
     }
 
     /// Whether a save just now left a running client on the settings from
@@ -3392,6 +3391,22 @@ mod tests {
         assert_eq!(saved.routed_domains, routes().routed_domains);
         assert_eq!(saved.routed_cidrs, routes().routed_cidrs);
 
+        // Padding around an entry is not part of the rule: a server trims
+        // it away too, and reports the entry as it was configured.
+        form.routes_fetch = RoutesFetch::Fetching(13);
+        form.routes_fetched(
+            13,
+            Ok(ServerRoutes {
+                routed_domains: vec![" padded.example ".into(), "nas.example".into()],
+                routed_cidrs: vec![" 10.0.0.0/8\t".into()],
+            }),
+        );
+        assert_eq!(form.routed_domains, "padded.example, nas.example");
+        assert_eq!(form.routed_cidrs, "10.0.0.0/8");
+        let saved = form.validate(&[], &keys).unwrap();
+        assert_eq!(saved.routed_domains, ["padded.example", "nas.example"]);
+        assert_eq!(saved.routed_cidrs, ["10.0.0.0/8"]);
+
         // A server with no lists empties the fields, and says so.
         form.routes_fetch = RoutesFetch::Fetching(8);
         form.routes_fetched(8, Ok(ServerRoutes::default()));
@@ -3440,7 +3455,6 @@ mod tests {
         for (domains, cidrs) in [
             (vec!["ok.example", "db.example, api.example"], vec!["10.0.0.0/8"]),
             (vec!["ok.example"], vec!["10.0.0.0/8,192.168.0.0/16"]),
-            (vec![" padded.example"], vec![]),
             (vec![","], vec![]),
         ] {
             let mut form = valid_form();

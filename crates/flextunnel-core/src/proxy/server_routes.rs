@@ -23,14 +23,7 @@ use iroh::{Endpoint, EndpointId};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
-use std::time::Duration;
-
-/// Bound wait on the graceful close of a routes request's endpoint. The close
-/// waits for the peer to acknowledge it and for the endpoint's own tasks, with
-/// no deadline of its own, and the answer — the routes, or why there are none
-/// — is already in hand by then: it must not be held back by a slow teardown.
-/// The close runs as its own task and is never cancelled by this wait.
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+use tokio::sync::oneshot;
 
 /// What a server routes: its `routed_domains` and `routed_cidrs` as
 /// configured, in the syntax a destination's own lists use.
@@ -50,50 +43,78 @@ impl ServerRoutes {
 }
 
 /// Ask the server `server_id` what it routes, authenticating with `key` and
-/// reaching it through `relay` — what a destination for it would use.
+/// reaching it through `relay` — what a destination for it would use. The
+/// answer arrives on the returned channel; a request that could not be started
+/// at all drops it.
 ///
-/// One attempt, on an endpoint of its own that is closed before this returns:
-/// a server that is unreachable, or that does not authorize `key`
-/// ([`ProxyError::AuthenticationFailed`]), is an error and nothing is
-/// retried. Each step is bounded (the endpoint's relay probe, the connect,
-/// the handshake, the status exchange, and the wait for the endpoint's close
-/// — [`CLOSE_TIMEOUT`], after which the close is left to finish by itself),
-/// so the whole can take about a minute against a server that never answers.
-pub async fn fetch_server_routes(
+/// One attempt, on an endpoint of its own: a server that is unreachable, or
+/// that does not authorize `key` ([`ProxyError::AuthenticationFailed`]), is an
+/// error and nothing is retried. Each step is bounded (the endpoint's relay
+/// probe, the connect, the handshake, the status exchange), so the answer can
+/// take about a minute against a server that never answers.
+///
+/// The request has a thread named `thread_name` and a runtime to itself, and
+/// both last until its endpoint has closed, which comes after the answer: the
+/// close waits for the peer to acknowledge it and for the endpoint's own
+/// tasks, with no deadline of its own, and must neither hold the answer back
+/// nor be cut short by a caller that has what it asked for.
+pub fn fetch_server_routes(
+    thread_name: &str,
     server_id: EndpointId,
-    key: &ClientKey,
-    relay: &RelayConfig,
-) -> ProxyResult<ServerRoutes> {
-    let auth = ClientAuth::Key(Box::new(key.clone()));
-    let relay = relay.clone();
-    // On a task of its own, so that a caller giving up on the answer never
-    // drops a bound endpoint half-way: it must be closed, not dropped.
-    let fetch = tokio::spawn(async move {
-        let endpoint = create_client_endpoint(&relay).await.map_err(|e| {
-            ProxyError::Signaling(format!("Failed to create the iroh endpoint: {e:#}"))
-        })?;
+    key: ClientKey,
+    relay: RelayConfig,
+) -> oneshot::Receiver<ProxyResult<ServerRoutes>> {
+    on_own_thread(thread_name, move |answer| async move {
+        let auth = ClientAuth::Key(Box::new(key));
+        let endpoint = match create_client_endpoint(&relay).await {
+            Ok(endpoint) => endpoint,
+            Err(e) => {
+                let failure = format!("Failed to create the iroh endpoint: {e:#}");
+                log::warn!("Asking server {server_id} for its routes failed: {failure}");
+                let _ = answer.send(Err(ProxyError::Signaling(failure)));
+                return;
+            }
+        };
         let routes = fetch_over(&endpoint.endpoint(), server_id, &relay, &auth).await;
-        // On every outcome. A close cut short by the caller's runtime going
-        // away has still begun, which is what keeps the endpoint's drop from
-        // tearing it down ungracefully.
-        if !closed_within(CLOSE_TIMEOUT, async move { endpoint.close().await }).await {
-            log::warn!(
-                "The routes request's endpoint is slow to close; leaving it to finish in the \
-                 background"
-            );
+        if let Err(e) = &routes {
+            log::warn!("Asking server {server_id} for its routes failed: {e}");
         }
-        routes
-    });
-    fetch
-        .await
-        .map_err(|e| ProxyError::Signaling(format!("the routes request did not finish: {e}")))?
+        // The answer first, then the close, on every outcome.
+        let _ = answer.send(routes);
+        endpoint.close().await;
+    })
 }
 
-/// Run `close` on a task of its own and wait up to `limit` for it. Returns
-/// whether it finished in time; when it did not, it keeps running.
-async fn closed_within(limit: Duration, close: impl Future<Output = ()> + Send + 'static) -> bool {
-    let mut close = tokio::spawn(close);
-    tokio::time::timeout(limit, &mut close).await.is_ok()
+/// Run `request` on a thread named `thread_name` with a runtime of its own,
+/// handing it the sender of the returned channel. Thread and runtime last
+/// until the request's future ends — not merely until it has answered — so
+/// what it does after answering runs to its end. A thread that cannot be
+/// spawned drops the channel.
+fn on_own_thread<T, F>(
+    thread_name: &str,
+    request: impl FnOnce(oneshot::Sender<ProxyResult<T>>) -> F + Send + 'static,
+) -> oneshot::Receiver<ProxyResult<T>>
+where
+    T: Send + 'static,
+    F: Future<Output = ()>,
+{
+    let (answer_tx, answer) = oneshot::channel();
+    let spawned = std::thread::Builder::new().name(thread_name.into()).spawn(move || {
+        match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(runtime) => runtime.block_on(request(answer_tx)),
+            Err(e) => {
+                let _ = answer_tx.send(Err(ProxyError::Signaling(format!(
+                    "Failed to build a runtime for the request: {e:#}"
+                ))));
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        // The sender went down with the closure, so the receiver reports a
+        // dropped request; say why here.
+        log::error!("Failed to spawn the {thread_name} thread for a request: {e:#}");
+    }
+    answer
 }
 
 /// [`fetch_server_routes`] from a bound `endpoint`, which stays the caller's
@@ -186,26 +207,27 @@ mod tests {
         );
     }
 
-    /// A close that takes its time holds the answer back for the limit and no
-    /// longer — and goes on by itself, rather than being cut off.
-    #[tokio::test(start_paused = true)]
-    async fn a_slow_close_is_waited_for_only_so_long() {
-        assert!(closed_within(CLOSE_TIMEOUT, async {}).await);
-
-        let (release, released) = tokio::sync::oneshot::channel::<()>();
-        let (done, mut finished) = tokio::sync::oneshot::channel::<()>();
-        let started = tokio::time::Instant::now();
-        let in_time = closed_within(CLOSE_TIMEOUT, async move {
+    /// A request's answer is there as soon as it is sent, and what the request
+    /// does afterwards — closing its endpoint — still runs to its end: the
+    /// thread and runtime are not gone with the answer.
+    #[test]
+    fn a_request_goes_on_after_its_answer() {
+        let (release, released) = oneshot::channel::<()>();
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let answer = on_own_thread("test-request", move |answer| async move {
+            let _ = answer.send(Ok(7));
+            // The close: it needs the runtime, well after the answer.
             let _ = released.await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             let _ = done.send(());
-        })
-        .await;
-        assert!(!in_time);
-        assert_eq!(started.elapsed(), CLOSE_TIMEOUT);
-        assert!(finished.try_recv().is_err(), "still closing");
+        });
 
+        assert_eq!(answer.blocking_recv().expect("answered").unwrap(), 7);
+        assert!(finished.try_recv().is_err(), "still closing");
         release.send(()).unwrap();
-        finished.await.expect("the close ran to its end");
+        finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the request ran to its end");
     }
 
     /// JSON that is no status page — a list missing, or of the wrong shape —

@@ -330,48 +330,28 @@ pub struct RoutesQuery {
 /// Ask a server what it routes (see
 /// [`flextunnel_core::proxy::fetch_server_routes`]): one connection made for
 /// the question, whatever the client session is doing — it need not be
-/// running, nor know the server. The answer arrives on the returned channel.
+/// running, nor know the server.
 ///
 /// The request runs on a thread and runtime of its own, named like the client
 /// session's so its log lines are filed with the client's. It always runs to
-/// its end — the endpoint it binds is closed there — even when nobody waits
-/// for the answer any more.
-pub fn fetch_server_routes(
-    query: RoutesQuery,
-) -> tokio::sync::oneshot::Receiver<Result<ServerRoutes, String>> {
-    let (answer_tx, answer) = tokio::sync::oneshot::channel();
-    let spawned = std::thread::Builder::new()
-        .name(CLIENT_THREAD_NAME.into())
-        .spawn(move || {
-            let fetched = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("Failed to build a runtime to ask the server: {e:#}"))
-                .and_then(|rt| {
-                    rt.block_on(flextunnel_core::proxy::fetch_server_routes(
-                        query.server_id,
-                        &query.key,
-                        &query.relay,
-                    ))
-                    .map_err(|e| match e {
-                        ProxyError::AuthenticationFailed(reason) => format!(
-                            "The server refused this client ({reason}): it must authorize the \
-                             auth key's public half before it answers."
-                        ),
-                        e => e.to_string(),
-                    })
-                });
-            if let Err(reason) = &fetched {
-                log::warn!("Asking server {} for its routes failed: {reason}", query.server_id);
-            }
-            let _ = answer_tx.send(fetched);
-        });
-    if let Err(e) = spawned {
-        // The sender went down with the closure, so the receiver reports a
-        // dropped request; say why here.
-        log::error!("Failed to spawn the thread asking the server for its routes: {e:#}");
+/// its end — the endpoint it binds is closed there, after the answer — even
+/// when nobody waits for the answer any more.
+pub async fn fetch_server_routes(query: RoutesQuery) -> Result<ServerRoutes, String> {
+    let answer = flextunnel_core::proxy::fetch_server_routes(
+        CLIENT_THREAD_NAME,
+        query.server_id,
+        query.key,
+        query.relay,
+    );
+    match answer.await {
+        Ok(Ok(routes)) => Ok(routes),
+        Ok(Err(ProxyError::AuthenticationFailed(reason))) => Err(format!(
+            "The server refused this client ({reason}): it must authorize the auth key's \
+             public half before it answers."
+        )),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("The request to the server could not be made".into()),
     }
-    answer
 }
 
 /// Bind a local listener, mapping the common taken-port case to a clear

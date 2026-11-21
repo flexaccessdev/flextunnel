@@ -145,7 +145,9 @@ FlextunnelHandle *flextunnel_start(const char *config_json, char *out_buf, size_
  *
  * BLOCKS until the server has answered or the one attempt has failed — a few
  * seconds as a rule, about a minute against a server that never answers — so
- * call it off the main thread. Nothing is retried.
+ * call it off the main thread. Nothing is retried. The request's endpoint
+ * closes after the answer, on a thread of the request's own: the call does not
+ * wait for it.
  *
  * Returns the byte count the JSON needs including the trailing NUL once the
  * server has answered, or -1 on failure. As with flextunnel_forward_statuses,

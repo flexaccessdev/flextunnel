@@ -266,7 +266,9 @@ What a server routes can be read, though, to set a destination up to match:
 config, and makes one connection of its own — endpoint, dial, auth handshake,
 a status stream for `/status.json`, close — returning the two lists from the
 server's status page. It is a single attempt outside any `ProxyClient`, so it
-works before the destination exists. The desktop app's destination form
+works before the destination exists. The request runs on a thread and runtime
+of its own that outlive the answer: the endpoint's close comes after it, and
+neither holds the answer back nor is cut short once the caller has it. The desktop app's destination form
 (*Fetch from server*) and the FFI (`flextunnel_fetch_server_routes`) offer the
 result for the user to save; the wire protocol is unchanged.
 
@@ -398,7 +400,6 @@ catches accidental identity reuse.
 | `liveness_window(interval)` / server `LIVENESS_WINDOW` | 3 × interval + 3s / 183s | `transport/mod.rs` |
 | `REBUILD_CLOSE_TIMEOUT` (client endpoint rebuild, old endpoint close) | 5s | `transport/endpoint.rs` |
 | `IDLE_CLOSE_TIMEOUT` (idle destination, endpoint close) | 5s | `proxy/destination.rs` |
-| `CLOSE_TIMEOUT` (routes request, endpoint close) | 5s | `proxy/server_routes.rs` |
 | `DEFAULT_IDLE_TIMEOUT` (unused connection kept) | 300s | `config.rs` |
 | `CONNECT_TIMEOUT` (client server connect) | 30s | `proxy/client.rs` |
 | `HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs`, `proxy/server.rs` |
