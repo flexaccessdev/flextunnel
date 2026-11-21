@@ -145,7 +145,8 @@ showing the endpoint id it gives — and *Create server* goes straight on to aut
   to send it here. Always reachable by its clients, under the name each gives
   this server: this computer's own `localhost` at
   `<name>.localhost.flextunnel.internal`, and this server's status page at
-  `http://flextunnel.internal/servers/<name>/`.
+  `http://flextunnel.internal/servers/<name>/` (through a proxy the client has
+  enabled).
 - **Restart to apply** — the server runs with the settings it started with;
   after a change (a client authorized, the tunnel set edited, a new identity)
   its pane offers *Restart now*. Removing a client applies at once: the server

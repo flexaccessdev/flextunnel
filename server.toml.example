@@ -48,7 +48,8 @@ authorized_keys_file = "./authorized_keys"
 # client, independent of the set: this machine's own `localhost` on any port
 # (at `<name>.localhost.flextunnel.internal`, `<name>` being the client's
 # destination name for this server), and this server's status page
-# (`http://flextunnel.internal/servers/<name>/`). With both lists omitted, clients reach just those
+# (`http://flextunnel.internal/servers/<name>/`, through the client's SOCKS5 or
+# HTTP proxy). With both lists omitted, clients reach just those
 # through this server (an empty set never means "tunnel everything").
 #
 # Domain entries are exact (`example.com`), wildcard (`*.example.com`, subdomains
