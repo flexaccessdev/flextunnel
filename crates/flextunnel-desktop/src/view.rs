@@ -1144,22 +1144,6 @@ fn destination_detail<'a>(app: &'a App, destination: &'a Destination) -> Element
                 .style(style::dim_text),
         );
     }
-    hero = hero.push(space().width(Fill));
-    // Connecting is on demand; this asks for one attempt now, to see whether
-    // the server is reachable without sending anything to it.
-    if let Some(status) = status
-        && matches!(
-            status.state,
-            DestinationState::Idle | DestinationState::Backoff | DestinationState::Failed
-        )
-    {
-        hero = hero.push(
-            button(text("Connect now").size(13).font(semibold()))
-                .padding([7, 16])
-                .style(style::primary)
-                .on_press(Message::ConnectNow(destination.id.clone())),
-        );
-    }
 
     let mut col = column![hero].spacing(12);
     if let Some(notice) = &app.notice {
@@ -1185,7 +1169,7 @@ fn destination_detail<'a>(app: &'a App, destination: &'a Destination) -> Element
             let explain = match status.state {
                 DestinationState::Idle if status.last_error.is_some() => Some(
                     "Not connected: the last attempt failed. It is tried again when \
-                     something next needs it, or with Connect now.",
+                     something next needs it.",
                 ),
                 DestinationState::Idle => Some(
                     "Not connected right now — it connects when something is sent to it.",
@@ -1831,14 +1815,16 @@ fn server_detail<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
             tunnel = tunnel.push(indented_item(cidr));
         }
     }
-    tunnel = tunnel.push(indented_label("always reachable by clients:"));
+    tunnel = tunnel.push(indented_label(
+        "always reachable by clients (<name> is each client's name for this server):",
+    ));
     tunnel = tunnel.push(indented_note_item(
-        "<the client's name for this server>",
+        "<name>.localhost.flextunnel.internal",
         "this machine's localhost, on any port",
     ));
     tunnel = tunnel.push(indented_note_item(
-        "the server status page",
-        "through the client's flextunnel.internal",
+        "flextunnel.internal/servers/<name>/",
+        "this server's status page",
     ));
     let relays = if server.relay_urls.is_empty() {
         "default".to_string()
@@ -2243,9 +2229,10 @@ fn server_form_view<'a>(app: &'a App, form: &'a ServerForm) -> Element<'a, Messa
             "TUNNEL SET & RELAYS",
             server_settings_card(app, form),
             "The tunnel set decides what else clients may reach through this server; \
-             both lists are optional, since this machine's localhost (under the name \
-             a client gives this server) and the server's status page are always \
-             reachable. A client must list a route itself to send it here. Clients \
+             both lists are optional, since this machine's localhost (at \
+             <name>.localhost.flextunnel.internal, <name> being the client's name for \
+             this server) and its status page (flextunnel.internal/servers/<name>/) \
+             are always reachable. A client must list a route itself to send it here. Clients \
              are authorized on the server pane.",
         ),
     };

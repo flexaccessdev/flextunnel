@@ -56,8 +56,7 @@ they reach. It is one session for all of them.
   connected when something is first sent to it — the request waits while it
   connects — and disconnected again once nothing has used it for five minutes,
   when it shows **idle**. A dropped connection is likewise re-established when
-  something next needs it, not before. *Connect now* on a destination's pane
-  asks for one attempt right away, to see whether the server is reachable.
+  something next needs it, not before.
 - **Enabled** — the client's only on/off control: a switch on its pane (and
   *Enable/Disable Client* in the tray). An enabled client runs: it starts with
   the app (at login or by hand), and as soon as it becomes startable — its
@@ -143,9 +142,10 @@ showing the endpoint id it gives — and *Create server* goes straight on to aut
 - **Tunnel set & relays** — the routed domains/CIDRs clients may reach through
   this server, enforced here, plus custom relays; optional, and edited any
   time. Clients route by their own lists, so a client must also list a route
-  to send it here. This computer's own `localhost` is always reachable by its
-  clients, under the name each gives this server
-  (`<name>.localhost.flextunnel.internal`).
+  to send it here. Always reachable by its clients, under the name each gives
+  this server: this computer's own `localhost` at
+  `<name>.localhost.flextunnel.internal`, and this server's status page at
+  `http://flextunnel.internal/servers/<name>/`.
 - **Restart to apply** — the server runs with the settings it started with;
   after a change (a client authorized, the tunnel set edited, a new identity)
   its pane offers *Restart now*. Removing a client applies at once: the server

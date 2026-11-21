@@ -147,9 +147,6 @@ pub enum Message {
     AddDestination,
     EditDestination(DestinationId),
     DeleteDestination(DestinationId),
-    /// Ask the running client for one connection attempt to the destination
-    /// now, instead of waiting for its first use.
-    ConnectNow(DestinationId),
     // Destination form
     DestinationNameChanged(String),
     ServerNodeIdChanged(String),
@@ -1645,12 +1642,6 @@ impl App {
             }
             Message::DeleteDestination(id) => {
                 self.delete_destination(id);
-                Task::none()
-            }
-            Message::ConnectNow(id) => {
-                if let Some(destination) = self.client.destination(&id) {
-                    self.controller.connect_now(&destination.name);
-                }
                 Task::none()
             }
             Message::DestinationNameChanged(value) => {

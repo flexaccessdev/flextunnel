@@ -400,19 +400,6 @@ impl TunnelDialer {
         tokio::io::copy_bidirectional(&mut local, &mut tunnel).await?;
         Ok(())
     }
-
-    /// Ask the destination called `name` to connect now, without waiting for
-    /// it: one attempt in the background, after which the connection lives or
-    /// idles out like any other. Returns whether there is such a destination.
-    pub fn warm(&self, name: &str) -> bool {
-        match self.router.destination(name) {
-            Some(destination) => {
-                destination.kick();
-                true
-            }
-            None => false,
-        }
-    }
 }
 
 /// A target's host, for messages.
@@ -1495,9 +1482,6 @@ mod tests {
         assert!(err.to_string().contains("status endpoint"), "{err}");
         // Refusing never asked a destination to connect.
         assert!(client.status().destinations.iter().all(|d| d.waiting == 0));
-
-        assert!(dialer.warm("m2"));
-        assert!(!dialer.warm("nope"));
     }
 
     /// fd exhaustion must be retried without ever rebinding; aborted/reset
