@@ -499,7 +499,7 @@ impl ProxyClient {
         let host = |dest: usize| table.hosts().nth(dest).unwrap_or_default().to_string();
         for overlap in table.overlaps() {
             log::info!(
-                "Routing: {} ({}) is within {} ({}); the narrower rule wins there",
+                "Routing: {} ({}) is within {} ({}); the most specific rule that matches a target takes it",
                 overlap.inner.rule,
                 host(overlap.inner.dest),
                 overlap.outer.rule,

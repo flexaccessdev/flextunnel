@@ -390,11 +390,12 @@ quick client reads no config, so it has no port forwards.
 itself**, through either proxy listener. It shows the client's routing across
 all its destinations and what each destination is doing — idle, connecting,
 connected, retrying — without connecting to anything. The routing is the whole
-table, most specific rule first: each rule, the destination it goes to, where
-it nests with another destination's rule (and so which one wins), and whether
-that destination's server routes it too. A destination reads its server's
-lists each time it connects, so until a destination's first use its rules show
-as `unchecked`. The browser view is HTML; `/status.txt` is plain text and
+table, most specific rule first, after the reserved names: each rule, the
+destination it goes to, the other destinations' rules it lies inside or that
+lie inside it, and whether that destination's server routes it too. A
+destination reads its server's lists each time it connects, so until a
+destination's first use its rules show as `unchecked`; when a later read
+fails, the earlier answer is shown as last known, with the error. The browser view is HTML; `/status.txt` is plain text and
 `/status.json` is structured JSON for scripts:
 
 ```sh
@@ -412,9 +413,10 @@ The JSON response includes `version`, `socks_listen`, `http_listen`,
 `idle_timeout_secs`, the table under `routes`, and one entry per destination
 under `destinations`. Each `routes` entry has `rule`, `kind` (`host`, `exact`,
 `wildcard`, `catch-all` or `network`), `destination`, `server` (`loopback`,
-`allowed`, `partly allowed`, `not allowed` or `unchecked`), `within` (other
-destinations' broader rules it takes over from) and `narrower` (their
-narrower rules that take part of it), each a list of `{rule, destination}`. A
+`allowed`, `partly allowed`, `not allowed` or `unchecked`), `server_last_known`
+(`server` comes from an earlier read because the latest one failed), `within`
+(other destinations' broader rules it lies inside) and `narrower` (their
+narrower rules that lie inside it), each a list of `{rule, destination}`. A
 destination entry has `host`, `server_node_id`, `state` (`idle`,
 `connecting`, `connected`, `backoff` or `failed`), `connected_secs`,
 `open_streams`, `waiting`, `client_node_id`, `failed_attempts`,
@@ -804,7 +806,9 @@ targets, accept a bare IP as a single host, and a default route (`0.0.0.0/0` /
 `::/0`) matches every IP. Hostnames are matched only against `routed_domains`
 and IPs only against `routed_cidrs`. A numeric IP literal is always gated by
 `routed_cidrs` even when it arrives in hostname form (SOCKS5 `ATYP_DOMAIN`), so
-`*` never lets a raw IP through — it can only route real hostnames.
+`*` never lets a raw IP through — it can only route real hostnames. For the same
+reason an IP address in `routed_domains` is a config error: list it in
+`routed_cidrs`.
 
 Either list, or both, may be omitted. The two never cross: an omitted/empty
 list means that whole category is not routed. So `routed_domains` alone (no

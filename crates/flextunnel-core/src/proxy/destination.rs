@@ -44,7 +44,7 @@ use crate::proxy::client::{
     HANDSHAKE_TIMEOUT, TUNNEL_RECOVERY_HOLD, calculate_backoff, client_heartbeat_loop,
     connect_with_timeout, rebuild_due,
 };
-use crate::proxy::routed_set::{Coverage, RoutedSet};
+use crate::proxy::routed_set::{Coverage, RoutedSet, Rule};
 use crate::proxy::server_routes::{self, ServerRoutes};
 use crate::proxy::signaling::{self, Hello, HelloResponse};
 use crate::transport::endpoint::{
@@ -55,6 +55,7 @@ use crate::transport::paths::ConnectionSnapshot;
 use futures::future::BoxFuture;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -267,8 +268,12 @@ pub struct DestinationStatus {
     /// could read it; kept while idle. `None` until a connection has.
     pub server_routes: Option<ServerRoutes>,
     /// Why reading the server's routes on the latest connection failed;
-    /// cleared by a read that succeeds.
+    /// cleared by a read that succeeds. Alongside `server_routes`, those are
+    /// the last known lists, from an earlier connection.
     pub server_routes_error: Option<String>,
+    /// Each of this destination's rules with how much of it `server_routes`
+    /// covers, graded once when they were read; empty until then.
+    pub server_coverage: Arc<HashMap<Rule, Coverage>>,
 }
 
 /// State every destination of one client shares.
@@ -354,6 +359,7 @@ struct StatusFields {
     last_error: Option<String>,
     server_routes: Option<ServerRoutes>,
     server_routes_error: Option<String>,
+    server_coverage: Arc<HashMap<Rule, Coverage>>,
     /// Counts the connections whose server routes were asked for: a read
     /// answers only while its connection is still the latest asked, so a
     /// slow read on an older connection never overwrites a newer answer.
@@ -705,6 +711,7 @@ impl Destination {
                 .collect(),
             server_routes: fields.server_routes.clone(),
             server_routes_error: fields.server_routes_error.clone(),
+            server_coverage: fields.server_coverage.clone(),
         }
     }
 
@@ -766,12 +773,13 @@ impl Destination {
     }
 
     /// Read what the server on the fresh `connection` routes, on a task of its
-    /// own so no request waits for it, and keep the answer for the status. A
-    /// rule of this destination's that the server does not route is logged:
-    /// the server refuses what is sent under it. The read opens a stream of
-    /// its own on the connection without leasing it, so it neither keeps the
-    /// connection from idling out nor survives its close. The answer is kept
-    /// after the connection closes, until a later connection reads another.
+    /// own so no request waits for it, and keep the answer for the status,
+    /// with each of this destination's rules graded against it. A rule the
+    /// server does not route in full is logged: the server refuses what is
+    /// sent under it. The read opens a stream of its own on the connection
+    /// without leasing it, so it neither keeps the connection from idling out
+    /// nor survives its close. The answer is kept after the connection
+    /// closes, until a later connection reads another.
     fn check_server_routes(self: &Arc<Self>, connection: &Connection) {
         let this = self.clone();
         let connection = connection.clone();
@@ -781,42 +789,74 @@ impl Destination {
             fields.server_routes_generation
         };
         tokio::spawn(async move {
-            let read = server_routes::read_routes(&connection).await;
-            let mut fields = this.status_fields();
-            if fields.server_routes_generation != generation {
-                return;
-            }
-            match read {
+            // Graded before the status lock is taken, and off the async
+            // workers: it is the work of both whole lists, and the status is
+            // read on every poll.
+            let read = match server_routes::read_routes(&connection).await {
                 Ok(routes) => {
-                    if fields.server_routes.as_ref() != Some(&routes) {
-                        this.log_refused_rules(&routes);
+                    let grader = this.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let coverage = grader.grade(&routes);
+                        (routes, coverage)
+                    })
+                    .await
+                    .map_err(|e| format!("grading the server's routes failed: {e}"))
+                }
+                Err(e) => Err(e),
+            };
+            let changed = {
+                let mut fields = this.status_fields();
+                if fields.server_routes_generation != generation {
+                    return;
+                }
+                match &read {
+                    Ok((routes, coverage)) => {
+                        let changed = fields.server_routes.as_ref() != Some(routes);
+                        fields.server_routes = Some(routes.clone());
+                        fields.server_coverage = coverage.clone();
+                        fields.server_routes_error = None;
+                        changed
                     }
-                    fields.server_routes = Some(routes);
-                    fields.server_routes_error = None;
+                    Err(e) => {
+                        fields.server_routes_error = Some(e.clone());
+                        false
+                    }
                 }
-                Err(e) => {
-                    log::warn!("{}: could not read what the server routes: {e}", this.host());
-                    fields.server_routes_error = Some(e);
-                }
+            };
+            match read {
+                Ok((_, coverage)) if changed => this.log_refused_rules(&coverage),
+                Ok(_) => {}
+                Err(e) => log::warn!("{}: could not read what the server routes: {e}", this.host()),
             }
         });
     }
 
-    /// Log each of this destination's routed rules that `routes` (the
-    /// server's) does not route in full.
-    fn log_refused_rules(&self, routes: &ServerRoutes) {
-        let (server, own) = match (
-            RoutedSet::new(&routes.routed_domains, &routes.routed_cidrs),
-            RoutedSet::new(&self.cfg.routed_domains, &self.cfg.routed_cidrs),
-        ) {
-            (Ok(server), Ok(own)) => (server, own),
-            (Err(e), _) | (_, Err(e)) => {
+    /// Each of this destination's rules with how much of it `routes` (the
+    /// server's) covers; empty, with a warning, when the two cannot be
+    /// compared.
+    fn grade(&self, routes: &ServerRoutes) -> Arc<HashMap<Rule, Coverage>> {
+        let graded = RoutedSet::new(&self.cfg.routed_domains, &self.cfg.routed_cidrs)
+            .and_then(|own| routes.coverage_of(&own));
+        match graded {
+            Ok(coverage) => Arc::new(coverage),
+            Err(e) => {
                 log::warn!("{}: cannot compare routes with the server's: {e:#}", self.host());
-                return;
+                Arc::default()
             }
-        };
-        for rule in own.rules() {
-            match server.coverage(&rule) {
+        }
+    }
+
+    /// Log each of this destination's rules the server does not route in
+    /// full, by `coverage` (see [`Self::grade`]).
+    fn log_refused_rules(&self, coverage: &HashMap<Rule, Coverage>) {
+        let mut refused: Vec<(&Rule, Coverage)> = coverage
+            .iter()
+            .filter(|(_, c)| **c != Coverage::Full)
+            .map(|(rule, c)| (rule, *c))
+            .collect();
+        refused.sort_by_cached_key(|(rule, _)| rule.to_string());
+        for (rule, coverage) in refused {
+            match coverage {
                 Coverage::Full => {}
                 Coverage::Partial => log::warn!(
                     "{}: the server routes only part of {rule}; the rest is refused when sent",

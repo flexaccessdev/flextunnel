@@ -163,15 +163,21 @@ fn normalized(net: IpNetwork) -> IpNetwork {
 }
 
 /// Whether `nets` together cover all of `net`: one of them contains it, or
-/// each of its two halves is covered in turn. Only halves some network lies
-/// inside are split, so the walk is bounded by the networks' prefixes.
+/// each of its two halves is covered in turn. Only the networks strictly
+/// inside `net` are carried into its halves, and only while there are some,
+/// so each level of the walk looks at every network at most once.
 fn cidr_covered(net: IpNetwork, nets: &[IpNetwork]) -> bool {
     let rule = Rule::Cidr(net);
-    if nets.iter().any(|n| Rule::Cidr(*n).contains(&rule)) {
-        return true;
+    let mut inside = Vec::new();
+    for n in nets {
+        if Rule::Cidr(*n).contains(&rule) {
+            return true;
+        }
+        if n.prefix() > net.prefix() && net.contains(n.network()) {
+            inside.push(*n);
+        }
     }
-    let inside = |n: &IpNetwork| n.prefix() > net.prefix() && net.contains(n.network());
-    if !nets.iter().any(inside) {
+    if inside.is_empty() {
         return false;
     }
     let prefix = net.prefix() + 1;
@@ -188,7 +194,7 @@ fn cidr_covered(net: IpNetwork, nets: &[IpNetwork]) -> bool {
         }
     };
     let half = |addr| IpNetwork::new(addr, prefix).expect("a half's prefix is valid");
-    cidr_covered(half(low), nets) && cidr_covered(half(high), nets)
+    cidr_covered(half(low), &inside) && cidr_covered(half(high), &inside)
 }
 
 /// A parsed destination routed set (the tunnel set). See the module docs.
@@ -232,6 +238,10 @@ impl RoutedSet {
                 domains_suffix.push(format!(".{}", suffix.to_ascii_lowercase()));
             } else if entry.is_empty() || entry.contains('*') {
                 bail!("invalid routed-domain pattern: {raw:?}");
+            } else if parse_ip_literal(entry).is_some() {
+                // A numeric target is always matched against the CIDRs, so
+                // this entry would match nothing.
+                bail!("routed domain {raw:?} is an IP address: list it in the routed CIDRs");
             } else {
                 domains_exact.insert(entry.to_ascii_lowercase());
             }
@@ -348,34 +358,38 @@ impl RoutedSet {
 
     /// How much of what `rule` matches this set routes (see [`Coverage`]).
     /// For a client's rule against its server's set, this says whether the
-    /// server will accept what the client sends it under that rule.
+    /// server will accept what the client sends it under that rule. One pass
+    /// over the set's rules; a client grades its rules once per answer from
+    /// its server (see [`super::server_routes::ServerRoutes::coverage_of`]).
     pub fn coverage(&self, rule: &Rule) -> Coverage {
-        let own = self.rules();
-        if let Rule::Cidr(net) = rule {
-            let nets: Vec<IpNetwork> = own
-                .iter()
-                .filter_map(|r| match r {
-                    Rule::Cidr(n) => Some(*n),
-                    _ => None,
-                })
-                .collect();
-            // Several networks can cover one between them (two /9s, a /8).
-            return if cidr_covered(*net, &nets) {
-                Coverage::Full
-            } else if nets.iter().any(|n| Rule::Cidr(*n).intersects(rule)) {
-                Coverage::Partial
-            } else {
-                Coverage::None
-            };
-        }
+        let grade = |full: bool, partial: bool| match (full, partial) {
+            (true, _) => Coverage::Full,
+            (false, true) => Coverage::Partial,
+            (false, false) => Coverage::None,
+        };
         // A hostname rule is covered only by one rule containing it: a zone
-        // has endless names, so no set of exact names or inner zones fills it.
-        if own.iter().any(|r| r.contains(rule)) {
-            Coverage::Full
-        } else if own.iter().any(|r| r.intersects(rule)) {
-            Coverage::Partial
-        } else {
-            Coverage::None
+        // has endless names, so no set of exact names or inner zones fills
+        // it. Zones nest or are apart, so a rule it meets lies inside it.
+        match rule {
+            // Several networks can cover one between them (two /9s, a /8).
+            Rule::Cidr(net) => grade(
+                cidr_covered(*net, &self.cidrs),
+                self.cidrs.iter().any(|n| Rule::Cidr(*n).intersects(rule)),
+            ),
+            _ if self.domains_all => Coverage::Full,
+            Rule::CatchAll => grade(false, !self.domains_exact.is_empty() || !self.domains_suffix.is_empty()),
+            Rule::Exact(name) => grade(self.allows_host(name), false),
+            Rule::Suffix(zone) => {
+                let dot_zone = format!(".{zone}");
+                grade(
+                    self.domains_suffix.iter().any(|s| dot_zone.ends_with(s.as_str())),
+                    self.domains_exact.iter().any(|e| e.ends_with(&dot_zone))
+                        || self
+                            .domains_suffix
+                            .iter()
+                            .any(|s| s.len() > dot_zone.len() && s.ends_with(&dot_zone)),
+                )
+            }
         }
     }
 
@@ -711,5 +725,24 @@ mod tests {
         assert!(RoutedSet::new(&["*.*.example.com".to_string()], &[]).is_err());
         assert!(RoutedSet::new(&["*..example.com".to_string()], &[]).is_err());
         assert!(RoutedSet::new(&[], &["not-a-cidr".to_string()]).is_err());
+        // A numeric target is matched against the CIDRs, never a domain rule:
+        // as a domain an address would be a rule that matches nothing.
+        for numeric in ["10.0.0.1", "10.0.0.1.", "fd00::1", "[fd00::1]"] {
+            let err = RoutedSet::new(&[numeric.to_string()], &[]).unwrap_err();
+            assert!(err.to_string().contains("routed CIDRs"), "{numeric}: {err}");
+        }
+    }
+
+    /// Many small networks tile a large one: the walk splits only where they
+    /// lie, and a single missing piece leaves it partly covered.
+    #[test]
+    fn many_networks_cover_one_between_them() {
+        let all: Vec<String> = (0..256).map(|i| format!("10.1.{i}.0/24")).collect();
+        let tiled = RoutedSet::new(&[], &all).unwrap();
+        assert_eq!(tiled.coverage(&rule("10.1.0.0/16")), Coverage::Full);
+        assert_eq!(tiled.coverage(&rule("10.0.0.0/8")), Coverage::Partial);
+        let holey = RoutedSet::new(&[], &all[1..]).unwrap();
+        assert_eq!(holey.coverage(&rule("10.1.0.0/16")), Coverage::Partial);
+        assert_eq!(holey.coverage(&rule("10.1.1.0/24")), Coverage::Full);
     }
 }

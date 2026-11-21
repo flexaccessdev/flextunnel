@@ -4,11 +4,12 @@ socks5: {{ socks_listen }}
 http: {{ http_listen }}
 idle timeout: {{ idle_timeout }}
 
-routing (most specific first):
+routing (most specific first; a request takes the first rule that matches it):
   flextunnel.internal -> this client (status page)
-{% for r in routes %}  {{ r.rule }} ({{ r.kind }}) -> {{ r.destination }}, server: {{ r.server }}
-{% for o in r.within %}      within {{ o.rule }} of {{ o.destination }}, which this takes over
-{% endfor %}{% for o in r.narrower %}      except {{ o.rule }}, which goes to {{ o.destination }}
+  *.flextunnel.internal -> this client (reserved, answers 404)
+{% for r in routes %}  {{ r.rule }} ({{ r.kind }}) -> {{ r.destination }}, server: {{ r.server }}{% if r.server_last_known %} (last known){% endif %}
+{% for o in r.within %}      inside {{ o.destination }}'s broader {{ o.rule }}
+{% endfor %}{% for o in r.narrower %}      contains {{ o.destination }}'s narrower {{ o.rule }}
 {% endfor %}{% endfor %}  anything else -> direct from this device
 
 destinations:

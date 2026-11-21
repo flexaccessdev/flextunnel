@@ -76,14 +76,15 @@
     <table class="routes">
       <tr><th>Rule</th><th>Goes to</th><th>Server</th></tr>
       <tr><td class="mono">flextunnel.internal</td><td>this client <span class="muted">status page</span></td><td></td></tr>
+      <tr><td class="mono">*.flextunnel.internal</td><td>this client <span class="muted">reserved, answers 404</span></td><td></td></tr>
       {% for r in routes %}
       <tr>
         <td><span class="mono">{{ r.rule }}</span> <span class="muted">{{ r.kind }}</span>
-          {% for o in r.within %}<span class="note">within <span class="mono">{{ o.rule }}</span> of <span class="mono">{{ o.destination }}</span>, which this takes over</span>{% endfor %}
-          {% for o in r.narrower %}<span class="note">except <span class="mono">{{ o.rule }}</span>, which goes to <span class="mono">{{ o.destination }}</span></span>{% endfor %}
+          {% for o in r.within %}<span class="note">inside <span class="mono">{{ o.destination }}</span>'s broader <span class="mono">{{ o.rule }}</span></span>{% endfor %}
+          {% for o in r.narrower %}<span class="note">contains <span class="mono">{{ o.destination }}</span>'s narrower <span class="mono">{{ o.rule }}</span></span>{% endfor %}
         </td>
         <td class="mono">{{ r.destination }}</td>
-        <td class="{{ r.server_class() }}">{{ r.server }}</td>
+        <td class="{{ r.server_class() }}">{{ r.server }}{% if r.server_last_known %} <span class="muted">last known</span>{% endif %}</td>
       </tr>
       {% endfor %}
       <tr><td class="muted">anything else</td><td>direct <span class="muted">from this device</span></td><td></td></tr>

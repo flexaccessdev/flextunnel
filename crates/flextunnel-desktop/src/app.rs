@@ -3424,8 +3424,8 @@ mod tests {
         assert_eq!(
             form.overlaps(std::slice::from_ref(&saved)),
             [
-                "*.corp.example takes over from nas.internal's *: it is narrower",
-                "lab.internal takes over from nas.internal's *: it is narrower",
+                "*.corp.example is inside nas.internal's broader *",
+                "lab.internal is inside nas.internal's broader *",
             ]
         );
         // The same rule twice is an error, which the form says elsewhere.

@@ -10,10 +10,11 @@
 //! | `/servers/<destination>/`, `…/status.txt`, `…/status.json` | That destination server's own status page, fetched from the server on demand (which connects to it, like any other use). |
 //!
 //! The routing is the whole table in the order a target is tried against it
-//! (see [`super::route_table`]): every rule, the destination it goes to, the
-//! other destinations' rules it sits within or that carve pieces out of it,
-//! and whether its server routes it too — as the server said on the
-//! destination's latest connection, or "unchecked" for one not yet used.
+//! (see [`super::route_table`]), after the reserved names: every rule, the
+//! destination it goes to, the other destinations' rules it lies inside or
+//! that lie inside it, and whether its server routes it too — as the server
+//! said on the destination's latest connection that read it ("last known"
+//! when a later read failed), or "unchecked" for one not yet used.
 //!
 //! On `/` (and `/servers/<destination>/`) an `Accept: application/json` or
 //! `text/plain` header picks the format, as the path suffix does. Any other
@@ -31,7 +32,7 @@ use super::client::{
 };
 use super::destination::{DestinationState, DestinationStatus};
 use super::route_table::{RouteTable, TableRow, TableRule};
-use super::routed_set::{RoutedSet, Rule};
+use super::routed_set::Rule;
 use super::signaling::{self, StreamRequest};
 use super::status_page::{
     self, CONTENT_TYPE_HTML, CONTENT_TYPE_JSON, CONTENT_TYPE_TEXT, STATUS_JSON_PATH,
@@ -132,6 +133,10 @@ struct RouteView {
     /// (by the server's own lists), or `unchecked` (not read from the server
     /// yet).
     server: &'static str,
+    /// The server's lists behind `server` are the last known ones: reading
+    /// them again on the latest connection failed (the destination's
+    /// `server_routes_error` says why).
+    server_last_known: bool,
     /// Other destinations' broader rules this one sits within: it wins over
     /// them for what it matches.
     within: Vec<RuleRef>,
@@ -153,18 +158,10 @@ impl RouteView {
 }
 
 /// The routing table over `status`'s destinations (the same, in the same
-/// order, as `table`'s), with each server's answer about its own lists.
+/// order, as `table`'s), with each server's answer about its own lists, as
+/// the destination graded it when it read them.
 fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
     let host = |dest: usize| table.hosts().nth(dest).unwrap_or_default().to_string();
-    // The server's lists, where a connection has read them.
-    let servers: Vec<Option<RoutedSet>> = status
-        .destinations
-        .iter()
-        .map(|d| {
-            let routes = d.server_routes.as_ref()?;
-            RoutedSet::new(&routes.routed_domains, &routes.routed_cidrs).ok()
-        })
-        .collect();
     let refer = |row: &TableRow| RuleRef { rule: row.rule.to_string(), destination: host(row.dest) };
     // Each row's overlaps, in the table's overlap order: the broader rules it
     // sits within, and the narrower rules inside it.
@@ -180,6 +177,7 @@ fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
         .map(|row| {
             let within = within.remove(&row).unwrap_or_default();
             let narrower = narrower.remove(&row).unwrap_or_default();
+            let destination = status.destinations.get(row.dest);
             let (kind, server) = match &row.rule {
                 TableRule::Host(_) => ("host", "loopback"),
                 TableRule::Routed(rule) => {
@@ -189,30 +187,45 @@ fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
                         Rule::Exact(_) => "exact",
                         Rule::Cidr(_) => "network",
                     };
-                    let server = match servers.get(row.dest).and_then(Option::as_ref) {
-                        Some(server) => server.coverage(rule).as_str(),
+                    let server = match destination.and_then(|d| d.server_coverage.get(rule)) {
+                        Some(coverage) => coverage.as_str(),
                         None => "unchecked",
                     };
                     (kind, server)
                 }
             };
-            RouteView { rule: row.rule.to_string(), kind, destination: host(row.dest), server, within, narrower }
+            let server_last_known = matches!(server, "allowed" | "partly allowed" | "not allowed")
+                && destination.is_some_and(|d| d.server_routes_error.is_some());
+            RouteView {
+                rule: row.rule.to_string(),
+                kind,
+                destination: host(row.dest),
+                server,
+                server_last_known,
+                within,
+                narrower,
+            }
         })
         .collect()
 }
 
 /// A destination's server routes as one line for the pages: the lists the
-/// server sent, `unchecked`, or why they could not be read.
+/// server sent (the last known ones, with why reading them again failed),
+/// `unchecked`, or why they could not be read.
 fn server_routes_line(d: &DestinationStatus) -> String {
     match (&d.server_routes, &d.server_routes_error) {
-        (Some(routes), _) => {
+        (Some(routes), error) => {
             let all: Vec<&str> = routes
                 .routed_domains
                 .iter()
                 .chain(&routes.routed_cidrs)
                 .map(String::as_str)
                 .collect();
-            if all.is_empty() { "none (loopback only)".to_string() } else { all.join(", ") }
+            let lists = if all.is_empty() { "none (loopback only)".to_string() } else { all.join(", ") };
+            match error {
+                Some(error) => format!("{lists} (last known; reading them again failed: {error})"),
+                None => lists,
+            }
         }
         (None, Some(error)) => format!("unreadable: {error}"),
         (None, None) => "unchecked (read on the first connection)".to_string(),
@@ -649,6 +662,7 @@ async fn respond<S: LocalStream>(
 mod tests {
     use super::*;
     use crate::proxy::route_table::RouteSpec;
+    use crate::proxy::routed_set::RoutedSet;
     use crate::proxy::server_routes::ServerRoutes;
     use std::time::Duration;
 
@@ -687,7 +701,16 @@ mod tests {
             relay_urls: Vec::new(),
             server_routes: None,
             server_routes_error: None,
+            server_coverage: Arc::default(),
         }
+    }
+
+    /// `d` as after a connection read `routes` from its server: graded as
+    /// the destination grades them.
+    fn answered(d: &mut DestinationStatus, routes: ServerRoutes) {
+        let own = RoutedSet::new(&d.routed_domains, &d.routed_cidrs).unwrap();
+        d.server_coverage = Arc::new(routes.coverage_of(&own).unwrap());
+        d.server_routes = Some(routes);
     }
 
     /// A status as of [`now`]: `m1` connected 125s earlier, `m2` retrying in
@@ -704,14 +727,17 @@ mod tests {
         connected.connected_since = Some(connected_at);
         connected.open_streams = 2;
         connected.client_node_id = Some("clientid".to_string());
-        connected.server_routes = Some(ServerRoutes {
-            routed_domains: strings(&["*.corp.example"]),
-            routed_cidrs: strings(&["10.0.0.0/9"]),
-        });
+        answered(
+            &mut connected,
+            ServerRoutes {
+                routed_domains: strings(&["*.corp.example"]),
+                routed_cidrs: strings(&["10.0.0.0/9"]),
+            },
+        );
         let mut backoff = destination("m2.internal", DestinationState::Backoff);
         backoff.routed_domains = strings(&["*.dev.corp.example"]);
         backoff.routed_cidrs = strings(&["10.1.0.0/16"]);
-        backoff.server_routes = Some(ServerRoutes::default());
+        answered(&mut backoff, ServerRoutes::default());
         backoff.failed_attempts = 3;
         backoff.last_error = Some("Signaling error: timed out".to_string());
         backoff.next_attempt_at = Some(now + Duration::from_secs(30));
@@ -825,8 +851,9 @@ mod tests {
 
         let (_, _, text) = render_fixed(StatusFormat::Text);
         assert!(text.contains("*.dev.corp.example (wildcard) -> m2.internal, server: not allowed"), "{text}");
-        assert!(text.contains("within *.corp.example of m1.internal"), "{text}");
-        assert!(text.contains("except 10.1.0.0/16, which goes to m2.internal"), "{text}");
+        assert!(text.contains("inside m1.internal's broader *.corp.example"), "{text}");
+        assert!(text.contains("contains m2.internal's narrower 10.1.0.0/16"), "{text}");
+        assert!(text.contains("*.flextunnel.internal -> this client (reserved, answers 404)"), "{text}");
         assert!(text.contains("anything else -> direct"), "{text}");
         assert!(text.contains("server routes: *.corp.example, 10.0.0.0/9"), "{text}");
         assert!(text.contains("server routes: unchecked"), "{text}");
@@ -834,7 +861,34 @@ mod tests {
         let (_, _, html) = render_fixed(StatusFormat::Html);
         assert!(html.contains("Routing"));
         assert!(html.contains("partly allowed"));
-        assert!(html.contains("which goes to <span class=\"mono\">m2.internal</span>"), "{html}");
+        assert!(html.contains("contains <span class=\"mono\">m2.internal</span>'s narrower"), "{html}");
+        assert!(html.contains("*.flextunnel.internal"), "{html}");
+    }
+
+    /// A failed read after a good one keeps the earlier answer, shown as the
+    /// last known, with why the latest read failed.
+    #[test]
+    fn a_failed_refresh_keeps_the_last_known_answer() {
+        let (mut status, now) = status();
+        status.destinations[0].server_routes_error = Some("timed out".to_string());
+        let table = table_of(&status);
+        let (_, _, body) = render_at(&status, &table, StatusFormat::Json, now);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let corp = json["routes"].as_array().unwrap().iter().find(|r| r["rule"] == "*.corp.example").unwrap();
+        assert_eq!(corp["server"], "allowed");
+        assert_eq!(corp["server_last_known"], true);
+        let dev = json["routes"].as_array().unwrap().iter().find(|r| r["rule"] == "*.dev.corp.example").unwrap();
+        assert_eq!(dev["server_last_known"], false);
+
+        let (_, _, text) = render_at(&status, &table, StatusFormat::Text, now);
+        assert!(text.contains("-> m1.internal, server: allowed (last known)"), "{text}");
+        assert!(
+            text.contains("server routes: *.corp.example, 10.0.0.0/9 (last known; reading them again failed: timed out)"),
+            "{text}"
+        );
+        let (_, _, html) = render_at(&status, &table, StatusFormat::Html, now);
+        assert!(html.contains("last known"), "{html}");
+        assert!(html.contains("reading them again failed: timed out"), "{html}");
     }
 
     #[test]

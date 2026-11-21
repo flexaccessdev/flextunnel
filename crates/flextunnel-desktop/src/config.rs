@@ -293,19 +293,9 @@ pub fn overlap_lines(table: &RouteTable, dest: usize) -> Vec<String> {
         .iter()
         .filter_map(|o| {
             if o.outer.dest == dest {
-                Some(format!(
-                    "{} goes to {} instead: it is narrower than {}",
-                    o.inner.rule,
-                    host(o.inner.dest),
-                    o.outer.rule
-                ))
+                Some(format!("{} contains {}'s narrower {}", o.outer.rule, host(o.inner.dest), o.inner.rule))
             } else if o.inner.dest == dest {
-                Some(format!(
-                    "{} takes over from {}'s {}: it is narrower",
-                    o.inner.rule,
-                    host(o.outer.dest),
-                    o.outer.rule
-                ))
+                Some(format!("{} is inside {}'s broader {}", o.inner.rule, host(o.outer.dest), o.outer.rule))
             } else {
                 None
             }
@@ -314,16 +304,15 @@ pub fn overlap_lines(table: &RouteTable, dest: usize) -> Vec<String> {
 }
 
 /// How much of one configured rule — a `routed_domains` entry, or a
-/// `routed_cidrs` one when `cidr` — its server routes, as the server said on
-/// the destination's latest connection (`status`). `None` while that is not
-/// known: never connected, or the server's lists could not be read.
+/// `routed_cidrs` one when `cidr` — its server routes, as the running
+/// destination (`status`) graded it when its latest connection read the
+/// server's lists. `None` while that is not known: never connected, the
+/// server's lists could not be read, or the rule is not the running one's.
 pub fn server_coverage(status: Option<&DestinationStatus>, raw: &str, cidr: bool) -> Option<Coverage> {
-    let routes = status?.server_routes.as_ref()?;
-    let server = RoutedSet::new(&routes.routed_domains, &routes.routed_cidrs).ok()?;
     let one = vec![raw.to_string()];
     let own = if cidr { RoutedSet::new(&[], &one) } else { RoutedSet::new(&one, &[]) }.ok()?;
     let rule = own.rules().into_iter().next()?;
-    Some(server.coverage(&rule))
+    status?.server_coverage.get(&rule).copied()
 }
 
 /// The server's entry in the sealed id → secret map. Key ids are 16 hex
@@ -1457,22 +1446,23 @@ mod tests {
         assert_eq!(
             overlap_lines(&table, 0),
             [
-                "*.dev.corp.example goes to lab.internal instead: it is narrower than *.corp.example",
-                "10.1.0.0/16 goes to lab.internal instead: it is narrower than 10.0.0.0/8",
+                "*.corp.example contains lab.internal's narrower *.dev.corp.example",
+                "10.0.0.0/8 contains lab.internal's narrower 10.1.0.0/16",
             ]
         );
         assert_eq!(
             overlap_lines(&table, 1),
             [
-                "*.dev.corp.example takes over from nas.internal's *.corp.example: it is narrower",
-                "10.1.0.0/16 takes over from nas.internal's 10.0.0.0/8: it is narrower",
+                "*.dev.corp.example is inside nas.internal's broader *.corp.example",
+                "10.1.0.0/16 is inside nas.internal's broader 10.0.0.0/8",
             ]
         );
         assert!(overlap_lines(&table, 2).is_empty());
     }
 
-    /// A rule's server check comes from what the server said on the
-    /// destination's latest connection, and is unknown until one has.
+    /// A rule's server check is the running destination's grade of it from
+    /// what the server said on its latest connection, and is unknown until
+    /// one has, or for a rule the running destination does not have.
     #[test]
     fn a_rule_is_checked_against_the_servers_routes() {
         let mut status = DestinationStatus {
@@ -1491,13 +1481,22 @@ mod tests {
             relay_urls: Vec::new(),
             server_routes: None,
             server_routes_error: None,
+            server_coverage: Default::default(),
         };
         assert_eq!(server_coverage(Some(&status), "*.corp.example", false), None);
         assert_eq!(server_coverage(None, "*.corp.example", false), None);
-        status.server_routes = Some(flextunnel_core::proxy::ServerRoutes {
+        let routes = flextunnel_core::proxy::ServerRoutes {
             routed_domains: vec!["*.corp.example".into()],
             routed_cidrs: vec!["10.0.0.0/16".into()],
-        });
+        };
+        let own = RoutedSet::new(
+            &["*.corp.example".into(), "api.corp.example".into(), "*".into(), "wiki.example".into()],
+            &["10.0.0.0/8".into(), "10.0.1.0/24".into(), "192.168.0.0/16".into()],
+        )
+        .unwrap();
+        status.server_coverage = std::sync::Arc::new(routes.coverage_of(&own).unwrap());
+        status.server_routes = Some(routes);
+        assert_eq!(server_coverage(Some(&status), "*.other.example", false), None, "not a running rule");
         for (rule, cidr, coverage) in [
             ("*.corp.example", false, Coverage::Full),
             ("api.corp.example", false, Coverage::Full),

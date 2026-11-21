@@ -414,6 +414,7 @@ mod tests {
                 relay_urls: Vec::new(),
                 server_routes: None,
                 server_routes_error: None,
+                server_coverage: Default::default(),
             }
         };
         ClientSnapshot {
