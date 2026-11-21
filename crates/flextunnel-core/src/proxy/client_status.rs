@@ -946,7 +946,7 @@ mod tests {
         let idle = &mut status.destinations[2];
         idle.server_routes_pending = true;
         let (_, _, text) = render_at(&status, &table, StatusFormat::Text, now);
-        assert!(text.contains("server routes: being read\n"), "{text}");
+        assert!(text.lines().any(|l| l.trim() == "server routes: being read"), "{text}");
         status.destinations[2].server_routes_error = Some("refused".to_string());
         let (_, _, text) = render_at(&status, &table, StatusFormat::Text, now);
         assert!(text.contains("server routes: being read again (the last read failed: refused)"), "{text}");
