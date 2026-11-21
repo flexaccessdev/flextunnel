@@ -53,9 +53,6 @@ pub struct ServerStatusTemplate {
     pub routed_cidrs: Vec<String>,
     /// `(alias, target)` pairs, sorted for stable output.
     pub host_aliases: Vec<(String, String)>,
-    /// Conditional DNS forwards as `(suffix, upstream servers)` pairs, sorted by
-    /// suffix for stable output.
-    pub dns_forwards: Vec<(String, Vec<String>)>,
     pub blocklist_path: String,
     pub blocked_client_count: usize,
     pub conflicted_server_count: usize,
@@ -80,7 +77,6 @@ struct ServerStatusJson<'a> {
     routed_domains: &'a [String],
     routed_cidrs: &'a [String],
     host_aliases: Vec<HostAliasJson<'a>>,
-    dns_forwards: Vec<DnsForwardJson<'a>>,
     duplicate_id_blocklist: DuplicateIdBlocklistJson<'a>,
 }
 
@@ -88,12 +84,6 @@ struct ServerStatusJson<'a> {
 struct HostAliasJson<'a> {
     name: &'a str,
     target: &'a str,
-}
-
-#[derive(Serialize)]
-struct DnsForwardJson<'a> {
-    suffix: &'a str,
-    servers: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -163,18 +153,12 @@ fn render_status_json(tpl: &ServerStatusTemplate) -> Result<String, serde_json::
         .iter()
         .map(|(name, target)| HostAliasJson { name, target })
         .collect();
-    let dns_forwards = tpl
-        .dns_forwards
-        .iter()
-        .map(|(suffix, servers)| DnsForwardJson { suffix, servers })
-        .collect();
     let payload = ServerStatusJson {
         version: tpl.version,
         server_node_id: &tpl.node_id,
         routed_domains: &tpl.routed_domains,
         routed_cidrs: &tpl.routed_cidrs,
         host_aliases,
-        dns_forwards,
         duplicate_id_blocklist: DuplicateIdBlocklistJson {
             file: &tpl.blocklist_path,
             blocked_clients: tpl.blocked_client_count,

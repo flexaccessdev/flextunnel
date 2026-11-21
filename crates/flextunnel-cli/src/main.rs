@@ -343,7 +343,6 @@ async fn run_async(command: Command) -> Result<()> {
                 host_aliases: None, // config-file only; no CLI flag
                 routed_domains: None, // config-file only; no CLI flag
                 routed_cidrs: None,   // config-file only; no CLI flag
-                dns_forwards: None,   // config-file only; no CLI flag
             };
             let file = config::load_server_config(config_path.as_deref(), default_config)?;
             run_server(config::resolve_server(cli, file)?, None).await
@@ -515,7 +514,6 @@ async fn run_server(
         host_aliases: r.host_aliases,
         routed_domains: r.routed_domains,
         routed_cidrs: r.routed_cidrs,
-        dns_forwards: r.dns_forwards,
         blocklist_file: r.blocklist_file,
     })?;
     let running = prepared.bind().await?;

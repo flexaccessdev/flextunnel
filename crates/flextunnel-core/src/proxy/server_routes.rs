@@ -198,7 +198,6 @@ mod tests {
                 routed_domains: strings(routed_domains),
                 routed_cidrs: strings(routed_cidrs),
                 host_aliases: vec![("nas.internal".to_string(), "10.0.0.7".to_string())],
-                dns_forwards: Vec::new(),
                 blocklist_path: "/nonexistent/blocklist.json".to_string(),
                 blocked_client_count: 0,
                 conflicted_server_count: 0,

@@ -5,7 +5,6 @@ pub mod client;
 pub mod client_status;
 pub mod destination;
 pub mod dial;
-pub mod dns_forward;
 pub mod forward;
 pub mod http;
 pub mod reserved;
@@ -26,7 +25,6 @@ pub use client::{
 pub use destination::{
     ClientAuth, DestinationConfig, DestinationState, DestinationStatus, EndpointProvider,
 };
-pub use dns_forward::DnsForwarder;
 pub use forward::{ForwardManager, ForwardSpec, ForwardState, ForwardStatus};
 pub use route_table::{Route, RouteSpec, RouteTable, validate_destination_host};
 pub use routed_set::RoutedSet;

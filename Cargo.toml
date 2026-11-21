@@ -28,7 +28,6 @@ env_logger = "0.11"
 flexaccess-keys = { git = "https://github.com/flexaccessdev/flexaccess-keys", tag = "v0.0.2", default-features = false }
 futures = "0.3"
 ipnetwork = "0.21"
-hickory-resolver = { version = "0.26", default-features = false, features = ["tokio"] }
 # Shared iroh transport layer (relay config + probe, endpoint building and
 # rebuild, home-relay watchdog, endpoint-bound auth transcript). `mdns` turns on
 # local-network discovery on every endpoint (compiled out on iOS by the crate);

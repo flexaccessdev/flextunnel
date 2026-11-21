@@ -133,7 +133,6 @@ fn options(server: &ServerConfig) -> anyhow::Result<ServerOptions> {
         host_aliases: HashMap::new(),
         routed_domains: server.routed_domains.clone(),
         routed_cidrs: server.routed_cidrs.clone(),
-        dns_forwards: HashMap::new(),
         blocklist_file,
     })
 }

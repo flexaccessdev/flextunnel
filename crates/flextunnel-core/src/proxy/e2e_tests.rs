@@ -23,7 +23,6 @@
 use crate::blocklist::BlockList;
 use crate::error::ProxyError;
 use crate::proxy::signaling::{self, Hello, HelloResponse, StreamRequest, Target};
-use crate::proxy::dns_forward::DnsForwarder;
 use crate::proxy::{
     ClientAuth, ClientConfig, DestinationConfig, DestinationState, DestinationStatus,
     EndpointProvider, ForwardManager, ForwardSpec, LocalListeners, ProxyClient, ProxyServer,
@@ -127,21 +126,8 @@ fn spawn_server_full(
     host_aliases: HashMap<String, String>,
     routed_domains: Vec<String>,
 ) -> iroh::EndpointId {
-    spawn_server_dns(endpoint, blocklist_path, host_aliases, routed_domains, HashMap::new())
-}
-
-/// Like [`spawn_server_full`] but also seeds the conditional DNS-forwarding
-/// table (`[dns_forwards]`), exercised by the status-page test.
-fn spawn_server_dns(
-    endpoint: Endpoint,
-    blocklist_path: std::path::PathBuf,
-    host_aliases: HashMap<String, String>,
-    routed_domains: Vec<String>,
-    dns_forwards: HashMap<String, Vec<String>>,
-) -> iroh::EndpointId {
     let own_id = endpoint.id();
     let no_cidrs: Vec<String> = Vec::new();
-    let dns_forwarder = DnsForwarder::new(&dns_forwards).unwrap();
     let server = ProxyServer::new(ProxyServerParams {
         own_id,
         authorized_keys: test_authorized_keys(),
@@ -149,7 +135,6 @@ fn spawn_server_dns(
         routed_set: RoutedSet::new(&routed_domains, &no_cidrs).unwrap(),
         routed_domains,
         routed_cidrs: no_cidrs,
-        dns_forwarder,
         blocklist: BlockList::load(blocklist_path).unwrap(),
         first_client: None,
     });
@@ -175,7 +160,6 @@ fn base_params(own_id: iroh::EndpointId, blocklist_path: std::path::PathBuf) -> 
         routed_set: RoutedSet::default(),
         routed_domains: Vec::new(),
         routed_cidrs: Vec::new(),
-        dns_forwarder: None,
         blocklist: BlockList::load(blocklist_path).unwrap(),
         first_client: None,
     }
@@ -1502,7 +1486,6 @@ async fn prepared_server_serves_an_authorized_client() {
         host_aliases: HashMap::new(),
         routed_domains: Vec::new(),
         routed_cidrs,
-        dns_forwards: HashMap::new(),
         blocklist_file: bl_path.clone(),
     })
     .unwrap();
@@ -1721,28 +1704,11 @@ async fn status_request_serves_the_server_status_page() {
     // A distinctive routed domain we expect to see rendered on the status page.
     let host_aliases =
         HashMap::from([("nas.internal".to_string(), "192.168.1.9".to_string())]);
-    // Two conditional DNS forwards we expect rendered on the status page (each
-    // suffix must be reachable through the routed set). `corp.example.com`
-    // carries two servers in a deliberate, non-sorted order; the server must
-    // emit the suffixes sorted (`corp` before `marker`) while preserving each
-    // suffix's server order verbatim — exercised through every serialization
-    // path below.
-    let dns_forwards = HashMap::from([
-        (
-            "marker.example.com".to_string(),
-            vec!["10.9.9.9:5353".to_string()],
-        ),
-        (
-            "corp.example.com".to_string(),
-            vec!["10.1.0.11".to_string(), "10.1.0.10:5353".to_string()],
-        ),
-    ]);
-    spawn_server_dns(
+    spawn_server_full(
         server_ep,
         temp_blocklist("status-page"),
         host_aliases,
         vec!["marker.example.com".to_string(), "corp.example.com".to_string()],
-        dns_forwards,
     );
 
     let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
@@ -1755,18 +1721,6 @@ async fn status_request_serves_the_server_status_page() {
     assert!(
         body.contains("marker.example.com"),
         "status page should list the configured routed domain"
-    );
-    assert!(
-        body.contains("10.9.9.9:5353"),
-        "status page should list the configured DNS forward server"
-    );
-    assert!(
-        body.contains("10.1.0.11, 10.1.0.10:5353"),
-        "status page should list the multi-server forward with servers in verbatim order"
-    );
-    assert!(
-        body.find("10.1.0.11").unwrap() < body.find("10.9.9.9:5353").unwrap(),
-        "status page should render DNS forwards sorted by suffix (corp before marker)"
     );
 
     let body = fetch_status(&client_conn, "/status.txt", None).await;
@@ -1782,19 +1736,6 @@ async fn status_request_serves_the_server_status_page() {
     assert!(
         body.contains("  - nas.internal -> 192.168.1.9"),
         "text status should show the configured host alias"
-    );
-    assert!(
-        body.contains("  - marker.example.com (+ subdomains) -> 10.9.9.9:5353"),
-        "text status should show the configured DNS forward"
-    );
-    assert!(
-        body.contains("  - corp.example.com (+ subdomains) -> 10.1.0.11, 10.1.0.10:5353"),
-        "text status should show the multi-server forward with servers in verbatim order"
-    );
-    assert!(
-        body.find("  - corp.example.com (+ subdomains) -> 10.1.0.11").unwrap()
-            < body.find("  - marker.example.com (+ subdomains) -> 10.9.9.9:5353").unwrap(),
-        "text status should render DNS forwards sorted by suffix (corp before marker)"
     );
 
     let body = fetch_status(&client_conn, "/status.json", None).await;
@@ -1818,14 +1759,6 @@ async fn status_request_serves_the_server_status_page() {
         status["host_aliases"],
         serde_json::json!([{"name": "nas.internal", "target": "192.168.1.9"}]),
         "json status should list the configured host alias"
-    );
-    assert_eq!(
-        status["dns_forwards"],
-        serde_json::json!([
-            {"suffix": "corp.example.com", "servers": ["10.1.0.11", "10.1.0.10:5353"]},
-            {"suffix": "marker.example.com", "servers": ["10.9.9.9:5353"]},
-        ]),
-        "json status should list the DNS forwards sorted by suffix, servers verbatim"
     );
 
     // Accept-header negotiation: a `/` request with `Accept: text/plain` should
@@ -1992,7 +1925,6 @@ async fn prepared_quick_server_admits_only_the_entered_client() {
         host_aliases: HashMap::new(),
         routed_domains: Vec::new(),
         routed_cidrs,
-        dns_forwards: HashMap::new(),
         blocklist_file: bl_path.clone(),
     })
     .unwrap();

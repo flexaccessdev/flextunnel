@@ -73,7 +73,7 @@ auth_key_file = "~/.config/flextunnel/client.key"
 #                   name, a `*.suffix` wildcard (subdomains only), or `*` for
 #                   every hostname. Names only — an IP address goes under
 #                   routed_cidrs. Resolved on the server (its host aliases
-#                   and DNS forwards apply).
+#                   apply).
 #   routed_cidrs    Optional further networks or bare IPs sent through this
 #                   server. `*` never covers IP literals; pair it with
 #                   "0.0.0.0/0" (and "::/0") for a full tunnel.
