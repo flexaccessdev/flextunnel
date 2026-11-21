@@ -96,6 +96,9 @@ struct DestinationJson<'a> {
     /// it; `null` until one has (see `server_routes_error`).
     server_routes: Option<&'a super::server_routes::ServerRoutes>,
     server_routes_error: Option<&'a str>,
+    /// A connection is reading the server's routes again: until it has,
+    /// `server_routes` is the last known answer.
+    server_routes_pending: bool,
     /// Path of this server's own status page (fetching it connects).
     server_status: String,
 }
@@ -133,9 +136,9 @@ struct RouteView {
     /// (by the server's own lists), or `unchecked` (not read from the server
     /// yet).
     server: &'static str,
-    /// The server's lists behind `server` are the last known ones: reading
-    /// them again on the latest connection failed (the destination's
-    /// `server_routes_error` says why).
+    /// The server's lists behind `server` are the last known ones: the
+    /// latest connection is still reading them again, or failed to (the
+    /// destination's `server_routes_error` says why).
     server_last_known: bool,
     /// Other destinations' broader rules this one sits within: it wins over
     /// them for what it matches.
@@ -195,7 +198,7 @@ fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
                 }
             };
             let server_last_known = matches!(server, "allowed" | "partly allowed" | "not allowed")
-                && destination.is_some_and(|d| d.server_routes_error.is_some());
+                && destination.is_some_and(|d| d.server_routes_pending || d.server_routes_error.is_some());
             RouteView {
                 rule: row.rule.to_string(),
                 kind,
@@ -210,8 +213,8 @@ fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
 }
 
 /// A destination's server routes as one line for the pages: the lists the
-/// server sent (the last known ones, with why reading them again failed),
-/// `unchecked`, or why they could not be read.
+/// server sent (the last known ones while they are read again, or with why
+/// reading them again failed), `unchecked`, or why they could not be read.
 fn server_routes_line(d: &DestinationStatus) -> String {
     match (&d.server_routes, &d.server_routes_error) {
         (Some(routes), error) => {
@@ -223,6 +226,7 @@ fn server_routes_line(d: &DestinationStatus) -> String {
                 .collect();
             let lists = if all.is_empty() { "none (loopback only)".to_string() } else { all.join(", ") };
             match error {
+                _ if d.server_routes_pending => format!("{lists} (last known; reading them again)"),
                 Some(error) => format!("{lists} (last known; reading them again failed: {error})"),
                 None => lists,
             }
@@ -393,6 +397,7 @@ fn render_at(
                         relay_urls: &d.relay_urls,
                         server_routes: d.server_routes.as_ref(),
                         server_routes_error: d.server_routes_error.as_deref(),
+                        server_routes_pending: d.server_routes_pending,
                         server_status: server_status_path(&d.host, StatusFormat::Json),
                     })
                     .collect(),
@@ -702,6 +707,7 @@ mod tests {
             server_routes: None,
             server_routes_error: None,
             server_coverage: Arc::default(),
+            server_routes_pending: false,
         }
     }
 
@@ -889,6 +895,14 @@ mod tests {
         let (_, _, html) = render_at(&status, &table, StatusFormat::Html, now);
         assert!(html.contains("last known"), "{html}");
         assert!(html.contains("reading them again failed: timed out"), "{html}");
+
+        // While a new connection reads them again, the kept answer is the
+        // last known too.
+        status.destinations[0].server_routes_error = None;
+        status.destinations[0].server_routes_pending = true;
+        let (_, _, text) = render_at(&status, &table, StatusFormat::Text, now);
+        assert!(text.contains("-> m1.internal, server: allowed (last known)"), "{text}");
+        assert!(text.contains("10.0.0.0/9 (last known; reading them again)"), "{text}");
     }
 
     #[test]

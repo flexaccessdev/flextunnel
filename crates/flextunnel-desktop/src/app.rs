@@ -36,6 +36,7 @@ use flextunnel_core::proxy::{
 use flextunnel_core::transport::paths::ConnectionSnapshot;
 use iced::futures::Stream;
 use iced::{window, Element, Size, Subscription, Task};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
 use tray_icon::menu::MenuEvent;
@@ -525,6 +526,19 @@ pub struct DestinationForm {
     pub relay_urls: String,
     pub relay_auth_token: String,
     pub routes_fetch: RoutesFetch,
+    /// What [`Self::routing`] last made, kept across the view's redraws.
+    routing: RefCell<FormRouting>,
+}
+
+/// The form's host and routes checked with the other destinations' (see
+/// [`DestinationForm::routing`]), and what that was made from.
+#[derive(Default)]
+struct FormRouting {
+    /// Every destination's host and routes, the form's last, as checked.
+    built_from: Vec<(String, Vec<String>, Vec<String>)>,
+    /// The form's host as the table stores it and its overlap lines, or why
+    /// the routes do not make a table; `None` before the first check.
+    made: Option<Result<(String, Vec<String>), String>>,
 }
 
 impl DestinationForm {
@@ -635,6 +649,7 @@ impl DestinationForm {
             relay_urls: destination.relay_urls.join(", "),
             relay_auth_token: destination.relay_auth_token.clone().unwrap_or_default(),
             routes_fetch: RoutesFetch::Idle,
+            routing: RefCell::default(),
         }
     }
 
@@ -643,9 +658,19 @@ impl DestinationForm {
     /// each (see [`config::overlap_lines`]). Empty while the host and routes
     /// do not make a table with the others; the form's error says why.
     pub fn overlaps(&self, destinations: &[Destination]) -> Vec<String> {
+        self.routing(destinations).map(|(_, lines)| lines).unwrap_or_default()
+    }
+
+    /// The form's host and routes checked with the other destinations' by
+    /// the core's routing table — the same check the session makes: the host
+    /// as the table stores it and the form's overlap lines (see
+    /// [`config::overlap_lines`]), or why they do not fit. The view asks on
+    /// every redraw, so the table is built only when a host or routes changed.
+    fn routing(&self, destinations: &[Destination]) -> Result<(String, Vec<String>), String> {
         let editing = self.editing_id.as_deref();
         let routed_domains = split_list(&self.routed_domains);
         let routed_cidrs = split_list(&self.routed_cidrs);
+        // This destination goes last, so its stored host is the table's last.
         let mut specs: Vec<RouteSpec<'_>> = destinations
             .iter()
             .filter(|d| Some(d.id.as_str()) != editing)
@@ -660,10 +685,24 @@ impl DestinationForm {
             routed_domains: &routed_domains,
             routed_cidrs: &routed_cidrs,
         });
-        match RouteTable::new(&specs) {
-            Ok(table) => config::overlap_lines(&table, specs.len() - 1),
-            Err(_) => Vec::new(),
+        let mut memo = self.routing.borrow_mut();
+        let fresh = memo.made.is_some()
+            && memo.built_from.len() == specs.len()
+            && memo.built_from.iter().zip(&specs).all(|((host, domains, cidrs), spec)| {
+                host == spec.host && domains[..] == *spec.routed_domains && cidrs[..] == *spec.routed_cidrs
+            });
+        if !fresh {
+            let made = RouteTable::new(&specs).map_err(|e| format!("{e:#}")).map(|table| {
+                let host = table.hosts().last().map(String::from).expect("the table has this destination");
+                (host, config::overlap_lines(&table, specs.len() - 1))
+            });
+            memo.built_from = specs
+                .iter()
+                .map(|spec| (spec.host.to_string(), spec.routed_domains.to_vec(), spec.routed_cidrs.to_vec()))
+                .collect();
+            memo.made = Some(made);
         }
+        memo.made.clone().expect("checked above")
     }
 
     /// The destination this form describes, checked against the others: the
@@ -693,27 +732,9 @@ impl DestinationForm {
                 other.host
             ));
         }
+        let (host, _) = self.routing(destinations)?;
         let routed_domains = split_list(&self.routed_domains);
         let routed_cidrs = split_list(&self.routed_cidrs);
-        // This destination goes last, so its stored host is the table's last.
-        let mut specs: Vec<RouteSpec<'_>> = others()
-            .map(|d| RouteSpec {
-                host: &d.host,
-                routed_domains: &d.routed_domains,
-                routed_cidrs: &d.routed_cidrs,
-            })
-            .collect();
-        specs.push(RouteSpec {
-            host: &self.host,
-            routed_domains: &routed_domains,
-            routed_cidrs: &routed_cidrs,
-        });
-        let host = RouteTable::new(&specs)
-            .map_err(|e| format!("{e:#}"))?
-            .hosts()
-            .last()
-            .map(String::from)
-            .expect("the table has this destination");
         if config::find_key(keys, &self.auth_key_id).is_none() {
             return Err("Pick an auth key (or create one with New key)".into());
         }
@@ -1429,6 +1450,15 @@ impl App {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.handle(message);
+        // The view reads the saved destinations' table from here, so it is
+        // brought up to date after anything that may have changed them —
+        // rebuilt only when a host or routes did.
+        view::refresh_routed_cache(&mut self.routed_cache, &self.client.destinations);
+        task
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => {
                 self.refresh();
@@ -2943,6 +2973,7 @@ mod tests {
             relay_urls: " https://a.example ,, https://b.example ".into(),
             relay_auth_token: String::new(),
             routes_fetch: RoutesFetch::Idle,
+            routing: RefCell::default(),
         }
     }
 

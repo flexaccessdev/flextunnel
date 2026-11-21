@@ -415,6 +415,7 @@ mod tests {
                 server_routes: None,
                 server_routes_error: None,
                 server_coverage: Default::default(),
+                server_routes_pending: false,
             }
         };
         ClientSnapshot {

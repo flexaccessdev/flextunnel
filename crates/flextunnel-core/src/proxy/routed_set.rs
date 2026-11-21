@@ -38,6 +38,7 @@
 //! (see [`super::signaling::StreamRequest`]). To tunnel *all* traffic, use the
 //! catch-alls: `*` for hostnames and `0.0.0.0/0` (+ `::/0`) for IPs.
 
+use crate::proxy::reserved;
 use crate::proxy::signaling::Target;
 use anyhow::{Context, Result, bail};
 use ipnetwork::IpNetwork;
@@ -235,13 +236,20 @@ impl RoutedSet {
                 if suffix.contains('*') || suffix.split('.').any(str::is_empty) {
                     bail!("invalid routed-domain wildcard pattern: {raw:?}");
                 }
+                if reserved::is_reserved_host(suffix) {
+                    bail!("routed_domains entry {raw:?} is in the reserved flextunnel.internal namespace");
+                }
                 domains_suffix.push(format!(".{}", suffix.to_ascii_lowercase()));
             } else if entry.is_empty() || entry.contains('*') {
                 bail!("invalid routed-domain pattern: {raw:?}");
             } else if parse_ip_literal(entry).is_some() {
                 // A numeric target is always matched against the CIDRs, so
                 // this entry would match nothing.
-                bail!("routed domain {raw:?} is an IP address: list it in the routed CIDRs");
+                bail!("routed_domains entry {raw:?} is an IP address: list it in routed_cidrs");
+            } else if reserved::is_reserved_host(entry) {
+                // The client answers the reserved names itself and a server
+                // refuses them: the entry would match nothing.
+                bail!("routed_domains entry {raw:?} is in the reserved flextunnel.internal namespace");
             } else {
                 domains_exact.insert(entry.to_ascii_lowercase());
             }
@@ -440,6 +448,9 @@ pub(crate) fn routing_key(host: &str) -> &str {
 }
 
 fn parse_ip_literal(host: &str) -> Option<IpAddr> {
+    // `10.0.0.1.` is the same address: classified as an IP, it is gated by
+    // the CIDRs alike everywhere — in config and in a target.
+    let host = routing_key(host);
     let unbracketed = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
@@ -584,6 +595,10 @@ mod tests {
         // even under `*`.
         let w_dom_only = rs(&["*"], &[]);
         assert!(!w_dom_only.allows(&domain("10.0.0.1")));
+        // With the root dot it is the same address, gated the same way.
+        assert!(!w_dom_only.allows(&domain("10.0.0.1.")));
+        assert!(w.allows(&domain("10.0.0.1.")));
+        assert_eq!(w.specificity(&domain("10.0.0.1.")), Some(Specificity::Cidr(8)));
         assert!(w_dom_only.allows(&domain("real.hostname")));
     }
 
@@ -725,11 +740,18 @@ mod tests {
         assert!(RoutedSet::new(&["*.*.example.com".to_string()], &[]).is_err());
         assert!(RoutedSet::new(&["*..example.com".to_string()], &[]).is_err());
         assert!(RoutedSet::new(&[], &["not-a-cidr".to_string()]).is_err());
+        // The client answers the reserved names itself and a server refuses
+        // them, so no list may name them.
+        for reserved in ["flextunnel.internal", "x.flextunnel.internal", "*.flextunnel.internal", "*.a.flextunnel.internal."] {
+            let err = RoutedSet::new(&[reserved.to_string()], &[]).unwrap_err();
+            assert!(err.to_string().contains("reserved"), "{reserved}: {err}");
+        }
+        assert!(RoutedSet::new(&["*.internal".to_string()], &[]).is_ok());
         // A numeric target is matched against the CIDRs, never a domain rule:
         // as a domain an address would be a rule that matches nothing.
         for numeric in ["10.0.0.1", "10.0.0.1.", "fd00::1", "[fd00::1]"] {
             let err = RoutedSet::new(&[numeric.to_string()], &[]).unwrap_err();
-            assert!(err.to_string().contains("routed CIDRs"), "{numeric}: {err}");
+            assert!(err.to_string().contains("routed_cidrs"), "{numeric}: {err}");
         }
     }
 

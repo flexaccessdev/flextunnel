@@ -1336,26 +1336,27 @@ fn routes_section<'a>(app: &'a App, destination: &'a Destination) -> Element<'a,
         });
         col = col.push(route_row(rule.clone(), badge));
     }
-    if let Some(status) = status
-        && let Some(error) = status.server_routes_error.as_deref()
-    {
-        let message = match status.server_routes {
-            Some(_) => format!(
-                "Could not read the server's routes again: {error}. The marks above are from an earlier connection."
-            ),
-            None => format!("Could not read the server's routes: {error}"),
+    if let Some(status) = status {
+        let earlier = "The marks above are from an earlier connection.";
+        let message = match (&status.server_routes, status.server_routes_error.as_deref()) {
+            (Some(_), _) if status.server_routes_pending => {
+                Some(format!("Reading the server's routes again. {earlier}"))
+            }
+            (Some(_), Some(error)) => {
+                Some(format!("Could not read the server's routes again: {error}. {earlier}"))
+            }
+            (None, Some(error)) => Some(format!("Could not read the server's routes: {error}")),
+            (_, None) => None,
         };
-        col = col.push(
-            text(message)
-                .size(11)
-                .style(style::faint_text),
-        );
+        if let Some(message) = message {
+            col = col.push(text(message).size(11).style(style::faint_text));
+        }
     }
 
     // Where another destination's rules nest with these.
     let index = app.client.destinations.iter().position(|d| d.id == destination.id);
-    if let (Ok(table), Some(index)) = (app.client.route_table(), index) {
-        let lines = config::overlap_lines(&table, index);
+    if let (Some(table), Some(index)) = (app.routed_cache.table.as_ref(), index) {
+        let lines = config::overlap_lines(table, index);
         if !lines.is_empty() {
             col = col.push(space().height(8));
             col = col.push(text("Overlaps with other destinations (the most specific rule that matches a target takes it):").size(12));
@@ -2892,6 +2893,7 @@ mod tests {
             server_routes: None,
             server_routes_error: None,
             server_coverage: Default::default(),
+            server_routes_pending: false,
         };
         let word = |status: &flextunnel_core::proxy::DestinationStatus| {
             destination_state(&DestinationLive::Live(status))

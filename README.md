@@ -394,8 +394,9 @@ table, most specific rule first, after the reserved names: each rule, the
 destination it goes to, the other destinations' rules it lies inside or that
 lie inside it, and whether that destination's server routes it too. A
 destination reads its server's lists each time it connects, so until a
-destination's first use its rules show as `unchecked`; when a later read
-fails, the earlier answer is shown as last known, with the error. The browser view is HTML; `/status.txt` is plain text and
+destination's first use its rules show as `unchecked`; while a later
+connection reads them again, or when that read fails, the earlier answer is
+shown as last known. The browser view is HTML; `/status.txt` is plain text and
 `/status.json` is structured JSON for scripts:
 
 ```sh
@@ -414,7 +415,7 @@ The JSON response includes `version`, `socks_listen`, `http_listen`,
 under `destinations`. Each `routes` entry has `rule`, `kind` (`host`, `exact`,
 `wildcard`, `catch-all` or `network`), `destination`, `server` (`loopback`,
 `allowed`, `partly allowed`, `not allowed` or `unchecked`), `server_last_known`
-(`server` comes from an earlier read because the latest one failed), `within`
+(`server` comes from an earlier read: the latest is still running or failed), `within`
 (other destinations' broader rules it lies inside) and `narrower` (their
 narrower rules that lie inside it), each a list of `{rule, destination}`. A
 destination entry has `host`, `server_node_id`, `state` (`idle`,
@@ -423,7 +424,8 @@ destination entry has `host`, `server_node_id`, `state` (`idle`,
 `next_attempt_secs`, `last_error`, `routed_domains`, `routed_cidrs`,
 `relay_urls`, `server_routes` (the server's `routed_domains` and
 `routed_cidrs` as read on its latest connection, `null` before one),
-`server_routes_error`, and `server_status`.
+`server_routes_error`, `server_routes_pending` (a connection is reading them
+again), and `server_status`.
 
 Each **server's** own status page is under `/servers/<destination>/`, with the
 same `/status.txt` and `/status.json` variants. Fetching it connects to that
@@ -438,6 +440,7 @@ That JSON includes `version`, `server_node_id`, `routed_domains`,
 counts under `duplicate_id_blocklist`.
 
 Other `*.flextunnel.internal` names are reserved and answer with an HTTP 404.
+No `routed_domains` list, a client's or a server's, may name a reserved name.
 
 #### A server's loopback
 
@@ -807,8 +810,8 @@ targets, accept a bare IP as a single host, and a default route (`0.0.0.0/0` /
 and IPs only against `routed_cidrs`. A numeric IP literal is always gated by
 `routed_cidrs` even when it arrives in hostname form (SOCKS5 `ATYP_DOMAIN`), so
 `*` never lets a raw IP through — it can only route real hostnames. For the same
-reason an IP address in `routed_domains` is a config error: list it in
-`routed_cidrs`.
+reason an IP address in `routed_domains` — with or without a trailing dot — is
+a config error: list it in `routed_cidrs`.
 
 Either list, or both, may be omitted. The two never cross: an omitted/empty
 list means that whole category is not routed. So `routed_domains` alone (no

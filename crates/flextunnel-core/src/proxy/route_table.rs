@@ -31,7 +31,7 @@
 use crate::proxy::reserved;
 use crate::proxy::routed_set::{RoutedSet, Rule, Specificity, routing_key};
 use crate::proxy::signaling::{StreamRequest, Target};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::net::IpAddr;
 
@@ -130,7 +130,7 @@ impl RouteTable {
                 })?;
             }
             let routed = RoutedSet::new(spec.routed_domains, spec.routed_cidrs)
-                .with_context(|| format!("destination {host:?}"))?;
+                .map_err(|e| anyhow::anyhow!("destination {host:?}: {e:#}"))?;
             entries.push(Entry { host, routed });
         }
 
@@ -157,22 +157,6 @@ impl RouteTable {
                      (it always means that server's loopback)",
                     entry.host
                 );
-            }
-        }
-        // The reserved namespace is the client's own; a rule naming it is dead.
-        for entry in &entries {
-            for rule in entry.routed.rules() {
-                let name = match &rule {
-                    Rule::Suffix(zone) | Rule::Exact(zone) => zone.as_str(),
-                    Rule::CatchAll | Rule::Cidr(_) => continue,
-                };
-                if reserved::is_reserved_host(name) {
-                    bail!(
-                        "destination {:?} routes {rule:?}, which is in the reserved \
-                         flextunnel.internal namespace",
-                        entry.host
-                    );
-                }
             }
         }
         let overlaps = find_overlaps(&entries);
@@ -318,16 +302,8 @@ fn validate_routed_domain(raw: &str) -> Result<(), String> {
     if entry == "*" {
         return Ok(());
     }
-    // An address here would be a rule that never matches: an IP target is
-    // routed by the networks alone, so the traffic it was meant to tunnel
-    // would connect directly instead.
-    let unbracketed = entry
-        .strip_prefix('[')
-        .and_then(|e| e.strip_suffix(']'))
-        .unwrap_or(entry);
-    if unbracketed.parse::<IpAddr>().is_ok() {
-        return Err("it is an IP address, which routed_cidrs routes — list it there".into());
-    }
+    // An IP address or a reserved name is refused by [`RoutedSet::new`]
+    // itself, on a server's lists as well as here.
     let name = entry.strip_prefix("*.").unwrap_or(entry);
     crate::forwards::validate_remote_host(name)
         .map(|_| ())

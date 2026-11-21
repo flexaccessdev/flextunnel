@@ -10,9 +10,10 @@
 //! connects to the destination if it is not connected.
 //!
 //! The names never reach a server. A client destination may not use one as its
-//! host, and a server rejects them as `[host_aliases]` names (at config
-//! resolution) and as stream targets, so no `routed_domains = ["*"]` or alias
-//! can capture them.
+//! host, no `routed_domains` list — a client's or a server's — may name one,
+//! and a server rejects them as `[host_aliases]` names (at config resolution)
+//! and as stream targets, so no `routed_domains = ["*"]` or alias can capture
+//! them.
 
 use super::routed_set::routing_key;
 

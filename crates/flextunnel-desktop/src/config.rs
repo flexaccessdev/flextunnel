@@ -1482,6 +1482,7 @@ mod tests {
             server_routes: None,
             server_routes_error: None,
             server_coverage: Default::default(),
+            server_routes_pending: false,
         };
         assert_eq!(server_coverage(Some(&status), "*.corp.example", false), None);
         assert_eq!(server_coverage(None, "*.corp.example", false), None);

@@ -274,6 +274,9 @@ pub struct DestinationStatus {
     /// Each of this destination's rules with how much of it `server_routes`
     /// covers, graded once when they were read; empty until then.
     pub server_coverage: Arc<HashMap<Rule, Coverage>>,
+    /// A connection is reading the server's routes again: until it has,
+    /// `server_routes` (if any) is the last known answer.
+    pub server_routes_pending: bool,
 }
 
 /// State every destination of one client shares.
@@ -360,6 +363,7 @@ struct StatusFields {
     server_routes: Option<ServerRoutes>,
     server_routes_error: Option<String>,
     server_coverage: Arc<HashMap<Rule, Coverage>>,
+    server_routes_pending: bool,
     /// Counts the connections whose server routes were asked for: a read
     /// answers only while its connection is still the latest asked, so a
     /// slow read on an older connection never overwrites a newer answer.
@@ -712,6 +716,7 @@ impl Destination {
             server_routes: fields.server_routes.clone(),
             server_routes_error: fields.server_routes_error.clone(),
             server_coverage: fields.server_coverage.clone(),
+            server_routes_pending: fields.server_routes_pending,
         }
     }
 
@@ -786,6 +791,9 @@ impl Destination {
         let generation = {
             let mut fields = self.status_fields();
             fields.server_routes_generation += 1;
+            // Whatever is kept from an earlier connection is the last known
+            // answer until this read replaces it.
+            fields.server_routes_pending = true;
             fields.server_routes_generation
         };
         tokio::spawn(async move {
@@ -796,11 +804,11 @@ impl Destination {
                 Ok(routes) => {
                     let grader = this.clone();
                     tokio::task::spawn_blocking(move || {
-                        let coverage = grader.grade(&routes);
-                        (routes, coverage)
+                        let coverage = grader.grade(&routes)?;
+                        Ok((routes, coverage))
                     })
                     .await
-                    .map_err(|e| format!("grading the server's routes failed: {e}"))
+                    .unwrap_or_else(|e| Err(format!("grading the server's routes failed: {e}")))
                 }
                 Err(e) => Err(e),
             };
@@ -809,6 +817,7 @@ impl Destination {
                 if fields.server_routes_generation != generation {
                     return;
                 }
+                fields.server_routes_pending = false;
                 match &read {
                     Ok((routes, coverage)) => {
                         let changed = fields.server_routes.as_ref() != Some(routes);
@@ -832,18 +841,13 @@ impl Destination {
     }
 
     /// Each of this destination's rules with how much of it `routes` (the
-    /// server's) covers; empty, with a warning, when the two cannot be
-    /// compared.
-    fn grade(&self, routes: &ServerRoutes) -> Arc<HashMap<Rule, Coverage>> {
-        let graded = RoutedSet::new(&self.cfg.routed_domains, &self.cfg.routed_cidrs)
-            .and_then(|own| routes.coverage_of(&own));
-        match graded {
-            Ok(coverage) => Arc::new(coverage),
-            Err(e) => {
-                log::warn!("{}: cannot compare routes with the server's: {e:#}", self.host());
-                Arc::default()
-            }
-        }
+    /// server's) covers, or why the two cannot be compared — a read that
+    /// failed, so an earlier answer stays as the last known.
+    fn grade(&self, routes: &ServerRoutes) -> Result<Arc<HashMap<Rule, Coverage>>, String> {
+        RoutedSet::new(&self.cfg.routed_domains, &self.cfg.routed_cidrs)
+            .and_then(|own| routes.coverage_of(&own))
+            .map(Arc::new)
+            .map_err(|e| format!("cannot compare routes with the server's: {e:#}"))
     }
 
     /// Log each of this destination's rules the server does not route in
