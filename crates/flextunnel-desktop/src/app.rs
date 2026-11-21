@@ -568,24 +568,48 @@ impl DestinationForm {
     /// Take the server's answer to fetch `id`: fill the two routed fields with
     /// its lists, replacing what they held, or keep them and say why not. An
     /// answer the form is not waiting for is dropped.
+    ///
+    /// The fields are comma-separated text, so an entry is only filled in if
+    /// it reads back from them as the one rule it is. A server takes any text
+    /// as an exact domain, and one like `a.example, b.example` would save here
+    /// as two rules the server does not have.
     fn routes_fetched(&mut self, id: u64, fetched: Result<ServerRoutes, String>) {
         if self.routes_fetch != RoutesFetch::Fetching(id) {
             return;
         }
         self.routes_fetch = match fetched {
             Ok(routes) => {
-                let filled = match (routes.routed_domains.len(), routes.routed_cidrs.len()) {
-                    (0, 0) => "The server routes nothing beyond itself.".to_string(),
-                    (domains, cidrs) => {
-                        format!("Filled in the server's {domains} domain(s) and {cidrs} CIDR(s).")
+                let mut rules = routes.routed_domains.iter().chain(&routes.routed_cidrs);
+                match rules.find(|rule| split_list(rule) != [rule.as_str()]) {
+                    Some(odd) => RoutesFetch::Failed(format!(
+                        "The server lists {odd:?}, which these fields cannot hold as one rule. \
+                         Nothing was filled in."
+                    )),
+                    None => {
+                        let filled = match (routes.routed_domains.len(), routes.routed_cidrs.len())
+                        {
+                            (0, 0) => "The server routes nothing beyond itself.".to_string(),
+                            (domains, cidrs) => format!(
+                                "Filled in the server's {domains} domain(s) and {cidrs} CIDR(s)."
+                            ),
+                        };
+                        self.routed_domains = routes.routed_domains.join(", ");
+                        self.routed_cidrs = routes.routed_cidrs.join(", ");
+                        RoutesFetch::Filled(filled)
                     }
-                };
-                self.routed_domains = routes.routed_domains.join(", ");
-                self.routed_cidrs = routes.routed_cidrs.join(", ");
-                RoutesFetch::Filled(filled)
+                }
             }
             Err(reason) => RoutesFetch::Failed(reason),
         };
+    }
+
+    /// A routed field was edited by hand. The answer to a fetch in flight
+    /// would replace both fields, and what was just typed with them, so it is
+    /// no longer waited for.
+    fn routes_edited(&mut self) {
+        if matches!(self.routes_fetch, RoutesFetch::Fetching(_)) {
+            self.routes_fetch = RoutesFetch::Idle;
+        }
     }
 
     /// The server, key or relays changed: a fetch in flight was for what they
@@ -1580,12 +1604,14 @@ impl App {
             Message::DestinationRoutedDomainsChanged(value) => {
                 if let Some(form) = &mut self.destination_form {
                     form.routed_domains = value;
+                    form.routes_edited();
                 }
                 Task::none()
             }
             Message::DestinationRoutedCidrsChanged(value) => {
                 if let Some(form) = &mut self.destination_form {
                     form.routed_cidrs = value;
+                    form.routes_edited();
                 }
                 Task::none()
             }
@@ -3389,7 +3415,53 @@ mod tests {
         form.server_changed();
         form.routes_fetched(11, Ok(routes()));
         assert_eq!(form.routes_fetch, RoutesFetch::Idle);
-        assert_eq!((form.routed_domains, form.routed_cidrs), typed);
+        assert_eq!((form.routed_domains.clone(), form.routed_cidrs.clone()), typed);
+
+        // Nor does one that arrives after a routed field was edited by hand:
+        // it would replace what was typed while it was on its way.
+        form.routes_fetch = RoutesFetch::Fetching(12);
+        form.routed_cidrs = "172.16.0.0/12".into();
+        form.routes_edited();
+        form.routes_fetched(12, Ok(routes()));
+        assert_eq!(form.routes_fetch, RoutesFetch::Idle);
+        assert_eq!(form.routed_cidrs, "172.16.0.0/12");
+        // An edit with nothing in flight leaves the last outcome standing.
+        form.routes_fetch = RoutesFetch::Failed("unreachable".into());
+        form.routes_edited();
+        assert_eq!(form.routes_fetch, RoutesFetch::Failed("unreachable".into()));
+    }
+
+    /// A server takes any text as an exact domain. An entry the form's
+    /// comma-separated fields would read back as something else — two rules,
+    /// a trimmed one, none — is not filled in, in either list.
+    #[test]
+    fn a_fetched_entry_that_is_not_one_rule_fills_nothing() {
+        let keys = test_keys();
+        for (domains, cidrs) in [
+            (vec!["ok.example", "db.example, api.example"], vec!["10.0.0.0/8"]),
+            (vec!["ok.example"], vec!["10.0.0.0/8,192.168.0.0/16"]),
+            (vec![" padded.example"], vec![]),
+            (vec![","], vec![]),
+        ] {
+            let mut form = valid_form();
+            let typed = (form.routed_domains.clone(), form.routed_cidrs.clone());
+            form.routes_fetch = RoutesFetch::Fetching(1);
+            form.routes_fetched(
+                1,
+                Ok(ServerRoutes {
+                    routed_domains: domains.iter().map(|d| d.to_string()).collect(),
+                    routed_cidrs: cidrs.iter().map(|c| c.to_string()).collect(),
+                }),
+            );
+            assert!(
+                matches!(&form.routes_fetch, RoutesFetch::Failed(said) if said.contains("one rule")),
+                "{domains:?} {cidrs:?}: {:?}",
+                form.routes_fetch
+            );
+            assert_eq!((form.routed_domains.clone(), form.routed_cidrs.clone()), typed);
+            // What saves is still what was typed, not half of the server's entry.
+            assert_eq!(form.validate(&[], &keys).unwrap().routed_cidrs, ["10.0.0.0/8"]);
+        }
     }
 
     /// A destination is checked against the others, with the core's own

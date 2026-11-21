@@ -136,7 +136,7 @@ FlextunnelHandle *flextunnel_start(const char *config_json, char *out_buf, size_
  *    "relay_urls":[],"relay_auth_token":null}
  *   relay_urls and relay_auth_token are optional, with the rules they have in
  *   flextunnel_start. The server must already authorize the key's public half.
- * out_buf/out_len : caller buffer. On success receives
+ * out_buf/out_len : caller buffer. Once the server has answered it receives
  *   {"routed_domains":["*.corp.example"],"routed_cidrs":["10.0.0.0/8"]}
  *   in the syntax a destination's own lists use; both are empty for a server
  *   that routes nothing beyond itself. On failure receives an error message:
@@ -147,11 +147,15 @@ FlextunnelHandle *flextunnel_start(const char *config_json, char *out_buf, size_
  * seconds as a rule, about a minute against a server that never answers — so
  * call it off the main thread. Nothing is retried.
  *
- * Returns 1 on success and 0 on failure. If out_buf is too small for the
- * success JSON it also returns 0, but out_buf then holds the truncated
- * (NUL-terminated) output — no diagnostic text — so retry with a larger buffer.
+ * Returns the byte count the JSON needs including the trailing NUL once the
+ * server has answered, or -1 on failure. As with flextunnel_forward_statuses,
+ * out_buf holds the complete JSON iff the return value is <= out_len; on a
+ * larger return it holds a NUL-terminated truncation, and the call must be
+ * repeated with a buffer of at least the returned size — which asks the server
+ * again, so start with a buffer that is generous for two lists of rules. A
+ * failure is -1 whatever the buffer: a larger one does not change it.
  */
-int flextunnel_fetch_server_routes(const char *request_json, char *out_buf, size_t out_len);
+ptrdiff_t flextunnel_fetch_server_routes(const char *request_json, char *out_buf, size_t out_len);
 
 /*
  * Replace the complete local-forward set. forwards_json must be a valid
