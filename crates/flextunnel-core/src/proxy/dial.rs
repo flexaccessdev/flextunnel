@@ -25,7 +25,12 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// `forwarder` is the server's conditional-DNS-forwarding table; the client's
 /// split-tunnel path passes `None`.
+///
+/// An address in domain form (`127.0.0.1.`, `[fd00::1]`) is dialed as that
+/// address, the way the routing read it ([`Target::into_numeric`]), never
+/// looked up by name — on the client's direct path as on a server's.
 pub async fn dial_target(target: &Target, forwarder: Option<&DnsForwarder>) -> io::Result<TcpStream> {
+    let target = &target.clone().into_numeric();
     if let Some(port) = loopback_port(target) {
         return connect_any(&loopback_addrs(port)).await;
     }
@@ -212,6 +217,10 @@ mod tests {
         for target in [
             Target::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
             Target::Domain("127.0.0.1".into(), port),
+            // With the root dot it is the same address, dialed as one, not
+            // looked up by name.
+            Target::Domain("127.0.0.1.".into(), port),
+            Target::Domain("[::1].".into(), port),
             Target::Domain("localhost".into(), port),
         ] {
             dial_target(&target, None)
