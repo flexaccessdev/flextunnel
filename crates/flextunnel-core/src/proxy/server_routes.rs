@@ -17,7 +17,7 @@ use super::destination::{ClientAuth, dial_server, exchange_hello};
 use super::status_page::{CONTENT_TYPE_JSON, STATUS_JSON_PATH, StatusFormat};
 use crate::auth::ClientKey;
 use crate::error::{ProxyError, ProxyResult};
-use crate::transport::endpoint::{RelayConfig, create_client_endpoint};
+use crate::transport::endpoint::{PendingCloses, RelayConfig, create_client_endpoint};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointId};
 use rand::RngExt;
@@ -57,7 +57,10 @@ impl ServerRoutes {
 /// both last until its endpoint has closed, which comes after the answer: the
 /// close waits for the peer to acknowledge it and for the endpoint's own
 /// tasks, with no deadline of its own, and must neither hold the answer back
-/// nor be cut short by a caller that has what it asked for.
+/// nor be cut short by a caller that has what it asked for. The same goes
+/// for the closes the endpoint's creation stopped waiting for
+/// ([`PendingCloses`]): a relay probe's, or the endpoint's own when it never
+/// came online.
 pub fn fetch_server_routes(
     thread_name: &str,
     server_id: EndpointId,
@@ -66,22 +69,23 @@ pub fn fetch_server_routes(
 ) -> oneshot::Receiver<ProxyResult<ServerRoutes>> {
     on_own_thread(thread_name, move |answer| async move {
         let auth = ClientAuth::Key(Box::new(key));
-        let endpoint = match create_client_endpoint(&relay).await {
-            Ok(endpoint) => endpoint,
-            Err(e) => {
-                let failure = format!("Failed to create the iroh endpoint: {e:#}");
-                log::warn!("Asking server {server_id} for its routes failed: {failure}");
-                let _ = answer.send(Err(ProxyError::Signaling(failure)));
-                return;
-            }
+        let closes = PendingCloses::new();
+        let endpoint = create_client_endpoint(&relay, &closes).await;
+        let routes = match &endpoint {
+            Ok(endpoint) => fetch_over(&endpoint.endpoint(), server_id, &relay, &auth).await,
+            Err(e) => Err(ProxyError::Signaling(format!(
+                "Failed to create the iroh endpoint: {e:#}"
+            ))),
         };
-        let routes = fetch_over(&endpoint.endpoint(), server_id, &relay, &auth).await;
         if let Err(e) = &routes {
             log::warn!("Asking server {server_id} for its routes failed: {e}");
         }
-        // The answer first, then the close, on every outcome.
+        // The answer first, then the closes, on every outcome.
         let _ = answer.send(routes);
-        endpoint.close().await;
+        if let Ok(endpoint) = endpoint {
+            endpoint.close().await;
+        }
+        closes.finished().await;
     })
 }
 

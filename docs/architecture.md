@@ -268,7 +268,10 @@ a status stream for `/status.json`, close — returning the two lists from the
 server's status page. It is a single attempt outside any `ProxyClient`, so it
 works before the destination exists. The request runs on a thread and runtime
 of its own that outlive the answer: the endpoint's close comes after it, and
-neither holds the answer back nor is cut short once the caller has it. The desktop app's destination form
+neither holds the answer back nor is cut short once the caller has it. The
+closes the endpoint's creation stopped waiting for — a relay probe's, or the
+endpoint's own when it never came online — are waited for there as well
+(`flexaccess_iroh::endpoint::PendingCloses`). The desktop app's destination form
 (*Fetch from server*) and the FFI (`flextunnel_fetch_server_routes`) offer the
 result for the user to save; the wire protocol is unchanged.
 

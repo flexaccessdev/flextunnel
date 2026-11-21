@@ -41,7 +41,8 @@ use crate::proxy::client::{
 };
 use crate::proxy::signaling::{self, Hello, HelloResponse};
 use crate::transport::endpoint::{
-    ClientEndpoint, RelayConfig, create_client_endpoint, create_quick_client_endpoint,
+    ClientEndpoint, PendingCloses, RelayConfig, create_client_endpoint,
+    create_quick_client_endpoint,
 };
 use crate::transport::paths::ConnectionSnapshot;
 use futures::future::BoxFuture;
@@ -118,9 +119,12 @@ pub(crate) fn default_endpoint_provider() -> EndpointProvider {
             ClientAuth::Quick(secret) => Some(secret.clone()),
         };
         Box::pin(async move {
+            // A client session's runtime outlives its endpoints: a close the
+            // creation stops waiting for finishes on it by itself.
+            let closes = PendingCloses::new();
             match secret {
-                Some(secret) => create_quick_client_endpoint(&relay, *secret).await,
-                None => create_client_endpoint(&relay).await,
+                Some(secret) => create_quick_client_endpoint(&relay, *secret, &closes).await,
+                None => create_client_endpoint(&relay, &closes).await,
             }
         })
     })

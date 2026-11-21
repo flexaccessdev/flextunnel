@@ -34,7 +34,7 @@ hickory-resolver = { version = "0.26", default-features = false, features = ["to
 # local-network discovery on every endpoint (compiled out on iOS by the crate);
 # `relay-health` is the custom-relay `/healthz` check the status views show
 # (see `transport::paths`).
-flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.17", features = ["mdns", "relay-health"] }
+flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.18", features = ["mdns", "relay-health"] }
 iroh = "1.5.0"
 libc = "0.2"
 log = "0.4"
