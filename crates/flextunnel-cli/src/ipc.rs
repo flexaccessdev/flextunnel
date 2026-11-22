@@ -70,6 +70,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(
 );
 /// Largest payload of one client-to-session tunnel frame.
 const MAX_FRAME: usize = 64 * 1024;
+/// Buffer for the tunnel's unframed direction, target to caller (see
+/// [`copy_unframed`]).
+const UNFRAMED_BUF: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -555,7 +558,7 @@ async fn serve_tunnel<S>(
         to_tunnel.shutdown().await
     };
     let download = async {
-        tokio::io::copy(&mut from_tunnel, &mut to_caller).await?;
+        copy_unframed(&mut from_tunnel, &mut to_caller).await?;
         to_caller.flush().await
     };
     tokio::pin!(download);
@@ -571,6 +574,22 @@ async fn serve_tunnel<S>(
     if let Err(e) = res {
         log::debug!("nc tunnel to {target} ended: {e}");
     }
+}
+
+/// Copy `reader` into `writer` as it comes, until `reader`'s EOF: the tunnel's
+/// target-to-caller direction, on both of its hops (the session reading the
+/// tunnel for the caller, and the caller reading the session for its stdout).
+/// It moves [`UNFRAMED_BUF`] at a time rather than `tokio::io::copy`'s 8 KiB:
+/// every write to stdout is a hand-off to a blocking thread, and that many of
+/// them held a download to about 60% of what the tunnel carries.
+pub async fn copy_unframed<R, W>(reader: &mut R, writer: &mut W) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut reader = BufReader::with_capacity(UNFRAMED_BUF, reader);
+    tokio::io::copy_buf(&mut reader, writer).await?;
+    Ok(())
 }
 
 /// Copy `reader` into `writer` as tunnel frames — a 4-byte big-endian length,
