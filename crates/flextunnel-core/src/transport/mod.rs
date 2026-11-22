@@ -1,9 +1,12 @@
 //! QUIC transport configuration shared by client and server endpoint setup.
 //!
 //! Unlike the ezvpn VPN this is derived from, the data path here is reliable
-//! QUIC bi-streams (not unreliable datagrams), so there is no datagram-buffer,
-//! congestion-controller, or flow-control-window tuning — just the idle
-//! timeout, the app-level heartbeat cadence, and a larger initial MTU.
+//! QUIC bi-streams (not unreliable datagrams), so there is no datagram-buffer
+//! or congestion-controller tuning — the idle timeout, the app-level heartbeat
+//! cadence, a larger initial MTU, and two settings that a single bulk stream
+//! depends on: the flow-control windows ([`STREAM_RECEIVE_WINDOW`],
+//! [`SEND_WINDOW`]) and how much reordering loss detection tolerates
+//! ([`REORDERING_PACKET_THRESHOLD`], [`REORDERING_TIME_THRESHOLD`]).
 
 pub mod endpoint;
 pub mod paths;
@@ -30,6 +33,56 @@ pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 /// 1452 is the IPv6-safe maximum for a standard 1500-byte Ethernet path
 /// (`1500 − 40 IPv6 − 8 UDP`) and matches quinn's DPLPMTUD upper-bound default.
 pub const QUIC_INITIAL_MTU: u16 = 1452;
+
+/// Flow-control window of one stream: how much the peer may send on it ahead
+/// of what the application has read.
+///
+/// A stream cannot carry more than a window per round trip, whatever the path
+/// could take, so this caps a transfer at `window / RTT`. iroh's default of
+/// 1.25 MB is 100 Mbit/s at 100 ms; over a path with 53 ms round trips and
+/// room for far more, a forward measured 180 Mbit/s with it in either
+/// direction, and with this 370–450 down and 560–680 up. A larger window
+/// would only matter on a path both faster and longer than that, and the
+/// window is also what a stream buffers when its reader stalls. The
+/// connection as a whole stays unlimited, as it is by default: a shared limit
+/// would let a few stalled streams block the rest.
+pub const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
+
+/// How much sent-but-unacknowledged stream data a connection holds, across its
+/// streams. Twice [`STREAM_RECEIVE_WINDOW`], so one stream can fill its window
+/// while others still send.
+pub const SEND_WINDOW: u64 = 2 * STREAM_RECEIVE_WINDOW as u64;
+
+/// How many later packets must be acknowledged before an unacknowledged one
+/// is declared lost on that ground alone (QUIC's packet reordering threshold,
+/// 3 by default).
+///
+/// The default mistakes reordering for loss, and a sender on a multi-queue NIC
+/// reorders its own packets: the kernel picks the transmit queue by the CPU a
+/// packet is sent from, and the task sending a connection's packets moves
+/// between runtime threads, so consecutive batches leave through different
+/// queues and overtake each other by milliseconds. A server on such a NIC
+/// (four queues) declared 9–12% of a download's packets lost when all of them
+/// had arrived, resent them, and shrank its congestion window thousands of
+/// times over. At that rate a millisecond is a hundred packets, hence a
+/// threshold in the hundreds: with this one and [`REORDERING_TIME_THRESHOLD`]
+/// the download ran 14% faster, as fast as with the kernel made to use one
+/// queue. A real loss in a bulk transfer is still noticed promptly, once this
+/// many packets have followed it; in a trickle the time threshold decides, as
+/// it always has.
+pub const REORDERING_PACKET_THRESHOLD: u32 = 256;
+
+/// How long an unacknowledged packet is waited for, as a multiple of the
+/// round-trip time, once a later packet has been acknowledged (QUIC's time
+/// reordering threshold, 9/8 by default).
+///
+/// The companion of [`REORDERING_PACKET_THRESHOLD`]: on a short path 9/8 of
+/// the round trip leaves a fraction of a millisecond for a reordered packet to
+/// turn up, less than transmit queues drift apart, so the time rule alone kept
+/// most of the spurious losses. The cost is in a stream too slow for the
+/// packet threshold to apply: a packet lost in mid-flight is resent after two
+/// round trips rather than one and an eighth.
+pub const REORDERING_TIME_THRESHOLD: f32 = 2.0;
 
 /// App-level heartbeat interval while the client is **active** (foregrounded,
 /// or a non-mobile embedder). After the auth handshake the control stream is
@@ -95,10 +148,12 @@ pub const ALPN: &[u8] = b"flextunnel/1";
 /// client.
 pub const QUICK_ALPN: &[u8] = b"flextunnel-quick/1";
 
-/// Build a QUIC transport config with the idle timeout and a larger initial
-/// MTU — and **no transport keep-alive** (see [`QUIC_IDLE_TIMEOUT`]; the
-/// app-level heartbeat is the sole periodic sender). Shared by client and
-/// server endpoint creation so both sides apply identical settings.
+/// Build a QUIC transport config with the idle timeout, a larger initial MTU,
+/// the flow-control windows and the reordering thresholds — and **no transport
+/// keep-alive** (see [`QUIC_IDLE_TIMEOUT`]; the app-level heartbeat is the sole
+/// periodic sender). Shared by client and server endpoint creation so both
+/// sides apply identical settings: each side's windows bound what the other
+/// sends, and each side's thresholds judge its own packets.
 pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
     let mut transport_config = QuicTransportConfig::builder();
     let idle_timeout = QUIC_IDLE_TIMEOUT
@@ -106,5 +161,9 @@ pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
         .context("converting QUIC_IDLE_TIMEOUT to IdleTimeout")?;
     transport_config = transport_config.max_idle_timeout(Some(idle_timeout));
     transport_config = transport_config.initial_mtu(QUIC_INITIAL_MTU);
+    transport_config = transport_config.stream_receive_window(STREAM_RECEIVE_WINDOW.into());
+    transport_config = transport_config.send_window(SEND_WINDOW);
+    transport_config = transport_config.packet_threshold(REORDERING_PACKET_THRESHOLD);
+    transport_config = transport_config.time_threshold(REORDERING_TIME_THRESHOLD);
     Ok(transport_config.build())
 }
