@@ -163,7 +163,8 @@ A port forward on the client and every target connection on the server splice
 the stream with their `TcpStream` in `proxy/splice.rs`, which runs the two
 directions independently and copies as little as it can: a read from the socket
 is handed to the QUIC stream as an owned chunk (`write_chunk`), in a buffer
-that grows to 64 KiB while reads fill it and shrinks back when they stop, and
+that grows to 64 KiB while reads fill it and shrinks back as they come back
+short (a stream that falls silent mid-transfer keeps it until it reads again), and
 the stream's received chunks go to the socket as they arrived, up to 64 in one
 vectored write (`read_many_chunks`). The client's proxy front-ends (SOCKS5,
 HTTP) join the halves with `tokio::io::join` and run

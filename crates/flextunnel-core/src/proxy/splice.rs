@@ -7,8 +7,11 @@
 //! - **local → tunnel**: each read lands in a [`BytesMut`] and is handed to
 //!   the QUIC stream as an owned chunk, which the stream queues as it is
 //!   instead of copying it into a buffer of its own. The read buffer grows
-//!   while reads fill it and shrinks again when they stop, so a bulk transfer
-//!   reads [`READ_MAX`] at a time and a quiet stream keeps about [`READ_MIN`].
+//!   while reads fill it and shrinks again as they come back short, so a bulk
+//!   transfer reads [`READ_MAX`] at a time and a stream that carries little
+//!   keeps about [`READ_MIN`]. Only a completed read changes the size: a
+//!   stream that falls silent in the middle of a bulk transfer waits for its
+//!   next input with up to [`READ_MAX`] allocated.
 //! - **tunnel → local**: the stream's received chunks are taken as they are,
 //!   up to [`MAX_CHUNKS`] per call, and leave in one vectored write. Nothing
 //!   is held while the stream is quiet.
@@ -26,7 +29,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 const READ_MIN: usize = 8 * 1024;
 /// The read buffer of a stream whose reads keep filling it. Larger reads were
 /// measured to buy nothing, and the buffer stays allocated while the stream
-/// waits for input.
+/// waits for input — for as long as it does, since the size only comes down
+/// after reads that return little.
 const READ_MAX: usize = 64 * 1024;
 /// Tunnel chunks taken per read and written per vectored write. A chunk is at
 /// most one QUIC packet's worth of stream data, so this is about 90 KiB.
@@ -57,7 +61,7 @@ where
             buf = BytesMut::with_capacity(want);
         }
         let room = buf.capacity();
-        let n = reader.read_buf(&mut buf).await?;
+        let n = read_some(&mut reader, &mut buf).await?;
         if n == 0 {
             break;
         }
@@ -65,6 +69,20 @@ where
         send.write_chunk(buf.split().freeze()).await?;
     }
     send.finish().map_err(io::Error::other)
+}
+
+/// One read into `buf`. An interrupted read took nothing and is made again
+/// rather than ending the splice, as `tokio::io::copy_bidirectional` does.
+async fn read_some<R>(reader: &mut R, buf: &mut BytesMut) -> io::Result<usize>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        match reader.read_buf(buf).await {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            res => return res,
+        }
+    }
 }
 
 /// The buffer size to offer the next read, after one that returned `n` bytes
@@ -121,7 +139,11 @@ where
         for (slice, chunk) in slices.iter_mut().zip(chunks.iter()) {
             *slice = IoSlice::new(chunk);
         }
-        let mut written = writer.write_vectored(&slices[..chunks.len()]).await?;
+        let mut written = match writer.write_vectored(&slices[..chunks.len()]).await {
+            // Nothing was taken; `write_all` retries the same way.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            res => res?,
+        };
         if written == 0 {
             return Err(io::ErrorKind::WriteZero.into());
         }
@@ -141,6 +163,7 @@ mod tests {
     use super::*;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
 
     #[test]
     fn read_size_follows_how_full_the_reads_are() {
@@ -157,12 +180,15 @@ mod tests {
     }
 
     /// A vectored writer that takes at most `limit` bytes per call, so a call
-    /// can end in the middle of a chunk.
+    /// can end in the middle of a chunk. A `flaky` one is interrupted before
+    /// every write it takes.
     struct Stingy {
         limit: usize,
         vectored: bool,
         out: Vec<u8>,
         vectored_calls: usize,
+        flaky: bool,
+        interrupted: bool,
     }
 
     impl Stingy {
@@ -172,7 +198,15 @@ mod tests {
                 vectored,
                 out: Vec::new(),
                 vectored_calls: 0,
+                flaky: false,
+                interrupted: false,
             }
+        }
+
+        /// Whether this call is one a flaky writer fails as interrupted.
+        fn interrupt(&mut self) -> bool {
+            self.interrupted = self.flaky && !self.interrupted;
+            self.interrupted
         }
     }
 
@@ -182,6 +216,9 @@ mod tests {
             _cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
+            if self.interrupt() {
+                return Poll::Ready(Err(io::ErrorKind::Interrupted.into()));
+            }
             let n = buf.len().min(self.limit);
             self.out.extend_from_slice(&buf[..n]);
             Poll::Ready(Ok(n))
@@ -192,6 +229,9 @@ mod tests {
             _cx: &mut Context<'_>,
             bufs: &[IoSlice<'_>],
         ) -> Poll<io::Result<usize>> {
+            if self.interrupt() {
+                return Poll::Ready(Err(io::ErrorKind::Interrupted.into()));
+            }
             self.vectored_calls += 1;
             let mut left = self.limit;
             for buf in bufs {
@@ -260,6 +300,45 @@ mod tests {
                 assert!(packet.is_unique(), "limit {limit}, vectored {vectored}");
             }
         }
+    }
+
+    /// An interrupted read or write took nothing, and is no reason to end the
+    /// splice: the bytes still arrive, once each.
+    #[tokio::test]
+    async fn interrupted_reads_and_writes_are_made_again() {
+        for vectored in [true, false] {
+            let (mut chunks, all) = sample_chunks();
+            let mut writer = Stingy::new(7, vectored);
+            writer.flaky = true;
+            write_chunks(&mut writer, &mut chunks).await.unwrap();
+            assert_eq!(writer.out, all, "vectored {vectored}");
+        }
+
+        /// Hands out `left` a few bytes at a time, interrupted before each.
+        struct Flaky {
+            left: &'static [u8],
+            interrupted: bool,
+        }
+        impl AsyncRead for Flaky {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                self.interrupted = !self.interrupted;
+                if self.interrupted {
+                    return Poll::Ready(Err(io::ErrorKind::Interrupted.into()));
+                }
+                let n = self.left.len().min(3).min(buf.remaining());
+                buf.put_slice(&self.left[..n]);
+                self.left = &self.left[n..];
+                Poll::Ready(Ok(()))
+            }
+        }
+        let mut reader = Flaky { left: b"interrupted", interrupted: false };
+        let mut buf = BytesMut::with_capacity(READ_MIN);
+        while read_some(&mut reader, &mut buf).await.unwrap() > 0 {}
+        assert_eq!(&buf[..], b"interrupted");
     }
 
     #[tokio::test]
