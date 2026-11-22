@@ -581,7 +581,10 @@ async fn serve_tunnel<S>(
 /// tunnel for the caller, and the caller reading the session for its stdout).
 /// It moves [`UNFRAMED_BUF`] at a time rather than `tokio::io::copy`'s 8 KiB:
 /// every write to stdout is a hand-off to a blocking thread, and that many of
-/// them held a download to about 60% of what the tunnel carries.
+/// them held a download to about 60% of what the tunnel carries. Like that
+/// copy, `copy_buf` flushes what it wrote whenever `reader` has nothing more
+/// yet, which is what gets a prompt without a newline past stdout's line
+/// buffering while the target waits for the answer.
 pub async fn copy_unframed<R, W>(reader: &mut R, writer: &mut W) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -1207,6 +1210,31 @@ mod tests {
         let oversized = ((MAX_FRAME + 1) as u32).to_be_bytes();
         let err = copy_from_frames(&mut &oversized[..], &mut Vec::new()).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// A target's output with no newline behind it — a password prompt, an SSH
+    /// packet — reaches the caller while the target waits for the answer,
+    /// through a writer that holds what it is given until flushed, as stdout
+    /// does without a newline.
+    #[tokio::test]
+    async fn the_unframed_copy_flushes_once_the_target_goes_quiet() {
+        let (mut target, mut from_target) = tokio::io::duplex(1024);
+        let (to_caller, mut caller) = tokio::io::duplex(1024);
+        let mut to_caller = tokio::io::BufWriter::new(to_caller);
+        let copy = tokio::spawn(async move {
+            copy_unframed(&mut from_target, &mut to_caller).await
+        });
+
+        target.write_all(b"Password: ").await.unwrap();
+        let mut prompt = [0u8; 10];
+        tokio::time::timeout(Duration::from_secs(5), caller.read_exact(&mut prompt))
+            .await
+            .expect("the prompt arrives while the target is still open")
+            .unwrap();
+        assert_eq!(&prompt, b"Password: ");
+
+        drop(target);
+        copy.await.unwrap().unwrap();
     }
 
     /// The socket's file name fits macOS's socket address limit for any
