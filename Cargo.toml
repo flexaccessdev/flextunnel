@@ -19,6 +19,8 @@ license = "MIT"
 anyhow = "1"
 askama = "0.16.1"
 base64 = "0.23"
+# The chunk type of iroh's QUIC streams (`write_chunk` / `read_many_chunks`).
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "7"
 env_logger = "0.11"

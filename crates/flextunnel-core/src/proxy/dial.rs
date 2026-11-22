@@ -5,6 +5,7 @@
 //! targets directly from the device). Callers wrap these in their own timeouts.
 
 use crate::proxy::signaling::{self, Target};
+use crate::proxy::splice;
 use iroh::endpoint::{RecvStream, SendStream};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -117,7 +118,7 @@ pub async fn connect_and_pipe(
         Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")),
     };
 
-    let mut tcp = match connected {
+    let tcp = match connected {
         Ok(s) => {
             signaling::write_reply(&mut send, signaling::REP_SUCCESS).await?;
             s
@@ -134,8 +135,7 @@ pub async fn connect_and_pipe(
     };
     send.flush().await?;
 
-    let mut iroh = tokio::io::join(recv, send);
-    let _ = tokio::io::copy_bidirectional(&mut iroh, &mut tcp).await;
+    let _ = splice::splice(tcp, recv, send).await;
     Ok(())
 }
 
