@@ -10,7 +10,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.0.105"
+version = "0.0.106"
 edition = "2024"
 description = "SOCKS5/HTTP proxy and port forwards over QUIC — split tunnel via iroh P2P"
 license = "MIT"
@@ -19,6 +19,8 @@ license = "MIT"
 anyhow = "1"
 askama = "0.16.1"
 base64 = "0.23"
+# The chunk type of iroh's QUIC streams (`write_chunk` / `read_many_chunks`).
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "7"
 env_logger = "0.11"

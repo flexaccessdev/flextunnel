@@ -924,6 +924,8 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
   the other platforms use SSH.
 - [`docs/systemd.md`](docs/systemd.md) — running the CLI client under systemd:
   one unit for all your servers, the control panel and journald logging.
+- [`docs/throughput.md`](docs/throughput.md) — what a forward or `client nc`
+  carries, what limits it, and the Linux UDP buffer limit worth raising.
 - [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) — remaining HTTP
   proxy work.
 - [`docs/proxy-usage.md`](docs/proxy-usage.md) — using the SOCKS5 and HTTP

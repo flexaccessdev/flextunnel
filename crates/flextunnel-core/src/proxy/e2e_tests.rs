@@ -1468,6 +1468,108 @@ async fn a_forward_connects_its_destination_and_relays() {
     let _ = std::fs::remove_file(bl_path);
 }
 
+/// `len` bytes that depend on their position and on `seed`, so a lost,
+/// repeated or reordered run of them shows.
+fn patterned(seed: u8, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u32).wrapping_mul(2_654_435_761).to_be_bytes()[0] ^ seed)
+        .collect()
+}
+
+/// A forward carries a bulk transfer intact in both directions at once, and a
+/// half-close crosses it either way: the local app's EOF reaches the target
+/// while the target is still sending, what the target sends afterwards still
+/// arrives, and the target's close ends the local stream.
+#[tokio::test]
+async fn a_forward_relays_bulk_data_and_half_closes() {
+    const LEN: usize = 3 * 1024 * 1024 + 4321;
+
+    let bl_path = temp_blocklist("forward-bulk");
+    let (server_ep, server_addr) = server_endpoint(SecretKey::generate()).await;
+    let server_id = server_ep.id();
+    let (routed_set, routed_cidrs) = loopback_cidr_set();
+    let params = ProxyServerParams {
+        routed_set,
+        routed_cidrs,
+        ..base_params(server_id, bl_path.clone())
+    };
+    spawn_server_params(server_ep, params);
+
+    let mut m1 = destination("m1", server_id);
+    m1.routed_cidrs = strings(&["127.0.0.0/8"]);
+    let client = start_client(
+        vec![m1],
+        None,
+        MemoryLookup::from_endpoint_info(vec![server_addr]),
+    )
+    .await;
+
+    // The target sends its own bulk while it reads the app's to EOF, then
+    // reports what it read and closes.
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_port = target.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (sock, _) = target.accept().await.unwrap();
+        let (mut from_app, mut to_app) = sock.into_split();
+        let sending = tokio::spawn(async move {
+            to_app.write_all(&patterned(0xB7, LEN)).await.unwrap();
+            to_app
+        });
+        let mut received = Vec::new();
+        from_app.read_to_end(&mut received).await.unwrap();
+        let mut to_app = sending.await.unwrap();
+        let verdict: &[u8] = if received == patterned(0x5A, LEN) {
+            b"INTACT"
+        } else {
+            b"BROKEN"
+        };
+        to_app.write_all(verdict).await.unwrap();
+    });
+
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let manager = ForwardManager::new(
+        tokio::runtime::Handle::current(),
+        client.client.dialer(),
+        &[ForwardSpec {
+            id: "bulk".into(),
+            local_port,
+            target: Target::Ip(format!("127.0.0.1:{target_port}").parse().unwrap()),
+        }],
+    );
+    let mut local = None;
+    for _ in 0..50 {
+        match TcpStream::connect(("127.0.0.1", local_port)).await {
+            Ok(stream) => {
+                local = Some(stream);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    let (mut from_target, mut to_target) = local.expect("forward listener reachable").into_split();
+
+    let sending = tokio::spawn(async move {
+        to_target.write_all(&patterned(0x5A, LEN)).await.unwrap();
+        // EOF for the target, with its own bulk and verdict still to come.
+        to_target.shutdown().await.unwrap();
+        to_target
+    });
+    let mut received = Vec::new();
+    with_timeout(from_target.read_to_end(&mut received))
+        .await
+        .unwrap();
+    let _to_target = with_timeout(sending).await.unwrap();
+
+    let (bulk, verdict) = received.split_at(received.len().saturating_sub(6));
+    assert_eq!(verdict, b"INTACT", "the target read the app's bytes intact");
+    assert!(bulk == patterned(0xB7, LEN), "the app read the target's bytes intact");
+
+    drop(manager);
+    let _ = std::fs::remove_file(bl_path);
+}
+
 /// The shared startup path ([`crate::server::prepare`], used by the CLI and
 /// the desktop app) yields a server that accepts an authorized client and
 /// tunnels an on-list target; dropping `serve` stops it.

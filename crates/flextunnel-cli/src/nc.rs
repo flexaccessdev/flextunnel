@@ -56,7 +56,7 @@ where
 
     let upload = ipc::copy_to_frames(&mut stdin, &mut to_tunnel);
     let download = async {
-        match tokio::io::copy(&mut from_tunnel, &mut stdout).await {
+        match ipc::copy_unframed(&mut from_tunnel, &mut stdout).await {
             // A closed Windows pipe can read as broken rather than as EOF.
             Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => return Err(e),
             _ => {}

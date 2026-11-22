@@ -14,6 +14,7 @@ pub mod server_routes;
 pub mod routed_set;
 pub mod signaling;
 pub mod socks5;
+mod splice;
 pub mod status_page;
 
 #[cfg(test)]

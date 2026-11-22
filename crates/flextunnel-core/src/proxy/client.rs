@@ -11,7 +11,7 @@ use crate::proxy::destination::{
 };
 use crate::proxy::route_table::{Route, RouteSpec, RouteTable};
 use crate::proxy::signaling::{self, ControlMsg, StreamRequest, Target};
-use crate::proxy::{client_status, dial, http, socks5};
+use crate::proxy::{client_status, dial, http, socks5, splice};
 use crate::transport::paths::ConnectionSnapshot;
 use crate::transport::{HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL_IDLE, liveness_window};
 use anyhow::Result;
@@ -392,12 +392,15 @@ impl TunnelDialer {
     }
 
     /// Open `target` and splice it with one accepted local connection.
-    pub async fn relay<S>(&self, mut local: S, target: &Target) -> Result<()>
+    pub async fn relay<S>(&self, local: S, target: &Target) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let mut tunnel = self.connect(target).await?;
-        tokio::io::copy_bidirectional(&mut local, &mut tunnel).await?;
+        // The guard is held through the splice: an open stream keeps its
+        // destination's connection from being closed as idle.
+        let TunnelStream { inner, _stream } = self.connect(target).await?;
+        let (recv, send) = inner.into_inner();
+        splice::splice(local, recv, send).await?;
         Ok(())
     }
 }
