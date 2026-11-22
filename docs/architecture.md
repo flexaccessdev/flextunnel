@@ -58,6 +58,7 @@ Core paths below are relative to `crates/flextunnel-core/src/`.
 | `proxy/socks5.rs`, `proxy/http.rs` | Local proxy protocol parsing and replies |
 | `proxy/routed_set.rs` | Domain/CIDR matching on client and server |
 | `proxy/server.rs`, `proxy/dial.rs` | Connection handling, routed-set checks and outbound TCP connections |
+| `proxy/splice.rs` | The splice of a tunnel stream with a local stream, for forwards and the server's targets |
 | `proxy/server_routes.rs` | One-shot read of a server's routed set, for setting up a destination |
 | `proxy/reserved.rs`, `proxy/status_page.rs` | The reserved `flextunnel.internal` namespace; the server status page and shared HTTP plumbing |
 | `forwards.rs`, `proxy/forward.rs` | Forward definitions and loopback forward listeners |
@@ -158,11 +159,31 @@ IPs are dialed as given. DNS and TCP connection share a 10s timeout in
 `signaling::map_io_err`.
 
 ### 5. Byte piping
-Both ends join the iroh `(SendStream, RecvStream)` halves with
-`tokio::io::join` and run `tokio::io::copy_bidirectional` against the `TcpStream`.
-This propagates half-close correctly (EOF on one side → `shutdown`, which quinn
-maps to a stream FIN). Per-stream errors stay per-stream — the shared QUIC
-`Connection` is never closed for a single failed proxied connection.
+A port forward on the client and every target connection on the server splice
+the stream with their `TcpStream` in `proxy/splice.rs`, which runs the two
+directions independently and copies as little as it can: a read from the socket
+is handed to the QUIC stream as an owned chunk (`write_chunk`), in a buffer
+that grows to 64 KiB while reads fill it and shrinks back when they stop, and
+the stream's received chunks go to the socket as they arrived, up to 64 in one
+vectored write (`read_many_chunks`). The client's proxy front-ends (SOCKS5,
+HTTP) join the halves with `tokio::io::join` and run
+`tokio::io::copy_bidirectional` instead. Either way a half-close crosses the
+tunnel (EOF on one side → the stream's FIN → `shutdown` on the other), and
+per-stream errors stay per-stream — the shared QUIC `Connection` is never
+closed for a single failed proxied connection.
+
+`client nc` adds a hop: the running client hands the tunnel to the `nc`
+process over its control socket (`crates/flextunnel-cli/src/ipc.rs`), in
+frames of up to 64 KiB toward the target and unframed, 64 KiB at a time,
+toward `nc`'s stdout.
+
+Two transport settings (`transport/mod.rs`) are there for a single bulk
+stream. The stream flow-control window is 8 MiB rather than iroh's 1.25 MB: a
+stream carries at most a window per round trip, which at 100 ms was 100 Mbit/s.
+And loss detection tolerates reordering — 256 packets, two round trips —
+because a sender on a multi-queue NIC reorders its own packets (the kernel
+picks the transmit queue by CPU, and the sending task moves between runtime
+threads), which the QUIC defaults read as loss.
 
 ### 6. Heartbeat & liveness (control stream)
 
@@ -421,6 +442,9 @@ catches accidental identity reuse.
 |---|---|---|
 | `QUIC_IDLE_TIMEOUT` | 180s | `transport/mod.rs` |
 | `QUIC_INITIAL_MTU` | 1452 | `transport/mod.rs` |
+| `STREAM_RECEIVE_WINDOW` / `SEND_WINDOW` (QUIC flow control) | 8 MiB / 16 MiB | `transport/mod.rs` |
+| `REORDERING_PACKET_THRESHOLD` / `REORDERING_TIME_THRESHOLD` (QUIC loss detection) | 256 packets / 2 × RTT | `transport/mod.rs` |
+| `READ_MIN` / `READ_MAX` / `MAX_CHUNKS` (stream splice) | 8 KiB / 64 KiB / 64 | `proxy/splice.rs` |
 | `HEARTBEAT_INTERVAL` / `HEARTBEAT_INTERVAL_IDLE` | 10s / 60s | `transport/mod.rs` |
 | `liveness_window(interval)` / server `LIVENESS_WINDOW` | 3 × interval + 3s / 183s | `transport/mod.rs` |
 | `REBUILD_CLOSE_TIMEOUT` (client endpoint rebuild, old endpoint close) | 5s | `transport/endpoint.rs` |
