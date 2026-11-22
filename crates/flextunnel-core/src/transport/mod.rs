@@ -43,9 +43,21 @@ pub const QUIC_INITIAL_MTU: u16 = 1452;
 /// room for far more, a forward measured 180 Mbit/s with it in either
 /// direction, and with this 370–450 down and 560–680 up. A larger window
 /// would only matter on a path both faster and longer than that, and the
-/// window is also what a stream buffers when its reader stalls. The
-/// connection as a whole stays unlimited, as it is by default: a shared limit
-/// would let a few stalled streams block the rest.
+/// window is also what a stream buffers when its reader stalls or is merely
+/// slower than the path. That is its price: 70 stalled readers on one
+/// connection took a client to 570–690 MB of memory and 95 to 900 MB, about
+/// 9 MB each, where the default window held under 2 MB each (QUIC's default
+/// limit of 100 streams stands). Halving the window halves that and the cap
+/// alike: with 50 ms added to a 3 ms path and the UDP buffer limits raised, an
+/// upload ran at 1040 Mbit/s with this window, 560 with 4 MiB, 290 with 2 MiB.
+///
+/// The connection as a whole stays unlimited all the same, as it is by
+/// default. A connection-wide limit is shared by every stream, the control
+/// stream included, and comes back an eighth at a time as readers read. With
+/// one of 128 MiB, 18 stalled readers left the heartbeat unanswered and the
+/// client dropped the link with every tunnel on it; 24 readers that were only
+/// slow (100 kB/s each) made a new stream wait 3–15 s for its first 100 kB,
+/// or time out, where without the limit it took 12 ms.
 pub const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 
 /// How much sent-but-unacknowledged stream data a connection holds, across its

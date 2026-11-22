@@ -56,6 +56,20 @@ A stream sends at most one flow-control window per round trip. The window is
 8 MiB, so the cap is 8 MiB ÷ RTT: about 1.2 Gbit/s at 53 ms, 640 Mbit/s at
 100 ms, 320 Mbit/s at 200 ms.
 
+The window is also memory: a stream whose reader is slower than the path, or
+has stopped reading, holds up to 8 MiB of received data until it is read —
+about 9 MB of process memory each when measured, so 70 stalled readers on one
+connection took a client to 570–690 MB and 95 to 900 MB (a connection carries
+at most 100 streams). A window half the size would halve that, and the cap
+above with it: at 53 ms an upload ran at 1040 Mbit/s with 8 MiB, 560 with
+4 MiB and 290 with 2 MiB.
+
+There is no limit across a connection's streams, because slow readers would
+then hold up every other stream, the heartbeat included. With a 128 MiB limit,
+18 stalled readers made the client drop the connection and every tunnel on it,
+and 24 readers taking 100 kB/s each made a new stream wait 3–15 s where it
+otherwise took 12 ms.
+
 Congestion control is CUBIC, which grows its window by the clock rather than
 by the round trip. After a loss on a long path it takes seconds to tens of
 seconds to return to full speed, so a transfer that starts right after
