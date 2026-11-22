@@ -92,9 +92,12 @@ where
     writer.shutdown().await
 }
 
-/// Write every chunk, leaving each one empty. A writer without vectored
-/// writes would take only the first slice of each call, so it gets the chunks
-/// one by one.
+/// Write every chunk, leaving an empty [`Bytes`] in the place of each. A chunk
+/// is a slice of the buffer its packet arrived in and holds that buffer even
+/// once it has been read to its end, so a spent one is replaced rather than
+/// left for the next read to overwrite, which a quiet stream may be long in
+/// making. A writer without vectored writes would take only the first slice
+/// of each call, so it gets the chunks one by one.
 async fn write_chunks<W>(writer: &mut W, mut chunks: &mut [Bytes]) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -102,13 +105,15 @@ where
     if !writer.is_write_vectored() {
         for chunk in chunks {
             writer.write_all(chunk).await?;
-            chunk.clear();
+            *chunk = Bytes::new();
         }
         return Ok(());
     }
     loop {
         let spent = chunks.iter().take_while(|chunk| chunk.is_empty()).count();
-        chunks = &mut std::mem::take(&mut chunks)[spent..];
+        let (done, rest) = std::mem::take(&mut chunks).split_at_mut(spent);
+        done.fill(Bytes::new());
+        chunks = rest;
         if chunks.is_empty() {
             return Ok(());
         }
@@ -229,6 +234,31 @@ mod tests {
             assert_eq!(writer.out, all, "limit {limit}");
             assert!(writer.vectored_calls > 0);
             assert!(chunks.iter().all(Bytes::is_empty), "chunks are spent");
+        }
+    }
+
+    /// Spent chunks let go of the buffer they were cut from, however the
+    /// writes fell, including one that was empty to begin with.
+    #[tokio::test]
+    async fn spent_chunks_release_their_buffer() {
+        for vectored in [true, false] {
+            for limit in [1, 7, 1200, 4096] {
+                let packet = Bytes::from(vec![9u8; 2000]);
+                let mut empty = packet.clone();
+                empty.advance(packet.len());
+                let mut chunks = [
+                    packet.slice(..5),
+                    packet.slice(5..1205),
+                    empty.clone(),
+                    packet.slice(1205..),
+                    empty,
+                ];
+                assert!(!packet.is_unique());
+                let mut writer = Stingy::new(limit, vectored);
+                write_chunks(&mut writer, &mut chunks).await.unwrap();
+                assert_eq!(writer.out, packet, "limit {limit}, vectored {vectored}");
+                assert!(packet.is_unique(), "limit {limit}, vectored {vectored}");
+            }
         }
     }
 
