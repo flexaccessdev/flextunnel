@@ -64,6 +64,12 @@ at most 100 streams). A window half the size would halve that, and the cap
 above with it: at 53 ms an upload ran at 1040 Mbit/s with 8 MiB, 560 with
 4 MiB and 290 with 2 MiB.
 
+The iOS client is the exception: the system ends an app that holds too much
+memory, so its window stays at 1.25 MB. Its downloads are capped at 1.25 MB ÷
+RTT (190 Mbit/s at 53 ms, 100 at 100 ms) and its streams hold under 2 MB
+each. Uploads from it are not affected, since the window that caps a
+direction is the receiver's.
+
 There is no limit across a connection's streams, because slow readers would
 then hold up every other stream, the heartbeat included. With a 128 MiB limit,
 18 stalled readers made the client drop the connection and every tunnel on it,

@@ -181,6 +181,8 @@ toward `nc`'s stdout.
 Two transport settings (`transport/mod.rs`) are there for a single bulk
 stream. The stream flow-control window is 8 MiB rather than iroh's 1.25 MB: a
 stream carries at most a window per round trip, which at 100 ms was 100 Mbit/s.
+The window is also what a stream with a slow reader buffers, so the iOS
+client, which the system kills for the memory it holds, keeps 1.25 MB.
 And loss detection tolerates reordering — 256 packets, two round trips —
 because a sender on a multi-queue NIC reorders its own packets (the kernel
 picks the transmit queue by CPU, and the sending task moves between runtime
@@ -443,7 +445,7 @@ catches accidental identity reuse.
 |---|---|---|
 | `QUIC_IDLE_TIMEOUT` | 180s | `transport/mod.rs` |
 | `QUIC_INITIAL_MTU` | 1452 | `transport/mod.rs` |
-| `STREAM_RECEIVE_WINDOW` / `SEND_WINDOW` (QUIC flow control) | 8 MiB / 16 MiB | `transport/mod.rs` |
+| `STREAM_RECEIVE_WINDOW` / `SEND_WINDOW` (QUIC flow control) | 8 MiB (iOS: 1.25 MB) / 16 MiB | `transport/mod.rs` |
 | `REORDERING_PACKET_THRESHOLD` / `REORDERING_TIME_THRESHOLD` (QUIC loss detection) | 256 packets / 2 × RTT | `transport/mod.rs` |
 | `READ_MIN` / `READ_MAX` / `MAX_CHUNKS` (stream splice) | 8 KiB / 64 KiB / 64 | `proxy/splice.rs` |
 | `HEARTBEAT_INTERVAL` / `HEARTBEAT_INTERVAL_IDLE` | 10s / 60s | `transport/mod.rs` |
