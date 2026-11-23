@@ -1,31 +1,40 @@
 # Throughput
 
 What a port forward or `client nc` can carry, what limits it, and the one
-host setting worth changing. The numbers were measured between Linux virtual
-machines, with `iperf3` through a forward and a 1.5 GB pipe through `nc`; they
-show proportions, not what your hardware will do. How the data path is built
-is in [architecture.md](architecture.md#5-byte-piping).
+host setting worth changing. The numbers show proportions, not what your
+hardware will do; how they were measured, and what each change to the data
+path was worth, is in [benchmarks.md](benchmarks.md). How the data path is
+built is in [architecture.md](architecture.md#5-byte-piping).
 
 ## What sets the ceiling
 
-A client holds one QUIC connection per destination, and one connection
-encrypts and sends on about one CPU core. Everything through a destination —
-every forward, every `nc`, every proxied request — shares it, so several
-transfers at once split what one would get rather than adding up.
+A client holds one QUIC connection per destination, and a connection's
+packets are built, encrypted and sent through one lock. Everything through a
+destination — every forward, every `nc`, every proxied request — shares it,
+so several transfers at once split what one would get rather than adding up:
+four streams through one forward moved what one did.
 
-| Path | Forward, down / up | `client nc`, down / up |
+Between two Linux virtual machines on one host, 0.4 ms apart, with `iperf3`
+through a forward and a 1.5 GB pipe through `nc`:
+
+| Host settings | Forward, down / up | `client nc`, down / up |
 |---|---|---|
-| Two VMs on one host, 0.5 ms round trip | 1.6 / 1.6 Gbit/s | 1.35 / 1.4 Gbit/s |
-| Across the internet, direct, 3 ms | 1.0 / 1.4 Gbit/s | 1.0 / 1.4 Gbit/s |
-| The same with 50 ms added | 0.37–0.45 / 0.56–0.68 Gbit/s | not measured |
+| As installed | 2.0 / 2.0 Gbit/s | 1.6 / 1.7 Gbit/s |
+| UDP buffer limit raised (below) | 2.6 / 2.6 Gbit/s | not measured |
+| The limit raised and the NIC's UDP segmentation offload on | 3.7 / 3.6 Gbit/s | not measured |
 
-Download is the server sending. Across the internet the path was not the
-limit in either direction: plain TCP did 2.1 Gbit/s up and 2.3 down over it. A
+Download is the server sending. Neither end was short of CPU in any of these
+(about one core a side at 2.6 Gbit/s). As installed, what holds a transfer is
+the kernel's limit on UDP socket buffers, which the next section raises. A
 connection that iroh has to carry over a relay instead of directly is limited
 by the relay instead.
 
-`nc` runs a little behind a forward on the same path: its bytes make one more
-hop, between the running client and the `nc` process.
+Against the same Linux server from another machine, a macOS client moved
+1.8 Gbit/s down and 1.1 up on a path that carries 1.9 and 2.4 without a
+tunnel, and a Windows client 1.8 and 1.7 on one that carries 2.1 and 2.4.
+
+`nc` runs behind a forward on the same path: its bytes make one more hop,
+between the running client and the `nc` process.
 
 ## Linux: raise the UDP buffer limit
 
@@ -33,8 +42,9 @@ iroh asks the kernel for 7 MB UDP socket buffers. Linux grants at most
 `net.core.rmem_max` / `net.core.wmem_max`, which default to 208 KB — about two
 milliseconds of a gigabit. On a fast path the receive buffer then overflows
 whenever the process is a moment late, QUIC sees loss, and the transfer slows
-down. Over the 53 ms path above, raising the limits on both machines took an
-upload from 540 to 1080 Mbit/s.
+down. Between the two virtual machines above, raising the limits on both
+took a transfer from 2.0 to 2.6 Gbit/s; over a path across the internet with
+53 ms round trips it took an upload from 540 to 1080 Mbit/s (v0.0.106).
 
 ```sh
 sudo sysctl -w net.core.rmem_max=7500000 net.core.wmem_max=7500000
@@ -49,6 +59,15 @@ printf 'net.core.rmem_max=7500000\nnet.core.wmem_max=7500000\n' | sudo tee /etc/
 Restart flextunnel afterwards: the buffers are sized when its sockets open.
 This is the only step here that needs root, and flextunnel runs without it —
 only slower on paths fast enough to fill the default.
+
+The limit can also be left alone and lifted for flextunnel only: a process
+that holds `CAP_NET_ADMIN` gets the full buffers whatever the limit says.
+flextunnel needs the capability for nothing else, and it is a broad one (it
+covers the machine's network configuration), so grant it only where changing
+the sysctl is not an option. In a systemd system unit that is
+`AmbientCapabilities=CAP_NET_ADMIN` beside `User=`; a user unit cannot grant
+it. Between the two virtual machines it measured the same as the raised
+limit.
 
 ## Long paths
 

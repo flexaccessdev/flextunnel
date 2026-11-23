@@ -926,6 +926,8 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
   one unit for all your servers, the control panel and journald logging.
 - [`docs/throughput.md`](docs/throughput.md) — what a forward or `client nc`
   carries, what limits it, and the Linux UDP buffer limit worth raising.
+- [`docs/benchmarks.md`](docs/benchmarks.md) — throughput measurements, one
+  version against the last, and what each change to the data path measured.
 - [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) — remaining HTTP
   proxy work.
 - [`docs/proxy-usage.md`](docs/proxy-usage.md) — using the SOCKS5 and HTTP
