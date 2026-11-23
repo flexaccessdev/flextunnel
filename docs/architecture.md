@@ -202,7 +202,7 @@ one per core (the desktop app's client has one): a connection's streams share on
 connection gains nothing from more threads and loses to the wakeups between
 them, and it is connections that spread over workers. And the UDP socket
 buffers are whatever the kernel grants, which on Linux is 208 KB unless
-[the limit is raised](throughput.md#linux-raise-the-udp-buffer-limit).
+[the limit is raised](benchmarks.md#linux-raise-the-udp-buffer-limit).
 
 ### 6. Heartbeat & liveness (control stream)
 

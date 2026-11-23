@@ -1,9 +1,10 @@
 # Benchmarks
 
-Throughput measurements kept to compare flextunnel with itself: one version
-against the next, and one technique against another, on the same machines.
-What the numbers mean for running it is in [throughput.md](throughput.md), and
-how the data path is built is in
+What a port forward or `client nc` can carry, what limits it, the one host
+setting worth changing, and the measurements behind all three. The
+measurements are kept to compare flextunnel with itself: one version against
+the next, and one technique against another, on the same machines. They show
+proportions, not what your hardware will do. How the data path is built is in
 [architecture.md](architecture.md#5-byte-piping).
 
 ## v0.0.107 against v0.0.106
@@ -47,6 +48,95 @@ way. Each is under "What the measurements showed" below.
 > root. A change of kernel, NIC, CPU, or a single offload flag reorders the
 > table, as the columns show. Measure on your own hardware and path before
 > drawing conclusions.
+
+## What sets the ceiling
+
+A client holds one QUIC connection per destination, and a connection's
+packets are built, encrypted and sent through one lock. Everything through a
+destination — every forward, every `nc`, every proxied request — shares it,
+so several transfers at once split what one would get rather than adding up:
+four streams through one forward moved what one did (the numbers are under
+[More runtime threads were slower](#more-runtime-threads-were-slower)).
+
+Neither end was short of CPU in any column of the table above (about one core
+a side at 2.6 Gbit/s). As installed, what holds a transfer between two Linux
+machines is the kernel's limit on UDP socket buffers, which the next section
+raises. A connection that iroh has to carry over a relay instead of directly
+is limited by the relay instead.
+
+`client nc` runs behind a forward on the same path, 1.6 Gbit/s down and 1.7
+up where the forward moved 2.0: its bytes make one more hop, between the
+running client and the `nc` process.
+
+## Linux: raise the UDP buffer limit
+
+iroh asks the kernel for 7 MB UDP socket buffers. Linux grants at most
+`net.core.rmem_max` / `net.core.wmem_max`, which default to 208 KB — about two
+milliseconds of a gigabit. On a fast path the receive buffer then overflows
+whenever the process is a moment late, QUIC sees loss, and the transfer slows
+down. Between the two virtual machines here, raising the limits on both took
+a transfer from 2.0 to 2.6 Gbit/s; over a path across the internet with 53 ms
+round trips it took an upload from 540 to 1080 Mbit/s (v0.0.106).
+
+```sh
+sudo sysctl -w net.core.rmem_max=7500000 net.core.wmem_max=7500000
+```
+
+To keep it across reboots:
+
+```sh
+printf 'net.core.rmem_max=7500000\nnet.core.wmem_max=7500000\n' | sudo tee /etc/sysctl.d/90-udp-buffers.conf
+```
+
+Restart flextunnel afterwards: the buffers are sized when its sockets open.
+This is the only step here that needs root, and flextunnel runs without it —
+only slower on paths fast enough to fill the default.
+
+The limit can also be left alone and lifted for flextunnel only: a process
+that holds `CAP_NET_ADMIN` gets the full buffers whatever the limit says.
+flextunnel needs the capability for nothing else, and it is a broad one (it
+covers the machine's network configuration), so grant it only where changing
+the sysctl is not an option. In a systemd system unit that is
+`AmbientCapabilities=CAP_NET_ADMIN` beside `User=`; a user unit cannot grant
+it. It measured the same as the raised limit
+([The buffers without the sysctl](#the-buffers-without-the-sysctl)).
+
+## Long paths
+
+The two virtual machines are 0.4 ms apart, so nothing in the tables shows
+what distance costs. The figures in this section were measured with v0.0.106
+over a path across the internet with 53 ms round trips, and have not been
+repeated since.
+
+A stream sends at most one flow-control window per round trip. The window is
+8 MiB, so the cap is 8 MiB ÷ RTT: about 1.2 Gbit/s at 53 ms, 640 Mbit/s at
+100 ms, 320 Mbit/s at 200 ms.
+
+The window is also memory: a stream whose reader is slower than the path, or
+has stopped reading, holds up to 8 MiB of received data until it is read —
+about 9 MB of process memory each when measured, so 70 stalled readers on one
+connection took a client to 570–690 MB and 95 to 900 MB (a connection carries
+at most 100 streams). A window half the size would halve that, and the cap
+above with it: at 53 ms an upload ran at 1040 Mbit/s with 8 MiB, 560 with
+4 MiB and 290 with 2 MiB.
+
+The iOS client is the exception: the system ends an app that holds too much
+memory, so its window stays at 1.25 MB. Its downloads are capped at 1.25 MB ÷
+RTT (190 Mbit/s at 53 ms, 100 at 100 ms) and its streams hold under 2 MB
+each. Uploads from it are not affected, since the window that caps a
+direction is the receiver's.
+
+There is no limit across a connection's streams, because slow readers would
+then hold up every other stream, the heartbeat included. With a 128 MiB limit,
+18 stalled readers made the client drop the connection and every tunnel on it,
+and 24 readers taking 100 kB/s each made a new stream wait 3–15 s where it
+otherwise took 12 ms.
+
+Congestion control is CUBIC, which grows its window by the clock rather than
+by the round trip. After a loss on a long path it takes seconds to tens of
+seconds to return to full speed, so a transfer that starts right after
+another one in the opposite direction on the same destination can begin slow
+and speed up as it goes.
 
 ## Setup (2026-11-23)
 
@@ -118,8 +208,7 @@ controls and for v0.0.106's download (no tunnel 18061 and 17234, Tailscale
 ### Linux pair, UDP buffer limit raised
 
 `net.core.rmem_max` and `net.core.wmem_max` at 7500000 on both machines, the
-setting [throughput.md](throughput.md#linux-raise-the-udp-buffer-limit)
-recommends.
+setting [recommended above](#linux-raise-the-udp-buffer-limit).
 
 | | Down | Up | Dropped (down / up) |
 |---|---:|---:|---:|
