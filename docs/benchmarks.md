@@ -559,7 +559,7 @@ sudo setpriv --reuid=<user> --regid=<group> --init-groups \
 
 The `client nc` rows piped `head -c 1500M /dev/zero` into
 `flextunnel client nc <host> <port>` toward a listener that discards
-(`nc -l -d`), and read the same amount back from one that sends it
+(`nc -l -d >/dev/null`), and read the same amount back from one that sends it
 (`head -c 1500M /dev/zero | nc -l -N`) with `client nc`'s stdin held open,
 because that listener stops sending once it sees the client's half-close.
 
