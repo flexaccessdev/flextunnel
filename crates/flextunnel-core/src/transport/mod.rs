@@ -60,14 +60,14 @@ pub const STREAM_RECEIVE_WINDOW: u32 = 1_250_000;
 /// within two round trips, the reader is keeping up with a sender the window
 /// is holding back, and the window doubles. A round trip counts as 5 ms at
 /// least: on a shorter path what the window has to cover is how late the
-/// receiving process runs, and held to the starting window a 3.8 Gbit/s
-/// download between two machines 0.3 ms apart lost 5%. It never shrinks
+/// receiving process runs, and held to the starting window a 3.7 Gbit/s
+/// transfer between two machines 0.3 ms apart lost 3–5%. It never shrinks
 /// again, since the credit behind it stays out until the peer has used it.
 ///
 /// At this size a stream carries 1.2 Gbit/s at 53 ms. Every stream used to be
 /// given it from the start, on every build but iOS, and that was the price:
 /// 95 stalled readers on one connection took a client past 1 GB of memory,
-/// about 11 MB each, where streams held to [`STREAM_RECEIVE_WINDOW`] took
+/// about 12 MB each, where streams held to [`STREAM_RECEIVE_WINDOW`] took
 /// under 2 MB each.
 ///
 /// The iOS client's windows do not grow. A reader that was fast and then
