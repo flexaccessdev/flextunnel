@@ -2192,3 +2192,77 @@ async fn startup_guard_recognizes_conflicted_own_id() {
 
     let _ = std::fs::remove_file(&bl_path);
 }
+
+/// A stream nobody reads holds what every stream starts with and no more: the
+/// peer gets [`STREAM_RECEIVE_WINDOW`](crate::transport::STREAM_RECEIVE_WINDOW)
+/// ahead of the reader and is held there, however much larger the window a
+/// stream may grow to. Once it is read, the stream carries the rest.
+#[tokio::test]
+async fn an_unread_stream_holds_only_its_starting_window() {
+    use crate::transport::{STREAM_RECEIVE_WINDOW, STREAM_RECEIVE_WINDOW_MAX};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const TEST_ALPN: &[u8] = b"flextunnel-test/stream-window";
+    const START: u64 = STREAM_RECEIVE_WINDOW as u64;
+    // More than a stream's window could ever grow to.
+    const PAYLOAD: u64 = 2 * STREAM_RECEIVE_WINDOW_MAX as u64;
+
+    let server = loopback_base(MemoryLookup::new())
+        .secret_key(SecretKey::from_bytes(&[71; 32]))
+        .alpns(vec![TEST_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let server_addr = EndpointAddr::new(server.id()).with_ip_addr(server.bound_sockets()[0]);
+    let client = loopback_base(MemoryLookup::new())
+        .secret_key(SecretKey::from_bytes(&[72; 32]))
+        .bind()
+        .await
+        .unwrap();
+
+    // The far side writes `PAYLOAD` bytes to the stream opened to it, counting
+    // what the stream has taken.
+    let sent = Arc::new(AtomicU64::new(0));
+    let sender = tokio::spawn({
+        let sent = Arc::clone(&sent);
+        async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let (mut send, _recv) = conn.accept_bi().await.unwrap();
+            let chunk = vec![5u8; 64 * 1024];
+            while sent.load(Ordering::Relaxed) < PAYLOAD {
+                let left = PAYLOAD - sent.load(Ordering::Relaxed);
+                let n = send
+                    .write(&chunk[..chunk.len().min(left as usize)])
+                    .await
+                    .unwrap();
+                sent.fetch_add(n as u64, Ordering::Relaxed);
+            }
+            send.finish().unwrap();
+            let _ = send.stopped().await;
+        }
+    });
+
+    let all = async {
+        let conn = client.connect(server_addr, TEST_ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"go").await.unwrap();
+
+        // Unread, the stream takes its starting window and stops there.
+        while sent.load(Ordering::Relaxed) < START {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(sent.load(Ordering::Relaxed), START);
+
+        let mut total = 0u64;
+        let mut chunks: [bytes::Bytes; 32] = std::array::from_fn(|_| bytes::Bytes::new());
+        while let Some(n) = recv.read_many_chunks(&mut chunks).await.unwrap() {
+            total += chunks[..n].iter().map(|c| c.len() as u64).sum::<u64>();
+        }
+        assert_eq!(total, PAYLOAD);
+    };
+    tokio::time::timeout(Duration::from_secs(60), all)
+        .await
+        .expect("timed out");
+    sender.await.unwrap();
+}

@@ -179,10 +179,16 @@ frames of up to 64 KiB toward the target and unframed, 64 KiB at a time,
 toward `nc`'s stdout.
 
 Two transport settings (`transport/mod.rs`) are there for a single bulk
-stream. The stream flow-control window is 8 MiB rather than iroh's 1.25 MB: a
-stream carries at most a window per round trip, which at 100 ms was 100 Mbit/s.
-The window is also what a stream with a slow reader buffers, so the iOS
-client, which the system kills for the memory it holds, keeps 1.25 MB.
+stream. A stream carries at most one flow-control window per round trip, which
+with iroh's 1.25 MB is 100 Mbit/s at 100 ms; but the window is also what a
+stream buffers when its reader is slower than the path, and credit once
+granted cannot be taken back. So every stream starts with 1.25 MB and the noq
+fork widens the ones whose reader keeps up: each time half a window was read
+within two round trips (of 5 ms at least) the window doubles, up to 8 MiB. What a connection's
+streams hold beyond their starting windows comes out of one 64 MiB budget,
+returned as streams end, and a stream it has nothing left for keeps the
+window it has. This is in the transport, so it holds for every stream alike:
+forwards, `client nc`, proxied requests, the control stream.
 And loss detection tolerates reordering — 256 packets, two round trips —
 because a sender on a multi-queue NIC reorders its own packets (the kernel
 picks the transmit queue by CPU, and the sending task moves between runtime
@@ -195,8 +201,8 @@ the workspace manifest: netwatch sends to a busy peer on a connected UDP
 socket, which on Linux keeps the connection's packets on one transmit queue
 (the cause of the reordering above) and on Apple platforms skips a
 per-datagram connect in the kernel; noq packs up to 32 datagrams into one
-send; iroh keeps a transmit the socket could not take instead of counting it
-sent. The runtime of the CLI, of the desktop app's server and of the iOS
+send, and grows each stream's window as above; iroh keeps a transmit the
+socket could not take instead of counting it sent. The runtime of the CLI, of the desktop app's server and of the iOS
 library has two worker threads (`app::RUNTIME_WORKER_THREADS`) rather than
 one per core (the desktop app's client has one): a connection's streams share one lock, so one
 connection gains nothing from more threads and loses to the wakeups between
@@ -461,7 +467,9 @@ catches accidental identity reuse.
 |---|---|---|
 | `QUIC_IDLE_TIMEOUT` | 180s | `transport/mod.rs` |
 | `QUIC_INITIAL_MTU` | 1452 | `transport/mod.rs` |
-| `STREAM_RECEIVE_WINDOW` / `SEND_WINDOW` (QUIC flow control) | 8 MiB (iOS: 1.25 MB) / 16 MiB | `transport/mod.rs` |
+| `STREAM_RECEIVE_WINDOW` / `STREAM_RECEIVE_WINDOW_MAX` (a stream's window: at first / at most) | 1.25 MB / 8 MiB | `transport/mod.rs` |
+| `STREAM_WINDOW_BUDGET` (window beyond the first, per connection) | 64 MiB | `transport/mod.rs` |
+| `SEND_WINDOW` (unacknowledged data, per connection) | 16 MiB | `transport/mod.rs` |
 | `REORDERING_PACKET_THRESHOLD` / `REORDERING_TIME_THRESHOLD` (QUIC loss detection) | 256 packets / 2 × RTT | `transport/mod.rs` |
 | `READ_MIN` / `READ_MAX` / `MAX_CHUNKS` (stream splice) | 8 KiB / 64 KiB / 64 | `proxy/splice.rs` |
 | `HEARTBEAT_INTERVAL` / `HEARTBEAT_INTERVAL_IDLE` | 10s / 60s | `transport/mod.rs` |

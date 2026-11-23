@@ -84,15 +84,20 @@ netwatch = { git = "https://github.com/flexaccessdev/net-tools.git", branch = "f
 # fork's peer sockets on Apple platforms, stamps each received batch as it is
 # read, and judges a loss burst against the newest delivery of that burst's own
 # size before calling it an MTU black hole: upstream took congestion loss for
-# one and dropped the path MTU to 1200 for a minute. All three crates come
-# from the fork so the graph holds a single `noq-udp`.
+# one and dropped the path MTU to 1200 for a minute. It also grows a stream's
+# receive window with its reader (`max_stream_receive_window`, out of a
+# `stream_receive_window_budget` per connection), where upstream gives every
+# stream of a connection one fixed window: `transport/mod.rs` sets the three
+# sizes and says why. All three crates come from the fork so the graph holds a
+# single `noq-udp`.
 noq = { git = "https://github.com/flexaccessdev/noq.git", branch = "flextunnel-1.5.0" }
 noq-proto = { git = "https://github.com/flexaccessdev/noq.git", branch = "flextunnel-1.5.0" }
 noq-udp = { git = "https://github.com/flexaccessdev/noq.git", branch = "flextunnel-1.5.0" }
 # Forked from iroh v1.5.0. Keeps a transmit a UDP socket could not take, so noq
-# retries it instead of counting a local discard as sent. `iroh-base` comes
-# from the fork with it: the mDNS address lookup depends on that crate
-# directly, and from crates.io its key types would not be iroh's.
+# retries it instead of counting a local discard as sent, and puts the noq
+# fork's receive window growth settings on the transport config builder.
+# `iroh-base` comes from the fork with it: the mDNS address lookup depends on
+# that crate directly, and from crates.io its key types would not be iroh's.
 iroh = { git = "https://github.com/flexaccessdev/iroh.git", branch = "flextunnel-1.5.0" }
 iroh-base = { git = "https://github.com/flexaccessdev/iroh.git", branch = "flextunnel-1.5.0" }
 
