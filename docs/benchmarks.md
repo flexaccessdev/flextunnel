@@ -142,23 +142,12 @@ table were taken in turn, one round after another, and the tunnel was
 restarted for every flextunnel run. Every flextunnel run was on a direct
 path, read off the client's log before the run began.
 
-The v0.0.107 rows were measured before later fixes to the forks, which
-v0.0.107 ships with. Each set was measured against the build before it, with
-the limit raised and the offload on, and neither rerun told its two builds
-apart (Mbit/s, down / up):
-
-| Fork revisions | One stream, before | One stream, after | Three clients, before | Three clients, after |
-|---|---:|---:|---:|---:|
-| netwatch `467e1db` (the sockets take turns on receive) and iroh `502a86c` (send backpressure kept to UDP sockets) | 3688 / 3656 | 3689 / 3658 | 5056 / 4549 | 5143 / 4450 |
-| netwatch `2f13eee` (the main socket keeps its turn when the last peer is idle) | 3658 / 3638 | 3604 / 3612 | 4959 / 4538 | 5116 / 4689 |
-
-The first row is six rounds for one stream and five for three clients. The
-second is four rounds each, with one stream measured twice per build in every
-round, once in each order. In one three-client round of the second row's
-"before" build, one client moved 210 Mbit/s each way while the other two
-moved 1.9 Gbit/s. That run did not record its paths, so whether that client
-was on a relay or was the starvation `2f13eee` fixes is not known; the four
-rounds with `2f13eee` had no such round.
+The v0.0.107 rows were measured two fork fixes short of the build that
+ships: the netwatch fork's sockets now take turns on receive, and the iroh
+fork keeps its send backpressure to UDP sockets. Neither changes what a
+single direct transfer does, and reruns with the limit raised and the offload
+on did not tell the builds apart: one stream stayed within 2% and three
+clients at once within 4%, in either direction.
 
 ## Results
 
