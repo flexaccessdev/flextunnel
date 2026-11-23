@@ -105,12 +105,42 @@ fn darwin_maxfilesperproc() -> Option<libc::rlim_t> {
 #[cfg(not(unix))]
 pub fn raise_fd_limit() {}
 
+/// Worker threads of the runtime a client or server runs on, on a machine with
+/// at least that many cores.
+///
+/// One connection's data path is a chain of tasks (the splice of each stream,
+/// the connection's driver, the endpoint's driver) that hand data on through
+/// the connection's lock, so it cannot use more cores at once, and on Tokio's
+/// default of one worker per core the chain spreads over idle workers, where
+/// each handoff is a cross-thread wake. Between two 6-vCPU Linux VMs one
+/// stream moved 1.86 Gbit/s down and 1.89 up on six workers, 1.93 and 2.04 on
+/// two, and 2.24 and 1.99 on one, and four streams on one connection moved no
+/// more than one did, at any count. Connections are what spread over workers:
+/// with those hosts set up for a higher rate, a server with three busy clients
+/// moved 5.1 Gbit/s down and 4.8 up in aggregate on two workers, the same on
+/// three, 4.7 and 4.6 on six, and 3.8 and 4.1 on one. Two rather than one, so
+/// a saturated connection cannot hold up the control streams and the
+/// listeners, and a server still has a second core for a second client.
+/// Numbers and method are in `docs/benchmarks.md`.
+pub const RUNTIME_WORKER_THREADS: usize = 2;
+
+/// A builder for the multi-threaded Tokio runtime of a client or server, with
+/// its worker count set. `TOKIO_WORKER_THREADS` overrides the count, for
+/// measurement: Tokio reads the variable only when no count is set, so the
+/// count is left unset when the variable is.
+pub fn runtime_builder() -> tokio::runtime::Builder {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        builder.worker_threads(cores.min(RUNTIME_WORKER_THREADS));
+    }
+    builder.enable_all();
+    builder
+}
+
 /// Build the multi-threaded Tokio runtime the entry points block on.
 pub fn build_runtime() -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(Into::into)
+    runtime_builder().build().map_err(Into::into)
 }
 
 /// Log the running binary's name and version. Callers pass their own crate's

@@ -152,11 +152,8 @@ pub(crate) fn spawn_server(
     let error_slot = slot.clone();
     let spawned = std::thread::Builder::new().name(THREAD_NAME.into()).spawn(move || {
         // Unlike a client session the server accepts many connections, so it
-        // gets the multi-threaded runtime's default worker count.
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .thread_name(THREAD_NAME)
-            .enable_all()
-            .build();
+        // gets the worker count the CLI server runs on.
+        let runtime = flextunnel_core::app::runtime_builder().thread_name(THREAD_NAME).build();
         match runtime {
             Ok(rt) => rt.block_on(run_server(server, rx, slot)),
             Err(e) => slot.fail(format!("Failed to start: {e:#}")),
