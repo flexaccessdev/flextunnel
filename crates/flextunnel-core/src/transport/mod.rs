@@ -7,6 +7,10 @@
 //! depends on: the flow-control windows ([`STREAM_RECEIVE_WINDOW`],
 //! [`SEND_WINDOW`]) and how much reordering loss detection tolerates
 //! ([`REORDERING_PACKET_THRESHOLD`], [`REORDERING_TIME_THRESHOLD`]).
+//!
+//! The stack underneath is forks of iroh, noq and netwatch carrying the
+//! changes ezvpn's forks do, patched in by the workspace manifest, whose
+//! comments say what each carries. `docs/benchmarks.md` has what they measured here.
 
 pub mod endpoint;
 pub mod paths;
@@ -95,6 +99,15 @@ pub const SEND_WINDOW: u64 = 16 * 1024 * 1024;
 /// queue. A real loss in a bulk transfer is still noticed promptly, once this
 /// many packets have followed it; in a trickle the time threshold decides, as
 /// it always has.
+///
+/// The netwatch fork has since removed that cause where it can: it sends to a
+/// busy peer on a connected socket, whose transmit queue the kernel keeps
+/// fixed (Linux and Apple platforms, up to 64 peers). Between two Linux VMs
+/// with six queues each, the upstream socket with these thresholds still lost
+/// over 2% of a transfer's packets and took 10 spurious congestion events a
+/// second; the peer socket brought that to under 1% and none. What reordering
+/// is left is this threshold's to absorb: with the peer socket and QUIC's
+/// defaults there were 2–3 spurious events a second, with these 0.1.
 pub const REORDERING_PACKET_THRESHOLD: u32 = 256;
 
 /// How long an unacknowledged packet is waited for, as a multiple of the

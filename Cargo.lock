@@ -281,7 +281,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
  "x11rb",
 ]
 
@@ -1451,7 +1451,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.10",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -1545,7 +1545,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1743,7 +1743,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1916,7 +1916,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-cli"
-version = "0.0.106"
+version = "0.0.107"
 dependencies = [
  "anyhow",
  "clap",
@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-core"
-version = "0.0.106"
+version = "0.0.107"
 dependencies = [
  "anyhow",
  "askama",
@@ -1963,7 +1963,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-desktop"
-version = "0.0.106"
+version = "0.0.107"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
@@ -1995,7 +1995,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-ffi"
-version = "0.0.106"
+version = "0.0.107"
 dependencies = [
  "flextunnel-core",
  "iroh",
@@ -2872,7 +2872,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -3298,8 +3298,7 @@ checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
 [[package]]
 name = "iroh"
 version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40ac5d8330439176254581b6db4bc6f1d947d7cc741fda4e04b96d758addf1db"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=flextunnel-1.5.0#502a86cbbdc0cbab5d0264c633c19c6945c5020e"
 dependencies = [
  "backon",
  "blake3",
@@ -3348,8 +3347,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eff8f9146946feac461ef2e5fcf7b4b795eff44958ef6faa85cba3cecea62ab3"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=flextunnel-1.5.0#502a86cbbdc0cbab5d0264c633c19c6945c5020e"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -3368,8 +3366,7 @@ dependencies = [
 [[package]]
 name = "iroh-dns"
 version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cf4ac424ab7e13357c7bff7b6320b865e6ffc2320d726b58d1c8162f52a1406"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=flextunnel-1.5.0#502a86cbbdc0cbab5d0264c633c19c6945c5020e"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -3438,8 +3435,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aef6e9c979c78b0dadf6a2aac4ff629c4ffb91ec34586275673524248dc72f55"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=flextunnel-1.5.0#502a86cbbdc0cbab5d0264c633c19c6945c5020e"
 dependencies = [
  "blake3",
  "bytes",
@@ -4255,8 +4251,7 @@ dependencies = [
 [[package]]
 name = "netwatch"
 version = "0.20.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2acf7a1ca9205d7c1fc9a1595193a8cbaa7537b4a07dca93c6ae3de7c8d0e597"
+source = "git+https://github.com/flexaccessdev/net-tools.git?branch=flextunnel-0.20.2#2f13eeec7275a46c8800b0b30842e602cfa134e3"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -4327,8 +4322,7 @@ dependencies = [
 [[package]]
 name = "noq"
 version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c2cf8bf3b78c2684a8485782c3357344416f264050f8d08a06c45c4642d87a2"
+source = "git+https://github.com/flexaccessdev/noq.git?branch=flextunnel-1.5.0#2814c282a3c426844b25bf2256480a321b9f32e5"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -4349,8 +4343,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afb15c81d1f9b529d0c1f5095ee2e799eca9f361aa5f712424e758ce90f825d3"
+source = "git+https://github.com/flexaccessdev/noq.git?branch=flextunnel-1.5.0#2814c282a3c426844b25bf2256480a321b9f32e5"
 dependencies = [
  "aes-gcm 0.10.3",
  "bytes",
@@ -4376,8 +4369,7 @@ dependencies = [
 [[package]]
 name = "noq-udp"
 version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "716df6621d528211d75608903c0dd54bee78745444cdcbb791bcfbc55717a29f"
+source = "git+https://github.com/flexaccessdev/noq.git?branch=flextunnel-1.5.0#2814c282a3c426844b25bf2256480a321b9f32e5"
 dependencies = [
  "cfg_aliases",
  "libc",
@@ -4392,7 +4384,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4438,7 +4430,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 3.5.0",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -5902,7 +5894,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5960,7 +5952,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6701,10 +6693,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.6",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8016,7 +8008,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -188,6 +188,22 @@ because a sender on a multi-queue NIC reorders its own packets (the kernel
 picks the transmit queue by CPU, and the sending task moves between runtime
 threads), which the QUIC defaults read as loss.
 
+Three things under the splice set how fast it runs, and
+[benchmarks.md](benchmarks.md) has what each measured. The transport stack is
+forks of iroh, noq and netwatch carrying the changes ezvpn's do, patched in by
+the workspace manifest: netwatch sends to a busy peer on a connected UDP
+socket, which on Linux keeps the connection's packets on one transmit queue
+(the cause of the reordering above) and on Apple platforms skips a
+per-datagram connect in the kernel; noq packs up to 32 datagrams into one
+send; iroh keeps a transmit the socket could not take instead of counting it
+sent. The runtime of the CLI, of the desktop app's server and of the iOS
+library has two worker threads (`app::RUNTIME_WORKER_THREADS`) rather than
+one per core (the desktop app's client has one): a connection's streams share one lock, so one
+connection gains nothing from more threads and loses to the wakeups between
+them, and it is connections that spread over workers. And the UDP socket
+buffers are whatever the kernel grants, which on Linux is 208 KB unless
+[the limit is raised](benchmarks.md#linux-raise-the-udp-buffer-limit).
+
 ### 6. Heartbeat & liveness (control stream)
 
 The client sends `ControlMsg::Heartbeat { seq }`; the server replies with
