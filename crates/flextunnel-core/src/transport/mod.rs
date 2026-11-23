@@ -93,9 +93,12 @@ const WIDEST_STREAM_WINDOW: u32 = 8 * 1024 * 1024;
 /// for nine at [`STREAM_RECEIVE_WINDOW_MAX`]. A stream takes what its window
 /// grows by out of this and returns it when it ends.
 ///
-/// It bounds what a peer can be made to buffer: with QUIC's 100 streams a
-/// connection, `100 × STREAM_RECEIVE_WINDOW` plus this, about 183 MiB, where
-/// the starting windows alone are the 119 MiB it always could.
+/// It bounds what flextunnel's tunnels can make a peer buffer: they are
+/// bidirectional streams, 100 to a connection by QUIC's default, so
+/// `100 × STREAM_RECEIVE_WINDOW` plus this, about 183 MiB, where the starting
+/// windows alone are the 119 MiB it always could. It is not a bound on the
+/// transport: a peer may also open 100 unidirectional streams, which nothing
+/// here does, and each would be given a starting window too.
 ///
 /// It is not QUIC's own limit across a connection's streams, which stays
 /// unlimited as it is by default. That limit is credit every stream draws on,

@@ -2273,8 +2273,11 @@ async fn a_streams_window_follows_its_reader() {
                 break;
             }
         }
-        // A build whose windows do not grow (iOS) has nothing more to show.
-        if MAX > START {
+        // Only the iOS build's windows stay as they start. Any other build
+        // has to show growth, whatever its maximum has been set to.
+        if cfg!(target_os = "ios") {
+            assert_eq!(MAX, START);
+        } else {
             assert!(ahead > START, "the window never grew: {ahead} bytes ahead");
         }
         recv.stop(0u32.into()).unwrap();

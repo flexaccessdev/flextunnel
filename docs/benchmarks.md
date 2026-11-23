@@ -23,10 +23,12 @@ v0.0.109 changes what a stream may buffer, not what carries it. A stream's
 flow-control window now starts at 1.25 MB and grows to 8 MiB while its reader
 keeps up, where v0.0.108 gave every stream 8 MiB at once. That is for the
 client's memory, and [Long paths](#long-paths) has what it measured. The
-table is here to show what it costs: the two versions are within 5% of each
-other in every column and neither is ahead throughout. Session by session
-the differences came and went ([Results](#results)), and two builds that
-behave the same were up to 2.4% apart themselves
+table is here to show what it costs: over all their rounds the two versions
+are within 5% of each other in every column and neither is ahead throughout.
+A single session put them further apart than that, by up to 7% in these
+columns' Linux sessions, 15% on macOS uploads and 13% over a 53 ms path, and
+the next session did not repeat it ([Results](#results)); two builds that behave the same were up to 2.4% apart
+themselves
 ([Windows that grow on a short path too](#windows-that-grow-on-a-short-path-too)).
 
 What the numbers themselves are made of came with v0.0.107: forks of iroh,
@@ -135,9 +137,13 @@ with the reader's own socket buffer held to 256 KiB so that what piles up
 does so in the tunnel.
 
 What a connection's streams hold beyond their starting windows is limited to
-64 MiB between them, returned as streams end. With the 100 streams a
-connection carries at most, it can be made to buffer about 183 MiB of stream
-data and no more. The second row is presumably that bound being met, at about
+64 MiB between them, returned as streams end. Flextunnel's traffic is
+bidirectional streams, of which a peer may have 100 open on a connection, so
+its tunnels can make a connection buffer about 183 MiB of stream data and no
+more. That is a bound on flextunnel's own traffic, not on the transport: the
+QUIC settings also let a peer open 100 unidirectional streams, which
+flextunnel never does, and each would be given a starting window as well.
+The second row is presumably that bound being met, at about
 70 MB over the first: on a long path the first megabytes of a stream go into
 the reader's socket buffers within two round trips, which counts as keeping
 up, so streams that then stall have grown until the 64 MiB was spent. A
@@ -193,7 +199,9 @@ path, read off the client's log before the run began.
 
 Mbit/s, medians. The Linux pair's tables are fifteen rounds each, from two
 sessions of five and of ten, because five could not tell the versions apart:
-either was ahead by up to 5% in one session and level in the next. "Dropped"
+in the sessions of five either was ahead by up to 7% (v0.0.109 by 6.6% on
+downloads with offload on, v0.0.108 by 5.5% on uploads as installed), and
+the sessions of ten had them within 3%. "Dropped"
 is the median count of receives the receiving machine's kernel refused for
 want of socket buffer during a run (`UdpRcvbufErrors`), on the client for a
 download and on the server for an upload. One of them can be a batch of
@@ -263,7 +271,8 @@ The delay of [Long paths](#long-paths) on both machines, runs of 20 s.
 
 As installed, fifteen rounds: downloads ranged from 330 to 839 for v0.0.108
 and from 465 to 815 for v0.0.109, and by session the versions read 640 / 618
-against 735 / 664 in the five and 684 / 676 against 630 / 627 in the ten.
+against 735 / 664 in the five and 684 / 676 against 630 / 627 in the ten:
+v0.0.109's downloads 13% behind in one session and 9% ahead in the other.
 With the limit raised, five rounds, all within 9% of each other.
 
 ### `client nc`
