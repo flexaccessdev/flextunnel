@@ -11,14 +11,12 @@ proportions, not what your hardware will do. How the data path is built is in
 
 Mbit/s, down / up, one TCP connection through a port forward, 2026-11-23. Each
 column is one session in which the rows were measured in turn, round after
-round; the numbers are medians. Each flextunnel and ezvpn row ran that version
-at both ends.
+round; the numbers are medians. Each flextunnel row ran that version at both
+ends.
 
 | | Linux pair, as installed | UDP offload on | UDP buffer limit raised | Limit raised, offload on | macOS client | Windows client |
 |---|---:|---:|---:|---:|---:|---:|
 | No tunnel | 20151 / 20609 | 20264 / 20381 | 20334 / 20605 | 20249 / 20318 | 1946 / 2354 | 2096 / 2369 |
-| Tailscale (control) | 1286 / 1760 | 3275 / 3156 | 1288 / 1306 | 3020 / 3042 | not measured | not installed |
-| ezvpn v0.0.70 (control) | 2376 / 2329 | 3278 / 2973 | 2102 / 2298 | 3312 / 2948 | not measured | not measured |
 | flextunnel v0.0.106 | 1360 / 1357 | 1790 / 1817 | 1400 / 1411 | 1742 / 1845 | 400 / 223 | 1847 / 1349 |
 | **flextunnel v0.0.107** | **2014 / 2037** | **2822 / 2847** | **2601 / 2633** | **3705 / 3634** | **1823 / 1100** | **1808 / 1700** |
 
@@ -29,25 +27,6 @@ fork's connected socket per peer is what the first column gains, and all of
 what the macOS client gains; the other two forks show once the NIC takes
 whole UDP batches or the kernel's limit on UDP socket buffers is out of the
 way. Each is under "What the measurements showed" below.
-
-> **Tailscale and ezvpn are in these tables as controls, not as competitors.**
-> Both run on the same machines, so when a flextunnel number comes out
-> unexpectedly low, their rows from the same round tell the two causes apart:
-> if they are low too, the host or the network is having a bad moment; if they
-> are where they were, flextunnel regressed.
->
-> The numbers are not meant to show which is the faster tunnel, and they
-> cannot. They come from one pair of virtual machines on one host, over a
-> virtual network with no real distance, loss or NAT, with one TCP connection
-> per test, and with each product at whatever version and defaults it had that
-> day. The three also do different jobs. ezvpn and Tailscale carry IP packets
-> and leave reliability to the TCP connection inside the tunnel, and both run
-> as root, which is how they get socket buffers larger than the kernel's limit
-> and why raising the limit does not move them. flextunnel ends the TCP
-> connection at each side and carries its bytes in a QUIC stream, without
-> root. A change of kernel, NIC, CPU, or a single offload flag reorders the
-> table, as the columns show. Measure on your own hardware and path before
-> drawing conclusions.
 
 ## What sets the ceiling
 
@@ -148,23 +127,20 @@ and speed up as it goes.
 | NIC | `virtio_net`, 6 queues (multi-queue), XPS at its default of one transmit queue per CPU, `tx-udp-segmentation` off by default |
 | Kernel UDP buffer limit | `net.core.rmem_max` and `wmem_max` at their default of 212992 bytes, or raised to 7500000 where a column says so |
 | flextunnel | v0.0.106 and v0.0.107, the same version at both ends, run as an unprivileged user; direct path, Cubic |
-| ezvpn | v0.0.70, run as root; direct path |
-| Tailscale | 1.104.7; direct path |
 | Tool | iperf3 3.18, one TCP connection, 6 s per run after a 1 s warm-up; "up" is client to server, "down" is server to client (`-R`) |
 
 A flextunnel run goes through a port forward: `iperf3 -s` listens on the
 server's loopback, the client forwards a local port to it at
 `<destination>.localhost.flextunnel.internal`, and `iperf3 -c` connects to
 that local port. So the bytes cross a loopback TCP connection on each machine
-and one QUIC stream between them. The ezvpn and Tailscale rows connect to the
-server's address inside the tunnel, and the "no tunnel" row to its address on
-the bridge.
+and one QUIC stream between them. The "no tunnel" row connects to the
+server's address on the bridge.
 
 One test ran at a time. Anything else running on the physical host moves
 every row (a busy moment halves all of them for a round), so the rows of a
 table were taken in turn, one round after another, and the tunnel was
-restarted for every flextunnel and ezvpn run. Every flextunnel run was on a
-direct path, read off the client's log before the run began.
+restarted for every flextunnel run. Every flextunnel run was on a direct
+path, read off the client's log before the run began.
 
 ## Results
 
@@ -178,8 +154,6 @@ an upload. One of them can be a batch of datagrams.
 | | Down | Up | Dropped (down / up) |
 |---|---:|---:|---:|
 | No tunnel (TCP with TSO over the bridge) | 20151 | 20609 | |
-| Tailscale 1.104.7 | 1286 | 1760 | |
-| ezvpn v0.0.70 | 2376 | 2329 | |
 | flextunnel v0.0.106 | 1360 | 1357 | 348 / 355 |
 | flextunnel v0.0.107 | 2014 | 2037 | 198 / 1101 |
 
@@ -192,8 +166,6 @@ median.
 | | Down | Up | Dropped (down / up) |
 |---|---:|---:|---:|
 | No tunnel | 20264 | 20381 | |
-| Tailscale 1.104.7 | 3275 | 3156 | |
-| ezvpn v0.0.70 | 3278 | 2973 | |
 | flextunnel v0.0.106 | 1790 | 1817 | 142 / 125 |
 | flextunnel v0.0.107 | 2822 | 2847 | 92 / 181 |
 
@@ -202,8 +174,8 @@ median.
 crosses to the host as one buffer instead of being segmented in the guest.
 It is a setting of the underlay NIC, outside any tunnel's control. The
 buffer limit is at its default here. The third round was slow for the
-controls and for v0.0.106's download (no tunnel 18061 and 17234, Tailscale
-1611 and 1326, v0.0.106 937 down).
+no-tunnel row and for v0.0.106's download (no tunnel 18061 and 17234,
+v0.0.106 937 down).
 
 ### Linux pair, UDP buffer limit raised
 
@@ -213,21 +185,17 @@ setting [recommended above](#linux-raise-the-udp-buffer-limit).
 | | Down | Up | Dropped (down / up) |
 |---|---:|---:|---:|
 | No tunnel | 20334 | 20605 | |
-| Tailscale 1.104.7 | 1288 | 1306 | |
-| ezvpn v0.0.70 | 2102 | 2298 | |
 | flextunnel v0.0.106 | 1400 | 1411 | 0 / 0 |
 | flextunnel v0.0.107 | 2601 | 2633 | 0 / 0 |
 
-The last round was slow for every tunnel (ezvpn 1326 and 1073, v0.0.106 387
-and 487, v0.0.107 1227 and 1373).
+The last round was slow for both versions (v0.0.106 387 and 487, v0.0.107
+1227 and 1373).
 
 ### Linux pair, buffer limit raised and `tx-udp-segmentation` on
 
 | | Down | Up |
 |---|---:|---:|
 | No tunnel | 20249 | 20318 |
-| Tailscale 1.104.7 | 3020 | 3042 |
-| ezvpn v0.0.70 | 3312 | 2948 |
 | flextunnel v0.0.106 | 1742 | 1845 |
 | flextunnel v0.0.107 | 3705 | 3634 |
 
