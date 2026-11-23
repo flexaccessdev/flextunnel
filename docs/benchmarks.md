@@ -142,6 +142,13 @@ table were taken in turn, one round after another, and the tunnel was
 restarted for every flextunnel run. Every flextunnel run was on a direct
 path, read off the client's log before the run began.
 
+The v0.0.107 rows were measured before two later fixes to the forks: the
+netwatch fork's sockets now take turns on receive, and the iroh fork keeps
+its send backpressure to UDP sockets. A rerun with both, each order of the
+two builds, did not tell them apart: 3689 / 3658 against 3688 / 3656 with the
+limit raised and the offload on, and 5143 / 4450 against 5056 / 4549 for
+three clients at once.
+
 ## Results
 
 Mbit/s, medians of five rounds. "Dropped" is the median count of receives
@@ -491,9 +498,16 @@ scheduled work.
 ## Reproducing
 
 Start a server on one machine with `iperf3 -s -B 127.0.0.1` beside it, and on
-the other a client whose config forwards a local port to it:
+the other a client whose config forwards a local port to it. The client needs
+a key the server authorizes: generate one with
+`flexaccess-keys generate-auth-key "bench" -o client.key`, and add the public
+entry that `flexaccess-keys show-auth-key --private-key-file client.key`
+prints to the server's authorized-keys file (the README's
+[quick start](../README.md#quick-start) has both configs in full).
 
 ```toml
+auth_key_file = "./client.key"
+
 [[destinations]]
 name = "t1"
 server_node_id = "<server endpoint id>"
