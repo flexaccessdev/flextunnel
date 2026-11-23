@@ -2193,6 +2193,40 @@ async fn startup_guard_recognizes_conflicted_own_id() {
     let _ = std::fs::remove_file(&bl_path);
 }
 
+/// A peer is granted no unidirectional stream, so it cannot have this side
+/// hold a window for one: opening one waits, where a bidirectional stream
+/// opens at once.
+#[tokio::test]
+async fn a_peer_is_granted_no_unidirectional_stream() {
+    const TEST_ALPN: &[u8] = b"flextunnel-test/no-uni";
+
+    let server = loopback_base(MemoryLookup::new())
+        .secret_key(SecretKey::from_bytes(&[73; 32]))
+        .alpns(vec![TEST_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let server_addr = EndpointAddr::new(server.id()).with_ip_addr(server.bound_sockets()[0]);
+    let client = loopback_base(MemoryLookup::new())
+        .secret_key(SecretKey::from_bytes(&[74; 32]))
+        .bind()
+        .await
+        .unwrap();
+
+    let accepted = tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        conn.closed().await;
+    });
+
+    let conn = with_timeout(client.connect(server_addr, TEST_ALPN)).await.unwrap();
+    with_timeout(conn.open_bi()).await.unwrap();
+    let uni = tokio::time::timeout(Duration::from_millis(500), conn.open_uni()).await;
+    assert!(uni.is_err(), "a unidirectional stream opened");
+
+    conn.close(0u32.into(), b"done");
+    with_timeout(accepted).await.unwrap();
+}
+
 /// A stream's flow-control window follows its reader. Unread, a stream holds
 /// what every stream starts with and no more: the peer gets
 /// [`STREAM_RECEIVE_WINDOW`](crate::transport::STREAM_RECEIVE_WINDOW) ahead of

@@ -137,12 +137,9 @@ with the reader's own socket buffer held to 256 KiB so that what piles up
 does so in the tunnel.
 
 What a connection's streams hold beyond their starting windows is limited to
-64 MiB between them, returned as streams end. Flextunnel's traffic is
-bidirectional streams, of which a peer may have 100 open on a connection, so
-its tunnels can make a connection buffer about 183 MiB of stream data and no
-more. That is a bound on flextunnel's own traffic, not on the transport: the
-QUIC settings also let a peer open 100 unidirectional streams, which
-flextunnel never does, and each would be given a starting window as well.
+64 MiB between them, returned as streams end. A peer may have 100
+bidirectional streams open on a connection and no unidirectional ones, so a
+connection can be made to buffer about 183 MiB of stream data and no more.
 The second row is presumably that bound being met, at about
 70 MB over the first: on a long path the first megabytes of a stream go into
 the reader's socket buffers within two round trips, which counts as keeping
@@ -520,6 +517,26 @@ ezvpn asks its peer for an ACK per 16 packets where QUIC's default is every
 other one. Here that changed nothing: the receiving side was already sending
 an ACK only when its connection task ran, about one per 50–70 packets
 (2,100–2,900 ACKs a second for 150,000 packets).
+
+v0.0.109 also grants a peer no unidirectional streams, where QUIC's default
+is 100: flextunnel opens none, and each is a stream window more that a peer
+could have a connection hold. The v0.0.109 rows above were taken before that
+was added. Against a build with it, twenty rounds in two sessions of ten,
+and in the second session a build of the same source with the constant back
+at 100:
+
+| | As installed (down / up) | Limit raised, offload on (down / up) |
+|---|---:|---:|
+| v0.0.109 as measured above (100 granted) | 2027 / 2032 | 3674 / 3650 |
+| None granted, as shipped | 1989 / 2038 | 3616 / 3582 |
+| The same source with 100 granted, ten rounds | 2012 / 1990 | 3635 / 3586 |
+
+Within 2% over the twenty. The first session had the shipped build behind by
+1–4% in all four figures (1969 / 2022 against 2037 / 2039, 3526 / 3574
+against 3670 / 3658); the second had it level with or ahead of both others
+(2059 / 2050 and 3666 / 3666, against 2020 / 2019 and 3674 / 3641, and the
+third row). A build that differs in that constant alone was not faster, so
+this is the difference between sessions and builds again, not the setting.
 
 ### No false MTU black hole
 

@@ -93,12 +93,11 @@ const WIDEST_STREAM_WINDOW: u32 = 8 * 1024 * 1024;
 /// for nine at [`STREAM_RECEIVE_WINDOW_MAX`]. A stream takes what its window
 /// grows by out of this and returns it when it ends.
 ///
-/// It bounds what flextunnel's tunnels can make a peer buffer: they are
-/// bidirectional streams, 100 to a connection by QUIC's default, so
-/// `100 × STREAM_RECEIVE_WINDOW` plus this, about 183 MiB, where the starting
-/// windows alone are the 119 MiB it always could. It is not a bound on the
-/// transport: a peer may also open 100 unidirectional streams, which nothing
-/// here does, and each would be given a starting window too.
+/// It bounds what a peer can be made to buffer: a connection carries QUIC's
+/// default of 100 bidirectional streams and no unidirectional ones
+/// ([`build_quic_transport_config`]), so `100 × STREAM_RECEIVE_WINDOW` plus
+/// this, about 183 MiB, where the starting windows alone are the 119 MiB it
+/// always could.
 ///
 /// It is not QUIC's own limit across a connection's streams, which stays
 /// unlimited as it is by default. That limit is credit every stream draws on,
@@ -228,6 +227,10 @@ pub const QUICK_ALPN: &[u8] = b"flextunnel-quick/1";
 /// sides apply identical settings: each side's windows bound what the other
 /// sends, and each side's thresholds judge its own packets.
 ///
+/// A peer is granted no unidirectional streams: nothing here opens one, and
+/// each one QUIC allows by default (100) is a stream receive window more that
+/// a peer could have this side hold.
+///
 /// The window growth settings exist only in the noq fork the workspace builds
 /// against, and reach here through the iroh fork's builder.
 pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
@@ -242,6 +245,7 @@ pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
         transport_config.max_stream_receive_window(STREAM_RECEIVE_WINDOW_MAX.into());
     transport_config = transport_config.stream_receive_window_budget(STREAM_WINDOW_BUDGET);
     transport_config = transport_config.send_window(SEND_WINDOW);
+    transport_config = transport_config.max_concurrent_uni_streams(0u32.into());
     transport_config = transport_config.packet_threshold(REORDERING_PACKET_THRESHOLD);
     transport_config = transport_config.time_threshold(REORDERING_TIME_THRESHOLD);
     Ok(transport_config.build())
