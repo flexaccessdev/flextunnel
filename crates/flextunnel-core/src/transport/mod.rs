@@ -50,7 +50,7 @@ pub const QUIC_INITIAL_MTU: u16 = 1452;
 /// be taken back once granted. So no stream is given more than this up front.
 /// A stream whose reader keeps up earns more, up to
 /// [`STREAM_RECEIVE_WINDOW_MAX`]; one that is read slowly or not at all, and
-/// the control stream, stay here.
+/// the control stream, stay here. So does every stream of the iOS client.
 pub const STREAM_RECEIVE_WINDOW: u32 = 1_250_000;
 
 /// The most a stream's window grows to.
@@ -66,10 +66,27 @@ pub const STREAM_RECEIVE_WINDOW: u32 = 1_250_000;
 ///
 /// At this size a stream carries 1.2 Gbit/s at 53 ms. Every stream used to be
 /// given it from the start, on every build but iOS, and that was the price:
-/// 95 stalled readers on one connection took a client to 900 MB of memory,
-/// about 9 MB each, where streams held to [`STREAM_RECEIVE_WINDOW`] took under
-/// 2 MB each.
-pub const STREAM_RECEIVE_WINDOW_MAX: u32 = 8 * 1024 * 1024;
+/// 95 stalled readers on one connection took a client past 1 GB of memory,
+/// about 11 MB each, where streams held to [`STREAM_RECEIVE_WINDOW`] took
+/// under 2 MB each.
+///
+/// The iOS client's windows do not grow. A reader that was fast and then
+/// stalls keeps the window it earned, so with growth an ordinary download can
+/// leave a stream holding several times the 1.25 MB that build has always
+/// held its streams to, and iOS is the one build the system kills for the
+/// memory it holds: what budget is safe on a device has not been measured.
+/// Its downloads stay capped at 100 Mbit/s per 100 ms of round trip. The
+/// window is each side's own, so a server still grows the one it offers that
+/// client for uploads.
+pub const STREAM_RECEIVE_WINDOW_MAX: u32 = if cfg!(target_os = "ios") {
+    STREAM_RECEIVE_WINDOW
+} else {
+    WIDEST_STREAM_WINDOW
+};
+
+/// The widest window a stream grows to on any build, which is what a peer may
+/// offer whatever this build's own [`STREAM_RECEIVE_WINDOW_MAX`].
+const WIDEST_STREAM_WINDOW: u32 = 8 * 1024 * 1024;
 
 /// What the streams of one connection may hold between them beyond their
 /// starting windows (the noq fork's `stream_receive_window_budget`): enough
@@ -92,10 +109,10 @@ pub const STREAM_RECEIVE_WINDOW_MAX: u32 = 8 * 1024 * 1024;
 pub const STREAM_WINDOW_BUDGET: u64 = 64 * 1024 * 1024;
 
 /// How much sent-but-unacknowledged stream data a connection holds, across its
-/// streams. Twice the widest window a stream grows to
-/// ([`STREAM_RECEIVE_WINDOW_MAX`]), so one stream can fill its window while
-/// others still send.
-pub const SEND_WINDOW: u64 = 2 * STREAM_RECEIVE_WINDOW_MAX as u64;
+/// streams. Twice the widest window a peer offers a stream (8 MiB, whatever
+/// this build's own [`STREAM_RECEIVE_WINDOW_MAX`]), so one stream can fill its
+/// window while others still send.
+pub const SEND_WINDOW: u64 = 2 * WIDEST_STREAM_WINDOW as u64;
 
 /// How many later packets must be acknowledged before an unacknowledged one
 /// is declared lost on that ground alone (QUIC's packet reordering threshold,

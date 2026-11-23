@@ -188,7 +188,10 @@ within two round trips (of 5 ms at least) the window doubles, up to 8 MiB. What 
 streams hold beyond their starting windows comes out of one 64 MiB budget,
 returned as streams end, and a stream it has nothing left for keeps the
 window it has. This is in the transport, so it holds for every stream alike:
-forwards, `client nc`, proxied requests, the control stream.
+forwards, `client nc`, proxied requests, the control stream. The iOS client
+is the exception: the system kills it for the memory it holds, and a window
+that grew stays grown when its reader stalls, so its windows stay at 1.25 MB
+until a device has been measured.
 And loss detection tolerates reordering — 256 packets, two round trips —
 because a sender on a multi-queue NIC reorders its own packets (the kernel
 picks the transmit queue by CPU, and the sending task moves between runtime
@@ -467,7 +470,7 @@ catches accidental identity reuse.
 |---|---|---|
 | `QUIC_IDLE_TIMEOUT` | 180s | `transport/mod.rs` |
 | `QUIC_INITIAL_MTU` | 1452 | `transport/mod.rs` |
-| `STREAM_RECEIVE_WINDOW` / `STREAM_RECEIVE_WINDOW_MAX` (a stream's window: at first / at most) | 1.25 MB / 8 MiB | `transport/mod.rs` |
+| `STREAM_RECEIVE_WINDOW` / `STREAM_RECEIVE_WINDOW_MAX` (a stream's window: at first / at most) | 1.25 MB / 8 MiB (iOS: 1.25 MB) | `transport/mod.rs` |
 | `STREAM_WINDOW_BUDGET` (window beyond the first, per connection) | 64 MiB | `transport/mod.rs` |
 | `SEND_WINDOW` (unacknowledged data, per connection) | 16 MiB | `transport/mod.rs` |
 | `REORDERING_PACKET_THRESHOLD` / `REORDERING_TIME_THRESHOLD` (QUIC loss detection) | 256 packets / 2 × RTT | `transport/mod.rs` |

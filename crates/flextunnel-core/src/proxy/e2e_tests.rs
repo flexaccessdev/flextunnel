@@ -2193,19 +2193,26 @@ async fn startup_guard_recognizes_conflicted_own_id() {
     let _ = std::fs::remove_file(&bl_path);
 }
 
-/// A stream nobody reads holds what every stream starts with and no more: the
-/// peer gets [`STREAM_RECEIVE_WINDOW`](crate::transport::STREAM_RECEIVE_WINDOW)
-/// ahead of the reader and is held there, however much larger the window a
-/// stream may grow to. Once it is read, the stream carries the rest.
+/// A stream's flow-control window follows its reader. Unread, a stream holds
+/// what every stream starts with and no more: the peer gets
+/// [`STREAM_RECEIVE_WINDOW`](crate::transport::STREAM_RECEIVE_WINDOW) ahead of
+/// the reader and is held there. Read as fast as loopback delivers, it is
+/// given more, and keeps it when the reader stops: the peer then gets further
+/// ahead than a starting window, though never past
+/// [`STREAM_RECEIVE_WINDOW_MAX`](crate::transport::STREAM_RECEIVE_WINDOW_MAX).
 #[tokio::test]
-async fn an_unread_stream_holds_only_its_starting_window() {
+async fn a_streams_window_follows_its_reader() {
     use crate::transport::{STREAM_RECEIVE_WINDOW, STREAM_RECEIVE_WINDOW_MAX};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const TEST_ALPN: &[u8] = b"flextunnel-test/stream-window";
     const START: u64 = STREAM_RECEIVE_WINDOW as u64;
-    // More than a stream's window could ever grow to.
-    const PAYLOAD: u64 = 2 * STREAM_RECEIVE_WINDOW_MAX as u64;
+    const MAX: u64 = STREAM_RECEIVE_WINDOW_MAX as u64;
+    // What the reader takes at a stretch before it stops to see how far ahead
+    // the sender gets: several times what a window needs to reach its maximum.
+    const STRETCH: u64 = 4 * MAX;
+    // Long enough for a sender with credit to use all of it.
+    const SETTLE: Duration = Duration::from_millis(500);
 
     let server = loopback_base(MemoryLookup::new())
         .secret_key(SecretKey::from_bytes(&[71; 32]))
@@ -2220,8 +2227,8 @@ async fn an_unread_stream_holds_only_its_starting_window() {
         .await
         .unwrap();
 
-    // The far side writes `PAYLOAD` bytes to the stream opened to it, counting
-    // what the stream has taken.
+    // The far side writes to the stream opened to it for as long as the
+    // stream takes it, counting what it has taken.
     let sent = Arc::new(AtomicU64::new(0));
     let sender = tokio::spawn({
         let sent = Arc::clone(&sent);
@@ -2229,16 +2236,9 @@ async fn an_unread_stream_holds_only_its_starting_window() {
             let conn = server.accept().await.unwrap().await.unwrap();
             let (mut send, _recv) = conn.accept_bi().await.unwrap();
             let chunk = vec![5u8; 64 * 1024];
-            while sent.load(Ordering::Relaxed) < PAYLOAD {
-                let left = PAYLOAD - sent.load(Ordering::Relaxed);
-                let n = send
-                    .write(&chunk[..chunk.len().min(left as usize)])
-                    .await
-                    .unwrap();
+            while let Ok(n) = send.write(&chunk).await {
                 sent.fetch_add(n as u64, Ordering::Relaxed);
             }
-            send.finish().unwrap();
-            let _ = send.stopped().await;
         }
     });
 
@@ -2251,17 +2251,35 @@ async fn an_unread_stream_holds_only_its_starting_window() {
         while sent.load(Ordering::Relaxed) < START {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(SETTLE).await;
         assert_eq!(sent.load(Ordering::Relaxed), START);
 
-        let mut total = 0u64;
+        // Read at full speed and then stopped, it has more than that. How fast
+        // a stretch has to be read for the window to grow is the transport's
+        // business; a slow machine gets several stretches to manage it.
+        let mut read = 0u64;
         let mut chunks: [bytes::Bytes; 32] = std::array::from_fn(|_| bytes::Bytes::new());
-        while let Some(n) = recv.read_many_chunks(&mut chunks).await.unwrap() {
-            total += chunks[..n].iter().map(|c| c.len() as u64).sum::<u64>();
+        let mut ahead = 0;
+        for _ in 0..8 {
+            let until = read + STRETCH;
+            while read < until {
+                let n = recv.read_many_chunks(&mut chunks).await.unwrap().unwrap();
+                read += chunks[..n].iter().map(|c| c.len() as u64).sum::<u64>();
+            }
+            tokio::time::sleep(SETTLE).await;
+            ahead = sent.load(Ordering::Relaxed) - read;
+            assert!(ahead <= MAX, "{ahead} bytes ahead of the reader");
+            if ahead > START {
+                break;
+            }
         }
-        assert_eq!(total, PAYLOAD);
+        // A build whose windows do not grow (iOS) has nothing more to show.
+        if MAX > START {
+            assert!(ahead > START, "the window never grew: {ahead} bytes ahead");
+        }
+        recv.stop(0u32.into()).unwrap();
     };
-    tokio::time::timeout(Duration::from_secs(60), all)
+    tokio::time::timeout(Duration::from_secs(120), all)
         .await
         .expect("timed out");
     sender.await.unwrap();
