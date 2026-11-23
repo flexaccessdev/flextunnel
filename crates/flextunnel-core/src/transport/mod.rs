@@ -18,7 +18,7 @@ pub mod endpoint;
 pub mod paths;
 
 use anyhow::{Context, Result};
-use iroh::endpoint::QuicTransportConfig;
+use iroh::endpoint::{QuicTransportConfig, Side};
 use std::time::Duration;
 
 /// QUIC idle timeout. A connection with no activity for this long is considered
@@ -93,11 +93,11 @@ const WIDEST_STREAM_WINDOW: u32 = 8 * 1024 * 1024;
 /// for nine at [`STREAM_RECEIVE_WINDOW_MAX`]. A stream takes what its window
 /// grows by out of this and returns it when it ends.
 ///
-/// It bounds what a peer can be made to buffer: a connection carries QUIC's
-/// default of 100 bidirectional streams and no unidirectional ones
+/// It bounds what a peer can be made to buffer: a connection carries the 100
+/// bidirectional streams a server grants its client and no others
 /// ([`build_quic_transport_config`]), so `100 × STREAM_RECEIVE_WINDOW` plus
-/// this, about 183 MiB, where the starting windows alone are the 119 MiB it
-/// always could.
+/// this, about 183 MiB at either end, where the starting windows alone are
+/// the 119 MiB it always could.
 ///
 /// It is not QUIC's own limit across a connection's streams, which stays
 /// unlimited as it is by default. That limit is credit every stream draws on,
@@ -224,16 +224,19 @@ pub const QUICK_ALPN: &[u8] = b"flextunnel-quick/1";
 /// the flow-control windows and the reordering thresholds — and **no transport
 /// keep-alive** (see [`QUIC_IDLE_TIMEOUT`]; the app-level heartbeat is the sole
 /// periodic sender). Shared by client and server endpoint creation so both
-/// sides apply identical settings: each side's windows bound what the other
+/// sides apply the same settings: each side's windows bound what the other
 /// sends, and each side's thresholds judge its own packets.
 ///
-/// A peer is granted no unidirectional streams: nothing here opens one, and
-/// each one QUIC allows by default (100) is a stream receive window more that
-/// a peer could have this side hold.
+/// What differs by `side` is the streams a peer is granted, which are the
+/// ones tunnels use and no others: a client opens bidirectional streams to
+/// its server, so a server grants QUIC's default of 100 and a client grants
+/// none, and neither grants unidirectional ones. Each stream QUIC would
+/// otherwise allow (100 of each kind, from either end) is a stream receive
+/// window more that a peer could have this side hold.
 ///
 /// The window growth settings exist only in the noq fork the workspace builds
 /// against, and reach here through the iroh fork's builder.
-pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
+pub fn build_quic_transport_config(side: Side) -> Result<QuicTransportConfig> {
     let mut transport_config = QuicTransportConfig::builder();
     let idle_timeout = QUIC_IDLE_TIMEOUT
         .try_into()
@@ -246,6 +249,9 @@ pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
     transport_config = transport_config.stream_receive_window_budget(STREAM_WINDOW_BUDGET);
     transport_config = transport_config.send_window(SEND_WINDOW);
     transport_config = transport_config.max_concurrent_uni_streams(0u32.into());
+    if side == Side::Client {
+        transport_config = transport_config.max_concurrent_bidi_streams(0u32.into());
+    }
     transport_config = transport_config.packet_threshold(REORDERING_PACKET_THRESHOLD);
     transport_config = transport_config.time_threshold(REORDERING_TIME_THRESHOLD);
     Ok(transport_config.build())

@@ -137,9 +137,10 @@ with the reader's own socket buffer held to 256 KiB so that what piles up
 does so in the tunnel.
 
 What a connection's streams hold beyond their starting windows is limited to
-64 MiB between them, returned as streams end. A peer may have 100
-bidirectional streams open on a connection and no unidirectional ones, so a
-connection can be made to buffer about 183 MiB of stream data and no more.
+64 MiB between them, returned as streams end. A connection carries the 100
+bidirectional streams a server grants its client and no others: a client
+grants its server none, and neither grants unidirectional ones. So either
+end can be made to buffer about 183 MiB of stream data and no more.
 The second row is presumably that bound being met, at about
 70 MB over the first: on a long path the first megabytes of a stream go into
 the reader's socket buffers within two round trips, which counts as keeping
@@ -537,6 +538,14 @@ against 3670 / 3658); the second had it level with or ahead of both others
 (2059 / 2050 and 3666 / 3666, against 2020 / 2019 and 3674 / 3641, and the
 third row). A build that differs in that constant alone was not faster, so
 this is the difference between sessions and builds again, not the setting.
+
+A client grants its server no bidirectional streams either, since only the
+client opens them. With that added, against the build above it, ten rounds
+in turn: 2067 / 2079 against 2093 / 2030 as installed, and 3687 / 3627
+against 3698 / 3609 with the limit raised and the offload on. The last
+leaves out one round of the ten, in which the new build's direct path was
+the machines' Tailscale address (607 / 496); with it the medians are 3685 /
+3544.
 
 ### No false MTU black hole
 

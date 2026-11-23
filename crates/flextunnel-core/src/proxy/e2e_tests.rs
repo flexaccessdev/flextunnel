@@ -31,7 +31,9 @@ use crate::proxy::{
 use crate::transport::endpoint::{ClientEndpoint, RelayConfig, server_setup};
 use crate::transport::{ALPN, QUICK_ALPN, build_quic_transport_config};
 use iroh::address_lookup::MemoryLookup;
-use iroh::endpoint::{presets, Builder as EndpointBuilder, Connection, RecvStream, SendStream};
+use iroh::endpoint::{
+    presets, Builder as EndpointBuilder, Connection, RecvStream, SendStream, Side,
+};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -76,10 +78,10 @@ async fn loopback_endpoint(secret: SecretKey, is_server: bool) -> Endpoint {
 /// The hermetic base every test endpoint is built on, in place of the relay
 /// setup: relay off, no discovery, `127.0.0.1:0`. `lookup` holds out-of-band
 /// addresses for the peers the endpoint dials by id alone.
-fn loopback_base(lookup: MemoryLookup) -> EndpointBuilder {
+fn loopback_base(side: Side, lookup: MemoryLookup) -> EndpointBuilder {
     Endpoint::builder(presets::Empty)
         .relay_mode(RelayMode::Disabled)
-        .transport_config(build_quic_transport_config().unwrap())
+        .transport_config(build_quic_transport_config(side).unwrap())
         .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
         .unwrap()
@@ -95,7 +97,8 @@ async fn loopback_endpoint_full(
     lookup: MemoryLookup,
     quick_clients: HashSet<EndpointId>,
 ) -> Endpoint {
-    let base = loopback_base(lookup);
+    let side = if is_server { Side::Server } else { Side::Client };
+    let base = loopback_base(side, lookup);
     let builder = if is_server {
         server_setup(base, secret, quick_clients)
     } else {
@@ -1293,7 +1296,7 @@ async fn a_peer_granting_no_stream_times_the_handshake_out() {
         .max_concurrent_bidi_streams(0u32.into())
         .build();
     let server = server_setup(
-        loopback_base(MemoryLookup::new()).transport_config(no_streams),
+        loopback_base(Side::Server, MemoryLookup::new()).transport_config(no_streams),
         SecretKey::generate(),
         HashSet::new(),
     )
@@ -1593,7 +1596,7 @@ async fn prepared_server_serves_an_authorized_client() {
     .unwrap();
     assert_eq!(prepared.own_id(), secret.public());
 
-    let running = Arc::new(prepared.bind_with(loopback_base(MemoryLookup::new())).await);
+    let running = Arc::new(prepared.bind_with(loopback_base(Side::Server, MemoryLookup::new())).await);
     let server_ep = running.endpoint();
     assert_eq!(server_ep.id(), secret.public(), "bound under the configured identity");
     let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
@@ -2031,7 +2034,7 @@ async fn prepared_quick_server_admits_only_the_entered_client() {
         blocklist_file: bl_path.clone(),
     })
     .unwrap();
-    let running = Arc::new(prepared.bind_with(loopback_base(MemoryLookup::new())).await);
+    let running = Arc::new(prepared.bind_with(loopback_base(Side::Server, MemoryLookup::new())).await);
     let server_ep = running.endpoint();
     let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
     let served = tokio::spawn({
@@ -2193,38 +2196,47 @@ async fn startup_guard_recognizes_conflicted_own_id() {
     let _ = std::fs::remove_file(&bl_path);
 }
 
-/// A peer is granted no unidirectional stream, so it cannot have this side
-/// hold a window for one: opening one waits, where a bidirectional stream
-/// opens at once.
+/// A peer is granted the streams tunnels use and no others, so it cannot have
+/// this side hold a window for any other: a client opens a bidirectional
+/// stream to its server at once, where a unidirectional stream from either
+/// end, or any stream from the server, waits.
 #[tokio::test]
-async fn a_peer_is_granted_no_unidirectional_stream() {
-    const TEST_ALPN: &[u8] = b"flextunnel-test/no-uni";
+async fn a_peer_is_granted_only_the_streams_tunnels_use() {
+    const TEST_ALPN: &[u8] = b"flextunnel-test/streams-granted";
+    const WAIT: Duration = Duration::from_millis(500);
 
-    let server = loopback_base(MemoryLookup::new())
+    let server = loopback_base(Side::Server, MemoryLookup::new())
         .secret_key(SecretKey::from_bytes(&[73; 32]))
         .alpns(vec![TEST_ALPN.to_vec()])
         .bind()
         .await
         .unwrap();
     let server_addr = EndpointAddr::new(server.id()).with_ip_addr(server.bound_sockets()[0]);
-    let client = loopback_base(MemoryLookup::new())
+    let client = loopback_base(Side::Client, MemoryLookup::new())
         .secret_key(SecretKey::from_bytes(&[74; 32]))
         .bind()
         .await
         .unwrap();
 
-    let accepted = tokio::spawn(async move {
+    let from_server = tokio::spawn(async move {
         let conn = server.accept().await.unwrap().await.unwrap();
+        let bi = matches!(tokio::time::timeout(WAIT, conn.open_bi()).await, Ok(Ok(_)));
+        let uni = matches!(tokio::time::timeout(WAIT, conn.open_uni()).await, Ok(Ok(_)));
         conn.closed().await;
+        (bi, uni)
     });
 
     let conn = with_timeout(client.connect(server_addr, TEST_ALPN)).await.unwrap();
     with_timeout(conn.open_bi()).await.unwrap();
-    let uni = tokio::time::timeout(Duration::from_millis(500), conn.open_uni()).await;
-    assert!(uni.is_err(), "a unidirectional stream opened");
+    let uni = tokio::time::timeout(WAIT, conn.open_uni()).await;
+    assert!(uni.is_err(), "the client opened a unidirectional stream");
 
+    // Past both of the server's waits before the connection goes.
+    tokio::time::sleep(2 * WAIT).await;
     conn.close(0u32.into(), b"done");
-    with_timeout(accepted).await.unwrap();
+    let (bi, uni) = with_timeout(from_server).await.unwrap();
+    assert!(!bi, "the server opened a bidirectional stream");
+    assert!(!uni, "the server opened a unidirectional stream");
 }
 
 /// A stream's flow-control window follows its reader. Unread, a stream holds
@@ -2248,14 +2260,14 @@ async fn a_streams_window_follows_its_reader() {
     // Long enough for a sender with credit to use all of it.
     const SETTLE: Duration = Duration::from_millis(500);
 
-    let server = loopback_base(MemoryLookup::new())
+    let server = loopback_base(Side::Server, MemoryLookup::new())
         .secret_key(SecretKey::from_bytes(&[71; 32]))
         .alpns(vec![TEST_ALPN.to_vec()])
         .bind()
         .await
         .unwrap();
     let server_addr = EndpointAddr::new(server.id()).with_ip_addr(server.bound_sockets()[0]);
-    let client = loopback_base(MemoryLookup::new())
+    let client = loopback_base(Side::Client, MemoryLookup::new())
         .secret_key(SecretKey::from_bytes(&[72; 32]))
         .bind()
         .await
