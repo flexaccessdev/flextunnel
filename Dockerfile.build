@@ -5,6 +5,9 @@ WORKDIR /build
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+# The workspace patches `block` to this vendored copy, so the manifest does not
+# load without it even though the CLI never builds it.
+COPY vendor ./vendor
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETPLATFORM} \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-${TARGETPLATFORM} \
