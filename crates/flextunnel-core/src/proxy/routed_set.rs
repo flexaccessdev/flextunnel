@@ -187,12 +187,18 @@ fn cidr_covered(net: IpNetwork, nets: &[IpNetwork]) -> bool {
         IpAddr::V4(addr) => {
             let base = u32::from(addr);
             let half = 1u32 << (32 - prefix);
-            (IpAddr::from(std::net::Ipv4Addr::from(base)), IpAddr::from(std::net::Ipv4Addr::from(base | half)))
+            (
+                IpAddr::from(std::net::Ipv4Addr::from(base)),
+                IpAddr::from(std::net::Ipv4Addr::from(base | half)),
+            )
         }
         IpAddr::V6(addr) => {
             let base = u128::from(addr);
             let half = 1u128 << (128 - prefix);
-            (IpAddr::from(std::net::Ipv6Addr::from(base)), IpAddr::from(std::net::Ipv6Addr::from(base | half)))
+            (
+                IpAddr::from(std::net::Ipv6Addr::from(base)),
+                IpAddr::from(std::net::Ipv6Addr::from(base | half)),
+            )
         }
     };
     let half = |addr| IpNetwork::new(addr, prefix).expect("a half's prefix is valid");
@@ -238,7 +244,9 @@ impl RoutedSet {
                     bail!("invalid routed-domain wildcard pattern: {raw:?}");
                 }
                 if reserved::is_reserved_host(suffix) {
-                    bail!("routed_domains entry {raw:?} is in the reserved flextunnel.internal namespace");
+                    bail!(
+                        "routed_domains entry {raw:?} is in the reserved flextunnel.internal namespace"
+                    );
                 }
                 domains_suffix.push(format!(".{}", suffix.to_ascii_lowercase()));
             } else if entry.is_empty() || entry.contains('*') {
@@ -250,7 +258,9 @@ impl RoutedSet {
             } else if reserved::is_reserved_host(entry) {
                 // The client answers the reserved names itself and a server
                 // refuses them: the entry would match nothing.
-                bail!("routed_domains entry {raw:?} is in the reserved flextunnel.internal namespace");
+                bail!(
+                    "routed_domains entry {raw:?} is in the reserved flextunnel.internal namespace"
+                );
             } else {
                 domains_exact.insert(entry.to_ascii_lowercase());
             }
@@ -350,7 +360,12 @@ impl RoutedSet {
     /// same targets with equal specificity, so [`super::route_table`] compares
     /// these to reject the ambiguity at config load.
     pub fn rules(&self) -> Vec<Rule> {
-        let mut rules: Vec<Rule> = self.domains_exact.iter().cloned().map(Rule::Exact).collect();
+        let mut rules: Vec<Rule> = self
+            .domains_exact
+            .iter()
+            .cloned()
+            .map(Rule::Exact)
+            .collect();
         rules.extend(
             self.domains_suffix
                 .iter()
@@ -386,12 +401,17 @@ impl RoutedSet {
                 self.cidrs.iter().any(|n| Rule::Cidr(*n).intersects(rule)),
             ),
             _ if self.domains_all => Coverage::Full,
-            Rule::CatchAll => grade(false, !self.domains_exact.is_empty() || !self.domains_suffix.is_empty()),
+            Rule::CatchAll => grade(
+                false,
+                !self.domains_exact.is_empty() || !self.domains_suffix.is_empty(),
+            ),
             Rule::Exact(name) => grade(self.allows_host(name), false),
             Rule::Suffix(zone) => {
                 let dot_zone = format!(".{zone}");
                 grade(
-                    self.domains_suffix.iter().any(|s| dot_zone.ends_with(s.as_str())),
+                    self.domains_suffix
+                        .iter()
+                        .any(|s| dot_zone.ends_with(s.as_str())),
                     self.domains_exact.iter().any(|e| e.ends_with(&dot_zone))
                         || self
                             .domains_suffix
@@ -486,11 +506,23 @@ mod tests {
     #[test]
     fn the_root_dot_does_not_change_a_match() {
         let w = rs(&["example.com", "*.corp.example."], &[]);
-        for host in ["example.com", "example.com.", "EXAMPLE.com.", "api.corp.example", "api.corp.example."] {
+        for host in [
+            "example.com",
+            "example.com.",
+            "EXAMPLE.com.",
+            "api.corp.example",
+            "api.corp.example.",
+        ] {
             assert!(w.allows(&domain(host)), "{host}");
         }
-        assert_eq!(w.specificity(&domain("example.com.")), Some(Specificity::Exact));
-        assert!(!w.allows(&domain("corp.example.")), "the apex stays out of a wildcard");
+        assert_eq!(
+            w.specificity(&domain("example.com.")),
+            Some(Specificity::Exact)
+        );
+        assert!(
+            !w.allows(&domain("corp.example.")),
+            "the apex stays out of a wildcard"
+        );
         assert!(!w.allows(&domain("other.example.")));
         let rules: Vec<String> = w.rules().iter().map(ToString::to_string).collect();
         assert_eq!(rules, ["*.corp.example", "example.com"]);
@@ -570,7 +602,10 @@ mod tests {
         // With the root dot it is the same address, gated the same way.
         assert!(!w_dom_only.allows(&domain("10.0.0.1.")));
         assert!(w.allows(&domain("10.0.0.1.")));
-        assert_eq!(w.specificity(&domain("10.0.0.1.")), Some(Specificity::Cidr(8)));
+        assert_eq!(
+            w.specificity(&domain("10.0.0.1.")),
+            Some(Specificity::Cidr(8))
+        );
         assert!(w_dom_only.allows(&domain("real.hostname")));
     }
 
@@ -646,7 +681,10 @@ mod tests {
     /// of it, or none of it.
     #[test]
     fn coverage_of_a_rule_by_a_set() {
-        let server = rs(&["*.corp.example", "wiki.example"], &["10.0.0.0/9", "10.128.0.0/9", "192.168.1.0/24"]);
+        let server = rs(
+            &["*.corp.example", "wiki.example"],
+            &["10.0.0.0/9", "10.128.0.0/9", "192.168.1.0/24"],
+        );
         for (raw, coverage) in [
             ("*.corp.example", Coverage::Full),
             ("*.dev.corp.example", Coverage::Full),
@@ -670,7 +708,10 @@ mod tests {
         }
         // Only the catch-all covers the catch-all.
         assert_eq!(rs(&["*"], &[]).coverage(&rule("*")), Coverage::Full);
-        assert_eq!(rs(&["*"], &[]).coverage(&rule("10.0.0.0/8")), Coverage::None);
+        assert_eq!(
+            rs(&["*"], &[]).coverage(&rule("10.0.0.0/8")),
+            Coverage::None
+        );
         // A set with holes in a network covers it only in part.
         let holey = rs(&[], &["10.0.0.0/9", "10.128.0.0/10"]);
         assert_eq!(holey.coverage(&rule("10.0.0.0/8")), Coverage::Partial);
@@ -689,7 +730,12 @@ mod tests {
         assert!(RoutedSet::new(&[], &["not-a-cidr".to_string()]).is_err());
         // The client answers the reserved names itself and a server refuses
         // them, so no list may name them.
-        for reserved in ["flextunnel.internal", "x.flextunnel.internal", "*.flextunnel.internal", "*.a.flextunnel.internal."] {
+        for reserved in [
+            "flextunnel.internal",
+            "x.flextunnel.internal",
+            "*.flextunnel.internal",
+            "*.a.flextunnel.internal.",
+        ] {
             let err = RoutedSet::new(&[reserved.to_string()], &[]).unwrap_err();
             assert!(err.to_string().contains("reserved"), "{reserved}: {err}");
         }

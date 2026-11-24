@@ -84,7 +84,10 @@ impl InstanceLock {
             }
             Err(TryLockError::WouldBlock) => anyhow::bail!("{contended_msg}"),
             Err(TryLockError::Error(e)) => Err(e).with_context(|| {
-                format!("Failed to acquire the single-instance lock ({})", path.display())
+                format!(
+                    "Failed to acquire the single-instance lock ({})",
+                    path.display()
+                )
             }),
         }
     }
@@ -106,8 +109,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir()
-            .join(format!("flextunnel-instance-lock-test-{}-{nanos}.lock", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "flextunnel-instance-lock-test-{}-{nanos}.lock",
+            std::process::id()
+        ));
         let first = InstanceLock::acquire(&path, "held").expect("first acquire");
         assert!(
             InstanceLock::acquire(&path, "held").is_err(),

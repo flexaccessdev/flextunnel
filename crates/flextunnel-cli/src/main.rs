@@ -259,9 +259,11 @@ fn main() -> Result<()> {
                     port,
                 },
         } => nc::run(config, name, host, port),
-        Command::GenerateIrohKey { output, force, json } => {
-            secret::generate_iroh_key(output, force, json)
-        }
+        Command::GenerateIrohKey {
+            output,
+            force,
+            json,
+        } => secret::generate_iroh_key(output, force, json),
         Command::ShowIrohId {
             config,
             default_config,
@@ -341,7 +343,7 @@ async fn run_async(command: Command) -> Result<()> {
                 authorized_keys_file,
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
                 relay_auth_token,
-                host_aliases: None, // config-file only; no CLI flag
+                host_aliases: None,   // config-file only; no CLI flag
                 routed_domains: None, // config-file only; no CLI flag
                 routed_cidrs: None,   // config-file only; no CLI flag
             };
@@ -476,10 +478,7 @@ fn print_quick_server_bootstrap(endpoint_id: &EndpointId) {
     println!("Waiting for the client — will exit in 5 minutes if it does not connect.");
 }
 
-async fn run_server(
-    r: config::ResolvedServer,
-    quick: Option<QuickServer>,
-) -> Result<()> {
+async fn run_server(r: config::ResolvedServer, quick: Option<QuickServer>) -> Result<()> {
     // A quick server's identity is the ephemeral in-memory key it carries;
     // a regular server's comes from its key file.
     let (secret_key, quick_client) = match &quick {
@@ -498,8 +497,9 @@ async fn run_server(
     // A quick server runs without client keys: its single allowlisted client
     // id is the whole credential set (enforced natively by the endpoint's hook).
     let authorized_keys = match &r.authorized_keys_file {
-        Some(path) => auth::load_authorized_keys(path)
-            .context("Failed to load the authorized client keys")?,
+        Some(path) => {
+            auth::load_authorized_keys(path).context("Failed to load the authorized client keys")?
+        }
         None => Default::default(),
     };
     // Quick mode arms an idle-exit timer; the server fires this on the first
@@ -702,8 +702,14 @@ mod cli_tests {
             } if name == "work"
         ));
         // `nc` with no selector uses the default client; HOST and PORT follow.
-        let args =
-            Args::try_parse_from(["flextunnel", "client", "nc", "machine1.localhost.flextunnel.internal", "22"]).unwrap();
+        let args = Args::try_parse_from([
+            "flextunnel",
+            "client",
+            "nc",
+            "machine1.localhost.flextunnel.internal",
+            "22",
+        ])
+        .unwrap();
         assert!(matches!(
             args.command,
             Command::Client {
@@ -711,13 +717,22 @@ mod cli_tests {
             } if host == "machine1.localhost.flextunnel.internal"
         ));
         let args = Args::try_parse_from([
-            "flextunnel", "client", "nc", "-c", "work.toml", "machine1.internal", "22",
+            "flextunnel",
+            "client",
+            "nc",
+            "-c",
+            "work.toml",
+            "machine1.internal",
+            "22",
         ])
         .unwrap();
         assert!(matches!(
             args.command,
             Command::Client {
-                action: ClientAction::Nc { config: Some(_), .. }
+                action: ClientAction::Nc {
+                    config: Some(_),
+                    ..
+                }
             }
         ));
     }
@@ -751,16 +766,65 @@ mod cli_tests {
         // `--quick` mints everything ephemerally, so it is mutually exclusive
         // with the config/secret/key flags on both sides.
         let cases = [
-            vec!["flextunnel", "server", "start", "--quick", "-c", "server.toml"],
-            vec!["flextunnel", "server", "start", "--quick", "--secret-file", "k.key"],
-            vec!["flextunnel", "server", "start", "--quick", "--authorized-keys-file", "ak.txt"],
-            vec!["flextunnel", "client", "start", "--quick", "-c", "client.toml"],
+            vec![
+                "flextunnel",
+                "server",
+                "start",
+                "--quick",
+                "-c",
+                "server.toml",
+            ],
+            vec![
+                "flextunnel",
+                "server",
+                "start",
+                "--quick",
+                "--secret-file",
+                "k.key",
+            ],
+            vec![
+                "flextunnel",
+                "server",
+                "start",
+                "--quick",
+                "--authorized-keys-file",
+                "ak.txt",
+            ],
+            vec![
+                "flextunnel",
+                "client",
+                "start",
+                "--quick",
+                "-c",
+                "client.toml",
+            ],
             // Quick mode has no keypair auth at all (the credential is the
             // client's endpoint id), so key flags are rejected too.
-            vec!["flextunnel", "client", "start", "--quick", "--auth-key", "ed25519-sec:X"],
-            vec!["flextunnel", "client", "start", "--quick", "--auth-key-file", "c.key"],
+            vec![
+                "flextunnel",
+                "client",
+                "start",
+                "--quick",
+                "--auth-key",
+                "ed25519-sec:X",
+            ],
+            vec![
+                "flextunnel",
+                "client",
+                "start",
+                "--quick",
+                "--auth-key-file",
+                "c.key",
+            ],
             // A quick session is kept connected; there is no idle timeout to set.
-            vec!["flextunnel", "client", "start", "--quick", "--idle-timeout", "60"],
+            vec![
+                "flextunnel",
+                "client",
+                "start",
+                "--quick",
+                "--idle-timeout",
+                "60",
+            ],
         ];
         for case in cases {
             let Err(error) = Args::try_parse_from(&case) else {
@@ -779,7 +843,10 @@ mod cli_tests {
         assert_eq!(cli.authorized_keys_file, None);
         assert_eq!(cli.secret_file, None);
         // Full tunnel: the catch-alls for domains and both IP families.
-        assert_eq!(cli.routed_domains.as_deref(), Some(["*".to_string()].as_slice()));
+        assert_eq!(
+            cli.routed_domains.as_deref(),
+            Some(["*".to_string()].as_slice())
+        );
         assert_eq!(
             cli.routed_cidrs.as_deref(),
             Some(["0.0.0.0/0".to_string(), "::/0".to_string()].as_slice())

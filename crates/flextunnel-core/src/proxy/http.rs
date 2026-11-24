@@ -137,7 +137,10 @@ pub async fn read_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         parts.next().unwrap_or(""),
         parts.next().unwrap_or(""),
     );
-    if method.is_empty() || request_target.is_empty() || version.is_empty() || parts.next().is_some()
+    if method.is_empty()
+        || request_target.is_empty()
+        || version.is_empty()
+        || parts.next().is_some()
     {
         write_error(stream, 400, "Bad Request").await?;
         return Err(io::Error::other(format!(
@@ -477,7 +480,10 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp:?}");
 
         let (target, resp) = run(b"GET http://foo:bar:80/ HTTP/1.1\r\n\r\n").await;
-        assert!(target.is_err(), "colon-bearing host must not become a Domain");
+        assert!(
+            target.is_err(),
+            "colon-bearing host must not become a Domain"
+        );
         assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp:?}");
     }
 
@@ -508,7 +514,9 @@ mod tests {
         // A never-terminated head that overruns the cap. Held open so the reader
         // sees the overrun rather than an EOF.
         tokio::spawn(async move {
-            let _ = client.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nX: ").await;
+            let _ = client
+                .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nX: ")
+                .await;
             let _ = client.write_all(&vec![b'a'; MAX_HTTP_HEADER + 16]).await;
             std::future::pending::<()>().await;
         });
@@ -590,9 +598,7 @@ mod tests {
     async fn forward_leaves_body_bytes_in_the_stream() {
         let (mut client, mut server) = tokio::io::duplex(4096);
         client
-            .write_all(
-                b"POST http://example.com/ HTTP/1.1\r\nContent-Length: 4\r\n\r\nBODY",
-            )
+            .write_all(b"POST http://example.com/ HTTP/1.1\r\nContent-Length: 4\r\n\r\nBODY")
             .await
             .unwrap();
         let req = read_request(&mut server).await.unwrap();
@@ -671,10 +677,8 @@ mod tests {
 
     #[tokio::test]
     async fn obs_fold_header_is_400() {
-        let (target, resp) = run(
-            b"GET http://example.com/ HTTP/1.1\r\nX-Long: a\r\n b\r\n\r\n",
-        )
-        .await;
+        let (target, resp) =
+            run(b"GET http://example.com/ HTTP/1.1\r\nX-Long: a\r\n b\r\n\r\n").await;
         assert!(target.is_err());
         assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp:?}");
     }

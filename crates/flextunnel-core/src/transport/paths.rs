@@ -68,9 +68,10 @@ fn connection_paths_from(paths: &PathList<'_>) -> Vec<ConnPath> {
             let rtt = path.rtt();
             let selected = path.is_selected();
             let (kind, display) = match path.remote_addr() {
-                TransportAddr::Ip(addr) => {
-                    (ConnPathKind::Direct, format!("Direct {addr} (rtt {rtt:.0?})"))
-                }
+                TransportAddr::Ip(addr) => (
+                    ConnPathKind::Direct,
+                    format!("Direct {addr} (rtt {rtt:.0?})"),
+                ),
                 TransportAddr::Relay(url) => {
                     (ConnPathKind::Relay, format!("Relay {url} (rtt {rtt:.0?})"))
                 }

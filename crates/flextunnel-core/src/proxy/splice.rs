@@ -335,7 +335,10 @@ mod tests {
                 Poll::Ready(Ok(()))
             }
         }
-        let mut reader = Flaky { left: b"interrupted", interrupted: false };
+        let mut reader = Flaky {
+            left: b"interrupted",
+            interrupted: false,
+        };
         let mut buf = BytesMut::with_capacity(READ_MIN);
         while read_some(&mut reader, &mut buf).await.unwrap() > 0 {}
         assert_eq!(&buf[..], b"interrupted");

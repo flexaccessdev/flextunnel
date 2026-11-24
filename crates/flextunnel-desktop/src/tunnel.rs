@@ -219,7 +219,10 @@ impl Controller {
         let thread = std::thread::Builder::new()
             .name("tunnel".into())
             .spawn(move || {
-                match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
                     Ok(rt) => rt.block_on(run_loop(rx, worker_client_shared, worker_server_shared)),
                     Err(e) => log::error!("Failed to build the Tokio runtime: {e:#}"),
                 }
@@ -248,11 +251,15 @@ impl Controller {
     }
 
     pub fn start_server(&self, server: ServerConfig) {
-        let _ = self.tx.blocking_send(Command::StartServer(Box::new(server)));
+        let _ = self
+            .tx
+            .blocking_send(Command::StartServer(Box::new(server)));
     }
 
     pub fn restart_server(&self, server: ServerConfig) {
-        let _ = self.tx.blocking_send(Command::RestartServer(Box::new(server)));
+        let _ = self
+            .tx
+            .blocking_send(Command::RestartServer(Box::new(server)));
     }
 
     pub fn stop_server(&self) {
@@ -351,7 +358,10 @@ pub async fn fetch_server_routes(query: RoutesQuery) -> Result<ServerRoutes, Str
 async fn bind_local(addr: SocketAddr, label: &str) -> Result<tokio::net::TcpListener, String> {
     tokio::net::TcpListener::bind(addr).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::AddrInUse {
-            format!("{label} port {} is already in use — another flextunnel?", addr.port())
+            format!(
+                "{label} port {} is already in use — another flextunnel?",
+                addr.port()
+            )
         } else {
             format!("Failed to bind the {label} listener on {addr}: {e}")
         }
@@ -711,7 +721,10 @@ async fn run_client(
     // Boxed so it can be dropped before the endpoints are closed below.
     let mut run = Box::pin(client.run(LocalListeners::tcp(socks_listener, http_listener)));
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
-    log::info!("The client is running with {} destination(s)", spec.destinations.len());
+    log::info!(
+        "The client is running with {} destination(s)",
+        spec.destinations.len()
+    );
     slot.update(|s| {
         s.phase = ClientPhase::Running;
         s.running_since = Some(Instant::now());
@@ -830,7 +843,11 @@ mod tests {
         };
         let spec = ClientSpec::resolve(&client, &keys).expect("every key resolves");
         assert_eq!((spec.socks_port, spec.http_port), (Some(1085), None));
-        let secrets: Vec<&str> = spec.destinations.iter().map(|d| d.auth_secret.as_str()).collect();
+        let secrets: Vec<&str> = spec
+            .destinations
+            .iter()
+            .map(|d| d.auth_secret.as_str())
+            .collect();
         assert_eq!(secrets, ["secret-2", "secret-1"]);
 
         // A missing key, or one whose secret was lost, resolves to nothing.
@@ -865,7 +882,9 @@ mod tests {
         other_port.http_port = Some(18080);
         assert!(ClientSpec::resolve(&other_port, &keys).unwrap() != spec);
         let mut routed = client.clone();
-        routed.destinations[0].routed_domains.push("*.corp.example".into());
+        routed.destinations[0]
+            .routed_domains
+            .push("*.corp.example".into());
         assert!(ClientSpec::resolve(&routed, &keys).unwrap() != spec);
         assert!(ClientSpec::resolve(&client, &[key("k1", "rotated")]).unwrap() != spec);
     }
@@ -876,8 +895,12 @@ mod tests {
             destination,
             auth_secret: secret.into(),
         };
-        let secret = flextunnel_core::auth::ClientKey::generate().unwrap().secret_str();
-        let server_id = flextunnel_core::iroh::SecretKey::generate().public().to_string();
+        let secret = flextunnel_core::auth::ClientKey::generate()
+            .unwrap()
+            .secret_str();
+        let server_id = flextunnel_core::iroh::SecretKey::generate()
+            .public()
+            .to_string();
         let mut good = destination("a", "k1");
         good.server_node_id = server_id.clone();
         assert!(destination_config(&spec(good.clone(), &secret)).is_ok());

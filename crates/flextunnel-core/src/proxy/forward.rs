@@ -120,7 +120,9 @@ impl ForwardShared {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// First delay between listener (re)bind attempts while a forward's port is
@@ -172,13 +174,14 @@ impl ForwardManager {
     pub fn apply(&mut self, forwards: &[ForwardSpec]) {
         let desired: HashMap<&str, &ForwardSpec> =
             forwards.iter().map(|f| (f.id.as_str(), f)).collect();
-        self.tasks.retain(|id, task| match desired.get(id.as_str()) {
-            Some(spec) if **spec == task.spec => true,
-            _ => {
-                task.handle.abort();
-                false
-            }
-        });
+        self.tasks
+            .retain(|id, task| match desired.get(id.as_str()) {
+                Some(spec) if **spec == task.spec => true,
+                _ => {
+                    task.handle.abort();
+                    false
+                }
+            });
         for spec in forwards {
             if self.tasks.contains_key(&spec.id) {
                 continue;
@@ -475,7 +478,9 @@ mod tests {
 
         wait_for_state(&shared, ForwardState::Listening).await;
         TcpStream::connect(addr).await.unwrap();
-        rx.recv().await.expect("accepted connection should be handed off");
+        rx.recv()
+            .await
+            .expect("accepted connection should be handed off");
         stack.abort();
     }
 

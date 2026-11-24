@@ -27,15 +27,20 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let header_lines = header_lines(s);
     let destination_rows = s.destinations.len().clamp(1, MAX_DESTINATION_ROWS);
     let forwards_height = (s.forwards.len().max(1) + 2).min(8) as u16;
-    let [header_area, destinations_area, details_area, forwards_area, footer_area] =
-        Layout::vertical([
-            Constraint::Length(header_lines.len() as u16 + 2),
-            Constraint::Length(destination_rows as u16 + 2),
-            Constraint::Min(3),
-            Constraint::Length(forwards_height),
-            Constraint::Length(1),
-        ])
-        .areas(frame.area());
+    let [
+        header_area,
+        destinations_area,
+        details_area,
+        forwards_area,
+        footer_area,
+    ] = Layout::vertical([
+        Constraint::Length(header_lines.len() as u16 + 2),
+        Constraint::Length(destination_rows as u16 + 2),
+        Constraint::Min(3),
+        Constraint::Length(forwards_height),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
 
     frame.render_widget(
         Paragraph::new(header_lines).block(titled_block("Client")),
@@ -215,7 +220,10 @@ fn destination_lines(destinations: &[DestinationRow], selected: usize) -> Vec<Li
 /// and where its server's own status page is.
 fn details_lines(d: &DestinationRow, status_host: &str) -> Vec<Line<'static>> {
     let field = |label: &str, value: String| {
-        Line::from(vec![Span::styled(format!("{label:<16}"), DIM), Span::raw(value)])
+        Line::from(vec![
+            Span::styled(format!("{label:<16}"), DIM),
+            Span::raw(value),
+        ])
     };
     let mut lines = vec![
         field("server node id", d.server_node_id.clone()),
@@ -256,7 +264,9 @@ fn details_lines(d: &DestinationRow, status_host: &str) -> Vec<Line<'static>> {
     }
 
     lines.push(Line::default());
-    lines.push(section("Server status page (opening it connects):".to_string()));
+    lines.push(section(
+        "Server status page (opening it connects):".to_string(),
+    ));
     lines.push(item(format!("http://{status_host}/servers/{}/", d.name)));
     lines
 }
@@ -330,7 +340,10 @@ fn draw_conn_path(frame: &mut Frame, name: &str, snapshot: &WireConnSnapshot) {
 }
 
 fn section(title: String) -> Line<'static> {
-    Line::from(Span::styled(title, Style::new().add_modifier(Modifier::BOLD)))
+    Line::from(Span::styled(
+        title,
+        Style::new().add_modifier(Modifier::BOLD),
+    ))
 }
 
 fn item(text: String) -> Line<'static> {
@@ -389,13 +402,12 @@ fn forward_lines(forwards: &[ForwardRow]) -> Vec<Line<'static>> {
 
 fn footer_line(app: &App) -> Line<'static> {
     if let Some(notice) = &app.notice {
-        return Line::from(Span::styled(
-            notice.clone(),
-            Style::new().fg(Color::Red),
-        ));
+        return Line::from(Span::styled(notice.clone(), Style::new().fg(Color::Red)));
     }
     let hints = match app.mode {
-        Mode::Normal => "q quit · ↑/↓ destination · p its path · [/] scroll details · PgUp/PgDn forwards",
+        Mode::Normal => {
+            "q quit · ↑/↓ destination · p its path · [/] scroll details · PgUp/PgDn forwards"
+        }
         Mode::ConnPath { .. } => "r refresh · Esc close",
     };
     Line::from(Span::styled(hints, DIM))
@@ -480,7 +492,11 @@ mod tests {
             &[busy, destination("m2", DestState::Idle)],
             1,
         ));
-        assert!(rows[0].starts_with("  machine1  ● connected"), "{}", rows[0]);
+        assert!(
+            rows[0].starts_with("  machine1  ● connected"),
+            "{}",
+            rows[0]
+        );
         assert!(rows[0].ends_with("2 open, 1 waiting"), "{}", rows[0]);
         // The second row is selected, and hosts are padded to one column.
         assert!(rows[1].starts_with("▸ m2        ● idle"), "{}", rows[1]);
@@ -546,6 +562,10 @@ mod tests {
             rows.join("\n")
         );
         // The last row of the details, the status page link, shows too.
-        assert!(rows.iter().any(|row| row.contains("/servers/")), "{}", rows.join("\n"));
+        assert!(
+            rows.iter().any(|row| row.contains("/servers/")),
+            "{}",
+            rows.join("\n")
+        );
     }
 }

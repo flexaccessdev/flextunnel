@@ -222,7 +222,10 @@ pub enum StreamRequest {
 }
 
 /// Write a length-prefixed message (4-byte big-endian length + payload).
-pub async fn write_message<W: AsyncWriteExt + Unpin>(writer: &mut W, data: &[u8]) -> io::Result<()> {
+pub async fn write_message<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+) -> io::Result<()> {
     let len = u32::try_from(data.len())
         .map_err(|_| io::Error::other(format!("Message too large: {} bytes", data.len())))?;
     writer.write_all(&len.to_be_bytes()).await?;
@@ -357,7 +360,9 @@ pub async fn read_request<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Stre
         }
         REQ_LOOPBACK => Ok(StreamRequest::Loopback(r.read_u16().await?)),
         REQ_STATUS => Ok(StreamRequest::Status),
-        other => Err(io::Error::other(format!("invalid request kind: 0x{other:02x}"))),
+        other => Err(io::Error::other(format!(
+            "invalid request kind: 0x{other:02x}"
+        ))),
     }
 }
 
@@ -404,7 +409,11 @@ mod tests {
             ("[fd00::1]", "[fd00::1]:80"),
             ("[fd00::1].", "[fd00::1]:80"),
         ] {
-            assert_eq!(domain(host).into_numeric(), Target::Ip(ip.parse().unwrap()), "{host}");
+            assert_eq!(
+                domain(host).into_numeric(),
+                Target::Ip(ip.parse().unwrap()),
+                "{host}"
+            );
         }
         for host in ["example.com", "example.com.", "127.0.0.1..", "10.1"] {
             assert_eq!(domain(host).into_numeric(), domain(host), "{host}");

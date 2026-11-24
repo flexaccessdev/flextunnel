@@ -35,7 +35,9 @@ struct LogFile {
 
 /// Never panic inside the logger: recover the guard from a poisoned mutex.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub fn log_dir() -> Option<PathBuf> {

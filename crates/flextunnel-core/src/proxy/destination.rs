@@ -114,8 +114,9 @@ pub struct DestinationConfig {
 
 /// Builds a destination's endpoint. The default creates a real client endpoint
 /// from the destination's relay config; tests substitute loopback endpoints.
-pub type EndpointProvider =
-    Arc<dyn Fn(&DestinationConfig) -> BoxFuture<'static, anyhow::Result<ClientEndpoint>> + Send + Sync>;
+pub type EndpointProvider = Arc<
+    dyn Fn(&DestinationConfig) -> BoxFuture<'static, anyhow::Result<ClientEndpoint>> + Send + Sync,
+>;
 
 /// The production [`EndpointProvider`]: an ephemeral-identity client endpoint,
 /// or one bound to the session secret for a quick-mode destination.
@@ -193,9 +194,10 @@ pub(crate) async fn exchange_hello(
     let hello = signaling::encode_hello(&hello)?;
 
     let exchange = async {
-        let (mut send, mut recv) = connection.open_bi().await.map_err(|e| {
-            ProxyError::Signaling(format!("Failed to open handshake stream: {e}"))
-        })?;
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| ProxyError::Signaling(format!("Failed to open handshake stream: {e}")))?;
         signaling::write_message(&mut send, &hello).await?;
         send.flush().await?;
         let data = signaling::read_message(&mut recv, signaling::MAX_HANDSHAKE_SIZE).await?;
@@ -203,7 +205,9 @@ pub(crate) async fn exchange_hello(
     };
     let (send, recv, data) = tokio::time::timeout(HANDSHAKE_TIMEOUT, exchange)
         .await
-        .map_err(|_| ProxyError::Signaling("timed out waiting for server handshake response".into()))??;
+        .map_err(|_| {
+            ProxyError::Signaling("timed out waiting for server handshake response".into())
+        })??;
     let response = signaling::decode_hello_response(&data)?;
     Ok((send, recv, response))
 }
@@ -309,7 +313,10 @@ enum Link {
     Backoff,
     /// A permanent failure: requests fail with `reason` at once. The manager
     /// leaves this state at `retry_at`.
-    Failed { reason: String, retry_at: Instant },
+    Failed {
+        reason: String,
+        retry_at: Instant,
+    },
     /// The client was closed ([`Destination::close`]). Terminal: requests are
     /// turned away, and no later transition replaces it.
     Closed,
@@ -666,7 +673,10 @@ impl Destination {
             Some(holds) => match holds.try_acquire() {
                 Some(permit) => Some(permit),
                 None => {
-                    log::debug!("Hold capacity exhausted; not holding request for {}", self.name());
+                    log::debug!(
+                        "Hold capacity exhausted; not holding request for {}",
+                        self.name()
+                    );
                     self.kick();
                     return Err(AcquireError::HoldCap);
                 }
@@ -686,7 +696,10 @@ impl Destination {
                 // `wait_for` inspects the current value first, so a publish
                 // racing the registration above is never missed.
                 let settled = |s: &DestState| {
-                    matches!(s.link, Link::Connected(_) | Link::Failed { .. } | Link::Closed)
+                    matches!(
+                        s.link,
+                        Link::Connected(_) | Link::Failed { .. } | Link::Closed
+                    )
                 };
                 if live.wait_for(settled).await.is_err() {
                     return Err(AcquireError::Closed);
@@ -852,7 +865,10 @@ impl Destination {
             match read {
                 Ok((_, coverage)) if changed => this.log_refused_rules(&coverage),
                 Ok(_) => {}
-                Err(e) => log::warn!("{}: could not read what the server routes: {e}", this.name()),
+                Err(e) => log::warn!(
+                    "{}: could not read what the server routes: {e}",
+                    this.name()
+                ),
             }
         });
     }
@@ -979,7 +995,10 @@ impl Destination {
             if !*available.borrow_and_update() {
                 // No usable path: park with no timers at all, and give the
                 // restored network an immediate, fresh attempt.
-                log::info!("{}: network unavailable; not dialing until a path returns", self.name());
+                log::info!(
+                    "{}: network unavailable; not dialing until a path returns",
+                    self.name()
+                );
                 self.set_link(Link::Backoff);
                 tokio::select! {
                     r = available.wait_for(|a| *a) => {
@@ -1148,9 +1167,18 @@ impl Destination {
         &self,
         endpoint: &Endpoint,
     ) -> ProxyResult<(Connection, SendStream, RecvStream)> {
-        log::info!("{}: connecting to server {}", self.name(), self.cfg.server_id);
-        let connection =
-            dial_server(endpoint, self.cfg.server_id, &self.cfg.relay, &self.cfg.auth).await?;
+        log::info!(
+            "{}: connecting to server {}",
+            self.name(),
+            self.cfg.server_id
+        );
+        let connection = dial_server(
+            endpoint,
+            self.cfg.server_id,
+            &self.cfg.relay,
+            &self.cfg.auth,
+        )
+        .await?;
         log::info!("{}: connected, authenticating...", self.name());
         let (send, recv) = self.handshake(&connection, endpoint.id()).await?;
         log::info!("{}: authenticated", self.name());
@@ -1183,7 +1211,9 @@ impl Destination {
         let newly_flagged_duplicate = self.observe_server_nonce(response.server_instance_nonce);
 
         if !response.accepted {
-            let reason = response.reject_reason.unwrap_or_else(|| "unknown".to_string());
+            let reason = response
+                .reject_reason
+                .unwrap_or_else(|| "unknown".to_string());
             return Err(ProxyError::AuthenticationFailed(reason));
         }
 
@@ -1345,13 +1375,22 @@ mod tests {
         let mut fields = StatusFields::default();
         let older = fields.begin_routes_read();
         let newer = fields.begin_routes_read();
-        assert_eq!(fields.finish_routes_read(newer, &answer(&["*.corp.example"], Coverage::Full)), Some(true));
-        assert_eq!(fields.finish_routes_read(older, &answer(&["*.other.example"], Coverage::None)), None);
+        assert_eq!(
+            fields.finish_routes_read(newer, &answer(&["*.corp.example"], Coverage::Full)),
+            Some(true)
+        );
+        assert_eq!(
+            fields.finish_routes_read(older, &answer(&["*.other.example"], Coverage::None)),
+            None
+        );
         assert_eq!(fields.server_routes, Some(routes(&["*.corp.example"])));
         assert!(!fields.server_routes_pending);
         // A late failure of the older read does not mark the newer answer
         // stale either.
-        assert_eq!(fields.finish_routes_read(older, &Err("timed out".into())), None);
+        assert_eq!(
+            fields.finish_routes_read(older, &Err("timed out".into())),
+            None
+        );
         assert_eq!(fields.server_routes_error, None);
     }
 
@@ -1363,14 +1402,28 @@ mod tests {
         let first = fields.begin_routes_read();
         fields.finish_routes_read(first, &answer(&["*.corp.example"], Coverage::Full));
         let second = fields.begin_routes_read();
-        assert!(fields.server_routes_pending, "kept lists are the last known while read again");
-        assert_eq!(fields.finish_routes_read(second, &Err("refused".into())), Some(false));
+        assert!(
+            fields.server_routes_pending,
+            "kept lists are the last known while read again"
+        );
+        assert_eq!(
+            fields.finish_routes_read(second, &Err("refused".into())),
+            Some(false)
+        );
         assert_eq!(fields.server_routes, Some(routes(&["*.corp.example"])));
-        assert_eq!(fields.server_coverage.get(&Rule::Suffix("corp.example".into())), Some(&Coverage::Full));
+        assert_eq!(
+            fields
+                .server_coverage
+                .get(&Rule::Suffix("corp.example".into())),
+            Some(&Coverage::Full)
+        );
         assert_eq!(fields.server_routes_error.as_deref(), Some("refused"));
         assert!(!fields.server_routes_pending);
         let third = fields.begin_routes_read();
-        assert_eq!(fields.finish_routes_read(third, &answer(&["*.corp.example"], Coverage::Full)), Some(false));
+        assert_eq!(
+            fields.finish_routes_read(third, &answer(&["*.corp.example"], Coverage::Full)),
+            Some(false)
+        );
         assert_eq!(fields.server_routes_error, None);
     }
 
@@ -1380,12 +1433,26 @@ mod tests {
     fn identical_routes_are_no_change() {
         let mut fields = StatusFields::default();
         let first = fields.begin_routes_read();
-        assert_eq!(fields.finish_routes_read(first, &answer(&["*.corp.example"], Coverage::Full)), Some(true));
+        assert_eq!(
+            fields.finish_routes_read(first, &answer(&["*.corp.example"], Coverage::Full)),
+            Some(true)
+        );
         let second = fields.begin_routes_read();
-        assert_eq!(fields.finish_routes_read(second, &answer(&["*.corp.example"], Coverage::Full)), Some(false));
+        assert_eq!(
+            fields.finish_routes_read(second, &answer(&["*.corp.example"], Coverage::Full)),
+            Some(false)
+        );
         let third = fields.begin_routes_read();
-        assert_eq!(fields.finish_routes_read(third, &answer(&["*.example"], Coverage::Partial)), Some(true));
-        assert_eq!(fields.server_coverage.get(&Rule::Suffix("corp.example".into())), Some(&Coverage::Partial));
+        assert_eq!(
+            fields.finish_routes_read(third, &answer(&["*.example"], Coverage::Partial)),
+            Some(true)
+        );
+        assert_eq!(
+            fields
+                .server_coverage
+                .get(&Rule::Suffix("corp.example".into())),
+            Some(&Coverage::Partial)
+        );
     }
 
     fn shared(idle_timeout: Option<Duration>) -> Arc<Shared> {
@@ -1435,9 +1502,15 @@ mod tests {
         assert!(!d.observe_server_nonce(1), "first sight");
         assert!(!d.observe_server_nonce(1), "same server");
         assert!(!d.observe_server_nonce(2), "a change alone is a restart");
-        assert!(d.observe_server_nonce(1), "an old nonce back again is a duplicate");
+        assert!(
+            d.observe_server_nonce(1),
+            "an old nonce back again is a duplicate"
+        );
         assert!(d.duplicate_server.load(Ordering::Relaxed));
-        assert!(!d.observe_server_nonce(2), "already latched: not newly flagged");
+        assert!(
+            !d.observe_server_nonce(2),
+            "already latched: not newly flagged"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1463,7 +1536,10 @@ mod tests {
     async fn at_the_hold_cap_a_request_is_refused_but_still_asks_for_a_dial() {
         let d = destination(false);
         let (reserved, shared) = (Semaphore::new(0), Semaphore::new(0));
-        let holds = Holds { reserved: &reserved, shared: &shared };
+        let holds = Holds {
+            reserved: &reserved,
+            shared: &shared,
+        };
         let result = d.acquire(Some(holds)).await.map(|_| ());
         assert!(matches!(result, Err(AcquireError::HoldCap)), "{result:?}");
         assert_eq!(d.status().waiting, 0);
@@ -1477,16 +1553,25 @@ mod tests {
     #[test]
     fn holds_come_from_the_reserved_share_then_the_pool() {
         let (reserved, shared) = (Semaphore::new(1), Semaphore::new(1));
-        let holds = Holds { reserved: &reserved, shared: &shared };
+        let holds = Holds {
+            reserved: &reserved,
+            shared: &shared,
+        };
         let first = holds.try_acquire().expect("the reserved hold");
-        assert_eq!((reserved.available_permits(), shared.available_permits()), (0, 1));
+        assert_eq!(
+            (reserved.available_permits(), shared.available_permits()),
+            (0, 1)
+        );
         let second = holds.try_acquire().expect("then one from the pool");
         assert!(holds.try_acquire().is_none(), "both exhausted");
         drop((first, second));
 
         // Another destination took the whole pool: the reserved hold is left.
         let drained = Semaphore::new(0);
-        let holds = Holds { reserved: &reserved, shared: &drained };
+        let holds = Holds {
+            reserved: &reserved,
+            shared: &drained,
+        };
         assert!(holds.try_acquire().is_some());
     }
 
@@ -1507,7 +1592,11 @@ mod tests {
         d.close().await;
         let result = held.await.unwrap();
         assert!(matches!(result, Err(AcquireError::Closed)), "{result:?}");
-        assert_eq!(started.elapsed(), Duration::ZERO, "woken by the close, not the hold");
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "woken by the close, not the hold"
+        );
 
         let result = d.acquire(None).await.map(|_| ());
         assert!(matches!(result, Err(AcquireError::Closed)), "{result:?}");
@@ -1540,7 +1629,10 @@ mod tests {
         let due_at = |now: Instant| {
             now.saturating_duration_since(d.state.borrow().unused_since) >= idle_timeout
         };
-        assert!(!due_at(connected_at + idle_timeout), "300s after connecting is 1s after the use");
+        assert!(
+            !due_at(connected_at + idle_timeout),
+            "300s after connecting is 1s after the use"
+        );
         assert!(due_at(released_at + idle_timeout));
         assert!(!d.idle_due(&d.state.borrow(), idle_timeout, released_at + idle_timeout));
 
@@ -1548,7 +1640,10 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(5)).await;
         d.state.send_modify(|s| s.waiters += 1);
         drop(WaiterGuard(&d));
-        assert_eq!(d.state.borrow().unused_since - released_at, Duration::from_secs(5));
+        assert_eq!(
+            d.state.borrow().unused_since - released_at,
+            Duration::from_secs(5)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1589,7 +1684,11 @@ mod tests {
         d.kick();
         let started = Instant::now();
         d.wait_until_due(&mut outage).await;
-        assert_eq!(started.elapsed(), Duration::from_secs(10), "the rest of the backoff");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(10),
+            "the rest of the backoff"
+        );
         assert!(!d.state.borrow().kick, "the kick is spent on this attempt");
         assert_eq!(outage.attempt, 2, "waiting does not reset the series");
     }
@@ -1610,9 +1709,17 @@ mod tests {
             let due = d.wait_until_due(&mut outage);
             tokio::pin!(due);
             // Idle, and told "available" again without having been offline.
-            assert!(tokio::time::timeout(Duration::from_secs(1), &mut due).await.is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), &mut due)
+                    .await
+                    .is_err()
+            );
             d.shared.network_available.send_replace(true);
-            assert!(tokio::time::timeout(Duration::from_secs(1), &mut due).await.is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), &mut due)
+                    .await
+                    .is_err()
+            );
         }
         assert_eq!(outage.attempt, 5, "no restoration, no reset");
 
@@ -1620,10 +1727,18 @@ mod tests {
             let due = d.wait_until_due(&mut outage);
             tokio::pin!(due);
             d.shared.network_available.send_replace(false);
-            assert!(tokio::time::timeout(Duration::from_secs(1), &mut due).await.is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), &mut due)
+                    .await
+                    .is_err()
+            );
             d.shared.network_available.send_replace(true);
             // Still idle: restoring the path dials nothing by itself.
-            assert!(tokio::time::timeout(Duration::from_secs(1), &mut due).await.is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), &mut due)
+                    .await
+                    .is_err()
+            );
             assert_eq!(d.status().state, DestinationState::Idle);
 
             // The request that needs it is due at once.
@@ -1676,10 +1791,17 @@ mod tests {
         };
         let due = d.wait_until_due(&mut outage);
         tokio::pin!(due);
-        assert!(tokio::time::timeout(Duration::from_secs(1), &mut due).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut due)
+                .await
+                .is_err()
+        );
         d.shared.network_available.send_replace(false);
         let parked = tokio::time::timeout(Duration::from_secs(3600), &mut due).await;
-        assert!(parked.is_err(), "the elapsed backoff does not end a parked wait");
+        assert!(
+            parked.is_err(),
+            "the elapsed backoff does not end a parked wait"
+        );
     }
 
     /// The embedding app coming to the foreground ends a backoff at once; a
@@ -1696,7 +1818,11 @@ mod tests {
         {
             let due = d.wait_until_due(&mut outage);
             tokio::pin!(due);
-            assert!(tokio::time::timeout(Duration::from_secs(5), &mut due).await.is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), &mut due)
+                    .await
+                    .is_err()
+            );
             d.shared.background.send_replace(false);
             tokio::time::timeout(Duration::from_millis(1), &mut due)
                 .await
@@ -1727,9 +1853,17 @@ mod tests {
         {
             let due = d.wait_until_due(&mut outage);
             tokio::pin!(due);
-            assert!(tokio::time::timeout(Duration::from_secs(5), &mut due).await.is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), &mut due)
+                    .await
+                    .is_err()
+            );
             d.shared.background.send_replace(true);
-            assert!(tokio::time::timeout(Duration::from_secs(5), &mut due).await.is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), &mut due)
+                    .await
+                    .is_err()
+            );
             d.shared.background.send_replace(false);
             tokio::time::timeout(Duration::from_millis(1), &mut due)
                 .await

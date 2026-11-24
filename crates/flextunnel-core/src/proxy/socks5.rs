@@ -46,7 +46,9 @@ pub async fn negotiate_method<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         stream
             .write_all(&[SOCKS_VERSION, METHOD_NONE_ACCEPTABLE])
             .await?;
-        Err(io::Error::other("client offered no acceptable SOCKS5 method"))
+        Err(io::Error::other(
+            "client offered no acceptable SOCKS5 method",
+        ))
     }
 }
 
@@ -56,7 +58,9 @@ pub async fn negotiate_method<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 pub async fn client_handshake_noauth<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
 ) -> io::Result<()> {
-    stream.write_all(&[SOCKS_VERSION, 1, METHOD_NO_AUTH]).await?;
+    stream
+        .write_all(&[SOCKS_VERSION, 1, METHOD_NO_AUTH])
+        .await?;
     let mut choice = [0u8; 2];
     stream.read_exact(&mut choice).await?;
     let [ver, method] = choice;
@@ -189,7 +193,10 @@ pub async fn read_connect_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             let mut octets = [0u8; 4];
             stream.read_exact(&mut octets).await?;
             let port = stream.read_u16().await?;
-            Target::Ip(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(octets), port)))
+            Target::Ip(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from(octets),
+                port,
+            )))
         }
         ATYP_IPV6 => {
             let mut octets = [0u8; 16];
@@ -357,7 +364,10 @@ mod tests {
         let mut raw = vec![SOCKS_VERSION, signaling::REP_SUCCESS, 0x00, ATYP_IPV6];
         raw.extend_from_slice(&[0u8; 18]); // 16-byte addr + 2-byte port
         s.write_all(&raw).await.unwrap();
-        assert_eq!(client_read_reply(&mut c).await.unwrap(), signaling::REP_SUCCESS);
+        assert_eq!(
+            client_read_reply(&mut c).await.unwrap(),
+            signaling::REP_SUCCESS
+        );
 
         // Domain BND
         let (mut c, mut s) = tokio::io::duplex(1024);
@@ -365,6 +375,9 @@ mod tests {
         raw.extend_from_slice(b"host");
         raw.extend_from_slice(&[0u8; 2]);
         s.write_all(&raw).await.unwrap();
-        assert_eq!(client_read_reply(&mut c).await.unwrap(), signaling::REP_SUCCESS);
+        assert_eq!(
+            client_read_reply(&mut c).await.unwrap(),
+            signaling::REP_SUCCESS
+        );
     }
 }

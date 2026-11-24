@@ -194,14 +194,23 @@ impl RouteView {
 /// the destination graded it when it read them.
 fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
     let name = |dest: usize| table.names().nth(dest).unwrap_or_default().to_string();
-    let refer = |row: &TableRow| RuleRef { rule: row.rule.to_string(), destination: name(row.dest) };
+    let refer = |row: &TableRow| RuleRef {
+        rule: row.rule.to_string(),
+        destination: name(row.dest),
+    };
     // Each row's overlaps, in the table's overlap order: the broader rules it
     // sits within, and the narrower rules inside it.
     let mut within: HashMap<&TableRow, Vec<RuleRef>> = HashMap::new();
     let mut narrower: HashMap<&TableRow, Vec<RuleRef>> = HashMap::new();
     for overlap in table.overlaps() {
-        within.entry(&overlap.inner).or_default().push(refer(&overlap.outer));
-        narrower.entry(&overlap.outer).or_default().push(refer(&overlap.inner));
+        within
+            .entry(&overlap.inner)
+            .or_default()
+            .push(refer(&overlap.outer));
+        narrower
+            .entry(&overlap.outer)
+            .or_default()
+            .push(refer(&overlap.inner));
     }
     table
         .rows()
@@ -233,7 +242,8 @@ fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
                 ServerCheck::Loopback | ServerCheck::Unchecked => false,
             };
             let server_last_known = graded
-                && destination.is_some_and(|d| d.server_routes_pending || d.server_routes_error.is_some());
+                && destination
+                    .is_some_and(|d| d.server_routes_pending || d.server_routes_error.is_some());
             RouteView {
                 rule: row.rule.to_string(),
                 kind,
@@ -261,7 +271,11 @@ fn server_routes_line(d: &DestinationStatus) -> String {
                 .chain(&routes.routed_cidrs)
                 .map(String::as_str)
                 .collect();
-            let lists = if all.is_empty() { "none (loopback only)".to_string() } else { all.join(", ") };
+            let lists = if all.is_empty() {
+                "none (loopback only)".to_string()
+            } else {
+                all.join(", ")
+            };
             match error {
                 _ if d.server_routes_pending => format!("{lists} (last known; reading them again)"),
                 Some(error) => format!("{lists} (last known; reading them again failed: {error})"),
@@ -389,7 +403,8 @@ fn render_at(
 ) -> (&'static str, &'static str, String) {
     let routes = routes(status, table);
     let version = env!("CARGO_PKG_VERSION");
-    let addr = |a: Option<std::net::SocketAddr>| a.map_or_else(|| "off".to_string(), |a| a.to_string());
+    let addr =
+        |a: Option<std::net::SocketAddr>| a.map_or_else(|| "off".to_string(), |a| a.to_string());
     let idle_timeout = match status.idle_timeout {
         Some(idle) => human_duration(idle.as_secs()),
         None => "never".to_string(),
@@ -500,7 +515,13 @@ pub(super) async fn serve<P: LocalProto, S: LocalStream>(
         return respond(tcp, status_line, content_type, &body).await;
     }
     let Some(request) = status_page::parse_status_request(&head) else {
-        return respond(tcp, "400 Bad Request", CONTENT_TYPE_TEXT, "not an HTTP request\n").await;
+        return respond(
+            tcp,
+            "400 Bad Request",
+            CONTENT_TYPE_TEXT,
+            "not an HTTP request\n",
+        )
+        .await;
     };
     if request.method != "GET" {
         return respond(
@@ -587,17 +608,22 @@ pub(crate) async fn fetch_server_status(
     tail: &str,
     accept: Option<StatusFormat>,
 ) -> Result<Vec<u8>, String> {
-    let (mut send, mut recv) =
-        match tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, open_tunnel(conn, &StreamRequest::Status))
-            .await
-        {
-            Ok(Ok((send, recv, signaling::REP_SUCCESS))) => (send, recv),
-            Ok(Ok((_, _, rep))) => {
-                return Err(format!("server refused: {}", super::socks5::describe_reply(rep)));
-            }
-            Ok(Err(e)) => return Err(e.to_string()),
-            Err(_) => return Err("timed out asking the server for its status page".to_string()),
-        };
+    let (mut send, mut recv) = match tokio::time::timeout(
+        TUNNEL_OPEN_TIMEOUT,
+        open_tunnel(conn, &StreamRequest::Status),
+    )
+    .await
+    {
+        Ok(Ok((send, recv, signaling::REP_SUCCESS))) => (send, recv),
+        Ok(Ok((_, _, rep))) => {
+            return Err(format!(
+                "server refused: {}",
+                super::socks5::describe_reply(rep)
+            ));
+        }
+        Ok(Err(e)) => return Err(e.to_string()),
+        Err(_) => return Err("timed out asking the server for its status page".to_string()),
+    };
 
     // The server picks its format from this request's path and `Accept`.
     let accept = match accept {
@@ -609,7 +635,13 @@ pub(crate) async fn fetch_server_status(
         "GET {tail} HTTP/1.1\r\nHost: {}\r\nAccept: {accept}\r\nConnection: close\r\n\r\n",
         super::reserved::STATUS_HOST
     );
-    exchange(&mut send, &mut recv, request.as_bytes(), TUNNEL_OPEN_TIMEOUT).await
+    exchange(
+        &mut send,
+        &mut recv,
+        request.as_bytes(),
+        TUNNEL_OPEN_TIMEOUT,
+    )
+    .await
 }
 
 /// Send `request` on a status stream and read the server's whole response —
@@ -672,7 +704,10 @@ pub(crate) fn parse_server_status(response: &[u8]) -> Result<(&'static str, &str
         return Err(malformed());
     }
     if code != Some("200") {
-        return Err(format!("the server answered {}", code.unwrap_or("without a status")));
+        return Err(format!(
+            "the server answered {}",
+            code.unwrap_or("without a status")
+        ));
     }
     if let Some(stated) = header("content-length")
         && stated.parse::<usize>().ok() != Some(body.len())
@@ -682,7 +717,9 @@ pub(crate) fn parse_server_status(response: &[u8]) -> Result<(&'static str, &str
             body.len()
         ));
     }
-    let content_type = header("content-type").unwrap_or_default().to_ascii_lowercase();
+    let content_type = header("content-type")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     let content_type = match content_type.split(';').next().unwrap_or_default().trim() {
         "text/html" => CONTENT_TYPE_HTML,
         "text/plain" => CONTENT_TYPE_TEXT,
@@ -693,7 +730,13 @@ pub(crate) fn parse_server_status(response: &[u8]) -> Result<(&'static str, &str
 }
 
 async fn not_found<S: LocalStream>(tcp: &mut S, detail: &str) -> Result<()> {
-    respond(tcp, "404 Not Found", CONTENT_TYPE_TEXT, &format!("{detail}\n")).await
+    respond(
+        tcp,
+        "404 Not Found",
+        CONTENT_TYPE_TEXT,
+        &format!("{detail}\n"),
+    )
+    .await
 }
 
 /// Write one complete HTTP response and end the exchange.
@@ -883,9 +926,24 @@ mod tests {
         assert_eq!(
             summary,
             [
-                ("m1.localhost.flextunnel.internal", "loopback", "m1", "loopback"),
-                ("m2.localhost.flextunnel.internal", "loopback", "m2", "loopback"),
-                ("m3.localhost.flextunnel.internal", "loopback", "m3", "loopback"),
+                (
+                    "m1.localhost.flextunnel.internal",
+                    "loopback",
+                    "m1",
+                    "loopback"
+                ),
+                (
+                    "m2.localhost.flextunnel.internal",
+                    "loopback",
+                    "m2",
+                    "loopback"
+                ),
+                (
+                    "m3.localhost.flextunnel.internal",
+                    "loopback",
+                    "m3",
+                    "loopback"
+                ),
                 ("wiki.example", "exact", "m3", "unchecked"),
                 ("*.dev.corp.example", "wildcard", "m2", "not allowed"),
                 ("*.corp.example", "wildcard", "m1", "allowed"),
@@ -902,18 +960,36 @@ mod tests {
         assert!(corp["within"].as_array().unwrap().is_empty());
 
         let (_, _, text) = render_fixed(StatusFormat::Text);
-        assert!(text.contains("*.dev.corp.example (wildcard) -> m2, server: not allowed"), "{text}");
-        assert!(text.contains("inside m1's broader *.corp.example"), "{text}");
-        assert!(text.contains("contains m2's narrower 10.1.0.0/16"), "{text}");
-        assert!(text.contains("any other *.flextunnel.internal -> this client (reserved, answers 404)"), "{text}");
+        assert!(
+            text.contains("*.dev.corp.example (wildcard) -> m2, server: not allowed"),
+            "{text}"
+        );
+        assert!(
+            text.contains("inside m1's broader *.corp.example"),
+            "{text}"
+        );
+        assert!(
+            text.contains("contains m2's narrower 10.1.0.0/16"),
+            "{text}"
+        );
+        assert!(
+            text.contains("any other *.flextunnel.internal -> this client (reserved, answers 404)"),
+            "{text}"
+        );
         assert!(text.contains("anything else -> direct"), "{text}");
-        assert!(text.contains("server routes: *.corp.example, 10.0.0.0/9"), "{text}");
+        assert!(
+            text.contains("server routes: *.corp.example, 10.0.0.0/9"),
+            "{text}"
+        );
         assert!(text.contains("server routes: unchecked"), "{text}");
 
         let (_, _, html) = render_fixed(StatusFormat::Html);
         assert!(html.contains("Routing"));
         assert!(html.contains("partly allowed"));
-        assert!(html.contains("contains <span class=\"mono\">m2</span>'s narrower"), "{html}");
+        assert!(
+            html.contains("contains <span class=\"mono\">m2</span>'s narrower"),
+            "{html}"
+        );
         assert!(html.contains("*.flextunnel.internal"), "{html}");
     }
 
@@ -926,29 +1002,51 @@ mod tests {
         let table = table_of(&status);
         let (_, _, body) = render_at(&status, &table, StatusFormat::Json, now);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let corp = json["routes"].as_array().unwrap().iter().find(|r| r["rule"] == "*.corp.example").unwrap();
+        let corp = json["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["rule"] == "*.corp.example")
+            .unwrap();
         assert_eq!(corp["server"], "allowed");
         assert_eq!(corp["server_last_known"], true);
-        let dev = json["routes"].as_array().unwrap().iter().find(|r| r["rule"] == "*.dev.corp.example").unwrap();
+        let dev = json["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["rule"] == "*.dev.corp.example")
+            .unwrap();
         assert_eq!(dev["server_last_known"], false);
 
         let (_, _, text) = render_at(&status, &table, StatusFormat::Text, now);
-        assert!(text.contains("-> m1, server: allowed (last known)"), "{text}");
+        assert!(
+            text.contains("-> m1, server: allowed (last known)"),
+            "{text}"
+        );
         assert!(
             text.contains("server routes: *.corp.example, 10.0.0.0/9 (last known; reading them again failed: timed out)"),
             "{text}"
         );
         let (_, _, html) = render_at(&status, &table, StatusFormat::Html, now);
         assert!(html.contains("last known"), "{html}");
-        assert!(html.contains("reading them again failed: timed out"), "{html}");
+        assert!(
+            html.contains("reading them again failed: timed out"),
+            "{html}"
+        );
 
         // While a new connection reads them again, the kept answer is the
         // last known too.
         status.destinations[0].server_routes_error = None;
         status.destinations[0].server_routes_pending = true;
         let (_, _, text) = render_at(&status, &table, StatusFormat::Text, now);
-        assert!(text.contains("-> m1, server: allowed (last known)"), "{text}");
-        assert!(text.contains("10.0.0.0/9 (last known; reading them again)"), "{text}");
+        assert!(
+            text.contains("-> m1, server: allowed (last known)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("10.0.0.0/9 (last known; reading them again)"),
+            "{text}"
+        );
 
         // With nothing read yet, a read in progress says so — a first one, or
         // one retrying after a failure — instead of the failure or
@@ -956,13 +1054,23 @@ mod tests {
         let idle = &mut status.destinations[2];
         idle.server_routes_pending = true;
         let (_, _, text) = render_at(&status, &table, StatusFormat::Text, now);
-        assert!(text.lines().any(|l| l.trim() == "server routes: being read"), "{text}");
+        assert!(
+            text.lines()
+                .any(|l| l.trim() == "server routes: being read"),
+            "{text}"
+        );
         status.destinations[2].server_routes_error = Some("refused".to_string());
         let (_, _, text) = render_at(&status, &table, StatusFormat::Text, now);
-        assert!(text.contains("server routes: being read again (the last read failed: refused)"), "{text}");
+        assert!(
+            text.contains("server routes: being read again (the last read failed: refused)"),
+            "{text}"
+        );
         status.destinations[2].server_routes_pending = false;
         let (_, _, text) = render_at(&status, &table, StatusFormat::Text, now);
-        assert!(text.contains("server routes: unreadable: refused"), "{text}");
+        assert!(
+            text.contains("server routes: unreadable: refused"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -989,17 +1097,38 @@ mod tests {
     #[test]
     fn a_server_status_response_is_taken_apart() {
         let response = |head: &str, body: &str| format!("{head}\r\n\r\n{body}").into_bytes();
-        let ok = response("HTTP/1.1 200 OK\r\nContent-Type: Application/JSON; charset=utf-8\r\nSet-Cookie: x=1", "{}\n");
+        let ok = response(
+            "HTTP/1.1 200 OK\r\nContent-Type: Application/JSON; charset=utf-8\r\nSet-Cookie: x=1",
+            "{}\n",
+        );
         assert_eq!(parse_server_status(&ok), Ok((CONTENT_TYPE_JSON, "{}\n")));
-        let html = response("HTTP/1.1 200 OK\r\ncontent-type:text/html", "<p>hi</p>\r\n\r\nmore");
-        assert_eq!(parse_server_status(&html), Ok((CONTENT_TYPE_HTML, "<p>hi</p>\r\n\r\nmore")));
+        let html = response(
+            "HTTP/1.1 200 OK\r\ncontent-type:text/html",
+            "<p>hi</p>\r\n\r\nmore",
+        );
+        assert_eq!(
+            parse_server_status(&html),
+            Ok((CONTENT_TYPE_HTML, "<p>hi</p>\r\n\r\nmore"))
+        );
 
         for (bad, why) in [
-            (response("HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain", "x"), "answered 500"),
-            (response("HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml", "<svg/>"), "content type"),
+            (
+                response(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain",
+                    "x",
+                ),
+                "answered 500",
+            ),
+            (
+                response("HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml", "<svg/>"),
+                "content type",
+            ),
             (response("HTTP/1.1 200 OK", "no type"), "content type"),
             (response("SSH-2.0-nope", ""), "HTTP response"),
-            (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n".to_vec(), "HTTP response"),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n".to_vec(),
+                "HTTP response",
+            ),
             (vec![0xff; 16], "HTTP response"),
             (vec![b'a'; SERVER_STATUS_LIMIT + 1], "too large"),
         ] {
@@ -1014,7 +1143,8 @@ mod tests {
     #[test]
     fn a_server_status_body_must_match_its_stated_length() {
         let response = |length: &str, body: &str| {
-            format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n{length}\r\n\r\n{body}").into_bytes()
+            format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n{length}\r\n\r\n{body}")
+                .into_bytes()
         };
         // Bytes, not characters: "é" is two.
         assert_eq!(
@@ -1055,7 +1185,10 @@ mod tests {
         let serving = tokio::spawn(async move {
             let mut request = Vec::new();
             server.read_to_end(&mut request).await.unwrap();
-            server.write_all(b"HTTP/1.1 200 OK\r\n\r\nbody").await.unwrap();
+            server
+                .write_all(b"HTTP/1.1 200 OK\r\n\r\nbody")
+                .await
+                .unwrap();
             request
         });
         let (mut recv, mut send) = tokio::io::split(&mut ours);
@@ -1067,7 +1200,9 @@ mod tests {
         let (mut ours, _silent) = tokio::io::duplex(1024);
         let (mut recv, mut send) = tokio::io::split(&mut ours);
         let started = tokio::time::Instant::now();
-        let err = exchange(&mut send, &mut recv, b"GET / HTTP/1.1\r\n\r\n", deadline).await.unwrap_err();
+        let err = exchange(&mut send, &mut recv, b"GET / HTTP/1.1\r\n\r\n", deadline)
+            .await
+            .unwrap_err();
         assert!(err.contains("timed out"), "{err}");
         assert_eq!(started.elapsed(), deadline);
 
@@ -1080,7 +1215,11 @@ mod tests {
         });
         let (mut recv, mut send) = tokio::io::split(&mut ours);
         let started = tokio::time::Instant::now();
-        assert!(exchange(&mut send, &mut recv, b"GET /", deadline).await.is_err());
+        assert!(
+            exchange(&mut send, &mut recv, b"GET /", deadline)
+                .await
+                .is_err()
+        );
         assert_eq!(started.elapsed(), deadline);
     }
 

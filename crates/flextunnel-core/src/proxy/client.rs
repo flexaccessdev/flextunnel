@@ -279,7 +279,9 @@ impl Router {
     }
 
     fn destination(&self, name: &str) -> Option<&Arc<Destination>> {
-        self.table.index_of(name).map(|dest| &self.destinations[dest])
+        self.table
+            .index_of(name)
+            .map(|dest| &self.destinations[dest])
     }
 
     /// Stop reporting the front-end addresses: nothing listens on them now.
@@ -375,9 +377,12 @@ impl TunnelDialer {
             .await
             .map_err(|e| anyhow::anyhow!("{}: {e}", destination.name()))?;
         let (conn, stream) = lease.into_parts();
-        let (send, recv, rep) = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, open_tunnel(&conn, &request))
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out opening a stream to {}", destination.name()))??;
+        let (send, recv, rep) =
+            tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, open_tunnel(&conn, &request))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("timed out opening a stream to {}", destination.name())
+                })??;
         if rep != signaling::REP_SUCCESS {
             anyhow::bail!(
                 "{} rejected target: {}",
@@ -463,7 +468,9 @@ impl ProxyClient {
             idle_timeout,
         } = config;
         if destinations.is_empty() {
-            return Err(ProxyError::config("the client has no destinations configured"));
+            return Err(ProxyError::config(
+                "the client has no destinations configured",
+            ));
         }
         if let Some(idle_timeout) = idle_timeout
             && idle_timeout > MAX_IDLE_TIMEOUT
@@ -637,7 +644,10 @@ impl ProxyClient {
         }
         #[cfg(unix)]
         if let Some(l) = &unix_socks {
-            log::info!("SOCKS5 proxy also listening on unix socket {:?}", l.local_addr()?);
+            log::info!(
+                "SOCKS5 proxy also listening on unix socket {:?}",
+                l.local_addr()?
+            );
         }
         *self.router.listen.lock().expect("listen addrs lock") = listen;
         // The addresses are advertised for as long as they are served: until
@@ -674,9 +684,8 @@ impl ProxyClient {
         // The destination managers never finish; they are here so they run —
         // and stop — with this future. One task, N concurrent futures: an
         // embedder's `task.abort()` tears everything down, no orphaned task.
-        let managers = futures::future::join_all(
-            router.destinations.iter().map(|d| d.clone().run()),
-        );
+        let managers =
+            futures::future::join_all(router.destinations.iter().map(|d| d.clone().run()));
 
         // On the close signal every accept loop drops its listener and parks,
         // so the session lives on with nothing listening: say so.
@@ -979,7 +988,10 @@ impl AcceptRetry {
 
     /// Log the retry (warn periodically, debug otherwise) and back off.
     pub(crate) async fn wait_retry(&mut self, e: &io::Error) {
-        if self.consecutive_failures.is_multiple_of(ACCEPT_RETRY_WARN_EVERY) {
+        if self
+            .consecutive_failures
+            .is_multiple_of(ACCEPT_RETRY_WARN_EVERY)
+        {
             log::warn!(
                 "{} accept failed ({e}); retrying every {}ms",
                 self.label,
@@ -1145,7 +1157,9 @@ async fn accept_loop_unix(
             Err(e) => {
                 match retry.record_error(&e) {
                     AcceptOutcome::Rebind => {
-                        let Some(path) = &path else { return Err(e.into()) };
+                        let Some(path) = &path else {
+                            return Err(e.into());
+                        };
                         log::warn!("Unix SOCKS5 listener at {path:?} is dead ({e}); rebinding");
                         drop(listener);
                         listener = rebind_unix_listener(path).await?;
@@ -1249,7 +1263,10 @@ async fn handle_local_conn<P: LocalProto, S: LocalStream>(
     // error for this target instead of hanging forever. A destination that is
     // connected takes no hold at all.
     let destination = &router.destinations[dest];
-    let lease = match destination.acquire(Some(hold_limiter.for_destination(dest))).await {
+    let lease = match destination
+        .acquire(Some(hold_limiter.for_destination(dest)))
+        .await
+    {
         Ok(lease) => lease,
         Err(e) => {
             log::debug!("{}: {e}; refusing {target:?}", destination.name());
@@ -1374,7 +1391,12 @@ mod tests {
 
     /// A destination called `name` whose server id derives from `seed`,
     /// routing the given rules. Its key is throwaway: these tests never connect.
-    fn test_destination(name: &str, seed: u8, domains: &[&str], cidrs: &[&str]) -> DestinationConfig {
+    fn test_destination(
+        name: &str,
+        seed: u8,
+        domains: &[&str],
+        cidrs: &[&str],
+    ) -> DestinationConfig {
         DestinationConfig {
             name: name.to_string(),
             server_id: SecretKey::from_bytes(&[seed; 32]).public(),
@@ -1425,9 +1447,14 @@ mod tests {
             test_destination("m2", 1, &[], &[]),
         ]);
         assert!(message.contains("same server"), "{message}");
-        assert!(message.contains("m1") && message.contains("m2"), "{message}");
+        assert!(
+            message.contains("m1") && message.contains("m2"),
+            "{message}"
+        );
         // Routing-table errors surface as configuration errors too.
-        assert!(config_error(vec![test_destination("10.0.0.1", 1, &[], &[])]).contains("one DNS label"));
+        assert!(
+            config_error(vec![test_destination("10.0.0.1", 1, &[], &[])]).contains("one DNS label")
+        );
         assert!(
             config_error(vec![
                 test_destination("m1", 1, &["*.corp.example"], &[]),
@@ -1451,7 +1478,11 @@ mod tests {
         let status = client.status();
         assert_eq!(status.idle_timeout, Some(Duration::from_secs(300)));
         assert!(status.socks_listen.is_none() && status.http_listen.is_none());
-        let names: Vec<&str> = status.destinations.iter().map(|d| d.name.as_str()).collect();
+        let names: Vec<&str> = status
+            .destinations
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
         assert_eq!(names, ["machine1", "m2"]);
         for destination in &status.destinations {
             assert_eq!(destination.state, crate::proxy::DestinationState::Idle);
@@ -1473,15 +1504,33 @@ mod tests {
         .unwrap();
         let dialer = client.dialer();
         let domain = |host: &str| Target::Domain(host.to_string(), 80);
-        assert_eq!(dialer.destination_for(&domain("M1.localhost.flextunnel.internal")), Some("m1"));
-        assert_eq!(dialer.destination_for(&domain("api.corp.example")), Some("m1"));
+        assert_eq!(
+            dialer.destination_for(&domain("M1.localhost.flextunnel.internal")),
+            Some("m1")
+        );
+        assert_eq!(
+            dialer.destination_for(&domain("api.corp.example")),
+            Some("m1")
+        );
         assert_eq!(dialer.destination_for(&domain("10.2.3.4")), Some("m2"));
         assert_eq!(dialer.destination_for(&domain("example.org")), None);
         assert_eq!(dialer.destination_for(&domain("flextunnel.internal")), None);
 
-        let err = dialer.connect(&domain("example.org")).await.err().expect("refused");
-        assert!(err.to_string().contains("no destination routes example.org"), "{err}");
-        let err = dialer.connect(&domain("flextunnel.internal")).await.err().expect("refused");
+        let err = dialer
+            .connect(&domain("example.org"))
+            .await
+            .err()
+            .expect("refused");
+        assert!(
+            err.to_string()
+                .contains("no destination routes example.org"),
+            "{err}"
+        );
+        let err = dialer
+            .connect(&domain("flextunnel.internal"))
+            .await
+            .err()
+            .expect("refused");
         assert!(err.to_string().contains("status endpoint"), "{err}");
         // Refusing never asked a destination to connect.
         assert!(client.status().destinations.iter().all(|d| d.waiting == 0));
@@ -1536,15 +1585,31 @@ mod tests {
                 idle_timeout,
             })
         };
-        for too_long in [Duration::MAX, Duration::from_secs(u64::MAX), MAX_IDLE_TIMEOUT + Duration::from_secs(1)] {
+        for too_long in [
+            Duration::MAX,
+            Duration::from_secs(u64::MAX),
+            MAX_IDLE_TIMEOUT + Duration::from_secs(1),
+        ] {
             let err = build(Some(too_long)).err().expect("refused").to_string();
-            assert!(err.contains("idle timeout") && err.contains("set it to 0"), "{err}");
+            assert!(
+                err.contains("idle timeout") && err.contains("set it to 0"),
+                "{err}"
+            );
         }
-        for fine in [None, Some(Duration::ZERO), Some(Duration::from_secs(300)), Some(MAX_IDLE_TIMEOUT)] {
+        for fine in [
+            None,
+            Some(Duration::ZERO),
+            Some(Duration::from_secs(300)),
+            Some(MAX_IDLE_TIMEOUT),
+        ] {
             assert!(build(fine).is_ok(), "{fine:?}");
         }
         // What an accepted timeout is added to cannot overflow.
-        assert!(tokio::time::Instant::now().checked_add(MAX_IDLE_TIMEOUT).is_some());
+        assert!(
+            tokio::time::Instant::now()
+                .checked_add(MAX_IDLE_TIMEOUT)
+                .is_some()
+        );
     }
 
     /// The hold budget keeps its total, gives every destination a share no
@@ -1553,26 +1618,47 @@ mod tests {
     fn the_hold_budget_reserves_a_share_per_destination() {
         for destinations in [1, 2, 5, 8, 9, 64, 200] {
             let budget = HoldBudget::new(destinations);
-            let total: usize = budget.reserved.iter().map(Semaphore::available_permits).sum::<usize>()
+            let total: usize = budget
+                .reserved
+                .iter()
+                .map(Semaphore::available_permits)
+                .sum::<usize>()
                 + budget.shared.available_permits();
             assert_eq!(total, MAX_HELD_CONNS, "{destinations} destinations");
         }
-        assert_eq!(HoldBudget::new(1).reserved[0].available_permits(), HOLDS_RESERVED_PER_DESTINATION);
-        assert_eq!(HoldBudget::new(200).reserved[0].available_permits(), 0, "too many to reserve for");
+        assert_eq!(
+            HoldBudget::new(1).reserved[0].available_permits(),
+            HOLDS_RESERVED_PER_DESTINATION
+        );
+        assert_eq!(
+            HoldBudget::new(200).reserved[0].available_permits(),
+            0,
+            "too many to reserve for"
+        );
 
         // One destination's server is down and its retries pile up: it holds
         // everything it can reach...
         let budget = HoldBudget::new(3);
         let down = budget.for_destination(0);
         let mut held = Vec::new();
-        while let Ok(permit) = down.reserved.try_acquire().or_else(|_| down.shared.try_acquire()) {
+        while let Ok(permit) = down
+            .reserved
+            .try_acquire()
+            .or_else(|_| down.shared.try_acquire())
+        {
             held.push(permit);
         }
-        assert_eq!(held.len(), MAX_HELD_CONNS - 2 * HOLDS_RESERVED_PER_DESTINATION);
+        assert_eq!(
+            held.len(),
+            MAX_HELD_CONNS - 2 * HOLDS_RESERVED_PER_DESTINATION
+        );
         // ...and the other destinations can still hold their first requests.
         for other in [1, 2] {
             let holds = budget.for_destination(other);
-            assert_eq!(holds.reserved.available_permits(), HOLDS_RESERVED_PER_DESTINATION);
+            assert_eq!(
+                holds.reserved.available_permits(),
+                HOLDS_RESERVED_PER_DESTINATION
+            );
             assert_eq!(holds.shared.available_permits(), 0);
         }
     }
@@ -1795,7 +1881,6 @@ mod tests {
         assert!(!rebuild_due(REBUILD_ENDPOINT_ATTEMPTS - 1, long_ago));
     }
 
-
     /// End-to-end plain-HTTP forwarding through the *direct* path: the HTTP
     /// front-end rewrites the absolute-URI request to origin-form, the target
     /// no destination routes is dialed directly, the rewritten head is written
@@ -1837,7 +1922,9 @@ mod tests {
         tokio::spawn(async move {
             let holds = Arc::new(HoldBudget::new(router.destinations.len()));
             let (tcp, _) = proxy.accept().await.unwrap();
-            handle_local_conn(HttpProto, tcp, router, holds).await.unwrap();
+            handle_local_conn(HttpProto, tcp, router, holds)
+                .await
+                .unwrap();
         });
 
         let mut app = TcpStream::connect(proxy_addr).await.unwrap();
@@ -1899,7 +1986,12 @@ mod tests {
 
         // SOCKS5: method reply (2 bytes) + CONNECT reply (10 bytes), then HTTP.
         let get = "GET /status.json HTTP/1.1\r\nHost: flextunnel.internal\r\n\r\n";
-        let response = exchange(Socks5Proto, router.clone(), socks_request("flextunnel.internal", get)).await;
+        let response = exchange(
+            Socks5Proto,
+            router.clone(),
+            socks_request("flextunnel.internal", get),
+        )
+        .await;
         let body = response.split_once("\r\n\r\n").expect("an HTTP response").1;
         let json: serde_json::Value = serde_json::from_str(body).expect("JSON status");
         assert_eq!(json["destinations"][0]["name"], "m1");
@@ -1910,33 +2002,61 @@ mod tests {
         let connect = "CONNECT flextunnel.internal:80 HTTP/1.1\r\nHost: flextunnel.internal:80\r\n\r\n\
                        GET / HTTP/1.1\r\nHost: flextunnel.internal\r\nAccept: text/plain\r\n\r\n";
         let response = exchange(HttpProto, router.clone(), connect.as_bytes().to_vec()).await;
-        assert!(response.starts_with("HTTP/1.1 200 Connection Established\r\n\r\n"), "{response:.80}");
+        assert!(
+            response.starts_with("HTTP/1.1 200 Connection Established\r\n\r\n"),
+            "{response:.80}"
+        );
         assert!(response.contains("Content-Type: text/plain"), "{response}");
         assert!(response.contains("flextunnel client status"));
         assert!(response.contains("m1"));
 
         // A plain absolute-URI GET: the response is the page itself.
-        let forward = "GET http://flextunnel.internal/ HTTP/1.1\r\nHost: flextunnel.internal\r\n\r\n";
+        let forward =
+            "GET http://flextunnel.internal/ HTTP/1.1\r\nHost: flextunnel.internal\r\n\r\n";
         let response = exchange(HttpProto, router.clone(), forward.as_bytes().to_vec()).await;
-        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response:.80}");
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "{response:.80}"
+        );
         assert!(response.contains("Content-Type: text/html"));
         assert!(response.contains("href=\"/servers/m1/\""));
 
         // Unknown pages and destinations, other methods, other reserved names.
         for (request, status) in [
-            ("GET http://flextunnel.internal/nope HTTP/1.1\r\n\r\n", "404 Not Found"),
-            ("GET http://flextunnel.internal/servers/nope/ HTTP/1.1\r\n\r\n", "404 Not Found"),
-            ("GET http://flextunnel.internal/servers/m1/x HTTP/1.1\r\n\r\n", "404 Not Found"),
-            ("POST http://flextunnel.internal/ HTTP/1.1\r\nContent-Length: 0\r\n\r\n", "405 Method Not Allowed"),
-            ("GET http://localhost.flextunnel.internal/ HTTP/1.1\r\n\r\n", "404 Not Found"),
+            (
+                "GET http://flextunnel.internal/nope HTTP/1.1\r\n\r\n",
+                "404 Not Found",
+            ),
+            (
+                "GET http://flextunnel.internal/servers/nope/ HTTP/1.1\r\n\r\n",
+                "404 Not Found",
+            ),
+            (
+                "GET http://flextunnel.internal/servers/m1/x HTTP/1.1\r\n\r\n",
+                "404 Not Found",
+            ),
+            (
+                "POST http://flextunnel.internal/ HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+                "405 Method Not Allowed",
+            ),
+            (
+                "GET http://localhost.flextunnel.internal/ HTTP/1.1\r\n\r\n",
+                "404 Not Found",
+            ),
         ] {
             let response = exchange(HttpProto, router.clone(), request.as_bytes().to_vec()).await;
-            assert!(response.starts_with(&format!("HTTP/1.1 {status}\r\n")), "{request}: {response:.80}");
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}\r\n")),
+                "{request}: {response:.80}"
+            );
         }
 
         // None of it touched the destination.
         let status = client.status();
-        assert_eq!(status.destinations[0].state, crate::proxy::DestinationState::Idle);
+        assert_eq!(
+            status.destinations[0].state,
+            crate::proxy::DestinationState::Idle
+        );
         assert_eq!(status.destinations[0].waiting, 0);
         assert!(status.destinations[0].client_node_id.is_none());
     }

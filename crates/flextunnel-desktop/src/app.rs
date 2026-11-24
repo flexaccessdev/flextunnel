@@ -15,32 +15,32 @@
 
 use crate::autostart;
 use crate::config::{
-    self, AuthKey, AuthorizedClient, ClientSettings, Destination, Portable, ServerConfig,
-    DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT,
-};
-use flextunnel_core::forwards::{
-    PortForward, disable_failed_forwards, parse_port, validate_label, validate_remote_host,
+    self, AuthKey, AuthorizedClient, ClientSettings, DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT,
+    Destination, Portable, ServerConfig,
 };
 use crate::icon;
 use crate::logging;
 use crate::server_session::{self, ServerPhase, ServerSnapshot};
 use crate::tray::{self, Tray};
 use crate::tunnel::{
-    self, ClientPhase, ClientSnapshot, ClientSpec, Controller, DestinationId, RoutesQuery,
-    CLIENT_THREAD_NAME,
+    self, CLIENT_THREAD_NAME, ClientPhase, ClientSnapshot, ClientSpec, Controller, DestinationId,
+    RoutesQuery,
 };
 use crate::view;
+use flextunnel_core::forwards::{
+    PortForward, disable_failed_forwards, parse_port, validate_label, validate_remote_host,
+};
 use flextunnel_core::proxy::{
     DestinationStatus, RouteSpec, RouteTable, ServerRoutes, validate_destination_name,
 };
 use flextunnel_core::transport::paths::ConnectionSnapshot;
 use iced::futures::Stream;
-use iced::{window, Element, Size, Subscription, Task};
+use iced::{Element, Size, Subscription, Task, window};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
-use tray_icon::menu::MenuEvent;
 use tray_icon::TrayIconEvent;
+use tray_icon::menu::MenuEvent;
 
 /// Why the saved store could not be used whole at launch (see
 /// [`App::store_reset`]).
@@ -373,7 +373,10 @@ fn merge_imported(
     imported: Portable,
 ) -> Result<(ClientSettings, ImportSummary), String> {
     let mut incoming_destinations = imported.destinations;
-    let (mut names, mut servers) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+    let (mut names, mut servers) = (
+        std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
+    );
     for destination in &mut incoming_destinations {
         // Stored the way the core spells them, like what is typed into the
         // form: one server is one id, so the match against the destinations
@@ -486,7 +489,11 @@ fn check_relays(relay_urls: &[String], relay_auth_token: Option<String>) -> Resu
 
 /// Whether the session behind `snapshot` was started with exactly the saved
 /// settings: the same ports, destinations and key secrets.
-fn runs_saved_settings(snapshot: &ClientSnapshot, client: &ClientSettings, keys: &[AuthKey]) -> bool {
+fn runs_saved_settings(
+    snapshot: &ClientSnapshot,
+    client: &ClientSettings,
+    keys: &[AuthKey],
+) -> bool {
     snapshot.spec.as_deref() == ClientSpec::resolve(client, keys).as_ref()
 }
 
@@ -609,7 +616,11 @@ impl DestinationForm {
                             ),
                         };
                         let field = |rules: &[String]| {
-                            rules.iter().map(|rule| rule.trim()).collect::<Vec<_>>().join(", ")
+                            rules
+                                .iter()
+                                .map(|rule| rule.trim())
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         };
                         self.routed_domains = field(&routes.routed_domains);
                         self.routed_cidrs = field(&routes.routed_cidrs);
@@ -657,7 +668,9 @@ impl DestinationForm {
     /// each (see [`config::overlap_lines`]). Empty while the name and routes
     /// do not make a table with the others; the form's error says why.
     pub fn overlaps(&self, destinations: &[Destination]) -> Vec<String> {
-        self.routing(destinations).map(|(_, lines)| lines).unwrap_or_default()
+        self.routing(destinations)
+            .map(|(_, lines)| lines)
+            .unwrap_or_default()
     }
 
     /// The form's name and routes checked with the other destinations' by
@@ -687,17 +700,35 @@ impl DestinationForm {
         let mut memo = self.routing.borrow_mut();
         let fresh = memo.made.is_some()
             && memo.built_from.len() == specs.len()
-            && memo.built_from.iter().zip(&specs).all(|((name, domains, cidrs), spec)| {
-                name == spec.name && domains[..] == *spec.routed_domains && cidrs[..] == *spec.routed_cidrs
-            });
+            && memo
+                .built_from
+                .iter()
+                .zip(&specs)
+                .all(|((name, domains, cidrs), spec)| {
+                    name == spec.name
+                        && domains[..] == *spec.routed_domains
+                        && cidrs[..] == *spec.routed_cidrs
+                });
         if !fresh {
-            let made = RouteTable::new(&specs).map_err(|e| format!("{e:#}")).map(|table| {
-                let name = table.names().last().map(String::from).expect("the table has this destination");
-                (name, config::overlap_lines(&table, specs.len() - 1))
-            });
+            let made = RouteTable::new(&specs)
+                .map_err(|e| format!("{e:#}"))
+                .map(|table| {
+                    let name = table
+                        .names()
+                        .last()
+                        .map(String::from)
+                        .expect("the table has this destination");
+                    (name, config::overlap_lines(&table, specs.len() - 1))
+                });
             memo.built_from = specs
                 .iter()
-                .map(|spec| (spec.name.to_string(), spec.routed_domains.to_vec(), spec.routed_cidrs.to_vec()))
+                .map(|spec| {
+                    (
+                        spec.name.to_string(),
+                        spec.routed_domains.to_vec(),
+                        spec.routed_cidrs.to_vec(),
+                    )
+                })
                 .collect();
             memo.made = Some(made);
         }
@@ -714,7 +745,11 @@ impl DestinationForm {
         keys: &[AuthKey],
     ) -> Result<Destination, String> {
         let editing = self.editing_id.as_deref();
-        let others = || destinations.iter().filter(|d| Some(d.id.as_str()) != editing);
+        let others = || {
+            destinations
+                .iter()
+                .filter(|d| Some(d.id.as_str()) != editing)
+        };
         if self.name.trim().is_empty() {
             return Err("Name is required — one DNS label for this server, e.g. nas".into());
         }
@@ -850,10 +885,9 @@ impl KeyForm {
         let public_key = client_key.public_str();
         // The same keypair twice under two names is an accidental re-add, not
         // a use case — destinations share one entry instead.
-        if let Some(other) = keys
-            .iter()
-            .find(|k| k.public_key == public_key && Some(k.id.as_str()) != self.editing_id.as_deref())
-        {
+        if let Some(other) = keys.iter().find(|k| {
+            k.public_key == public_key && Some(k.id.as_str()) != self.editing_id.as_deref()
+        }) {
             return Err(format!("Key \"{}\" already holds this secret", other.name));
         }
         Ok(AuthKey {
@@ -1122,13 +1156,12 @@ impl ForwardForm {
         let remote_host = validate_remote_host(&self.remote_host)?;
         let remote_port = parse_port(&self.remote_port, "Remote port")?;
         if let Some(owner) = port_owner(client, local_port, false, self.editing_id.as_deref()) {
-            return Err(format!("Local port {local_port} is already used by {owner}"));
+            return Err(format!(
+                "Local port {local_port} is already used by {owner}"
+            ));
         }
         Ok(PortForward {
-            id: self
-                .editing_id
-                .clone()
-                .unwrap_or_else(PortForward::new_id),
+            id: self.editing_id.clone().unwrap_or_else(PortForward::new_id),
             label,
             local_port,
             remote_host,
@@ -1315,7 +1348,10 @@ impl App {
             }
             Err(e) => {
                 log::error!("{e:#}");
-                (config::Store::default(), Some(StoreReset::Unreadable(format!("{e:#}"))))
+                (
+                    config::Store::default(),
+                    Some(StoreReset::Unreadable(format!("{e:#}"))),
+                )
             }
         };
         let store_intact = store_reset.is_none();
@@ -1771,7 +1807,9 @@ impl App {
             }
             Message::KeyGenerateSecret => {
                 if let Some(form) = &mut self.key_form {
-                    form.secret = flextunnel_core::auth::ClientKey::generate().expect("system RNG unavailable").secret_str();
+                    form.secret = flextunnel_core::auth::ClientKey::generate()
+                        .expect("system RNG unavailable")
+                        .secret_str();
                 }
                 Task::none()
             }
@@ -1805,8 +1843,7 @@ impl App {
                 Task::none()
             }
             Message::ToggleForward(forward_id, enabled) => {
-                if let Some(forward) =
-                    self.client.forwards.iter_mut().find(|f| f.id == forward_id)
+                if let Some(forward) = self.client.forwards.iter_mut().find(|f| f.id == forward_id)
                 {
                     // Desired state, but not a plain checkbox: enabling
                     // attempts the setup now, and a setup failure snaps the
@@ -1899,13 +1936,15 @@ impl App {
                 Task::none()
             }
             Message::ServerImportToggled(import) => {
-                if let Some(identity) = self.server_form.as_mut().and_then(|f| f.identity.as_mut()) {
+                if let Some(identity) = self.server_form.as_mut().and_then(|f| f.identity.as_mut())
+                {
                     identity.import = import.then(String::new);
                 }
                 Task::none()
             }
             Message::ServerRegenerateIdentity => {
-                if let Some(identity) = self.server_form.as_mut().and_then(|f| f.identity.as_mut()) {
+                if let Some(identity) = self.server_form.as_mut().and_then(|f| f.identity.as_mut())
+                {
                     identity.regenerate();
                 }
                 Task::none()
@@ -2063,10 +2102,12 @@ impl App {
         let Some(running) = &self.client_snapshot.spec else {
             return DestinationLive::Stopped;
         };
-        let secret = config::find_key(&self.keys, &destination.auth_key_id).map(|k| k.secret.as_str());
-        let applied = running.destinations.iter().any(|d| {
-            d.destination == *destination && Some(d.auth_secret.as_str()) == secret
-        });
+        let secret =
+            config::find_key(&self.keys, &destination.auth_key_id).map(|k| k.secret.as_str());
+        let applied = running
+            .destinations
+            .iter()
+            .any(|d| d.destination == *destination && Some(d.auth_secret.as_str()) == secret);
         if !applied {
             return DestinationLive::Pending;
         }
@@ -2123,7 +2164,8 @@ impl App {
     /// asked for here.
     fn start_client(&mut self) {
         if let Some(spec) = ClientSpec::resolve(&self.client, &self.keys) {
-            self.controller.start_client(spec, self.client.forwards.clone());
+            self.controller
+                .start_client(spec, self.client.forwards.clone());
         }
     }
 
@@ -2149,7 +2191,8 @@ impl App {
         match self.client.start_blocker(&self.keys) {
             None => {
                 if let Some(spec) = ClientSpec::resolve(&self.client, &self.keys) {
-                    self.controller.restart_client(spec, self.client.forwards.clone());
+                    self.controller
+                        .restart_client(spec, self.client.forwards.clone());
                 }
             }
             Some(blocker) => {
@@ -2270,12 +2313,7 @@ impl App {
             self.controller.server_snapshot().phase,
             ServerPhase::Stopped | ServerPhase::Failed | ServerPhase::Stopping
         );
-        if down
-            && let Some(server) = self
-                .server
-                .clone()
-                .filter(|s| s.enabled && s.is_ready())
-        {
+        if down && let Some(server) = self.server.clone().filter(|s| s.enabled && s.is_ready()) {
             self.controller.start_server(server.clone());
             self.server_applied = Some(server);
         }
@@ -2368,7 +2406,11 @@ impl App {
         if self.notice.is_some() {
             return;
         }
-        if self.server.as_ref().is_some_and(|s| s.authorized_clients.is_empty()) {
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|s| s.authorized_clients.is_empty())
+        {
             self.client_form = Some(ClientForm::default());
             self.notice = Some(if setting_up {
                 "Server created. Authorize the first client to start it.".into()
@@ -2409,7 +2451,9 @@ impl App {
             return;
         };
         let before = server.authorized_clients.len();
-        server.authorized_clients.retain(|c| c.public_key != public_key);
+        server
+            .authorized_clients
+            .retain(|c| c.public_key != public_key);
         if server.authorized_clients.len() == before {
             return;
         }
@@ -2537,7 +2581,10 @@ impl App {
         let running = self.client_snapshot.spec.as_deref();
         view::refresh_routed_cache(
             &mut self.running_routed_cache,
-            running.into_iter().flat_map(|spec| &spec.destinations).map(|d| &d.destination),
+            running
+                .into_iter()
+                .flat_map(|spec| &spec.destinations)
+                .map(|d| &d.destination),
         );
 
         let revision = logging::revision();
@@ -2650,14 +2697,19 @@ impl App {
     /// (Cancelling the destination form afterwards keeps the key — it's in
     /// the list, deletable from the Keys pane.)
     fn create_key_for_destination_form(&mut self) {
-        let Some(name) = self.destination_form.as_ref().and_then(|f| f.new_key_name.clone()) else {
+        let Some(name) = self
+            .destination_form
+            .as_ref()
+            .and_then(|f| f.new_key_name.clone())
+        else {
             return;
         };
         // The view disables Create on an invalid name; this is the backstop.
         let Ok(name) = validate_key_name(&name, &self.keys, None) else {
             return;
         };
-        let client_key = flextunnel_core::auth::ClientKey::generate().expect("system RNG unavailable");
+        let client_key =
+            flextunnel_core::auth::ClientKey::generate().expect("system RNG unavailable");
         let key = AuthKey {
             id: AuthKey::new_id(),
             name,
@@ -2705,7 +2757,12 @@ impl App {
         self.confirm_export_key = None;
         // Shared keys never delete out from under a destination; repoint or
         // delete the destinations first.
-        if let Some(user) = self.client.destinations.iter().find(|d| d.auth_key_id == id) {
+        if let Some(user) = self
+            .client
+            .destinations
+            .iter()
+            .find(|d| d.auth_key_id == id)
+        {
             self.notice = Some(format!(
                 "This key is used by destination \"{}\" — repoint or delete that destination \
                  first.",
@@ -2746,7 +2803,9 @@ impl App {
         // Announce "copied" only when the clipboard write actually took —
         // a false success here would have the user paste nothing elsewhere.
         self.notice = Some(if self.copy_text(secret) {
-            format!("Secret key of \"{name}\" copied — paste it into the key form of another install.")
+            format!(
+                "Secret key of \"{name}\" copied — paste it into the key form of another install."
+            )
         } else {
             "Clipboard unavailable — the secret key was not copied.".into()
         });
@@ -2833,14 +2892,12 @@ impl App {
             LogFilter::Server => Some(format!("[{}]", server_session::THREAD_NAME)),
         };
         self.log_text = match tag {
-            Some(tag) => {
-                lines
-                    .iter()
-                    .filter(|line| line.contains(&tag))
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
+            Some(tag) => lines
+                .iter()
+                .filter(|line| line.contains(&tag))
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n"),
             None => lines.join("\n"),
         };
     }
@@ -2852,7 +2909,9 @@ impl App {
         let enabled = autostart::is_enabled();
         let changed = enabled != self.launch_at_login;
         self.launch_at_login = enabled;
-        if (changed || force) && let Some(tray) = &self.tray {
+        if (changed || force)
+            && let Some(tray) = &self.tray
+        {
             tray.set_launch_at_login(enabled);
         }
     }
@@ -2951,7 +3010,9 @@ mod tests {
         for (slot, byte) in bytes.iter_mut().zip(seed.bytes()) {
             *slot = byte;
         }
-        flextunnel_core::iroh::SecretKey::from_bytes(&bytes).public().to_string()
+        flextunnel_core::iroh::SecretKey::from_bytes(&bytes)
+            .public()
+            .to_string()
     }
 
     fn valid_form() -> DestinationForm {
@@ -3018,7 +3079,9 @@ mod tests {
 
     #[test]
     fn forward_form_trims_and_builds() {
-        let forward = valid_forward_form().validate(&client(1080, vec![])).expect("valid");
+        let forward = valid_forward_form()
+            .validate(&client(1080, vec![]))
+            .expect("valid");
         assert_eq!(forward.label, "db");
         assert_eq!(forward.local_port, 5432);
         assert_eq!(forward.remote_host, "db.internal");
@@ -3053,7 +3116,11 @@ mod tests {
 
         // Collisions with the client's proxy ports.
         let form = valid_forward_form();
-        assert!(form.validate(&client(5432, vec![])).unwrap_err().contains("SOCKS5 proxy"));
+        assert!(
+            form.validate(&client(5432, vec![]))
+                .unwrap_err()
+                .contains("SOCKS5 proxy")
+        );
         let mut http = client(1080, vec![]);
         http.http_port = Some(5432);
         assert!(form.validate(&http).unwrap_err().contains("HTTP proxy"));
@@ -3081,16 +3148,34 @@ mod tests {
         // The form opens on what is saved, with a suggestion for what is off.
         let open = ProxyForm::edit(&current);
         assert!(open.socks_enabled && !open.http_enabled);
-        assert_eq!((open.socks_port.as_str(), open.http_port.as_str()), ("1080", "18080"));
+        assert_eq!(
+            (open.socks_port.as_str(), open.http_port.as_str()),
+            ("1080", "18080")
+        );
         // The client's own current port is not a clash with itself.
         assert_eq!(open.validate(&current), Ok((Some(1080), None)));
 
-        assert_eq!(form(Some("1081"), Some("8081")).validate(&current), Ok((Some(1081), Some(8081))));
-        assert_eq!(form(None, None).validate(&current), Ok((None, None)), "forwards only");
+        assert_eq!(
+            form(Some("1081"), Some("8081")).validate(&current),
+            Ok((Some(1081), Some(8081)))
+        );
+        assert_eq!(
+            form(None, None).validate(&current),
+            Ok((None, None)),
+            "forwards only"
+        );
         assert!(form(Some("0"), None).validate(&current).is_err());
-        assert!(form(Some("1081"), Some("1081")).validate(&current).is_err(), "same port twice");
+        assert!(
+            form(Some("1081"), Some("1081")).validate(&current).is_err(),
+            "same port twice"
+        );
         // A forward's local port, as SOCKS or HTTP.
-        assert!(form(Some("5000"), None).validate(&current).unwrap_err().contains("forward"));
+        assert!(
+            form(Some("5000"), None)
+                .validate(&current)
+                .unwrap_err()
+                .contains("forward")
+        );
         assert!(form(Some("1081"), Some("5000")).validate(&current).is_err());
         // A switched-off front-end's port buffer is not looked at.
         let mut off = form(None, None);
@@ -3124,7 +3209,11 @@ mod tests {
         replacing.enabled = true;
         let imported = Portable {
             destinations: vec![same_server, new_server],
-            forwards: vec![replacing, existing_forward("f3", 6000), existing_forward("f4", 1080)],
+            forwards: vec![
+                replacing,
+                existing_forward("f3", 6000),
+                existing_forward("f4", 1080),
+            ],
         };
 
         let (merged, summary) = merge_imported(&current, imported).expect("fits");
@@ -3166,11 +3255,20 @@ mod tests {
         // The proxy ports are this computer's own; forwards come back stopped.
         assert_eq!((merged.socks_port, merged.http_port), (Some(1080), None));
         assert_eq!(merged.forwards.len(), 2);
-        assert_eq!(merged.forwards[0].id, "f1", "a replaced forward keeps its id");
-        assert_eq!(merged.forwards[0].remote_host, "renamed.localhost.flextunnel.internal");
+        assert_eq!(
+            merged.forwards[0].id, "f1",
+            "a replaced forward keeps its id"
+        );
+        assert_eq!(
+            merged.forwards[0].remote_host,
+            "renamed.localhost.flextunnel.internal"
+        );
         assert!(!merged.forwards[0].enabled);
         assert_eq!(merged.forwards[1].local_port, 6000);
-        assert_ne!(merged.forwards[1].id, "f3", "imported forward ids are fresh");
+        assert_ne!(
+            merged.forwards[1].id, "f3",
+            "imported forward ids are fresh"
+        );
     }
 
     /// A replaced destination keeps its relay auth token only with the relays
@@ -3192,13 +3290,25 @@ mod tests {
         moved.relay_urls = relays(&["https://c.example", "https://d.example"]);
         let mut defaulted = current.destinations[2].clone();
         defaulted.relay_urls.clear();
-        let imported = Portable { destinations: vec![same, moved, defaulted], forwards: Vec::new() };
+        let imported = Portable {
+            destinations: vec![same, moved, defaulted],
+            forwards: Vec::new(),
+        };
 
         let (merged, summary) = merge_imported(&current, imported).expect("fits");
         assert_eq!(summary.destinations_replaced, 3);
-        assert_eq!(merged.destinations[0].relay_auth_token.as_deref(), Some("relay-psk"));
-        assert_eq!(merged.destinations[1].relay_auth_token, None, "not sent to other relays");
-        assert_eq!(merged.destinations[1].relay_urls, relays(&["https://c.example", "https://d.example"]));
+        assert_eq!(
+            merged.destinations[0].relay_auth_token.as_deref(),
+            Some("relay-psk")
+        );
+        assert_eq!(
+            merged.destinations[1].relay_auth_token, None,
+            "not sent to other relays"
+        );
+        assert_eq!(
+            merged.destinations[1].relay_urls,
+            relays(&["https://c.example", "https://d.example"])
+        );
         assert_eq!(merged.destinations[2].relay_auth_token, None);
         // Only the one that now has relays to authenticate to is called out.
         assert_eq!(summary.relay_tokens_needed, ["p2"]);
@@ -3216,7 +3326,13 @@ mod tests {
         let current = client(1080, vec![]);
         let import = |destinations: Vec<Destination>| {
             let forwards = vec![existing_forward("f", 6000)];
-            merge_imported(&current, Portable { destinations, forwards })
+            merge_imported(
+                &current,
+                Portable {
+                    destinations,
+                    forwards,
+                },
+            )
         };
 
         let mut same_host = existing_destination("b");
@@ -3227,13 +3343,19 @@ mod tests {
         let mut same_server = existing_destination("b");
         same_server.server_node_id = node_id("a");
         let err = import(vec![existing_destination("a"), same_server]).unwrap_err();
-        assert!(err.contains("more than one destination for server"), "{err}");
+        assert!(
+            err.contains("more than one destination for server"),
+            "{err}"
+        );
 
         for bad_host in ["10.0.0.1", "flextunnel.internal", "bad..name", ""] {
             let mut bad = existing_destination("b");
             bad.name = bad_host.into();
             // A valid entry before it does not get the import through.
-            assert!(import(vec![existing_destination("a"), bad]).is_err(), "{bad_host:?}");
+            assert!(
+                import(vec![existing_destination("a"), bad]).is_err(),
+                "{bad_host:?}"
+            );
         }
 
         // What the client could not start with is refused too, by name: a
@@ -3243,13 +3365,22 @@ mod tests {
             let mut bad = existing_destination("b");
             bad.server_node_id = bad_id.into();
             let err = import(vec![existing_destination("a"), bad]).unwrap_err();
-            assert!(err.contains("\"b\"") && err.contains("not an endpoint id"), "{bad_id:?}: {err}");
+            assert!(
+                err.contains("\"b\"") && err.contains("not an endpoint id"),
+                "{bad_id:?}: {err}"
+            );
         }
-        for bad_relays in [&["not a url", "https://b.example"][..], &["https://only.example"][..]] {
+        for bad_relays in [
+            &["not a url", "https://b.example"][..],
+            &["https://only.example"][..],
+        ] {
             let mut bad = existing_destination("b");
             bad.relay_urls = bad_relays.iter().map(|u| u.to_string()).collect();
             let err = import(vec![existing_destination("a"), bad]).unwrap_err();
-            assert!(err.contains("\"b\"") && err.contains("relay"), "{bad_relays:?}: {err}");
+            assert!(
+                err.contains("\"b\"") && err.contains("relay"),
+                "{bad_relays:?}: {err}"
+            );
         }
         // Replacing a working destination is held to the same: its relays
         // are not swapped for ones that would stop the client starting.
@@ -3263,7 +3394,10 @@ mod tests {
         respelled.server_node_id = format!("  {}  ", node_id("p1"));
         respelled.routed_domains = vec!["*.corp.example".into()];
         let (merged, summary) = import(vec![respelled]).expect("the same server");
-        assert_eq!((summary.destinations_replaced, summary.destinations_added), (1, 0));
+        assert_eq!(
+            (summary.destinations_replaced, summary.destinations_added),
+            (1, 0)
+        );
         assert_eq!(merged.destinations[0].server_node_id, node_id("p1"));
 
         // A host spelled another way is stored the way the core spells it.
@@ -3284,8 +3418,15 @@ mod tests {
         // Another server under a host already taken.
         let mut same_host = existing_destination("z");
         same_host.name = "p1".into();
-        let clash = Portable { destinations: vec![same_host], forwards: Vec::new() };
-        assert!(merge_imported(&current, clash).unwrap_err().contains("more than once"));
+        let clash = Portable {
+            destinations: vec![same_host],
+            forwards: Vec::new(),
+        };
+        assert!(
+            merge_imported(&current, clash)
+                .unwrap_err()
+                .contains("more than once")
+        );
 
         // Another server claiming a rule already routed.
         let mut same_rule = existing_destination("z");
@@ -3294,7 +3435,11 @@ mod tests {
             destinations: vec![existing_destination("ok"), same_rule],
             forwards: vec![existing_forward("f", 6000)],
         };
-        assert!(merge_imported(&current, clash).unwrap_err().contains("both route"));
+        assert!(
+            merge_imported(&current, clash)
+                .unwrap_err()
+                .contains("both route")
+        );
 
         // Nothing to import is fine, and changes nothing.
         let (merged, summary) = merge_imported(&current, Portable::default()).unwrap();
@@ -3306,14 +3451,24 @@ mod tests {
     #[test]
     fn validate_trims_and_parses() {
         let destination = valid_form().validate(&[], &test_keys()).expect("valid");
-        assert_eq!(destination.server_node_id, node_id("form"), "stored as the parser spells it");
+        assert_eq!(
+            destination.server_node_id,
+            node_id("form"),
+            "stored as the parser spells it"
+        );
         assert_eq!(destination.name, "prod", "stored trimmed and lowercased");
-        assert_eq!(destination.routed_domains, ["*.corp.example", "db.internal"]);
+        assert_eq!(
+            destination.routed_domains,
+            ["*.corp.example", "db.internal"]
+        );
         assert_eq!(destination.routed_cidrs, ["10.0.0.0/8"]);
         assert_eq!(destination.auth_key_id, "k1");
         assert_eq!(
             destination.relay_urls,
-            vec!["https://a.example".to_string(), "https://b.example".to_string()]
+            vec![
+                "https://a.example".to_string(),
+                "https://b.example".to_string()
+            ]
         );
         assert_eq!(destination.relay_auth_token, None);
         assert!(!destination.id.is_empty());
@@ -3322,7 +3477,9 @@ mod tests {
         let form = DestinationForm::edit(&destination);
         assert!(form.is_edit());
         assert_eq!(form.routed_domains, "*.corp.example, db.internal");
-        let again = form.validate(std::slice::from_ref(&destination), &test_keys()).unwrap();
+        let again = form
+            .validate(std::slice::from_ref(&destination), &test_keys())
+            .unwrap();
         assert_eq!(again, destination);
     }
 
@@ -3350,7 +3507,14 @@ mod tests {
 
         // The name is required and must be one DNS label; the routes must
         // parse and stay out of the reserved namespace.
-        for name in ["  ", "10.0.0.1", "nas.home", "flextunnel.internal", "my_host", "-nas"] {
+        for name in [
+            "  ",
+            "10.0.0.1",
+            "nas.home",
+            "flextunnel.internal",
+            "my_host",
+            "-nas",
+        ] {
             let mut form = valid_form();
             form.name = name.into();
             assert!(form.validate(&[], &keys).is_err(), "name {name:?}");
@@ -3390,7 +3554,9 @@ mod tests {
     /// that parse — not a host, nor routes: those are what is being filled.
     #[test]
     fn a_routes_query_needs_the_server_and_a_key() {
-        let secret = flextunnel_core::auth::ClientKey::generate().unwrap().secret_str();
+        let secret = flextunnel_core::auth::ClientKey::generate()
+            .unwrap()
+            .secret_str();
         let keys = vec![AuthKey {
             secret,
             ..test_keys().remove(0)
@@ -3449,9 +3615,7 @@ mod tests {
         };
         assert_eq!(
             form.overlaps(std::slice::from_ref(&saved)),
-            [
-                "*.corp.example is inside nas's broader *",
-            ]
+            ["*.corp.example is inside nas's broader *",]
         );
         // The same rule twice is an error, which the form says elsewhere.
         form.routed_domains = "*".into();
@@ -3476,7 +3640,9 @@ mod tests {
         form.routes_fetched(7, Ok(routes()));
         assert_eq!(form.routed_domains, "*.lab.example, nas.example");
         assert_eq!(form.routed_cidrs, "192.168.0.0/16");
-        assert!(matches!(&form.routes_fetch, RoutesFetch::Filled(said) if said.contains("2 domain(s) and 1 CIDR(s)")));
+        assert!(
+            matches!(&form.routes_fetch, RoutesFetch::Filled(said) if said.contains("2 domain(s) and 1 CIDR(s)"))
+        );
         let saved = form.validate(&[], &keys).unwrap();
         assert_eq!(saved.routed_domains, routes().routed_domains);
         assert_eq!(saved.routed_cidrs, routes().routed_cidrs);
@@ -3500,15 +3666,23 @@ mod tests {
         // A server with no lists empties the fields, and says so.
         form.routes_fetch = RoutesFetch::Fetching(8);
         form.routes_fetched(8, Ok(ServerRoutes::default()));
-        assert_eq!((form.routed_domains.as_str(), form.routed_cidrs.as_str()), ("", ""));
-        assert!(matches!(&form.routes_fetch, RoutesFetch::Filled(said) if said.contains("nothing beyond itself")));
+        assert_eq!(
+            (form.routed_domains.as_str(), form.routed_cidrs.as_str()),
+            ("", "")
+        );
+        assert!(
+            matches!(&form.routes_fetch, RoutesFetch::Filled(said) if said.contains("nothing beyond itself"))
+        );
 
         // A failure keeps what was typed.
         let mut form = valid_form();
         let typed = (form.routed_domains.clone(), form.routed_cidrs.clone());
         form.routes_fetch = RoutesFetch::Fetching(9);
         form.routes_fetched(9, Err("unreachable".into()));
-        assert_eq!((form.routed_domains.clone(), form.routed_cidrs.clone()), typed);
+        assert_eq!(
+            (form.routed_domains.clone(), form.routed_cidrs.clone()),
+            typed
+        );
         assert_eq!(form.routes_fetch, RoutesFetch::Failed("unreachable".into()));
 
         // An answer to another request, or after the form was pointed at
@@ -3520,7 +3694,10 @@ mod tests {
         form.server_changed();
         form.routes_fetched(11, Ok(routes()));
         assert_eq!(form.routes_fetch, RoutesFetch::Idle);
-        assert_eq!((form.routed_domains.clone(), form.routed_cidrs.clone()), typed);
+        assert_eq!(
+            (form.routed_domains.clone(), form.routed_cidrs.clone()),
+            typed
+        );
 
         // Nor does one that arrives after a routed field was edited by hand:
         // it would replace what was typed while it was on its way.
@@ -3543,7 +3720,10 @@ mod tests {
     fn a_fetched_entry_that_is_not_one_rule_fills_nothing() {
         let keys = test_keys();
         for (domains, cidrs) in [
-            (vec!["ok.example", "db.example, api.example"], vec!["10.0.0.0/8"]),
+            (
+                vec!["ok.example", "db.example, api.example"],
+                vec!["10.0.0.0/8"],
+            ),
             (vec!["ok.example"], vec!["10.0.0.0/8,192.168.0.0/16"]),
             (vec![","], vec![]),
         ] {
@@ -3562,9 +3742,15 @@ mod tests {
                 "{domains:?} {cidrs:?}: {:?}",
                 form.routes_fetch
             );
-            assert_eq!((form.routed_domains.clone(), form.routed_cidrs.clone()), typed);
+            assert_eq!(
+                (form.routed_domains.clone(), form.routed_cidrs.clone()),
+                typed
+            );
             // What saves is still what was typed, not half of the server's entry.
-            assert_eq!(form.validate(&[], &keys).unwrap().routed_cidrs, ["10.0.0.0/8"]);
+            assert_eq!(
+                form.validate(&[], &keys).unwrap().routed_cidrs,
+                ["10.0.0.0/8"]
+            );
         }
     }
 
@@ -3587,7 +3773,11 @@ mod tests {
         // Another destination's name, in any case…
         let mut form = fresh();
         form.name = " P1 ".into();
-        assert!(form.validate(&existing, &keys).unwrap_err().contains("more than once"));
+        assert!(
+            form.validate(&existing, &keys)
+                .unwrap_err()
+                .contains("more than once")
+        );
         // …or its server, however the id is typed…
         let mut form = fresh();
         form.server_node_id = format!("  {}\t", node_id("p1"));
@@ -3596,7 +3786,11 @@ mod tests {
         // …or one of its rules.
         let mut form = fresh();
         form.routed_cidrs = "10.0.0.0/8".into();
-        assert!(form.validate(&existing, &keys).unwrap_err().contains("both route"));
+        assert!(
+            form.validate(&existing, &keys)
+                .unwrap_err()
+                .contains("both route")
+        );
         // A narrower rule inside another destination's is fine: it wins.
         let mut form = fresh();
         form.routed_domains = "db.corp.example".into();
@@ -3606,14 +3800,18 @@ mod tests {
         // None of it applies to the destination being edited itself.
         let mut form = DestinationForm::edit(&existing[0]);
         form.routed_domains = "*.corp.example, extra.example".into();
-        let edited = form.validate(&existing, &keys).expect("own name, server and rules");
+        let edited = form
+            .validate(&existing, &keys)
+            .expect("own name, server and rules");
         assert_eq!(edited.id, "p1");
     }
 
     #[test]
     fn key_form_validates() {
         let keys = test_keys();
-        let secret = flextunnel_core::auth::ClientKey::generate().expect("system RNG unavailable").secret_str();
+        let secret = flextunnel_core::auth::ClientKey::generate()
+            .expect("system RNG unavailable")
+            .secret_str();
 
         let form = KeyForm {
             editing_id: None,
@@ -3657,13 +3855,15 @@ mod tests {
 
         // The same keypair under a second name is an accidental re-add.
         let mut existing_pair = keys.clone();
-        existing_pair.push(KeyForm {
-            editing_id: None,
-            name: "first".into(),
-            secret: secret.clone(),
-        }
-        .validate(&keys)
-        .unwrap());
+        existing_pair.push(
+            KeyForm {
+                editing_id: None,
+                name: "first".into(),
+                secret: secret.clone(),
+            }
+            .validate(&keys)
+            .unwrap(),
+        );
         let readd = KeyForm {
             editing_id: None,
             name: "second".into(),
@@ -3681,7 +3881,9 @@ mod tests {
     }
 
     fn client_key() -> String {
-        flextunnel_core::auth::ClientKey::generate().unwrap().public_str()
+        flextunnel_core::auth::ClientKey::generate()
+            .unwrap()
+            .public_str()
     }
 
     #[test]
@@ -3692,7 +3894,10 @@ mod tests {
         assert_eq!((server.secret, server.endpoint_id), (secret, endpoint_id));
         assert_eq!(server.routed_domains, ["*.internal", "example.com"]);
         assert_eq!(server.routed_cidrs, ["10.0.0.0/8"]);
-        assert!(server.authorized_clients.is_empty(), "clients come after setup");
+        assert!(
+            server.authorized_clients.is_empty(),
+            "clients come after setup"
+        );
         assert_ne!(
             ServerForm::add().validate(None).unwrap().endpoint_id,
             ServerForm::add().validate(None).unwrap().endpoint_id,
@@ -3706,7 +3911,10 @@ mod tests {
         let (_, before) = identity.resolve().unwrap();
         identity.regenerate();
         let (_, after) = identity.resolve().unwrap();
-        assert_ne!(before, after, "a regenerated identity gives a new endpoint id");
+        assert_ne!(
+            before, after,
+            "a regenerated identity gives a new endpoint id"
+        );
     }
 
     #[test]
@@ -3735,7 +3943,9 @@ mod tests {
         assert!(form.identity.is_none());
         form.routed_domains = String::new();
         form.routed_cidrs = " , ".into();
-        let edited = form.validate(Some(&current)).expect("an empty tunnel set is fine");
+        let edited = form
+            .validate(Some(&current))
+            .expect("an empty tunnel set is fine");
         assert!(edited.routed_domains.is_empty() && edited.routed_cidrs.is_empty());
         assert_eq!(edited.secret, current.secret);
         assert_eq!(edited.authorized_clients, current.authorized_clients);
@@ -3764,16 +3974,35 @@ mod tests {
         assert_eq!(client.name, "work laptop");
         assert_eq!(client.public_key, key);
 
-        assert!(ClientForm { name: " ".into(), ..ClientForm::default() }.validate(&[]).is_err());
-        let no_key = ClientForm { name: "phone".into(), public_key: String::new() };
+        assert!(
+            ClientForm {
+                name: " ".into(),
+                ..ClientForm::default()
+            }
+            .validate(&[])
+            .is_err()
+        );
+        let no_key = ClientForm {
+            name: "phone".into(),
+            public_key: String::new(),
+        };
         assert!(no_key.validate(&[]).is_err());
-        let bad_key = ClientForm { name: "phone".into(), public_key: "ed25519-pub:nope".into() };
+        let bad_key = ClientForm {
+            name: "phone".into(),
+            public_key: "ed25519-pub:nope".into(),
+        };
         assert!(bad_key.validate(&[]).is_err());
 
         let existing = [client];
-        let same_name = ClientForm { name: "work laptop".into(), public_key: client_key() };
+        let same_name = ClientForm {
+            name: "work laptop".into(),
+            public_key: client_key(),
+        };
         assert!(same_name.validate(&existing).is_err(), "duplicate name");
-        let same_key = ClientForm { name: "phone".into(), public_key: key.clone() };
+        let same_key = ClientForm {
+            name: "phone".into(),
+            public_key: key.clone(),
+        };
         assert!(same_key.validate(&existing).is_err(), "duplicate key");
     }
 
@@ -3782,12 +4011,21 @@ mod tests {
         let key = client_key();
         let mut form = ClientForm::default();
         form.set_public_key(format!(" {key}  alice   laptop "));
-        assert_eq!((form.name.as_str(), form.public_key.as_str()), ("alice laptop", key.as_str()));
+        assert_eq!(
+            (form.name.as_str(), form.public_key.as_str()),
+            ("alice laptop", key.as_str())
+        );
 
         // A name already typed wins over the comment.
-        let mut named = ClientForm { name: "phone".into(), ..ClientForm::default() };
+        let mut named = ClientForm {
+            name: "phone".into(),
+            ..ClientForm::default()
+        };
         named.set_public_key(format!("{key} alice laptop"));
-        assert_eq!((named.name.as_str(), named.public_key.as_str()), ("phone", key.as_str()));
+        assert_eq!(
+            (named.name.as_str(), named.public_key.as_str()),
+            ("phone", key.as_str())
+        );
         assert!(named.validate(&[]).is_ok());
     }
 }

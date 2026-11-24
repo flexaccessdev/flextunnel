@@ -197,7 +197,10 @@ mod tests {
             "ünï",
             &"x".repeat(33),
         ] {
-            assert!(instance_name(Some(bad)).is_err(), "{bad:?} should be rejected");
+            assert!(
+                instance_name(Some(bad)).is_err(),
+                "{bad:?} should be rejected"
+            );
         }
     }
 
@@ -222,7 +225,10 @@ mod tests {
         let located = locate(Some(named.clone()), None).unwrap();
         assert_eq!(located.name, "home");
         let msg = located.not_running().to_string();
-        assert!(msg.contains("'home'") && msg.contains("named.toml"), "{msg}");
+        assert!(
+            msg.contains("'home'") && msg.contains("named.toml"),
+            "{msg}"
+        );
 
         // No name in the config: the default instance.
         let unnamed = dir.path().join("unnamed.toml");

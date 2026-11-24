@@ -150,16 +150,20 @@ pub(crate) fn spawn_server(
         shared: shared.clone(),
     };
     let error_slot = slot.clone();
-    let spawned = std::thread::Builder::new().name(THREAD_NAME.into()).spawn(move || {
-        // Unlike a client session the server accepts many connections, so it
-        // gets the worker count the CLI server runs on.
-        let runtime = flextunnel_core::app::runtime_builder().thread_name(THREAD_NAME).build();
-        match runtime {
-            Ok(rt) => rt.block_on(run_server(server, rx, slot)),
-            Err(e) => slot.fail(format!("Failed to start: {e:#}")),
-        }
-        let _ = done_tx.send(());
-    });
+    let spawned = std::thread::Builder::new()
+        .name(THREAD_NAME.into())
+        .spawn(move || {
+            // Unlike a client session the server accepts many connections, so it
+            // gets the worker count the CLI server runs on.
+            let runtime = flextunnel_core::app::runtime_builder()
+                .thread_name(THREAD_NAME)
+                .build();
+            match runtime {
+                Ok(rt) => rt.block_on(run_server(server, rx, slot)),
+                Err(e) => slot.fail(format!("Failed to start: {e:#}")),
+            }
+            let _ = done_tx.send(());
+        });
     match spawned {
         Ok(_) => Some(ServerHandle { tx, done }),
         Err(e) => {
@@ -217,7 +221,10 @@ async fn run_server(server: ServerConfig, mut rx: mpsc::Receiver<ServerCmd>, slo
             return finish(&slot, cmd, Ok(()));
         }
     };
-    log::info!("Server running — clients connect to {}", running.endpoint().id());
+    log::info!(
+        "Server running — clients connect to {}",
+        running.endpoint().id()
+    );
     slot.update(|s| {
         s.phase = ServerPhase::Running;
         s.running_since = Some(Instant::now());

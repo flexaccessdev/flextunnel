@@ -32,7 +32,7 @@ use crate::transport::endpoint::{ClientEndpoint, RelayConfig, server_setup};
 use crate::transport::{ALPN, QUICK_ALPN, build_quic_transport_config};
 use iroh::address_lookup::MemoryLookup;
 use iroh::endpoint::{
-    presets, Builder as EndpointBuilder, Connection, RecvStream, SendStream, Side,
+    Builder as EndpointBuilder, Connection, RecvStream, SendStream, Side, presets,
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use std::collections::{HashMap, HashSet};
@@ -51,11 +51,8 @@ fn test_client_key() -> &'static crate::auth::ClientKey {
 
 /// An authorized-keys set holding only [`test_client_key`]'s public half.
 fn test_authorized_keys() -> crate::auth::AuthorizedKeys {
-    flexaccess_keys::parse_authorized_key_entries(
-        &[test_client_key().public_str()],
-        "e2e_tests",
-    )
-    .unwrap()
+    flexaccess_keys::parse_authorized_key_entries(&[test_client_key().public_str()], "e2e_tests")
+        .unwrap()
 }
 
 /// A valid signed auth payload for `ep` (binding its own endpoint id), signed
@@ -97,7 +94,11 @@ async fn loopback_endpoint_full(
     lookup: MemoryLookup,
     quick_clients: HashSet<EndpointId>,
 ) -> Endpoint {
-    let side = if is_server { Side::Server } else { Side::Client };
+    let side = if is_server {
+        Side::Server
+    } else {
+        Side::Client
+    };
     let base = loopback_base(side, lookup);
     let builder = if is_server {
         server_setup(base, secret, quick_clients)
@@ -342,9 +343,13 @@ async fn assert_rejected_by_allowlist(
 async fn assert_echo_roundtrip(conn: &Connection, port: u16) {
     let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
     let target = Target::Ip(format!("127.0.0.1:{port}").parse().unwrap());
-    signaling::write_request(&mut send, &StreamRequest::Connect(target)).await.unwrap();
+    signaling::write_request(&mut send, &StreamRequest::Connect(target))
+        .await
+        .unwrap();
     send.flush().await.unwrap();
-    let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
+    let rep = with_timeout(signaling::read_reply(&mut recv))
+        .await
+        .unwrap();
     assert_eq!(rep, signaling::REP_SUCCESS, "tunnel stream should connect");
     send.write_all(b"ping").await.unwrap();
     send.flush().await.unwrap();
@@ -544,7 +549,11 @@ async fn expect_echo<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(ap
 /// still-open stream.
 async fn socks_echo(socks: SocketAddr, host: &str, port: u16) -> TcpStream {
     let (mut app, rep) = socks_connect(socks, host, port).await;
-    assert_eq!(rep, signaling::REP_SUCCESS, "CONNECT {host}:{port} should succeed");
+    assert_eq!(
+        rep,
+        signaling::REP_SUCCESS,
+        "CONNECT {host}:{port} should succeed"
+    );
     expect_echo(&mut app).await;
     app
 }
@@ -553,7 +562,11 @@ async fn socks_echo(socks: SocketAddr, host: &str, port: u16) -> TcpStream {
 /// returning the whole HTTP response.
 async fn status_get(socks: SocketAddr, path: &str) -> String {
     let (mut app, rep) = socks_connect(socks, "flextunnel.internal", 80).await;
-    assert_eq!(rep, signaling::REP_SUCCESS, "the status host always answers");
+    assert_eq!(
+        rep,
+        signaling::REP_SUCCESS,
+        "the status host always answers"
+    );
     app.write_all(format!("GET {path} HTTP/1.1\r\nHost: flextunnel.internal\r\n\r\n").as_bytes())
         .await
         .unwrap();
@@ -591,7 +604,10 @@ async fn nothing_connects_before_first_use() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(client.built(), 0, "no endpoint before first use");
     assert_eq!(client.state("m1"), DestinationState::Idle);
-    assert!(server.connected_client_keys().is_empty(), "the server saw nobody");
+    assert!(
+        server.connected_client_keys().is_empty(),
+        "the server saw nobody"
+    );
     // Looking at the client's status is not a use.
     let page = status_get(client.socks, "/status.json").await;
     assert!(page.contains("\"state\": \"idle\""), "{page}");
@@ -603,7 +619,10 @@ async fn nothing_connects_before_first_use() {
     assert_eq!(status.state, DestinationState::Connected);
     assert_eq!(status.open_streams, 1);
     assert!(status.connected_since.is_some() && status.client_node_id.is_some());
-    assert_eq!(server.connected_client_keys(), [test_client_key().public_str()]);
+    assert_eq!(
+        server.connected_client_keys(),
+        [test_client_key().public_str()]
+    );
 
     // The stream ends; the connection stays for the next request.
     drop(app);
@@ -613,7 +632,11 @@ async fn nothing_connects_before_first_use() {
     .await;
     assert_eq!(client.state("m1"), DestinationState::Connected);
     let _app = socks_echo(client.socks, "m1.localhost.flextunnel.internal", echo_port).await;
-    assert_eq!(client.built(), 1, "the second request reused the connection");
+    assert_eq!(
+        client.built(),
+        1,
+        "the second request reused the connection"
+    );
 
     let _ = std::fs::remove_file(bl_path);
 }
@@ -641,7 +664,10 @@ async fn each_destination_reaches_its_own_server() {
     assert_eq!(client.state("m1"), DestinationState::Idle);
     assert_eq!(client.built(), 1);
     assert_eq!(server2.connected_client_keys().len(), 1);
-    assert!(server1.connected_client_keys().is_empty(), "server 1 was never dialed");
+    assert!(
+        server1.connected_client_keys().is_empty(),
+        "server 1 was never dialed"
+    );
 
     let _app1 = socks_echo(client.socks, "M1.LocalHost.FlexTunnel.Internal", echo_port).await;
     assert_eq!(client.state("m1"), DestinationState::Connected);
@@ -727,7 +753,10 @@ async fn routes_pick_the_destination_and_the_rest_goes_direct() {
 async fn a_route_the_server_does_not_list_is_refused() {
     let (server_ep, server_addr) = server_endpoint(SecretKey::generate()).await;
     let server_id = server_ep.id();
-    spawn_server_params(server_ep, base_params(server_id, temp_blocklist("route-refused")));
+    spawn_server_params(
+        server_ep,
+        base_params(server_id, temp_blocklist("route-refused")),
+    );
 
     let mut m1 = destination("m1", server_id);
     m1.routed_domains = strings(&["*.corp.test"]);
@@ -758,7 +787,12 @@ async fn a_destination_checks_its_routes_with_the_server_on_first_use() {
     );
     let mut m1 = destination("m1", server_id);
     m1.routed_domains = strings(&["*.corp.test", "*.other.test"]);
-    let client = start_client(vec![m1], None, MemoryLookup::from_endpoint_info(vec![server_addr])).await;
+    let client = start_client(
+        vec![m1],
+        None,
+        MemoryLookup::from_endpoint_info(vec![server_addr]),
+    )
+    .await;
 
     let routes = |page: &str| -> Vec<(String, String)> {
         let body = page.split_once("\r\n\r\n").unwrap().1;
@@ -767,27 +801,46 @@ async fn a_destination_checks_its_routes_with_the_server_on_first_use() {
             .as_array()
             .unwrap()
             .iter()
-            .map(|r| (r["rule"].as_str().unwrap().to_string(), r["server"].as_str().unwrap().to_string()))
+            .map(|r| {
+                (
+                    r["rule"].as_str().unwrap().to_string(),
+                    r["server"].as_str().unwrap().to_string(),
+                )
+            })
             .collect()
     };
     let pair = |rule: &str, server: &str| (rule.to_string(), server.to_string());
     assert_eq!(
         routes(&status_get(client.socks, "/status.json").await),
-        [pair("m1.localhost.flextunnel.internal", "loopback"), pair("*.other.test", "unchecked"), pair("*.corp.test", "unchecked")]
+        [
+            pair("m1.localhost.flextunnel.internal", "loopback"),
+            pair("*.other.test", "unchecked"),
+            pair("*.corp.test", "unchecked")
+        ]
     );
     assert_eq!(client.built(), 0, "the status page connects nothing");
 
     // Any use connects; this one the server refuses.
     let (_app, rep) = socks_connect(client.socks, "x.other.test", 443).await;
     assert_eq!(rep, signaling::REP_NOT_ALLOWED);
-    wait_until("the server's routes are read", || client.status("m1").server_routes.is_some()).await;
+    wait_until("the server's routes are read", || {
+        client.status("m1").server_routes.is_some()
+    })
+    .await;
     assert_eq!(
         client.status("m1").server_routes,
-        Some(ServerRoutes { routed_domains: strings(&["*.corp.test"]), routed_cidrs: Vec::new() })
+        Some(ServerRoutes {
+            routed_domains: strings(&["*.corp.test"]),
+            routed_cidrs: Vec::new()
+        })
     );
     assert_eq!(
         routes(&status_get(client.socks, "/status.json").await),
-        [pair("m1.localhost.flextunnel.internal", "loopback"), pair("*.other.test", "not allowed"), pair("*.corp.test", "allowed")]
+        [
+            pair("m1.localhost.flextunnel.internal", "loopback"),
+            pair("*.other.test", "not allowed"),
+            pair("*.corp.test", "allowed")
+        ]
     );
 }
 
@@ -846,7 +899,10 @@ async fn dialer_holds_while_the_server_comes_up() {
         .await
         .err()
         .expect("unrouted target refused");
-    assert!(unrouted.to_string().contains("no destination routes"), "{unrouted:#}");
+    assert!(
+        unrouted.to_string().contains("no destination routes"),
+        "{unrouted:#}"
+    );
     assert_eq!(client.built(), 0);
 
     // The request makes the destination dial; the attempt fails; the request
@@ -855,7 +911,10 @@ async fn dialer_holds_while_the_server_comes_up() {
         let dialer = dialer.clone();
         async move {
             dialer
-                .connect(&Target::Domain("m1.localhost.flextunnel.internal".into(), echo_port))
+                .connect(&Target::Domain(
+                    "m1.localhost.flextunnel.internal".into(),
+                    echo_port,
+                ))
                 .await
         }
     });
@@ -871,7 +930,10 @@ async fn dialer_holds_while_the_server_comes_up() {
     // The server comes up; the retry (1s backoff) lands and the held request
     // proceeds as if nothing had happened.
     up_tx.send_replace(true);
-    let mut stream = with_timeout(pending).await.unwrap().expect("held request connects");
+    let mut stream = with_timeout(pending)
+        .await
+        .unwrap()
+        .expect("held request connects");
     expect_echo(&mut stream).await;
     let status = client.status("m1");
     assert_eq!(status.state, DestinationState::Connected);
@@ -926,7 +988,11 @@ async fn idle_connection_is_closed_and_redialed_on_demand() {
         client.status("m1").client_node_id.is_none()
     })
     .await;
-    assert_eq!(client.status("m1").failed_attempts, 0, "idling is not a failure");
+    assert_eq!(
+        client.status("m1").failed_attempts,
+        0,
+        "idling is not a failure"
+    );
 
     // The next request redials, on a new endpoint.
     let _app = socks_echo(client.socks, "m1.localhost.flextunnel.internal", echo_port).await;
@@ -1144,22 +1210,34 @@ async fn a_rejected_key_fails_fast_and_spares_the_other_destination() {
     .await;
 
     let started = Instant::now();
-    let (_app, rep) = socks_connect(client.socks, "m1.localhost.flextunnel.internal", echo_port).await;
+    let (_app, rep) =
+        socks_connect(client.socks, "m1.localhost.flextunnel.internal", echo_port).await;
     assert_eq!(rep, signaling::REP_NOT_ALLOWED);
-    assert!(started.elapsed() < Duration::from_secs(5), "not held for the full window");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "not held for the full window"
+    );
     let status = client.status("m1");
     assert_eq!(status.state, DestinationState::Failed);
     assert!(
-        status.last_error.as_deref().unwrap_or_default().contains("Authentication failed"),
+        status
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Authentication failed"),
         "{:?}",
         status.last_error
     );
 
     // Asked again right away: refused without another dial.
     let started = Instant::now();
-    let (_app, rep) = socks_connect(client.socks, "m1.localhost.flextunnel.internal", echo_port).await;
+    let (_app, rep) =
+        socks_connect(client.socks, "m1.localhost.flextunnel.internal", echo_port).await;
     assert_eq!(rep, signaling::REP_NOT_ALLOWED);
-    assert!(started.elapsed() < Duration::from_millis(500), "failed fast");
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "failed fast"
+    );
     assert_eq!(client.status("m1").failed_attempts, 1, "no second dial");
 
     // The other destination works as if nothing happened.
@@ -1199,18 +1277,27 @@ async fn a_servers_status_page_is_fetched_through_the_client() {
     let body = response.split_once("\r\n\r\n").expect("headers").1;
     let status: serde_json::Value = serde_json::from_str(body).expect("server JSON status");
     assert_eq!(status["server_node_id"], server_id.to_string());
-    assert_eq!(status["routed_domains"], serde_json::json!(["marker.example.com"]));
+    assert_eq!(
+        status["routed_domains"],
+        serde_json::json!(["marker.example.com"])
+    );
     assert_eq!(client.built(), 1, "fetching it connected the destination");
     assert_eq!(client.state("m1"), DestinationState::Connected);
 
     // HTML at the bare path. It is the server's content under the client's
     // own host name, so the client sends it with an origin of its own.
     let response = status_get(client.socks, "/servers/m1/").await;
-    assert!(response.contains("Content-Type: text/html"), "{response:.200}");
+    assert!(
+        response.contains("Content-Type: text/html"),
+        "{response:.200}"
+    );
     assert!(response.contains("flextunnel server status"));
     assert!(response.contains("marker.example.com"));
     let head = response.split_once("\r\n\r\n").expect("headers").0;
-    assert!(head.contains("Content-Security-Policy: sandbox\r\n"), "{head}");
+    assert!(
+        head.contains("Content-Security-Policy: sandbox\r\n"),
+        "{head}"
+    );
     assert!(head.contains("X-Content-Type-Options: nosniff"), "{head}");
     // The client's own page is its own origin and carries no sandbox.
     let own = status_get(client.socks, "/").await;
@@ -1228,7 +1315,10 @@ async fn a_servers_status_page_is_fetched_through_the_client() {
     with_timeout(app.read_to_end(&mut response)).await.unwrap();
     let response = String::from_utf8(response).unwrap();
     assert!(response.starts_with("HTTP/1.1 200"), "{response:.60}");
-    assert!(response.contains("Content-Type: text/plain"), "{response:.200}");
+    assert!(
+        response.contains("Content-Type: text/plain"),
+        "{response:.200}"
+    );
     assert!(response.contains("flextunnel server status"));
 
     // The client's own page now shows the destination connected.
@@ -1264,9 +1354,11 @@ async fn a_servers_routes_are_fetched_in_one_connection() {
     let relay = RelayConfig::default();
 
     let auth = ClientAuth::Key(Box::new(test_client_key().clone()));
-    let routes = with_timeout(server_routes::fetch_over(&endpoint, server_id, &relay, &auth))
-        .await
-        .expect("an authorized key is answered");
+    let routes = with_timeout(server_routes::fetch_over(
+        &endpoint, server_id, &relay, &auth,
+    ))
+    .await
+    .expect("an authorized key is answered");
     assert_eq!(
         routes,
         ServerRoutes {
@@ -1280,9 +1372,11 @@ async fn a_servers_routes_are_fetched_in_one_connection() {
     .await;
 
     let stranger = ClientAuth::Key(Box::new(crate::auth::ClientKey::generate().unwrap()));
-    let err = with_timeout(server_routes::fetch_over(&endpoint, server_id, &relay, &stranger))
-        .await
-        .expect_err("an unauthorized key is refused");
+    let err = with_timeout(server_routes::fetch_over(
+        &endpoint, server_id, &relay, &stranger,
+    ))
+    .await
+    .expect_err("an unauthorized key is refused");
     assert!(matches!(err, ProxyError::AuthenticationFailed(_)), "{err}");
     endpoint.close().await;
 }
@@ -1311,8 +1405,13 @@ async fn a_peer_granting_no_stream_times_the_handshake_out() {
     });
 
     let client = loopback_endpoint(SecretKey::generate(), false).await;
-    let connection = with_timeout(client.connect(server_addr, ALPN)).await.unwrap();
-    let _held = with_timeout(accepted).await.unwrap().expect("the server accepts");
+    let connection = with_timeout(client.connect(server_addr, ALPN))
+        .await
+        .unwrap();
+    let _held = with_timeout(accepted)
+        .await
+        .unwrap()
+        .expect("the server accepts");
 
     // Waited out for real (the timeout is 10s): an endpoint's own tasks keep
     // a paused clock from running ahead.
@@ -1330,7 +1429,11 @@ async fn a_peer_granting_no_stream_times_the_handshake_out() {
         Err(other) => panic!("expected the handshake to time out: {other}"),
         Ok(_) => panic!("a handshake with no stream to run on succeeded"),
     }
-    assert!(started.elapsed() >= handshake_timeout, "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() >= handshake_timeout,
+        "{:?}",
+        started.elapsed()
+    );
 
     connection.close(0u32.into(), b"done");
     client.close().await;
@@ -1365,7 +1468,9 @@ async fn listener_addresses_are_reported_only_while_served() {
     // Listener-only: the destination managers are still running.
     let dialer = client.client.dialer();
     let target = Target::Domain("m1.localhost.flextunnel.internal".into(), echo_port);
-    let mut stream = with_timeout(dialer.connect(&target)).await.expect("still tunnels");
+    let mut stream = with_timeout(dialer.connect(&target))
+        .await
+        .expect("still tunnels");
     expect_echo(&mut stream).await;
     drop(stream);
 
@@ -1385,7 +1490,10 @@ async fn listener_addresses_are_reported_only_while_served() {
     // And once the client is closed, a dialer kept past it gets an answer.
     client.session.abort();
     client.client.close().await;
-    let refused = with_timeout(dialer.connect(&target)).await.err().expect("closed");
+    let refused = with_timeout(dialer.connect(&target))
+        .await
+        .err()
+        .expect("closed");
     assert!(refused.to_string().contains("shutting down"), "{refused:#}");
 }
 
@@ -1567,7 +1675,10 @@ async fn a_forward_relays_bulk_data_and_half_closes() {
 
     let (bulk, verdict) = received.split_at(received.len().saturating_sub(6));
     assert_eq!(verdict, b"INTACT", "the target read the app's bytes intact");
-    assert!(bulk == patterned(0xB7, LEN), "the app read the target's bytes intact");
+    assert!(
+        bulk == patterned(0xB7, LEN),
+        "the app read the target's bytes intact"
+    );
 
     drop(manager);
     let _ = std::fs::remove_file(bl_path);
@@ -1596,9 +1707,17 @@ async fn prepared_server_serves_an_authorized_client() {
     .unwrap();
     assert_eq!(prepared.own_id(), secret.public());
 
-    let running = Arc::new(prepared.bind_with(loopback_base(Side::Server, MemoryLookup::new())).await);
+    let running = Arc::new(
+        prepared
+            .bind_with(loopback_base(Side::Server, MemoryLookup::new()))
+            .await,
+    );
     let server_ep = running.endpoint();
-    assert_eq!(server_ep.id(), secret.public(), "bound under the configured identity");
+    assert_eq!(
+        server_ep.id(),
+        secret.public(),
+        "bound under the configured identity"
+    );
     let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let served = tokio::spawn({
@@ -1618,10 +1737,16 @@ async fn prepared_server_serves_an_authorized_client() {
     assert!(response.accepted, "authorized client accepted");
     assert_echo_roundtrip(&conn, spawn_echo().await).await;
     // The live client shows by the key it authenticated with, until it leaves.
-    assert_eq!(running.connected_client_keys(), [test_client_key().public_str()]);
+    assert_eq!(
+        running.connected_client_keys(),
+        [test_client_key().public_str()]
+    );
     drop((ctrl_send, ctrl_recv));
     conn.close(0u32.into(), b"done");
-    wait_until("the client to leave", || running.connected_client_keys().is_empty()).await;
+    wait_until("the client to leave", || {
+        running.connected_client_keys().is_empty()
+    })
+    .await;
 
     stop_tx.send(()).unwrap();
     let stopped = with_timeout(served).await.unwrap().unwrap();
@@ -1631,10 +1756,8 @@ async fn prepared_server_serves_an_authorized_client() {
 }
 
 fn temp_blocklist(tag: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "flextunnel-e2e-{tag}-{}.json",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("flextunnel-e2e-{tag}-{}.json", std::process::id()));
     let _ = std::fs::remove_file(&path);
     path
 }
@@ -1712,7 +1835,10 @@ async fn server_self_blocks_on_duplicate_advisory() {
 
     let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
     let (_conn, _s, _r, resp) = client_handshake(&client_ep, server_addr, 9, true).await;
-    assert!(!resp.accepted, "self-blocking server should reject the connection");
+    assert!(
+        !resp.accepted,
+        "self-blocking server should reject the connection"
+    );
 
     // The server recorded its own id as conflicted. Poll rather than assume a
     // fixed delay is enough (avoids flaking under load).
@@ -1755,7 +1881,9 @@ async fn wildcard_host_alias_still_requires_routed_set_coverage() {
     .await
     .unwrap();
     send.flush().await.unwrap();
-    let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
+    let rep = with_timeout(signaling::read_reply(&mut recv))
+        .await
+        .unwrap();
     assert_eq!(
         rep,
         signaling::REP_NOT_ALLOWED,
@@ -1785,7 +1913,9 @@ async fn wildcard_host_alias_still_requires_routed_set_coverage() {
     .await
     .unwrap();
     send2.flush().await.unwrap();
-    let rep2 = with_timeout(signaling::read_reply(&mut recv2)).await.unwrap();
+    let rep2 = with_timeout(signaling::read_reply(&mut recv2))
+        .await
+        .unwrap();
     assert_eq!(
         rep2,
         signaling::REP_SUCCESS,
@@ -1807,29 +1937,36 @@ async fn status_request_serves_the_server_status_page() {
     let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
     let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
     // A distinctive routed domain we expect to see rendered on the status page.
-    let host_aliases =
-        HashMap::from([("nas.internal".to_string(), "192.168.1.9".to_string())]);
+    let host_aliases = HashMap::from([("nas.internal".to_string(), "192.168.1.9".to_string())]);
     spawn_server_full(
         server_ep,
         temp_blocklist("status-page"),
         host_aliases,
-        vec!["marker.example.com".to_string(), "corp.example.com".to_string()],
+        vec![
+            "marker.example.com".to_string(),
+            "corp.example.com".to_string(),
+        ],
     );
 
     let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
-    let (client_conn, _cs, _cr, cresp) =
-        client_handshake(&client_ep, server_addr, 1, false).await;
+    let (client_conn, _cs, _cr, cresp) = client_handshake(&client_ep, server_addr, 1, false).await;
     assert!(cresp.accepted, "client should be accepted");
     // The bare path: expect an HTTP 200 whose body contains the routed domain.
     let body = fetch_status(&client_conn, "/", None).await;
-    assert!(body.starts_with("HTTP/1.1 200"), "status page should be 200: {body:.40}");
+    assert!(
+        body.starts_with("HTTP/1.1 200"),
+        "status page should be 200: {body:.40}"
+    );
     assert!(
         body.contains("marker.example.com"),
         "status page should list the configured routed domain"
     );
 
     let body = fetch_status(&client_conn, "/status.txt", None).await;
-    assert!(body.starts_with("HTTP/1.1 200"), "text status should be 200: {body:.40}");
+    assert!(
+        body.starts_with("HTTP/1.1 200"),
+        "text status should be 200: {body:.40}"
+    );
     assert!(
         body.contains("Content-Type: text/plain; charset=utf-8"),
         "text status should use text/plain"
@@ -1844,7 +1981,10 @@ async fn status_request_serves_the_server_status_page() {
     );
 
     let body = fetch_status(&client_conn, "/status.json", None).await;
-    assert!(body.starts_with("HTTP/1.1 200"), "json status should be 200: {body:.40}");
+    assert!(
+        body.starts_with("HTTP/1.1 200"),
+        "json status should be 200: {body:.40}"
+    );
     assert!(
         body.contains("Content-Type: application/json; charset=utf-8"),
         "json status should use application/json"
@@ -1869,7 +2009,10 @@ async fn status_request_serves_the_server_status_page() {
     // Accept-header negotiation: a `/` request with `Accept: text/plain` should
     // also return the plain-text status response (not the HTML page).
     let body = fetch_status(&client_conn, "/", Some("text/plain")).await;
-    assert!(body.starts_with("HTTP/1.1 200"), "accept-text status should be 200: {body:.40}");
+    assert!(
+        body.starts_with("HTTP/1.1 200"),
+        "accept-text status should be 200: {body:.40}"
+    );
     assert!(
         body.contains("Content-Type: text/plain; charset=utf-8"),
         "accept-text status should use text/plain"
@@ -1888,7 +2031,9 @@ async fn open_stream(conn: &Connection, request: StreamRequest) -> (SendStream, 
     let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
     signaling::write_request(&mut send, &request).await.unwrap();
     send.flush().await.unwrap();
-    let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
+    let rep = with_timeout(signaling::read_reply(&mut recv))
+        .await
+        .unwrap();
     (send, recv, rep)
 }
 
@@ -1909,11 +2054,19 @@ async fn loopback_request_dials_the_servers_own_loopback() {
     // Plain `localhost` is off the (empty) routed set and must be refused...
     let localhost = StreamRequest::Connect(Target::Domain("localhost".to_string(), echo_port));
     let (_send, _recv, rep) = open_stream(&conn, localhost).await;
-    assert_eq!(rep, signaling::REP_NOT_ALLOWED, "bare localhost is subject to the routed set");
+    assert_eq!(
+        rep,
+        signaling::REP_NOT_ALLOWED,
+        "bare localhost is subject to the routed set"
+    );
 
     // ...while the loopback request bypasses it.
     let (mut send, mut recv, rep) = open_stream(&conn, StreamRequest::Loopback(echo_port)).await;
-    assert_eq!(rep, signaling::REP_SUCCESS, "a loopback request bypasses the routed set");
+    assert_eq!(
+        rep,
+        signaling::REP_SUCCESS,
+        "a loopback request bypasses the routed set"
+    );
     send.write_all(b"ping").await.unwrap();
     send.flush().await.unwrap();
     let mut buf = [0u8; 9]; // "HELLO" + "ping"
@@ -1924,7 +2077,11 @@ async fn loopback_request_dials_the_servers_own_loopback() {
     // on every platform (nothing can listen on it), so this never depends on
     // which loopback ports happen to be in use.
     let (_send, _recv, rep) = open_stream(&conn, StreamRequest::Loopback(0)).await;
-    assert_ne!(rep, signaling::REP_SUCCESS, "closed loopback port must not reply success");
+    assert_ne!(
+        rep,
+        signaling::REP_SUCCESS,
+        "closed loopback port must not reply success"
+    );
 }
 
 /// The reserved `flextunnel.internal` namespace belongs to the client, which
@@ -1962,8 +2119,14 @@ async fn reserved_names_are_refused_as_targets() {
 /// full HTTP response after consuming the per-stream success reply byte.
 async fn fetch_status(conn: &Connection, path: &str, accept: Option<&str>) -> String {
     let (mut send, mut recv, rep) = open_stream(conn, StreamRequest::Status).await;
-    assert_eq!(rep, signaling::REP_SUCCESS, "a status request should reply success");
-    let accept_header = accept.map(|a| format!("Accept: {a}\r\n")).unwrap_or_default();
+    assert_eq!(
+        rep,
+        signaling::REP_SUCCESS,
+        "a status request should reply success"
+    );
+    let accept_header = accept
+        .map(|a| format!("Accept: {a}\r\n"))
+        .unwrap_or_default();
     let _ = send
         .write_all(
             format!("GET {path} HTTP/1.1\r\nHost: flextunnel.internal\r\n{accept_header}\r\n")
@@ -2007,7 +2170,11 @@ async fn quick_client_authenticates_by_endpoint_id() {
     let client_ep = loopback_endpoint(client_secret, false).await;
     let (conn, _cs, _cr, resp) =
         handshake_on_alpn(&client_ep, server_addr, QUICK_ALPN, 1, false).await;
-    assert!(resp.accepted, "allowlisted quick client must be accepted: {:?}", resp.reject_reason);
+    assert!(
+        resp.accepted,
+        "allowlisted quick client must be accepted: {:?}",
+        resp.reject_reason
+    );
     assert_echo_roundtrip(&conn, echo_port).await;
 }
 
@@ -2034,7 +2201,11 @@ async fn prepared_quick_server_admits_only_the_entered_client() {
         blocklist_file: bl_path.clone(),
     })
     .unwrap();
-    let running = Arc::new(prepared.bind_with(loopback_base(Side::Server, MemoryLookup::new())).await);
+    let running = Arc::new(
+        prepared
+            .bind_with(loopback_base(Side::Server, MemoryLookup::new()))
+            .await,
+    );
     let server_ep = running.endpoint();
     let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
     let served = tokio::spawn({
@@ -2045,7 +2216,11 @@ async fn prepared_quick_server_admits_only_the_entered_client() {
     let client_ep = loopback_endpoint(client_secret, false).await;
     let (conn, _cs, _cr, resp) =
         handshake_on_alpn(&client_ep, server_addr.clone(), QUICK_ALPN, 1, false).await;
-    assert!(resp.accepted, "the entered client must be accepted: {:?}", resp.reject_reason);
+    assert!(
+        resp.accepted,
+        "the entered client must be accepted: {:?}",
+        resp.reject_reason
+    );
     assert_echo_roundtrip(&conn, echo_port).await;
 
     let stranger = loopback_endpoint(SecretKey::generate(), false).await;
@@ -2100,7 +2275,9 @@ async fn send_hello_expect_response(
     server_addr: EndpointAddr,
     hello: Hello,
 ) -> HelloResponse {
-    let conn = with_timeout(client_ep.connect(server_addr, ALPN)).await.unwrap();
+    let conn = with_timeout(client_ep.connect(server_addr, ALPN))
+        .await
+        .unwrap();
     let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
     signaling::write_message(&mut send, &signaling::encode_hello(&hello).unwrap())
         .await
@@ -2226,7 +2403,9 @@ async fn a_peer_is_granted_only_the_streams_tunnels_use() {
         (bi, uni)
     });
 
-    let conn = with_timeout(client.connect(server_addr, TEST_ALPN)).await.unwrap();
+    let conn = with_timeout(client.connect(server_addr, TEST_ALPN))
+        .await
+        .unwrap();
     with_timeout(conn.open_bi()).await.unwrap();
     let uni = tokio::time::timeout(WAIT, conn.open_uni()).await;
     assert!(uni.is_err(), "the client opened a unidirectional stream");

@@ -84,8 +84,8 @@
 //! { "socks_port": null }
 //! ```
 
-use std::ffi::{CStr, c_char, c_int};
 use std::collections::HashSet;
+use std::ffi::{CStr, c_char, c_int};
 use std::net::Ipv4Addr;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -95,9 +95,9 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
+use flextunnel_core::config::DEFAULT_IDLE_TIMEOUT;
 use flextunnel_core::error::ProxyResult;
 use flextunnel_core::proxy::signaling::Target;
-use flextunnel_core::config::DEFAULT_IDLE_TIMEOUT;
 use flextunnel_core::proxy::{
     ClientAuth, ClientConfig, DestinationConfig, ForwardManager, ForwardSpec, ForwardState,
     LocalListeners, ProxyClient,
@@ -236,7 +236,11 @@ pub unsafe extern "C" fn flextunnel_generate_client_key(
         "secret_key": key.secret_str(),
     })
     .to_string();
-    if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
+    if write_cstr(out_buf, out_len, &json) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Derive the public key (`ed25519-pub:...`) of a stored secret key, so
@@ -268,7 +272,11 @@ pub unsafe extern "C" fn flextunnel_client_public_key(
     };
     match flextunnel_core::auth::ClientKey::from_secret_str(secret.trim()) {
         Ok(key) => {
-            if write_cstr(out_buf, out_len, &key.public_str()) { 1 } else { 0 }
+            if write_cstr(out_buf, out_len, &key.public_str()) {
+                1
+            } else {
+                0
+            }
         }
         Err(e) => {
             write_cstr(out_buf, out_len, &format!("invalid secret key: {e:#}"));
@@ -394,7 +402,10 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
     let mut destinations = Vec::with_capacity(cfg.destinations.len());
     for destination in cfg.destinations {
         let server_id = destination.server_node_id.trim().parse().map_err(|e| {
-            format!("destination {:?}: invalid server_node_id: {e}", destination.name)
+            format!(
+                "destination {:?}: invalid server_node_id: {e}",
+                destination.name
+            )
         })?;
         destinations.push(DestinationConfig {
             name: destination.name,
@@ -589,12 +600,20 @@ pub unsafe extern "C" fn flextunnel_set_forwards(
             return 0;
         }
         if forward.local_port == 0 || !ports.insert(forward.local_port) {
-            write_cstr(out_buf, out_len, "enabled forward local ports must be nonzero and unique");
+            write_cstr(
+                out_buf,
+                out_len,
+                "enabled forward local ports must be nonzero and unique",
+            );
             return 0;
         }
         let remote_host = forward.remote_host.trim();
         if remote_host.is_empty() || forward.remote_port == 0 {
-            write_cstr(out_buf, out_len, "forward targets require a host and nonzero port");
+            write_cstr(
+                out_buf,
+                out_len,
+                "forward targets require a host and nonzero port",
+            );
             return 0;
         }
         specs.push(ForwardSpec {
@@ -862,7 +881,11 @@ pub unsafe extern "C" fn flextunnel_status(
     }
     let handle = unsafe { &*handle };
     let json = status_json(&handle.client.status(), Instant::now());
-    if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
+    if write_cstr(out_buf, out_len, &json) {
+        1
+    } else {
+        0
+    }
 }
 
 /// The [`flextunnel_status`] JSON for `status` as of `now`.
@@ -964,7 +987,9 @@ pub unsafe extern "C" fn flextunnel_conn_path(
     // The relay health check performs on-demand HTTP, so drive the async snapshot
     // on the embedded runtime. Called from the app's own thread (never a runtime
     // worker), so `block_on` is safe and does not stall the running tunnel task.
-    let snapshot = handle.runtime.block_on(handle.client.connection_snapshot(name.trim()));
+    let snapshot = handle
+        .runtime
+        .block_on(handle.client.connection_snapshot(name.trim()));
     let paths: Vec<_> = snapshot
         .paths
         .into_iter()
@@ -989,7 +1014,11 @@ pub unsafe extern "C" fn flextunnel_conn_path(
         "udp_rx_datagrams": snapshot.udp_rx_datagrams,
     })
     .to_string();
-    if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
+    if write_cstr(out_buf, out_len, &json) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Stop the client session, close its endpoints gracefully, and shut the
@@ -1080,7 +1109,8 @@ mod tests {
 
     fn config(destinations: serde_json::Value) -> String {
         let key = flextunnel_core::auth::ClientKey::generate().unwrap();
-        serde_json::json!({ "auth_key": key.secret_str(), "destinations": destinations }).to_string()
+        serde_json::json!({ "auth_key": key.secret_str(), "destinations": destinations })
+            .to_string()
     }
 
     fn node_id(seed: u8) -> String {
@@ -1140,10 +1170,18 @@ mod tests {
     #[test]
     fn a_sized_write_reports_the_bytes_it_needs() {
         let json = r#"{"routed_domains":[],"routed_cidrs":[]}"#;
-        let read = |buf: &[c_char]| unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap().to_owned();
+        let read = |buf: &[c_char]| {
+            unsafe { CStr::from_ptr(buf.as_ptr()) }
+                .to_str()
+                .unwrap()
+                .to_owned()
+        };
 
         let mut exact = vec![0 as c_char; json.len() + 1];
-        assert_eq!(write_sized(exact.as_mut_ptr(), exact.len(), json), exact.len() as isize);
+        assert_eq!(
+            write_sized(exact.as_mut_ptr(), exact.len(), json),
+            exact.len() as isize
+        );
         assert_eq!(read(&exact), json);
 
         // One byte short: truncated, NUL-terminated, and the size to retry with.
@@ -1161,27 +1199,38 @@ mod tests {
     fn a_failed_routes_request_is_not_a_short_buffer() {
         let request = std::ffi::CString::new("{").unwrap();
         let mut tiny = [0 as c_char; 8];
-        let status =
-            unsafe { flextunnel_fetch_server_routes(request.as_ptr(), tiny.as_mut_ptr(), tiny.len()) };
+        let status = unsafe {
+            flextunnel_fetch_server_routes(request.as_ptr(), tiny.as_mut_ptr(), tiny.len())
+        };
         assert_eq!(status, -1);
         let mut roomy = [0 as c_char; 256];
-        let status =
-            unsafe { flextunnel_fetch_server_routes(request.as_ptr(), roomy.as_mut_ptr(), roomy.len()) };
+        let status = unsafe {
+            flextunnel_fetch_server_routes(request.as_ptr(), roomy.as_mut_ptr(), roomy.len())
+        };
         assert_eq!(status, -1);
         let message = unsafe { CStr::from_ptr(roomy.as_ptr()) }.to_str().unwrap();
         assert!(message.contains("invalid request JSON"), "{message}");
-        assert_eq!(unsafe { flextunnel_fetch_server_routes(ptr::null(), ptr::null_mut(), 0) }, -1);
+        assert_eq!(
+            unsafe { flextunnel_fetch_server_routes(ptr::null(), ptr::null_mut(), 0) },
+            -1
+        );
     }
 
     /// A routes request that cannot be acted on is refused before anything is
     /// bound or dialed.
     #[test]
     fn invalid_routes_requests_are_rejected() {
-        let key = flextunnel_core::auth::ClientKey::generate().unwrap().secret_str();
+        let key = flextunnel_core::auth::ClientKey::generate()
+            .unwrap()
+            .secret_str();
         let request = |value: serde_json::Value| fetch_server_routes_inner(&value.to_string());
         let err = |value: serde_json::Value| request(value).expect_err("rejected");
 
-        assert!(fetch_server_routes_inner("{").unwrap_err().contains("invalid request JSON"));
+        assert!(
+            fetch_server_routes_inner("{")
+                .unwrap_err()
+                .contains("invalid request JSON")
+        );
         assert!(err(serde_json::json!({ "auth_key": key })).contains("server_node_id"));
         assert!(
             err(serde_json::json!({ "auth_key": key, "server_node_id": "nope" }))
@@ -1209,10 +1258,17 @@ mod tests {
         assert!(start_error(&config(serde_json::json!([]))).contains("no destinations"));
         let bad_id = config(serde_json::json!([{ "name": "m1", "server_node_id": "nope" }]));
         let message = start_error(&bad_id);
-        assert!(message.contains("\"m1\"") && message.contains("server_node_id"), "{message}");
+        assert!(
+            message.contains("\"m1\"") && message.contains("server_node_id"),
+            "{message}"
+        );
         for bad_name in ["m1.internal", "10.0.0.1", "my_host", "-m1"] {
-            let bad = config(serde_json::json!([{ "name": bad_name, "server_node_id": node_id(1) }]));
-            assert!(start_error(&bad).contains("Destination name"), "{bad_name:?}");
+            let bad =
+                config(serde_json::json!([{ "name": bad_name, "server_node_id": node_id(1) }]));
+            assert!(
+                start_error(&bad).contains("Destination name"),
+                "{bad_name:?}"
+            );
         }
         let same_name = config(serde_json::json!([
             { "name": "m1", "server_node_id": node_id(1) },

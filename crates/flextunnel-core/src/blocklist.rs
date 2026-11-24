@@ -75,10 +75,7 @@ impl BlockList {
     pub fn load(path: PathBuf) -> io::Result<Self> {
         let data = match std::fs::read_to_string(&path) {
             Ok(content) => serde_json::from_str(&content).map_err(|e| {
-                io::Error::other(format!(
-                    "Failed to parse blocklist {}: {e}",
-                    path.display()
-                ))
+                io::Error::other(format!("Failed to parse blocklist {}: {e}", path.display()))
             })?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => BlockListData::default(),
             Err(e) => {
@@ -239,7 +236,11 @@ mod tests {
         let handles: Vec<_> = (0..8)
             .map(|i| {
                 let p = path.clone();
-                let json = if i % 2 == 0 { json_a.clone() } else { json_b.clone() };
+                let json = if i % 2 == 0 {
+                    json_a.clone()
+                } else {
+                    json_b.clone()
+                };
                 std::thread::spawn(move || {
                     for _ in 0..25 {
                         write_atomic(&p, &json).unwrap();
@@ -254,8 +255,12 @@ mod tests {
         // Whatever the last writer was, the file must be a complete, valid
         // snapshot (never a torn/corrupt one) that reloads cleanly.
         let reloaded = BlockList::load(path.clone()).unwrap();
-        let ok = reloaded.is_client_blocked("aaaaaaaa") || reloaded.is_server_conflicted("bbbbbbbb");
-        assert!(ok, "reloaded blocklist should be one of the valid snapshots");
+        let ok =
+            reloaded.is_client_blocked("aaaaaaaa") || reloaded.is_server_conflicted("bbbbbbbb");
+        assert!(
+            ok,
+            "reloaded blocklist should be one of the valid snapshots"
+        );
 
         // No orphan temp files should be left in the directory.
         let dir = path.parent().unwrap();

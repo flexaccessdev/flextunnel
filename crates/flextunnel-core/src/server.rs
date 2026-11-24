@@ -203,10 +203,12 @@ impl PreparedServer {
     /// Bind the iroh endpoint (with the relays that pass the startup probe).
     /// Can take several seconds (the relay online-wait).
     pub async fn bind(self) -> Result<RunningServer> {
-        let CreatedEndpoint { endpoint, relays_left_out } =
-            create_server_endpoint(&self.relay_config, |base| self.endpoint_on(base))
-                .await
-                .context("Failed to create iroh endpoint")?;
+        let CreatedEndpoint {
+            endpoint,
+            relays_left_out,
+        } = create_server_endpoint(&self.relay_config, |base| self.endpoint_on(base))
+            .await
+            .context("Failed to create iroh endpoint")?;
         log::info!("flextunnel server Node ID: {}", endpoint.id());
         Ok(RunningServer {
             endpoint,
@@ -317,7 +319,10 @@ mod tests {
         let mut opts = options(dir.path());
         opts.authorized_keys = Default::default();
         let err = prepare(opts).err().expect("no client keys");
-        assert!(err.to_string().contains("authorized client public key"), "{err}");
+        assert!(
+            err.to_string().contains("authorized client public key"),
+            "{err}"
+        );
 
         let mut quick = options(dir.path());
         quick.authorized_keys = Default::default();
@@ -330,7 +335,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut opts = options(dir.path());
         opts.routed_domains.clear();
-        assert!(prepare(opts).is_ok(), "loopback and status need no routed set");
+        assert!(
+            prepare(opts).is_ok(),
+            "loopback and status need no routed set"
+        );
     }
 
     #[test]
@@ -354,6 +362,9 @@ mod tests {
         assert_eq!(path_a, server_lock_path(&a).unwrap());
         assert_ne!(path_a, server_lock_path(&b).unwrap());
         let name = path_a.file_name().unwrap().to_str().unwrap();
-        assert_eq!(name, format!("server-{}.lock", &a.to_string()[..LOCK_KEY_LEN]));
+        assert_eq!(
+            name,
+            format!("server-{}.lock", &a.to_string()[..LOCK_KEY_LEN])
+        );
     }
 }
