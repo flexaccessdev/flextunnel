@@ -17,11 +17,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+use flextunnel_core::config::ForwardConfig;
 use flextunnel_core::forwards::{
     ForwardManager, ForwardState, ForwardStatus, PortForward, disable_failed_forwards,
     validate_label, validate_remote_host,
 };
-use flextunnel_core::config::ForwardConfig;
 use flextunnel_core::iroh::{EndpointId, SecretKey};
 use flextunnel_core::proxy::signaling::Target;
 use flextunnel_core::proxy::{
@@ -63,7 +63,8 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
     // Validates the destinations (names, routes, one entry per server).
     // Nothing is bound or dialed by this.
     let client = Arc::new(
-        ProxyClient::new(proxy_config).map_err(|e| anyhow::anyhow!("Invalid client config: {e}"))?,
+        ProxyClient::new(proxy_config)
+            .map_err(|e| anyhow::anyhow!("Invalid client config: {e}"))?,
     );
 
     // The forward set is the config's `[[forwards]]` tables, fixed for the
@@ -208,7 +209,11 @@ async fn build_session(
     // Forwards listen for the whole session; a forwarded connection connects
     // its destination on demand. They die with the manager when the session
     // ends.
-    let fwd_mgr = ForwardManager::new(tokio::runtime::Handle::current(), client.dialer(), &forwards);
+    let fwd_mgr = ForwardManager::new(
+        tokio::runtime::Handle::current(),
+        client.dialer(),
+        &forwards,
+    );
 
     let state = SessionState {
         name,
@@ -434,12 +439,18 @@ impl SessionState {
                 // Enabled but not yet reconciled into the manager: starting.
                 None => (ForwardRowState::Starting, None, 0, None),
                 Some(s) => match &s.state {
-                    ForwardState::Starting => {
-                        (ForwardRowState::Starting, None, s.active, s.last_conn_error.clone())
-                    }
-                    ForwardState::Listening => {
-                        (ForwardRowState::Listening, None, s.active, s.last_conn_error.clone())
-                    }
+                    ForwardState::Starting => (
+                        ForwardRowState::Starting,
+                        None,
+                        s.active,
+                        s.last_conn_error.clone(),
+                    ),
+                    ForwardState::Listening => (
+                        ForwardRowState::Listening,
+                        None,
+                        s.active,
+                        s.last_conn_error.clone(),
+                    ),
                     ForwardState::Failed(reason) => (
                         ForwardRowState::Failed,
                         Some(reason.clone()),
@@ -576,15 +587,16 @@ mod tests {
     /// `2001:db8::/32`, `m2` routing `10.0.0.0/8`. Building it
     /// connects nothing.
     fn dialer() -> TunnelDialer {
-        let destination = |name: &str, seed: u8, domains: &[&str], cidrs: &[&str]| DestinationConfig {
-            name: name.to_string(),
-            server_id: SecretKey::from_bytes(&[seed; 32]).public(),
-            auth: ClientAuth::Quick(Box::new(SecretKey::from_bytes(&[seed + 100; 32]))),
-            relay: RelayConfig::default(),
-            routed_domains: domains.iter().map(|s| s.to_string()).collect(),
-            routed_cidrs: cidrs.iter().map(|s| s.to_string()).collect(),
-            keep_connected: false,
-        };
+        let destination =
+            |name: &str, seed: u8, domains: &[&str], cidrs: &[&str]| DestinationConfig {
+                name: name.to_string(),
+                server_id: SecretKey::from_bytes(&[seed; 32]).public(),
+                auth: ClientAuth::Quick(Box::new(SecretKey::from_bytes(&[seed + 100; 32]))),
+                relay: RelayConfig::default(),
+                routed_domains: domains.iter().map(|s| s.to_string()).collect(),
+                routed_cidrs: cidrs.iter().map(|s| s.to_string()).collect(),
+                keep_connected: false,
+            };
         ProxyClient::new(ClientConfig {
             destinations: vec![
                 destination("m1", 1, &["*.internal"], &["2001:db8::/32"]),
@@ -618,19 +630,34 @@ mod tests {
         assert_eq!(forwards[0].id, "5000");
         assert_eq!(forwards[1].local_port, 5001);
 
-        let err = forwards_from_config(&[entry(5000, "a.internal"), entry(5000, "b.internal")], &dialer)
-            .unwrap_err();
+        let err = forwards_from_config(
+            &[entry(5000, "a.internal"), entry(5000, "b.internal")],
+            &dialer,
+        )
+        .unwrap_err();
         assert!(err.contains("forward #2") && err.contains("5000"), "{err}");
-        assert!(forwards_from_config(&[entry(0, "db.internal")], &dialer).is_err(), "zero local port");
-        assert!(forwards_from_config(&[entry(5000, "bad..host")], &dialer).is_err(), "bad host");
+        assert!(
+            forwards_from_config(&[entry(0, "db.internal")], &dialer).is_err(),
+            "zero local port"
+        );
+        assert!(
+            forwards_from_config(&[entry(5000, "bad..host")], &dialer).is_err(),
+            "bad host"
+        );
 
         let mut zero_remote = entry(5000, "db.internal");
         zero_remote.remote_port = 0;
-        assert!(forwards_from_config(&[zero_remote], &dialer).is_err(), "zero remote port");
+        assert!(
+            forwards_from_config(&[zero_remote], &dialer).is_err(),
+            "zero remote port"
+        );
 
         let mut long_label = entry(5000, "db.internal");
         long_label.label = "x".repeat(65);
-        assert!(forwards_from_config(&[long_label], &dialer).is_err(), "oversized label");
+        assert!(
+            forwards_from_config(&[long_label], &dialer).is_err(),
+            "oversized label"
+        );
     }
 
     #[tokio::test]
@@ -663,7 +690,11 @@ mod tests {
             let forward = forwards_from_config(&[entry(5000, host)], &dialer)
                 .unwrap_or_else(|e| panic!("{host}: {e}"))
                 .remove(0);
-            assert_eq!(state.forward_row(&forward, &[], &dialer).destination, destination, "{host}");
+            assert_eq!(
+                state.forward_row(&forward, &[], &dialer).destination,
+                destination,
+                "{host}"
+            );
         }
         for unrouted in [
             "example.org",
@@ -674,7 +705,10 @@ mod tests {
             "nope.localhost.flextunnel.internal",
         ] {
             let err = forwards_from_config(&[entry(5000, unrouted)], &dialer).unwrap_err();
-            assert!(err.contains("forward #1") && err.contains("no destination routes"), "{err}");
+            assert!(
+                err.contains("forward #1") && err.contains("no destination routes"),
+                "{err}"
+            );
         }
     }
 

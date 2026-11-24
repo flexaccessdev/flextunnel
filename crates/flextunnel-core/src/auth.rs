@@ -75,7 +75,13 @@ mod tests {
     fn key_files_load_through_the_shared_format() {
         let key = ClientKey::generate().unwrap();
         let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, "# Public key: {} alice\n{}", key.public_str(), key.secret_str()).unwrap();
+        writeln!(
+            file,
+            "# Public key: {} alice\n{}",
+            key.public_str(),
+            key.secret_str()
+        )
+        .unwrap();
         assert_eq!(
             load_client_key_from_file(file.path()).unwrap().public_str(),
             key.public_str()
@@ -104,6 +110,10 @@ mod tests {
         // (ezvpn shares the key format and transcript) is not a flextunnel
         // credential.
         let foreign = key.sign_endpoint_id(b"ezvpn-client-auth-v1", &id);
-        assert!(!verify_endpoint_id_signature(&key.public_key(), &id, &foreign));
+        assert!(!verify_endpoint_id_signature(
+            &key.public_key(),
+            &id,
+            &foreign
+        ));
     }
 }

@@ -391,8 +391,14 @@ mod tests {
     #[test]
     fn request_line_forms_yield_the_path() {
         assert_eq!(parse("GET / HTTP/1.1\r\n\r\n").path, "/");
-        assert_eq!(parse("GET /status.json?x=1 HTTP/1.1\r\n\r\n").path, "/status.json");
-        assert_eq!(parse("GET http://flextunnel.internal HTTP/1.1\r\n\r\n").path, "/");
+        assert_eq!(
+            parse("GET /status.json?x=1 HTTP/1.1\r\n\r\n").path,
+            "/status.json"
+        );
+        assert_eq!(
+            parse("GET http://flextunnel.internal HTTP/1.1\r\n\r\n").path,
+            "/"
+        );
         assert_eq!(
             parse("GET HTTP://flextunnel.internal/servers/m1/status.txt?q HTTP/1.1\r\n\r\n"),
             StatusRequest {
@@ -402,11 +408,20 @@ mod tests {
             }
         );
         // Either version a client speaks is a request.
-        assert_eq!(parse("GET /status.txt HTTP/1.0\r\n\r\n").path, "/status.txt");
-        assert_eq!(parse("GET /status.txt HTTP/1.1\r\nHost: x\r\n\r\n").path, "/status.txt");
+        assert_eq!(
+            parse("GET /status.txt HTTP/1.0\r\n\r\n").path,
+            "/status.txt"
+        );
+        assert_eq!(
+            parse("GET /status.txt HTTP/1.1\r\nHost: x\r\n\r\n").path,
+            "/status.txt"
+        );
         // The method is kept as sent, for the caller's exact `GET` check.
         assert_eq!(parse("get / HTTP/1.1\r\n\r\n").method, "get");
-        assert_eq!(parse("POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n").method, "POST");
+        assert_eq!(
+            parse("POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n").method,
+            "POST"
+        );
     }
 
     /// Anything short of a whole request head is an error, not a `GET /`.
@@ -436,7 +451,10 @@ mod tests {
         ] {
             assert_eq!(parse_status_request(head.as_bytes()), None, "{head:?}");
         }
-        assert_eq!(parse_status_request(&[0xff, 0xfe, b'\r', b'\n', b'\r', b'\n']), None);
+        assert_eq!(
+            parse_status_request(&[0xff, 0xfe, b'\r', b'\n', b'\r', b'\n']),
+            None
+        );
     }
 
     /// What follows the blank line is a body, never headers.
@@ -453,9 +471,18 @@ mod tests {
         assert_eq!(json.accept, Some(StatusFormat::Json));
         assert_eq!(status_format_for("/", json.accept), StatusFormat::Json);
         // The path names a format outright, whatever `Accept` says.
-        assert_eq!(status_format_for(STATUS_TEXT_PATH, json.accept), StatusFormat::Text);
-        assert_eq!(status_format_for(STATUS_JSON_PATH, Some(StatusFormat::Html)), StatusFormat::Json);
-        assert_eq!(status_format_for(STATUS_JSON_PATH, None), StatusFormat::Json);
+        assert_eq!(
+            status_format_for(STATUS_TEXT_PATH, json.accept),
+            StatusFormat::Text
+        );
+        assert_eq!(
+            status_format_for(STATUS_JSON_PATH, Some(StatusFormat::Html)),
+            StatusFormat::Json
+        );
+        assert_eq!(
+            status_format_for(STATUS_JSON_PATH, None),
+            StatusFormat::Json
+        );
         assert_eq!(status_format_for("/", None), StatusFormat::Html);
         let text = parse("GET / HTTP/1.1\r\naccept: TEXT/PLAIN\r\n\r\n");
         assert_eq!(text.accept, Some(StatusFormat::Text));
@@ -463,17 +490,36 @@ mod tests {
 
     #[test]
     fn accept_weights_are_honored() {
-        let accept = |value: &str| parse(&format!("GET / HTTP/1.1\r\nAccept: {value}\r\n\r\n")).accept;
+        let accept =
+            |value: &str| parse(&format!("GET / HTTP/1.1\r\nAccept: {value}\r\n\r\n")).accept;
         // The heaviest served type wins, wherever it is listed.
-        assert_eq!(accept("text/html, application/json;q=0.9"), Some(StatusFormat::Html));
-        assert_eq!(accept("text/plain;q=0.5, application/json;q=0.8"), Some(StatusFormat::Json));
-        assert_eq!(accept("application/json; Q=0.2 , text/plain; q=0.3"), Some(StatusFormat::Text));
+        assert_eq!(
+            accept("text/html, application/json;q=0.9"),
+            Some(StatusFormat::Html)
+        );
+        assert_eq!(
+            accept("text/plain;q=0.5, application/json;q=0.8"),
+            Some(StatusFormat::Json)
+        );
+        assert_eq!(
+            accept("application/json; Q=0.2 , text/plain; q=0.3"),
+            Some(StatusFormat::Text)
+        );
         // A tie goes to the first listed.
-        assert_eq!(accept("text/plain, application/json"), Some(StatusFormat::Text));
+        assert_eq!(
+            accept("text/plain, application/json"),
+            Some(StatusFormat::Text)
+        );
         // `q=0` is "not acceptable", and an unreadable weight is no preference.
-        assert_eq!(accept("application/json;q=0, text/plain"), Some(StatusFormat::Text));
+        assert_eq!(
+            accept("application/json;q=0, text/plain"),
+            Some(StatusFormat::Text)
+        );
         assert_eq!(accept("application/json;q=0"), None);
-        assert_eq!(accept("application/json;q=high, text/plain;q=0.1"), Some(StatusFormat::Text));
+        assert_eq!(
+            accept("application/json;q=high, text/plain;q=0.1"),
+            Some(StatusFormat::Text)
+        );
         // What a browser sends, and ranges alone: the default (HTML).
         assert_eq!(
             accept("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
@@ -481,7 +527,9 @@ mod tests {
         );
         assert_eq!(accept("*/*"), None);
         // Several `Accept` lines are one list.
-        let two = parse("GET / HTTP/1.1\r\nAccept: text/plain;q=0.4\r\nAccept: application/json;q=0.6\r\n\r\n");
+        let two = parse(
+            "GET / HTTP/1.1\r\nAccept: text/plain;q=0.4\r\nAccept: application/json;q=0.6\r\n\r\n",
+        );
         assert_eq!(two.accept, Some(StatusFormat::Json));
     }
 
@@ -490,7 +538,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_head_reader_stops_at_the_blank_line_and_the_deadline() {
         let mut one_read: &[u8] = b"POST / HTTP/1.1\r\nA: b\r\n\r\nbody";
-        assert_eq!(read_request_head(&mut one_read).await, b"POST / HTTP/1.1\r\nA: b\r\n\r\n");
+        assert_eq!(
+            read_request_head(&mut one_read).await,
+            b"POST / HTTP/1.1\r\nA: b\r\n\r\n"
+        );
 
         // The blank line split across two reads is still found.
         let (mut peer, mut ours) = tokio::io::duplex(64);
@@ -500,7 +551,10 @@ mod tests {
             peer.write_all(b"\nrest").await.unwrap();
             peer
         });
-        assert_eq!(read_request_head(&mut ours).await, b"GET / HTTP/1.1\r\n\r\n");
+        assert_eq!(
+            read_request_head(&mut ours).await,
+            b"GET / HTTP/1.1\r\n\r\n"
+        );
         drop(writer.await.unwrap());
 
         // A peer trickling bytes is cut off at the one deadline, not kept

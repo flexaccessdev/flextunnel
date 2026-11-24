@@ -5,7 +5,7 @@
 
 use iced::overlay::menu;
 use iced::widget::{button, checkbox, container, pick_list, text_input, toggler};
-use iced::{border, Border, Color, Shadow, Theme, Vector};
+use iced::{Border, Color, Shadow, Theme, Vector, border};
 
 /// Status colors, readable on both modes.
 pub const GREEN: Color = rgb(0x34C264);
@@ -134,9 +134,7 @@ pub fn ghost(theme: &Theme, status: button::Status) -> button::Style {
     let t = tokens(theme);
     match status {
         button::Status::Active => plain(None, t.dim, 6.0),
-        button::Status::Hovered | button::Status::Pressed => {
-            plain(Some(t.surface_hi), t.text, 6.0)
-        }
+        button::Status::Hovered | button::Status::Pressed => plain(Some(t.surface_hi), t.text, 6.0),
         button::Status::Disabled => plain(None, t.faint, 6.0),
     }
 }
@@ -319,10 +317,15 @@ pub fn switch(theme: &Theme, status: toggler::Status) -> toggler::Style {
     let t = tokens(theme);
     let on = matches!(
         status,
-        toggler::Status::Active { is_toggled: true } | toggler::Status::Hovered { is_toggled: true }
+        toggler::Status::Active { is_toggled: true }
+            | toggler::Status::Hovered { is_toggled: true }
     );
     toggler::Style {
-        background: if on { GREEN.into() } else { t.surface_hi.into() },
+        background: if on {
+            GREEN.into()
+        } else {
+            t.surface_hi.into()
+        },
         background_border_width: 1.0,
         background_border_color: if on { Color::TRANSPARENT } else { t.border },
         foreground: Color::WHITE.into(),

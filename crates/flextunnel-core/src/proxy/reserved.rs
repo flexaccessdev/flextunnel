@@ -98,9 +98,18 @@ mod tests {
 
     #[test]
     fn loopback_names_are_single_labels_under_localhost() {
-        assert_eq!(loopback_host("machine1"), "machine1.localhost.flextunnel.internal");
-        assert_eq!(loopback_name("machine1.localhost.flextunnel.internal").as_deref(), Some("machine1"));
-        assert_eq!(loopback_name("NAS.LocalHost.FlexTunnel.Internal.").as_deref(), Some("nas"));
+        assert_eq!(
+            loopback_host("machine1"),
+            "machine1.localhost.flextunnel.internal"
+        );
+        assert_eq!(
+            loopback_name("machine1.localhost.flextunnel.internal").as_deref(),
+            Some("machine1")
+        );
+        assert_eq!(
+            loopback_name("NAS.LocalHost.FlexTunnel.Internal.").as_deref(),
+            Some("nas")
+        );
         for other in [
             "localhost.flextunnel.internal",
             ".localhost.flextunnel.internal",

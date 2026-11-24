@@ -162,7 +162,11 @@ impl App {
     /// Move the highlight by `delta` rows, stopping at either end.
     fn select(&mut self, delta: isize) {
         let last = self.snapshot.destinations.len().saturating_sub(1);
-        let selected = self.selected.min(last).saturating_add_signed(delta).min(last);
+        let selected = self
+            .selected
+            .min(last)
+            .saturating_add_signed(delta)
+            .min(last);
         if selected != self.selected {
             self.selected = selected;
             // Another destination's details: start at their top.
@@ -187,9 +191,7 @@ impl App {
                 && key.kind == KeyEventKind::Press
             {
                 self.notice = None;
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.code == KeyCode::Char('c')
-                {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                     return Ok(());
                 }
                 let quit = match &self.mode {
@@ -264,7 +266,9 @@ impl App {
         Ok(match backend.request(request)? {
             Response::ConnPath(snapshot) => Ok(snapshot),
             Response::Error { message } => Err(message),
-            other => Err(format!("unexpected response to a conn-path request: {other:?}")),
+            other => Err(format!(
+                "unexpected response to a conn-path request: {other:?}"
+            )),
         })
     }
 

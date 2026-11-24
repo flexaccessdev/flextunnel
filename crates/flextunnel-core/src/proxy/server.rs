@@ -6,7 +6,7 @@ use crate::blocklist::{self, BlockList};
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::signaling::{self, ControlMsg, HelloResponse, StreamRequest, Target};
 use crate::proxy::status_page::{self, ServerStatusTemplate};
-use crate::proxy::{dial, reserved, RoutedSet};
+use crate::proxy::{RoutedSet, dial, reserved};
 use crate::transport::LIVENESS_WINDOW;
 use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointId};
@@ -482,7 +482,10 @@ impl ProxyServer {
                     "Duplicate client id {remote_id} ({} other live connection(s)); blocklisting",
                     dups.len()
                 );
-                self.block_client(&remote_id, "duplicate client id (concurrent live connections)");
+                self.block_client(
+                    &remote_id,
+                    "duplicate client id (concurrent live connections)",
+                );
                 // Tear down the other live connections sharing this id, then
                 // reject and close this one.
                 for c in dups {
@@ -492,11 +495,9 @@ impl ProxyServer {
                     self.server_instance_nonce,
                     "duplicate client id detected",
                 );
-                let _ = signaling::write_message(
-                    &mut send,
-                    &signaling::encode_hello_response(&resp)?,
-                )
-                .await;
+                let _ =
+                    signaling::write_message(&mut send, &signaling::encode_hello_response(&resp)?)
+                        .await;
                 let _ = send.finish();
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 connection.close(CLOSE_DUPLICATE.into(), b"duplicate client id");
@@ -825,9 +826,15 @@ mod tests {
 
     #[test]
     fn wildcard_matches_subdomain() {
-        assert_eq!(resolve_alias(&wildcard_aliases(), "foo.web.internal"), Some("10.0.0.1"));
+        assert_eq!(
+            resolve_alias(&wildcard_aliases(), "foo.web.internal"),
+            Some("10.0.0.1")
+        );
         // Deeper subdomains match the broad wildcard too (when no closer one wins).
-        assert_eq!(resolve_alias(&wildcard_aliases(), "a.b.web.internal"), Some("10.0.0.1"));
+        assert_eq!(
+            resolve_alias(&wildcard_aliases(), "a.b.web.internal"),
+            Some("10.0.0.1")
+        );
     }
 
     #[test]
@@ -835,30 +842,45 @@ mod tests {
         // `*.web.internal` excludes the bare apex...
         assert_eq!(resolve_alias(&wildcard_aliases(), "web.internal"), None);
         // ...and a sibling that only shares a label suffix, not a dot boundary.
-        assert_eq!(resolve_alias(&wildcard_aliases(), "evil-web.internal"), None);
+        assert_eq!(
+            resolve_alias(&wildcard_aliases(), "evil-web.internal"),
+            None
+        );
     }
 
     #[test]
     fn exact_key_beats_wildcard() {
         // `special.web.internal` has an exact entry; it must win over `*.web.internal`.
-        assert_eq!(resolve_alias(&wildcard_aliases(), "special.web.internal"), Some("10.0.0.9"));
+        assert_eq!(
+            resolve_alias(&wildcard_aliases(), "special.web.internal"),
+            Some("10.0.0.9")
+        );
     }
 
     #[test]
     fn most_specific_wildcard_wins() {
         // `x.api.web.internal` matches both `*.web.internal` and `*.api.web.internal`;
         // the longer (more specific) suffix wins regardless of map iteration order.
-        assert_eq!(resolve_alias(&wildcard_aliases(), "x.api.web.internal"), Some("10.0.0.2"));
+        assert_eq!(
+            resolve_alias(&wildcard_aliases(), "x.api.web.internal"),
+            Some("10.0.0.2")
+        );
     }
 
     #[test]
     fn wildcard_match_is_case_insensitive() {
-        assert_eq!(resolve_alias(&wildcard_aliases(), "Foo.Web.Internal"), Some("10.0.0.1"));
+        assert_eq!(
+            resolve_alias(&wildcard_aliases(), "Foo.Web.Internal"),
+            Some("10.0.0.1")
+        );
     }
 
     #[test]
     fn wildcard_alias_rewrites_through_apply_alias() {
-        let got = apply_alias(Target::Domain("db.web.internal".into(), 5432), &wildcard_aliases());
+        let got = apply_alias(
+            Target::Domain("db.web.internal".into(), 5432),
+            &wildcard_aliases(),
+        );
         assert_eq!(got, Target::Domain("10.0.0.1".into(), 5432));
     }
 }

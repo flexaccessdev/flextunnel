@@ -70,12 +70,17 @@ mod macos {
     #[cfg(target_os = "macos")]
     fn plist_path() -> Result<PathBuf> {
         dirs::home_dir()
-            .map(|h| h.join("Library/LaunchAgents").join(format!("{LABEL}.plist")))
+            .map(|h| {
+                h.join("Library/LaunchAgents")
+                    .join(format!("{LABEL}.plist"))
+            })
             .context("No home directory to install the LaunchAgent in")
     }
 
     fn xml_escape(s: &str) -> String {
-        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
     }
 
     /// The agent: run the executable with [`LOGIN_ITEM_ARG`] once at login
@@ -115,7 +120,9 @@ mod macos {
     fn disabled_list_path() -> PathBuf {
         // SAFETY: getuid has no preconditions and cannot fail.
         let uid = unsafe { libc::getuid() };
-        PathBuf::from(format!("/var/db/com.apple.xpc.launchd/disabled.{uid}.plist"))
+        PathBuf::from(format!(
+            "/var/db/com.apple.xpc.launchd/disabled.{uid}.plist"
+        ))
     }
 
     /// Whether `list` (the disabled-service plist: label → disabled) switches
@@ -287,9 +294,13 @@ mod tests {
     fn launchd_disabled_list_switches_the_agent_off() {
         let mut list = plist::Dictionary::new();
         assert!(!macos::disabled_in(None));
-        assert!(!macos::disabled_in(Some(plist::Value::Dictionary(list.clone()))));
+        assert!(!macos::disabled_in(Some(plist::Value::Dictionary(
+            list.clone()
+        ))));
         list.insert(macos::LABEL.into(), plist::Value::Boolean(false));
-        assert!(!macos::disabled_in(Some(plist::Value::Dictionary(list.clone()))));
+        assert!(!macos::disabled_in(Some(plist::Value::Dictionary(
+            list.clone()
+        ))));
         list.insert(macos::LABEL.into(), plist::Value::Boolean(true));
         assert!(macos::disabled_in(Some(plist::Value::Dictionary(list))));
     }
@@ -297,7 +308,10 @@ mod tests {
     #[test]
     fn run_value_quotes_the_exe() {
         let cmd = windows::run_command(std::path::Path::new(r"C:\Program Files\flextunnel\a.exe"));
-        assert_eq!(cmd, format!(r#""C:\Program Files\flextunnel\a.exe" {LOGIN_ITEM_ARG}"#));
+        assert_eq!(
+            cmd,
+            format!(r#""C:\Program Files\flextunnel\a.exe" {LOGIN_ITEM_ARG}"#)
+        );
     }
 
     #[test]

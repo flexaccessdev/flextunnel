@@ -366,7 +366,10 @@ fn resolve_config_path(
 }
 
 /// Load the server config file (explicit path or `--default-config`), or `None`.
-pub fn load_server_config(path: Option<&Path>, default_config: bool) -> Result<Option<ServerConfig>> {
+pub fn load_server_config(
+    path: Option<&Path>,
+    default_config: bool,
+) -> Result<Option<ServerConfig>> {
     match resolve_config_path(path, default_config, "server.toml")? {
         Some(p) => Ok(Some(load_config(&p)?)),
         None => Ok(None),
@@ -654,7 +657,9 @@ mod tests {
     fn entry(name: &str, seed: u8) -> DestinationEntry {
         DestinationEntry {
             name: name.to_string(),
-            server_node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public().to_string(),
+            server_node_id: iroh::SecretKey::from_bytes(&[seed; 32])
+                .public()
+                .to_string(),
             routed_domains: Vec::new(),
             routed_cidrs: Vec::new(),
             auth_key_file: None,
@@ -681,8 +686,14 @@ mod tests {
         // its own.
         assert!(!config.destinations[0].relay.is_custom());
         assert_eq!(config.destinations[1].relay.custom_urls().len(), 2);
-        assert_eq!(config.destinations[1].relay.relay_auth_token(), Some("token"));
-        assert_eq!(config.destinations[1].routed_domains, vec!["*.corp.example"]);
+        assert_eq!(
+            config.destinations[1].relay.relay_auth_token(),
+            Some("token")
+        );
+        assert_eq!(
+            config.destinations[1].routed_domains,
+            vec!["*.corp.example"]
+        );
         assert!(config.destinations.iter().all(|d| !d.keep_connected));
     }
 
@@ -698,17 +709,26 @@ mod tests {
         let mut bad_id = entry("m1", 1);
         bad_id.server_node_id = "not-an-id".to_string();
         let message = err(resolved_with(vec![bad_id]));
-        assert!(message.contains("m1") && message.contains("server_node_id"), "{message}");
+        assert!(
+            message.contains("m1") && message.contains("server_node_id"),
+            "{message}"
+        );
 
         let mut stray_token = entry("m1", 1);
         stray_token.relay_auth_token = Some("t".to_string());
         let message = err(resolved_with(vec![stray_token]));
-        assert!(message.contains("m1") && message.contains("relay_urls"), "{message}");
+        assert!(
+            message.contains("m1") && message.contains("relay_urls"),
+            "{message}"
+        );
 
         let mut no_key = resolved_with(vec![entry("m1", 1)]);
         no_key.auth_key = None;
         let message = err(no_key);
-        assert!(message.contains("m1") && message.contains("no client key"), "{message}");
+        assert!(
+            message.contains("m1") && message.contains("no client key"),
+            "{message}"
+        );
 
         let mut both = resolved_with(vec![entry("m1", 1)]);
         both.auth_key_file = Some(PathBuf::from("/nonexistent.key"));
@@ -717,7 +737,10 @@ mod tests {
         let mut missing_file = entry("m1", 1);
         missing_file.auth_key_file = Some(PathBuf::from("/nonexistent/flextunnel.key"));
         let message = err(resolved_with(vec![missing_file]));
-        assert!(message.contains("m1") && message.contains("flextunnel.key"), "{message}");
+        assert!(
+            message.contains("m1") && message.contains("flextunnel.key"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -749,7 +772,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
-        assert!(toml::from_str::<ClientConfig>("[[forwards]]\nlocal_port = 1\nremote_port = 1").is_err());
+        assert!(
+            toml::from_str::<ClientConfig>("[[forwards]]\nlocal_port = 1\nremote_port = 1")
+                .is_err()
+        );
     }
 
     #[test]
@@ -765,8 +791,7 @@ mod tests {
         // inline fields are serde(skip)ped so TOML rejects them as unknown.
         let err = toml::from_str::<ServerConfig>("secret = \"aGVsbG8=\"").unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
-        let err =
-            toml::from_str::<ClientConfig>("auth_key = \"ed25519-sec:AAAA\"").unwrap_err();
+        let err = toml::from_str::<ClientConfig>("auth_key = \"ed25519-sec:AAAA\"").unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
@@ -797,8 +822,14 @@ mod tests {
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let r = resolve_server(ServerConfig::default(), Some(file)).unwrap();
         // Keys are lowercased so matching against a lowercased host works.
-        assert_eq!(r.host_aliases.get("server.internal").map(String::as_str), Some("127.0.0.1"));
-        assert_eq!(r.host_aliases.get("node2.internal").map(String::as_str), Some("192.168.1.50"));
+        assert_eq!(
+            r.host_aliases.get("server.internal").map(String::as_str),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            r.host_aliases.get("node2.internal").map(String::as_str),
+            Some("192.168.1.50")
+        );
         assert!(!r.host_aliases.contains_key("Server.Internal"));
     }
 
@@ -834,7 +865,10 @@ mod tests {
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let r = resolve_server(ServerConfig::default(), Some(file)).unwrap();
         // The `*.` prefix survives lowercasing of the rest of the key.
-        assert_eq!(r.host_aliases.get("*.web.internal").map(String::as_str), Some("10.0.0.1"));
+        assert_eq!(
+            r.host_aliases.get("*.web.internal").map(String::as_str),
+            Some("10.0.0.1")
+        );
     }
 
     #[test]

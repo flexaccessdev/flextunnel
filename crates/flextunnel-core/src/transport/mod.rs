@@ -244,8 +244,7 @@ pub fn build_quic_transport_config(side: Side) -> Result<QuicTransportConfig> {
     transport_config = transport_config.max_idle_timeout(Some(idle_timeout));
     transport_config = transport_config.initial_mtu(QUIC_INITIAL_MTU);
     transport_config = transport_config.stream_receive_window(STREAM_RECEIVE_WINDOW.into());
-    transport_config =
-        transport_config.max_stream_receive_window(STREAM_RECEIVE_WINDOW_MAX.into());
+    transport_config = transport_config.max_stream_receive_window(STREAM_RECEIVE_WINDOW_MAX.into());
     transport_config = transport_config.stream_receive_window_budget(STREAM_WINDOW_BUDGET);
     transport_config = transport_config.send_window(SEND_WINDOW);
     transport_config = transport_config.max_concurrent_uni_streams(0u32.into());

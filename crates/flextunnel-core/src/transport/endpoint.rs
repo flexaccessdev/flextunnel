@@ -9,16 +9,15 @@
 
 use crate::transport::{ALPN, QUICK_ALPN, build_quic_transport_config};
 use anyhow::{Context, Result};
+pub use flexaccess_iroh::endpoint::PendingCloses;
 use flexaccess_iroh::endpoint::{
     CreatedEndpoint, EndpointOptions, create_endpoint, endpoint_builder,
 };
-pub use flexaccess_iroh::endpoint::PendingCloses;
 use futures::future::BoxFuture;
 use iroh::{
     Endpoint, EndpointId, SecretKey,
     endpoint::{
-        AfterHandshakeOutcome, Builder as EndpointBuilder, Connection, EndpointHooks, Side,
-        VarInt,
+        AfterHandshakeOutcome, Builder as EndpointBuilder, Connection, EndpointHooks, Side, VarInt,
     },
 };
 use std::collections::HashSet;
@@ -126,12 +125,20 @@ pub async fn create_server_endpoint(
     // A server's runtime is the process's: a close the creation stops waiting
     // for finishes on it by itself.
     let closes = PendingCloses::new();
-    create_endpoint(relay_config, setup(base_builder(relay_config, Side::Server)?), &closes).await
+    create_endpoint(
+        relay_config,
+        setup(base_builder(relay_config, Side::Server)?),
+        &closes,
+    )
+    .await
 }
 
 /// A client endpoint builder. A client never publishes its address (it only
 /// dials out), even with a quick-mode secret bound as its identity.
-fn client_builder(relay_config: &RelayConfig, secret: Option<SecretKey>) -> Result<EndpointBuilder> {
+fn client_builder(
+    relay_config: &RelayConfig,
+    secret: Option<SecretKey>,
+) -> Result<EndpointBuilder> {
     let mut builder = base_builder(relay_config, Side::Client)?;
     if let Some(secret) = secret {
         builder = builder.secret_key(secret);
@@ -179,9 +186,12 @@ async fn create_client(
     // map for its lifetime: a client only dials, runs no failover, and
     // reaches the server through the relay hints it attaches, so a rebuilt
     // endpoint (below) goes back to the full configured set instead.
-    let CreatedEndpoint { endpoint, .. } =
-        create_endpoint(relay_config, client_builder(relay_config, secret.clone())?, closes)
-            .await?;
+    let CreatedEndpoint { endpoint, .. } = create_endpoint(
+        relay_config,
+        client_builder(relay_config, secret.clone())?,
+        closes,
+    )
+    .await?;
     let factory: EndpointFactory = {
         let relay_config = relay_config.clone();
         Arc::new(move || {
@@ -207,7 +217,10 @@ async fn create_client(
 ///   reconnect loop that asked for the rebuild escalates again if the relays
 ///   stay unreachable.
 async fn rebuild_client_endpoint(builder: EndpointBuilder) -> Result<Endpoint> {
-    let endpoint = builder.bind().await.context("Failed to create iroh endpoint")?;
+    let endpoint = builder
+        .bind()
+        .await
+        .context("Failed to create iroh endpoint")?;
     if tokio::time::timeout(RELAY_CONNECT_TIMEOUT, endpoint.online())
         .await
         .is_err()
@@ -396,9 +409,16 @@ mod tests {
         });
         ra.unwrap();
         rb.unwrap();
-        assert_eq!(builds.load(Ordering::SeqCst), 1, "the second caller joined the first");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "the second caller joined the first"
+        );
         assert!(first.is_closed());
-        assert!(!handle.endpoint().is_closed(), "the one fresh endpoint is live");
+        assert!(
+            !handle.endpoint().is_closed(),
+            "the one fresh endpoint is live"
+        );
 
         // A rebuild after the coalesced one is a new outage: it builds again.
         handle.rebuild().await.unwrap();

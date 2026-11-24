@@ -35,16 +35,16 @@
 //! the store is sealed into a `mock-profiles.json` of its own, emptied at start:
 //! the account's keychain and `profiles.json` are never read or written.
 
-use flextunnel_core::forwards::{PortForward, validate_label, validate_remote_host};
-use flextunnel_core::proxy::routed_set::Coverage;
-use flextunnel_core::proxy::{
-    DestinationStatus, RouteSpec, RouteTable, RoutedSet, validate_destination_name,
-};
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit};
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use flextunnel_core::forwards::{PortForward, validate_label, validate_remote_host};
+use flextunnel_core::proxy::routed_set::Coverage;
+use flextunnel_core::proxy::{
+    DestinationStatus, RouteSpec, RouteTable, RoutedSet, validate_destination_name,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -253,7 +253,9 @@ impl ClientSettings {
         for destination in &self.destinations {
             let name = &destination.name;
             if destination.server_node_id.is_empty() {
-                return Some(format!("Destination \"{name}\" has no server node id — edit it."));
+                return Some(format!(
+                    "Destination \"{name}\" has no server node id — edit it."
+                ));
             }
             match find_key(keys, &destination.auth_key_id) {
                 None => {
@@ -304,9 +306,19 @@ pub fn overlap_lines(table: &RouteTable, dest: usize) -> Vec<String> {
         .iter()
         .filter_map(|o| {
             if o.outer.dest == dest {
-                Some(format!("{} contains {}'s narrower {}", o.outer.rule, name(o.inner.dest), o.inner.rule))
+                Some(format!(
+                    "{} contains {}'s narrower {}",
+                    o.outer.rule,
+                    name(o.inner.dest),
+                    o.inner.rule
+                ))
             } else if o.inner.dest == dest {
-                Some(format!("{} is inside {}'s broader {}", o.inner.rule, name(o.outer.dest), o.outer.rule))
+                Some(format!(
+                    "{} is inside {}'s broader {}",
+                    o.inner.rule,
+                    name(o.outer.dest),
+                    o.outer.rule
+                ))
             } else {
                 None
             }
@@ -319,9 +331,18 @@ pub fn overlap_lines(table: &RouteTable, dest: usize) -> Vec<String> {
 /// destination (`status`) graded it when its latest connection read the
 /// server's lists. `None` while that is not known: never connected, the
 /// server's lists could not be read, or the rule is not the running one's.
-pub fn server_coverage(status: Option<&DestinationStatus>, raw: &str, cidr: bool) -> Option<Coverage> {
+pub fn server_coverage(
+    status: Option<&DestinationStatus>,
+    raw: &str,
+    cidr: bool,
+) -> Option<Coverage> {
     let one = vec![raw.to_string()];
-    let own = if cidr { RoutedSet::new(&[], &one) } else { RoutedSet::new(&one, &[]) }.ok()?;
+    let own = if cidr {
+        RoutedSet::new(&[], &one)
+    } else {
+        RoutedSet::new(&one, &[])
+    }
+    .ok()?;
     let rule = own.rules().into_iter().next()?;
     status?.server_coverage.get(&rule).copied()
 }
@@ -342,7 +363,9 @@ fn destination_relay_secret_id(destination_id: &str) -> String {
 
 /// Whether a key id would collide with a non-key entry of the sealed map.
 fn is_reserved_secret_id(id: &str) -> bool {
-    id == SERVER_SECRET_ID || id == SERVER_RELAY_SECRET_ID || id.starts_with(DESTINATION_RELAY_PREFIX)
+    id == SERVER_SECRET_ID
+        || id == SERVER_RELAY_SECRET_ID
+        || id.starts_with(DESTINATION_RELAY_PREFIX)
 }
 
 /// One client the server lets in: the public half of the client's auth key,
@@ -450,7 +473,10 @@ fn drop_invalid_clients(clients: Vec<AuthorizedClient>) -> Vec<AuthorizedClient>
             // Both checked before either is reserved: a dropped entry must
             // not shadow a later valid one sharing its name or key.
             if names.contains(&c.name) {
-                log::error!("Ignoring an authorized client: duplicate name \"{}\"", c.name);
+                log::error!(
+                    "Ignoring an authorized client: duplicate name \"{}\"",
+                    c.name
+                );
                 return false;
             }
             if publics.contains(&c.public_key) {
@@ -587,7 +613,11 @@ fn mock_keychain(value: Option<&std::ffi::OsStr>) -> Result<bool> {
 /// The sealed store's file: `profiles.json`, or `mock-profiles.json` for the
 /// mock keychain, whose secrets no other run's master key opens.
 fn sealed_path(mock: bool) -> Result<PathBuf> {
-    let name = if mock { "mock-profiles.json" } else { "profiles.json" };
+    let name = if mock {
+        "mock-profiles.json"
+    } else {
+        "profiles.json"
+    };
     dirs::data_local_dir()
         .map(|d| d.join("flextunnel").join(name))
         .ok_or_else(|| anyhow::anyhow!("no local data directory to store settings in"))
@@ -614,7 +644,10 @@ pub fn dev_store() -> bool {
 pub fn init_store() -> Result<()> {
     let mock = mock_keychain(std::env::var_os(KEYCHAIN_ENV).as_deref())?;
     if let Some(path) = dev_config_path() {
-        anyhow::ensure!(!mock, "{DEV_CONFIG_ENV} and {KEYCHAIN_ENV}=mock are both set; pick one");
+        anyhow::ensure!(
+            !mock,
+            "{DEV_CONFIG_ENV} and {KEYCHAIN_ENV}=mock are both set; pick one"
+        );
         log::warn!(
             "{DEV_CONFIG_ENV} set: storing settings (secret keys included) UNENCRYPTED at {} \
              (development only)",
@@ -699,15 +732,19 @@ fn secret_entries<'a>(
     let relay = |token: &'a Option<String>| token.as_deref().unwrap_or_default();
     keys.iter()
         .map(|k| (k.id.clone(), k.secret.as_str()))
-        .chain(
-            destinations
-                .iter()
-                .map(move |d| (destination_relay_secret_id(&d.id), relay(&d.relay_auth_token))),
-        )
+        .chain(destinations.iter().map(move |d| {
+            (
+                destination_relay_secret_id(&d.id),
+                relay(&d.relay_auth_token),
+            )
+        }))
         .chain(server.into_iter().flat_map(move |s| {
             [
                 (SERVER_SECRET_ID.to_owned(), s.secret.as_str()),
-                (SERVER_RELAY_SECRET_ID.to_owned(), relay(&s.relay_auth_token)),
+                (
+                    SERVER_RELAY_SECRET_ID.to_owned(),
+                    relay(&s.relay_auth_token),
+                ),
             ]
         }))
 }
@@ -944,8 +981,9 @@ pub fn load_store() -> Result<Store> {
             }
             // A relay token is optional, so a missing one is not lost.
             for destination in &mut store.client.destinations {
-                destination.relay_auth_token =
-                    secrets.get(&destination_relay_secret_id(&destination.id)).cloned();
+                destination.relay_auth_token = secrets
+                    .get(&destination_relay_secret_id(&destination.id))
+                    .cloned();
             }
             if let Some(server) = &mut store.server {
                 match secrets.get(SERVER_SECRET_ID) {
@@ -1056,8 +1094,8 @@ pub fn export_client(path: &Path, client: &ClientSettings) -> Result<()> {
 /// trusted (a hand-written relay auth token never deserializes), so imported
 /// destinations come back with both empty.
 pub fn import_client(path: &Path) -> Result<Portable> {
-    let mut doc: serde_json::Value = read_json(path)?
-        .ok_or_else(|| anyhow::anyhow!("{} does not exist", path.display()))?;
+    let mut doc: serde_json::Value =
+        read_json(path)?.ok_or_else(|| anyhow::anyhow!("{} does not exist", path.display()))?;
     anyhow::ensure!(
         doc.is_object(),
         "{} is not a flextunnel export (destinations and forwards)",
@@ -1157,10 +1195,11 @@ fn save_dev_file(
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     match std::fs::read(path) {
-        Ok(raw) => Ok(Some(
-            serde_json::from_slice(&raw)
-                .with_context(|| format!("Failed to parse {}", path.display()))?,
-        )),
+        Ok(raw) => {
+            Ok(Some(serde_json::from_slice(&raw).with_context(|| {
+                format!("Failed to parse {}", path.display())
+            })?))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("Failed to read {}", path.display())),
     }
@@ -1171,13 +1210,11 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("settings path has no parent directory"))?;
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("Failed to create {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(value)?)
         .with_context(|| format!("Failed to write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("Failed to persist {}", path.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("Failed to persist {}", path.display()))?;
     Ok(())
 }
 
@@ -1197,7 +1234,9 @@ mod tests {
     }
 
     fn client_public_key() -> String {
-        flextunnel_core::auth::ClientKey::generate().unwrap().public_str()
+        flextunnel_core::auth::ClientKey::generate()
+            .unwrap()
+            .public_str()
     }
 
     fn server() -> ServerConfig {
@@ -1257,8 +1296,7 @@ mod tests {
     #[test]
     fn optional_fields_default_when_absent() {
         let d: Destination =
-            serde_json::from_str(r#"{"id":"1","name":"n","server_node_id":"abc"}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"id":"1","name":"n","server_node_id":"abc"}"#).unwrap();
         assert!(d.routed_domains.is_empty() && d.routed_cidrs.is_empty());
         assert!(d.relay_urls.is_empty());
         assert!(d.auth_key_id.is_empty());
@@ -1292,28 +1330,61 @@ mod tests {
             sealed_version: SEALED_VERSION,
         })
         .unwrap();
-        assert!(!json.contains("ftc-secret-authtok"), "secret leaked: {json}");
-        assert!(!json.contains("ftc-secret-identity"), "server secret leaked: {json}");
+        assert!(
+            !json.contains("ftc-secret-authtok"),
+            "secret leaked: {json}"
+        );
+        assert!(
+            !json.contains("ftc-secret-identity"),
+            "server secret leaked: {json}"
+        );
         // The server's public identity and settings persist.
-        assert!(json.contains("\"endpoint_id\":\"endpoint\""), "endpoint id dropped: {json}");
+        assert!(
+            json.contains("\"endpoint_id\":\"endpoint\""),
+            "endpoint id dropped: {json}"
+        );
         assert!(json.contains("*.internal"), "tunnel set dropped: {json}");
         // The non-secret halves of the key persist, as does the destination's
         // reference to it.
-        assert!(json.contains("ed25519-pub:abc"), "public key dropped: {json}");
-        assert!(json.contains("\"auth_key_id\":\"key1\""), "reference dropped: {json}");
+        assert!(
+            json.contains("ed25519-pub:abc"),
+            "public key dropped: {json}"
+        );
+        assert!(
+            json.contains("\"auth_key_id\":\"key1\""),
+            "reference dropped: {json}"
+        );
         // `enabled` is runtime-only on forwards and must not leak either; the
         // server's is its persisted intent.
         let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
         let forward = &doc["client"]["forwards"][0];
         assert_eq!(forward["local_port"], 5432);
-        assert!(forward.get("enabled").is_none(), "forward enabled leaked: {json}");
-        assert_eq!(doc["server"]["enabled"], true, "server enabled dropped: {json}");
-        assert_eq!(doc["client"]["enabled"], true, "client enabled dropped: {json}");
+        assert!(
+            forward.get("enabled").is_none(),
+            "forward enabled leaked: {json}"
+        );
+        assert_eq!(
+            doc["server"]["enabled"], true,
+            "server enabled dropped: {json}"
+        );
+        assert_eq!(
+            doc["client"]["enabled"], true,
+            "client enabled dropped: {json}"
+        );
         assert_eq!(doc["client"]["destinations"][0]["name"], "prod");
         // The relay tokens are secrets: sealed, never plaintext.
-        assert!(!json.contains("relay_auth_token"), "relay token field leaked: {json}");
-        assert!(!json.contains("ftc-secret-relaypsk"), "destination relay token leaked: {json}");
-        assert!(!json.contains("ftc-secret-serverpsk"), "server relay token leaked: {json}");
+        assert!(
+            !json.contains("relay_auth_token"),
+            "relay token field leaked: {json}"
+        );
+        assert!(
+            !json.contains("ftc-secret-relaypsk"),
+            "destination relay token leaked: {json}"
+        );
+        assert!(
+            !json.contains("ftc-secret-serverpsk"),
+            "server relay token leaked: {json}"
+        );
     }
 
     #[test]
@@ -1325,20 +1396,36 @@ mod tests {
         let (keys, destinations, server) = ([key()], [destination(), no_relay], server());
         let sealed =
             seal_secrets(&master, secret_entries(&keys, &destinations, Some(&server))).unwrap();
-        assert!(!sealed.contains("ftc-secret-authtok"), "secret leaked: {sealed}");
-        assert!(!sealed.contains("ftc-secret-identity"), "server secret leaked: {sealed}");
-        assert!(!sealed.contains("ftc-secret-relaypsk"), "relay token leaked: {sealed}");
+        assert!(
+            !sealed.contains("ftc-secret-authtok"),
+            "secret leaked: {sealed}"
+        );
+        assert!(
+            !sealed.contains("ftc-secret-identity"),
+            "server secret leaked: {sealed}"
+        );
+        assert!(
+            !sealed.contains("ftc-secret-relaypsk"),
+            "relay token leaked: {sealed}"
+        );
         let map = open_secrets(&master, &sealed).unwrap();
         // The destination without a relay token seals nothing.
         assert_eq!(map.len(), 4);
-        assert_eq!(map.get("key1").map(String::as_str), Some("ftc-secret-authtok"));
-        assert_eq!(map.get(SERVER_SECRET_ID).map(String::as_str), Some("ftc-secret-identity"));
+        assert_eq!(
+            map.get("key1").map(String::as_str),
+            Some("ftc-secret-authtok")
+        );
+        assert_eq!(
+            map.get(SERVER_SECRET_ID).map(String::as_str),
+            Some("ftc-secret-identity")
+        );
         assert_eq!(
             map.get(SERVER_RELAY_SECRET_ID).map(String::as_str),
             Some("ftc-secret-serverpsk")
         );
         assert_eq!(
-            map.get(&destination_relay_secret_id(&destination().id)).map(String::as_str),
+            map.get(&destination_relay_secret_id(&destination().id))
+                .map(String::as_str),
             Some("ftc-secret-relaypsk")
         );
     }
@@ -1385,9 +1472,15 @@ mod tests {
     #[test]
     fn unsealing_rejects_wrong_key_and_malformed_blobs() {
         let sealed = seal(&[7u8; 32], &[key()]);
-        assert!(open_secrets(&[8u8; 32], &sealed).is_err(), "wrong master key");
+        assert!(
+            open_secrets(&[8u8; 32], &sealed).is_err(),
+            "wrong master key"
+        );
         assert!(open_secrets(&[7u8; 32], "not base64!").is_err());
-        assert!(open_secrets(&[7u8; 32], "AAAA").is_err(), "shorter than a nonce");
+        assert!(
+            open_secrets(&[7u8; 32], "AAAA").is_err(),
+            "shorter than a nonce"
+        );
     }
 
     #[test]
@@ -1397,12 +1490,20 @@ mod tests {
         assert!(client().is_ready(&keys));
 
         let empty = ClientSettings::default();
-        assert!(empty.start_blocker(&keys).unwrap().contains("Add a destination"));
+        assert!(
+            empty
+                .start_blocker(&keys)
+                .unwrap()
+                .contains("Add a destination")
+        );
 
         let mut lost = key();
         lost.secret = String::new();
         let blocker = client().start_blocker(&[lost]).unwrap();
-        assert!(blocker.contains("work laptop") && blocker.contains("Keys pane"), "{blocker}");
+        assert!(
+            blocker.contains("work laptop") && blocker.contains("Keys pane"),
+            "{blocker}"
+        );
 
         assert!(
             client().start_blocker(&[]).unwrap().contains("no auth key"),
@@ -1410,11 +1511,21 @@ mod tests {
         );
         let mut unpicked = client();
         unpicked.destinations[0].auth_key_id = String::new();
-        assert!(unpicked.start_blocker(&keys).unwrap().contains("no auth key"));
+        assert!(
+            unpicked
+                .start_blocker(&keys)
+                .unwrap()
+                .contains("no auth key")
+        );
 
         let mut serverless = client();
         serverless.destinations[0].server_node_id = String::new();
-        assert!(serverless.start_blocker(&keys).unwrap().contains("server node id"));
+        assert!(
+            serverless
+                .start_blocker(&keys)
+                .unwrap()
+                .contains("server node id")
+        );
 
         // The destinations' routes are checked together, by the core's table.
         let mut bad_route = client();
@@ -1495,20 +1606,36 @@ mod tests {
             server_coverage: Default::default(),
             server_routes_pending: false,
         };
-        assert_eq!(server_coverage(Some(&status), "*.corp.example", false), None);
+        assert_eq!(
+            server_coverage(Some(&status), "*.corp.example", false),
+            None
+        );
         assert_eq!(server_coverage(None, "*.corp.example", false), None);
         let routes = flextunnel_core::proxy::ServerRoutes {
             routed_domains: vec!["*.corp.example".into()],
             routed_cidrs: vec!["10.0.0.0/16".into()],
         };
         let own = RoutedSet::new(
-            &["*.corp.example".into(), "api.corp.example".into(), "*".into(), "wiki.example".into()],
-            &["10.0.0.0/8".into(), "10.0.1.0/24".into(), "192.168.0.0/16".into()],
+            &[
+                "*.corp.example".into(),
+                "api.corp.example".into(),
+                "*".into(),
+                "wiki.example".into(),
+            ],
+            &[
+                "10.0.0.0/8".into(),
+                "10.0.1.0/24".into(),
+                "192.168.0.0/16".into(),
+            ],
         )
         .unwrap();
         status.server_coverage = std::sync::Arc::new(routes.coverage_of(&own).unwrap());
         status.server_routes = Some(routes);
-        assert_eq!(server_coverage(Some(&status), "*.other.example", false), None, "not a running rule");
+        assert_eq!(
+            server_coverage(Some(&status), "*.other.example", false),
+            None,
+            "not a running rule"
+        );
         for (rule, cidr, coverage) in [
             ("*.corp.example", false, Coverage::Full),
             ("api.corp.example", false, Coverage::Full),
@@ -1518,7 +1645,11 @@ mod tests {
             ("10.0.1.0/24", true, Coverage::Full),
             ("192.168.0.0/16", true, Coverage::None),
         ] {
-            assert_eq!(server_coverage(Some(&status), rule, cidr), Some(coverage), "{rule}");
+            assert_eq!(
+                server_coverage(Some(&status), rule, cidr),
+                Some(coverage),
+                "{rule}"
+            );
         }
     }
 
@@ -1527,10 +1658,16 @@ mod tests {
         let mut ready = server();
         assert_eq!(ready.start_blocker(), None);
         ready.authorized_clients.clear();
-        assert!(ready.start_blocker().unwrap().contains("Authorize"), "no client");
+        assert!(
+            ready.start_blocker().unwrap().contains("Authorize"),
+            "no client"
+        );
         let mut lost = server();
         lost.secret = String::new();
-        assert!(lost.start_blocker().unwrap().contains("identity"), "lost identity");
+        assert!(
+            lost.start_blocker().unwrap().contains("identity"),
+            "lost identity"
+        );
     }
 
     #[test]
@@ -1550,7 +1687,10 @@ mod tests {
             client("spaced", &format!(" {b_key}")),
             client("phone", &b_key),
         ]);
-        assert_eq!(kept, vec![client("laptop", &a_key), client("phone", &b_key)]);
+        assert_eq!(
+            kept,
+            vec![client("laptop", &a_key), client("phone", &b_key)]
+        );
     }
 
     #[test]
@@ -1679,9 +1819,15 @@ mod tests {
             "relay auth token leaked into the export: {raw}"
         );
         // The proxy ports and the on/off switch are this computer's own.
-        assert!(!raw.contains("socks_port") && !raw.contains("enabled"), "{raw}");
+        assert!(
+            !raw.contains("socks_port") && !raw.contains("enabled"),
+            "{raw}"
+        );
         // The non-secret relay setting it pairs with still travels.
-        assert!(raw.contains("https://relay.example"), "relay urls dropped: {raw}");
+        assert!(
+            raw.contains("https://relay.example"),
+            "relay urls dropped: {raw}"
+        );
 
         let imported = import_client(&path).unwrap();
         assert_eq!(imported.destinations.len(), 1);
@@ -1693,7 +1839,10 @@ mod tests {
         assert_eq!(d.name, destination().name);
         assert_eq!(d.routed_domains, destination().routed_domains);
         assert_eq!(imported.forwards.len(), 1);
-        assert!(!imported.forwards[0].id.is_empty(), "placeholder forward id assigned");
+        assert!(
+            !imported.forwards[0].id.is_empty(),
+            "placeholder forward id assigned"
+        );
         assert_eq!(imported.forwards[0].local_port, forward().local_port);
     }
 
@@ -1716,13 +1865,19 @@ mod tests {
         assert_eq!(imported.destinations.len(), 1);
         assert!(imported.destinations[0].auth_key_id.is_empty());
         assert_eq!(imported.destinations[0].relay_auth_token, None);
-        assert_eq!(imported.destinations[0].relay_urls, vec!["https://relay.example"]);
+        assert_eq!(
+            imported.destinations[0].relay_urls,
+            vec!["https://relay.example"]
+        );
         assert!(imported.forwards.is_empty());
 
         // A file of another shape — a bare list — is refused, not read as empty.
         std::fs::write(&path, r#"[{"name":"prod","server_node_id":"node"}]"#).unwrap();
         let e = import_client(&path).unwrap_err();
-        assert!(format!("{e:#}").contains("not a flextunnel export"), "{e:#}");
+        assert!(
+            format!("{e:#}").contains("not a flextunnel export"),
+            "{e:#}"
+        );
         assert!(import_client(&dir.path().join("missing.json")).is_err());
     }
 
@@ -1789,7 +1944,10 @@ mod tests {
         assert!(mock_keychain(Some(OsStr::new("mock"))).unwrap());
         for wrong in ["", "Mock", "memory", "1"] {
             let e = mock_keychain(Some(OsStr::new(wrong))).unwrap_err();
-            assert!(format!("{e:#}").contains("only value it takes"), "{wrong:?}: {e:#}");
+            assert!(
+                format!("{e:#}").contains("only value it takes"),
+                "{wrong:?}: {e:#}"
+            );
         }
     }
 

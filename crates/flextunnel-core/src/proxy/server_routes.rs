@@ -13,8 +13,8 @@
 //! follows the server's config afterwards.
 
 use super::client_status;
-use super::routed_set::{Coverage, RoutedSet, Rule};
 use super::destination::{ClientAuth, dial_server, exchange_hello};
+use super::routed_set::{Coverage, RoutedSet, Rule};
 use super::status_page::{CONTENT_TYPE_JSON, STATUS_JSON_PATH, StatusFormat};
 use crate::auth::ClientKey;
 use crate::error::{ProxyError, ProxyResult};
@@ -41,7 +41,14 @@ impl ServerRoutes {
     /// are not a routed set this client can read.
     pub fn coverage_of(&self, own: &RoutedSet) -> anyhow::Result<HashMap<Rule, Coverage>> {
         let server = RoutedSet::new(&self.routed_domains, &self.routed_cidrs)?;
-        Ok(own.rules().into_iter().map(|rule| { let coverage = server.coverage(&rule); (rule, coverage) }).collect())
+        Ok(own
+            .rules()
+            .into_iter()
+            .map(|rule| {
+                let coverage = server.coverage(&rule);
+                (rule, coverage)
+            })
+            .collect())
     }
 
     /// Read the routes out of a server's JSON status page
@@ -113,16 +120,21 @@ where
     F: Future<Output = ()>,
 {
     let (answer_tx, answer) = oneshot::channel();
-    let spawned = std::thread::Builder::new().name(thread_name.into()).spawn(move || {
-        match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-            Ok(runtime) => runtime.block_on(request(answer_tx)),
-            Err(e) => {
-                let _ = answer_tx.send(Err(ProxyError::Signaling(format!(
-                    "Failed to build a runtime for the request: {e:#}"
-                ))));
+    let spawned = std::thread::Builder::new()
+        .name(thread_name.into())
+        .spawn(move || {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(request(answer_tx)),
+                Err(e) => {
+                    let _ = answer_tx.send(Err(ProxyError::Signaling(format!(
+                        "Failed to build a runtime for the request: {e:#}"
+                    ))));
+                }
             }
-        }
-    });
+        });
     if let Err(e) = spawned {
         // The sender went down with the closure, so the receiver reports a
         // dropped request; say why here.
@@ -161,7 +173,9 @@ async fn ask(
     let (_ctrl_send, _ctrl_recv, response) =
         exchange_hello(connection, auth, own_id, instance_nonce, false).await?;
     if !response.accepted {
-        let reason = response.reject_reason.unwrap_or_else(|| "unknown".to_string());
+        let reason = response
+            .reject_reason
+            .unwrap_or_else(|| "unknown".to_string());
         return Err(ProxyError::AuthenticationFailed(reason));
     }
 
@@ -176,7 +190,9 @@ pub(crate) async fn read_routes(connection: &Connection) -> Result<ServerRoutes,
             .await?;
     let (content_type, body) = client_status::parse_server_status(&response)?;
     if content_type != CONTENT_TYPE_JSON {
-        return Err(format!("the server answered its JSON status with {content_type}"));
+        return Err(format!(
+            "the server answered its JSON status with {content_type}"
+        ));
     }
     ServerRoutes::from_status_json(body)
 }

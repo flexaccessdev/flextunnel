@@ -179,9 +179,7 @@ pub fn disable_failed_forwards(
     let mut disabled = Vec::new();
     for status in statuses {
         if let ForwardState::Failed(reason) = &status.state
-            && let Some(forward) = forwards
-                .iter_mut()
-                .find(|f| f.id == status.id && f.enabled)
+            && let Some(forward) = forwards.iter_mut().find(|f| f.id == status.id && f.enabled)
         {
             forward.enabled = false;
             disabled.push((forward.id.clone(), reason.clone()));
@@ -251,7 +249,10 @@ mod tests {
             last_conn_error: None,
         }];
         let disabled = disable_failed_forwards(&mut forwards, &statuses);
-        assert_eq!(disabled, vec![(forwards[0].id.clone(), "port in use".into())]);
+        assert_eq!(
+            disabled,
+            vec![(forwards[0].id.clone(), "port in use".into())]
+        );
         assert!(!forwards[0].enabled);
         // A second pass is a no-op: the forward is no longer enabled.
         assert!(disable_failed_forwards(&mut forwards, &statuses).is_empty());
@@ -272,14 +273,20 @@ mod tests {
 
     #[test]
     fn remote_host_rules() {
-        assert_eq!(validate_remote_host(" db.internal "), Ok("db.internal".into()));
+        assert_eq!(
+            validate_remote_host(" db.internal "),
+            Ok("db.internal".into())
+        );
         assert_eq!(
             validate_remote_host("net_dev-1.example.com"),
             Ok("net_dev-1.example.com".into())
         );
         assert_eq!(validate_remote_host("10.0.0.7"), Ok("10.0.0.7".into()));
         assert_eq!(validate_remote_host("::1"), Ok("::1".into()));
-        assert_eq!(validate_remote_host("[2001:db8::1]"), Ok("2001:db8::1".into()));
+        assert_eq!(
+            validate_remote_host("[2001:db8::1]"),
+            Ok("2001:db8::1".into())
+        );
 
         assert!(validate_remote_host("networking..internal").is_err());
         assert!(validate_remote_host(".internal").is_err());

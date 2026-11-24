@@ -14,10 +14,9 @@ pub const DEFAULT_LOG_FILTER: &str = "info,iroh=warn,tracing=warn";
 /// Uses `try_init` so it is idempotent and safe to call more than once (the FFI
 /// entry point may be invoked repeatedly).
 pub fn init_logger(default_filter: &str) {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(default_filter),
-    )
-    .try_init();
+    let _ =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
+            .try_init();
 }
 
 /// Raise this process's soft `RLIMIT_NOFILE` to its hard limit (on
@@ -169,7 +168,9 @@ pub async fn shutdown_signal() -> Result<()> {
 /// Resolve when a shutdown signal arrives (non-Unix: Ctrl-C only).
 #[cfg(not(unix))]
 pub async fn shutdown_signal() -> Result<()> {
-    tokio::signal::ctrl_c().await.context("installing Ctrl-C handler")?;
+    tokio::signal::ctrl_c()
+        .await
+        .context("installing Ctrl-C handler")?;
     Ok(())
 }
 

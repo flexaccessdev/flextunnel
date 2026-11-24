@@ -53,7 +53,10 @@ fn loopback_port(target: &Target) -> Option<u16> {
             if host.eq_ignore_ascii_case("localhost") {
                 return Some(*port);
             }
-            host.parse::<IpAddr>().ok().filter(|ip| canonical(*ip)).map(|_| *port)
+            host.parse::<IpAddr>()
+                .ok()
+                .filter(|ip| canonical(*ip))
+                .map(|_| *port)
         }
     }
 }
@@ -170,7 +173,10 @@ mod tests {
         assert_eq!(loopback_port(&Target::Domain("::1".into(), 85)), Some(85));
 
         // Another loopback address is its own socket: dialed as given.
-        assert_eq!(loopback_port(&Target::Ip("127.0.0.2:86".parse().unwrap())), None);
+        assert_eq!(
+            loopback_port(&Target::Ip("127.0.0.2:86".parse().unwrap())),
+            None
+        );
         assert_eq!(loopback_port(&Target::Domain("127.0.0.2".into(), 87)), None);
 
         // Non-loopback targets are dialed as given.
@@ -178,7 +184,10 @@ mod tests {
             loopback_port(&Target::Ip("93.184.216.34:443".parse().unwrap())),
             None
         );
-        assert_eq!(loopback_port(&Target::Domain("example.com".into(), 443)), None);
+        assert_eq!(
+            loopback_port(&Target::Domain("example.com".into(), 443)),
+            None
+        );
     }
 
     /// A loopback address other than `127.0.0.1` names a socket of its own: a
@@ -199,8 +208,14 @@ mod tests {
             Target::Domain("127.0.0.2".into(), port),
             Target::Domain("127.0.0.2.".into(), port),
         ] {
-            let stream = dial_target(&target).await.unwrap_or_else(|e| panic!("{target:?}: {e}"));
-            assert_eq!(stream.peer_addr().unwrap().ip(), Ipv4Addr::new(127, 0, 0, 2), "{target:?}");
+            let stream = dial_target(&target)
+                .await
+                .unwrap_or_else(|e| panic!("{target:?}: {e}"));
+            assert_eq!(
+                stream.peer_addr().unwrap().ip(),
+                Ipv4Addr::new(127, 0, 0, 2),
+                "{target:?}"
+            );
             listener.accept().await.unwrap();
         }
         drop(decoy);

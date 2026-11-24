@@ -66,7 +66,11 @@ fn server_line(server: Option<(&ServerConfig, &ServerSnapshot)>) -> String {
 /// The server toggle's label and whether it is clickable: Disable while
 /// enabled, Enable while disabled — not while the server is still stopping.
 fn server_toggle(server: &ServerConfig, phase: ServerPhase) -> (&'static str, bool) {
-    let label = if server.enabled { "Disable Server" } else { "Enable Server" };
+    let label = if server.enabled {
+        "Disable Server"
+    } else {
+        "Enable Server"
+    };
     (label, phase != ServerPhase::Stopping)
 }
 
@@ -101,7 +105,11 @@ fn client_line(client: &ClientSettings, snapshot: &ClientSnapshot) -> Option<Str
 /// The client toggle's label and whether it is clickable: Disable while
 /// enabled, Enable while disabled — not while the client is still stopping.
 fn client_toggle(client: &ClientSettings, phase: ClientPhase) -> (&'static str, bool) {
-    let label = if client.enabled { "Disable Client" } else { "Enable Client" };
+    let label = if client.enabled {
+        "Disable Client"
+    } else {
+        "Enable Client"
+    };
     (label, phase != ClientPhase::Stopping)
 }
 
@@ -110,10 +118,7 @@ fn client_toggle(client: &ClientSettings, phase: ClientPhase) -> (&'static str, 
 /// server, or with a disabled one, the app is client-only, and the icon shows
 /// by opacity alone whether the client is running (the badge means the
 /// server); a disabled server with the client down shows an empty circle.
-fn tray_state(
-    server: Option<(&ServerConfig, &ServerSnapshot)>,
-    client: ClientPhase,
-) -> TrayState {
+fn tray_state(server: Option<(&ServerConfig, &ServerSnapshot)>, client: ClientPhase) -> TrayState {
     // A running client is up — listening, each destination one use away —
     // whether or not anything is connected right now.
     let up = client == ClientPhase::Running;
@@ -155,7 +160,13 @@ struct Items {
 type Toggle = (&'static str, bool);
 
 /// Everything `sync` reacts to; native calls only happen when it changes.
-type SyncKey = (TrayState, String, Option<String>, Option<Toggle>, Option<Toggle>);
+type SyncKey = (
+    TrayState,
+    String,
+    Option<String>,
+    Option<Toggle>,
+    Option<Toggle>,
+);
 
 pub struct Tray {
     tray: TrayIcon,
@@ -214,7 +225,12 @@ impl Tray {
 
     fn rebuild_menu(&mut self, (has_server, has_destinations): Layout) -> Result<()> {
         let menu = Menu::new();
-        menu.append(&MenuItem::with_id(MENU_OPEN, "Open flextunnel…", true, None))?;
+        menu.append(&MenuItem::with_id(
+            MENU_OPEN,
+            "Open flextunnel…",
+            true,
+            None,
+        ))?;
         menu.append(&PredefinedMenuItem::separator())?;
 
         let client = if has_destinations {
@@ -334,9 +350,7 @@ impl Tray {
         };
         let _ = self.tray.set_tooltip(Some(tooltip));
 
-        if icon_changed
-            && let Ok(icon) = make_icon(state)
-        {
+        if icon_changed && let Ok(icon) = make_icon(state) {
             // `set_icon` alone re-sets the macOS image as non-template
             // (rendering it solid black instead of adapting to the menu
             // bar), so keep it a template there.
@@ -397,8 +411,8 @@ mod tests {
 
     /// A client snapshot in `phase` whose destinations are in `states`.
     fn client_snapshot(phase: ClientPhase, states: &[DestinationState]) -> ClientSnapshot {
-        let status = |(i, state): (usize, &DestinationState)| {
-            flextunnel_core::proxy::DestinationStatus {
+        let status =
+            |(i, state): (usize, &DestinationState)| flextunnel_core::proxy::DestinationStatus {
                 name: format!("d{i}"),
                 server_node_id: String::new(),
                 state: *state,
@@ -416,8 +430,7 @@ mod tests {
                 server_routes_error: None,
                 server_coverage: Default::default(),
                 server_routes_pending: false,
-            }
-        };
+            };
         ClientSnapshot {
             phase,
             destinations: states.iter().enumerate().map(status).collect(),
@@ -436,19 +449,28 @@ mod tests {
             TrayState::Running,
             "checkmark: running, with or without clients — the client doesn't count"
         );
-        assert_eq!(state(ServerPhase::Running, 2, ClientPhase::Stopped), TrayState::Running);
+        assert_eq!(
+            state(ServerPhase::Running, 2, ClientPhase::Stopped),
+            TrayState::Running
+        );
         assert_eq!(
             state(ServerPhase::Starting, 0, ClientPhase::Running),
             TrayState::Changing,
             "dot"
         );
-        assert_eq!(state(ServerPhase::Stopping, 0, ClientPhase::Stopped), TrayState::Changing);
+        assert_eq!(
+            state(ServerPhase::Stopping, 0, ClientPhase::Stopped),
+            TrayState::Changing
+        );
         assert_eq!(
             state(ServerPhase::Stopped, 0, ClientPhase::Running),
             TrayState::Off,
             "an enabled server that is down dims the icon whatever the client does"
         );
-        assert_eq!(state(ServerPhase::Failed, 0, ClientPhase::Stopped), TrayState::Off);
+        assert_eq!(
+            state(ServerPhase::Failed, 0, ClientPhase::Stopped),
+            TrayState::Off
+        );
     }
 
     #[test]
@@ -461,14 +483,20 @@ mod tests {
             TrayState::Disabled,
             "empty-circle badge"
         );
-        assert_eq!(state(ServerPhase::Failed, ClientPhase::Starting), TrayState::Disabled);
+        assert_eq!(
+            state(ServerPhase::Failed, ClientPhase::Starting),
+            TrayState::Disabled
+        );
         assert_eq!(
             state(ServerPhase::Stopped, ClientPhase::Running),
             TrayState::Active,
             "the client running: active, as with no server"
         );
         // Just disabled: shown as stopping until it has.
-        assert_eq!(state(ServerPhase::Stopping, ClientPhase::Running), TrayState::Changing);
+        assert_eq!(
+            state(ServerPhase::Stopping, ClientPhase::Running),
+            TrayState::Changing
+        );
     }
 
     #[test]
@@ -494,11 +522,20 @@ mod tests {
             server_line(Some((&on, &snapshot(ServerPhase::Running, 1)))),
             "Server running · 1 client connected"
         );
-        assert_eq!(server_toggle(&on, ServerPhase::Running), ("Disable Server", true));
-        assert_eq!(server_toggle(&on, ServerPhase::Stopping), ("Disable Server", false));
+        assert_eq!(
+            server_toggle(&on, ServerPhase::Running),
+            ("Disable Server", true)
+        );
+        assert_eq!(
+            server_toggle(&on, ServerPhase::Stopping),
+            ("Disable Server", false)
+        );
         let off = server(false);
         assert_eq!(server_line(Some((&off, &stopped))), "Server disabled");
-        assert_eq!(server_toggle(&off, ServerPhase::Stopped), ("Enable Server", true));
+        assert_eq!(
+            server_toggle(&off, ServerPhase::Stopped),
+            ("Enable Server", true)
+        );
     }
 
     #[test]
@@ -529,13 +566,31 @@ mod tests {
             line(&one, ClientPhase::Running, &[Idle]).as_deref(),
             Some("Client running · not connected")
         );
-        assert_eq!(line(&one, ClientPhase::Failed, &[]).as_deref(), Some("Client failed to start"));
-        assert_eq!(line(&one, ClientPhase::Stopped, &[]).as_deref(), Some("Client stopped"));
-        assert_eq!(client_toggle(&one, ClientPhase::Running), ("Disable Client", true));
-        assert_eq!(client_toggle(&one, ClientPhase::Stopping), ("Disable Client", false));
+        assert_eq!(
+            line(&one, ClientPhase::Failed, &[]).as_deref(),
+            Some("Client failed to start")
+        );
+        assert_eq!(
+            line(&one, ClientPhase::Stopped, &[]).as_deref(),
+            Some("Client stopped")
+        );
+        assert_eq!(
+            client_toggle(&one, ClientPhase::Running),
+            ("Disable Client", true)
+        );
+        assert_eq!(
+            client_toggle(&one, ClientPhase::Stopping),
+            ("Disable Client", false)
+        );
 
         let off = client(false, &["a"]);
-        assert_eq!(line(&off, ClientPhase::Stopped, &[]).as_deref(), Some("Client disabled"));
-        assert_eq!(client_toggle(&off, ClientPhase::Stopped), ("Enable Client", true));
+        assert_eq!(
+            line(&off, ClientPhase::Stopped, &[]).as_deref(),
+            Some("Client disabled")
+        );
+        assert_eq!(
+            client_toggle(&off, ClientPhase::Stopped),
+            ("Enable Client", true)
+        );
     }
 }

@@ -65,9 +65,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// session may spend on it — holding the request while the destination
 /// connects, then opening the stream — so the session's own error arrives
 /// first.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(
-    TUNNEL_RECOVERY_HOLD.as_secs() + TUNNEL_OPEN_TIMEOUT.as_secs() + 5,
-);
+const CONNECT_TIMEOUT: Duration =
+    Duration::from_secs(TUNNEL_RECOVERY_HOLD.as_secs() + TUNNEL_OPEN_TIMEOUT.as_secs() + 5);
 /// Largest payload of one client-to-session tunnel frame.
 const MAX_FRAME: usize = 64 * 1024;
 /// Buffer for the tunnel's unframed direction, target to caller (see
@@ -87,7 +86,9 @@ pub enum Request {
     /// off the polled `Status` because the custom-relay `/healthz` probe does
     /// on-demand HTTP. Empty for a destination that is not connected; asking
     /// never connects it.
-    ConnPath { name: String },
+    ConnPath {
+        name: String,
+    },
     /// Open a tunnel to `host:port` through the destination that routes
     /// `host`, like a port forward: the destination connects if it is idle
     /// (the request is held while it does), and its server enforces its
@@ -95,7 +96,10 @@ pub enum Request {
     /// [`Response::Connected`], after which the connection is that tunnel's
     /// byte stream, or with [`Response::Error`] — including for a host no
     /// destination routes.
-    Connect { host: String, port: u16 },
+    Connect {
+        host: String,
+        port: u16,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -771,8 +775,7 @@ impl IpcClient {
 
     #[cfg(unix)]
     async fn open(name: &str) -> std::io::Result<ClientStream> {
-        let path = socket_path(name)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let path = socket_path(name).map_err(|e| std::io::Error::other(e.to_string()))?;
         tokio::net::UnixStream::connect(path).await
     }
 
@@ -814,7 +817,9 @@ impl IpcClient {
             Ok(result) => result,
             Err(_) => {
                 self.stream = None;
-                Err(anyhow::anyhow!("Timed out waiting for the client's response"))
+                Err(anyhow::anyhow!(
+                    "Timed out waiting for the client's response"
+                ))
             }
         }
     }
@@ -858,7 +863,9 @@ impl IpcClient {
         };
         let response = tokio::time::timeout(CONNECT_TIMEOUT, round_trip(&mut stream, &request))
             .await
-            .map_err(|_| anyhow::anyhow!("Timed out waiting for the client to open the tunnel"))??;
+            .map_err(|_| {
+                anyhow::anyhow!("Timed out waiting for the client to open the tunnel")
+            })??;
         match response {
             Response::Connected => Ok(stream),
             Response::Error { message } => Err(anyhow::anyhow!(message)),
@@ -1057,7 +1064,10 @@ mod tests {
             }
         };
         #[cfg(windows)]
-        let mut client = IpcClient::connect(&instance).await.unwrap().expect("running");
+        let mut client = IpcClient::connect(&instance)
+            .await
+            .unwrap()
+            .expect("running");
 
         // Status.
         match client.request(&Request::Status).await.unwrap() {
@@ -1079,7 +1089,11 @@ mod tests {
 
         // ...and a malformed line gets an error while the connection stays open.
         let stream = client.stream.as_mut().unwrap();
-        stream.get_mut().write_all(b"{\"cmd\":\"nope\"}\n").await.unwrap();
+        stream
+            .get_mut()
+            .write_all(b"{\"cmd\":\"nope\"}\n")
+            .await
+            .unwrap();
         let mut line = Vec::new();
         read_line_capped(stream, &mut line).await.unwrap();
         match serde_json::from_slice::<Response>(&line).unwrap() {
@@ -1165,7 +1179,10 @@ mod tests {
             }
             #[cfg(windows)]
             {
-                IpcClient::connect(&self.instance).await.unwrap().expect("running")
+                IpcClient::connect(&self.instance)
+                    .await
+                    .unwrap()
+                    .expect("running")
             }
         }
     }
@@ -1189,7 +1206,9 @@ mod tests {
         // and closes, and that close ends the connection — EOF both ways with
         // no transport half-close, as on a Windows named pipe.
         let (mut from_tunnel, mut to_tunnel) = tokio::io::split(tunnel);
-        copy_to_frames(&mut &b"hello\n"[..], &mut to_tunnel).await.unwrap();
+        copy_to_frames(&mut &b"hello\n"[..], &mut to_tunnel)
+            .await
+            .unwrap();
         let mut echo = Vec::new();
         from_tunnel.read_to_end(&mut echo).await.unwrap();
         assert_eq!(echo, b"hello\n");
@@ -1204,11 +1223,15 @@ mod tests {
         copy_to_frames(&mut &input[..], &mut framed).await.unwrap();
         assert!(framed.ends_with(&[0, 0, 0, 0]), "ends with the empty frame");
         let mut output = Vec::new();
-        copy_from_frames(&mut &framed[..], &mut output).await.unwrap();
+        copy_from_frames(&mut &framed[..], &mut output)
+            .await
+            .unwrap();
         assert_eq!(output, input);
 
         let oversized = ((MAX_FRAME + 1) as u32).to_be_bytes();
-        let err = copy_from_frames(&mut &oversized[..], &mut Vec::new()).await.unwrap_err();
+        let err = copy_from_frames(&mut &oversized[..], &mut Vec::new())
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
@@ -1221,9 +1244,8 @@ mod tests {
         let (mut target, mut from_target) = tokio::io::duplex(1024);
         let (to_caller, mut caller) = tokio::io::duplex(1024);
         let mut to_caller = tokio::io::BufWriter::new(to_caller);
-        let copy = tokio::spawn(async move {
-            copy_unframed(&mut from_target, &mut to_caller).await
-        });
+        let copy =
+            tokio::spawn(async move { copy_unframed(&mut from_target, &mut to_caller).await });
 
         target.write_all(b"Password: ").await.unwrap();
         let mut prompt = [0u8; 10];
@@ -1271,13 +1293,20 @@ mod tests {
     async fn a_long_instance_name_binds_and_attaches() {
         let name = "n".repeat(32);
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(format!("client-{}.sock", socket_stem(&name)));
+        let path = dir
+            .path()
+            .join(format!("client-{}.sock", socket_stem(&name)));
         let guard = spawn_unix(path.clone(), stub_session(), EchoOpener).unwrap();
         let mut client = IpcClient {
             name: name.clone(),
-            stream: Some(BufReader::new(tokio::net::UnixStream::connect(&path).await.unwrap())),
+            stream: Some(BufReader::new(
+                tokio::net::UnixStream::connect(&path).await.unwrap(),
+            )),
         };
-        assert!(matches!(client.request(&Request::Status).await.unwrap(), Response::Status(_)));
+        assert!(matches!(
+            client.request(&Request::Status).await.unwrap(),
+            Response::Status(_)
+        ));
         assert_eq!(socket_path(&name).unwrap().file_name(), path.file_name());
         drop(guard);
     }
@@ -1291,8 +1320,12 @@ mod tests {
         let socket_dir = dir.path().join("flextunnel");
         std::fs::create_dir(&socket_dir).unwrap();
         std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let guard = spawn_unix(socket_dir.join("client-test.sock"), stub_session(), EchoOpener)
-            .unwrap();
+        let guard = spawn_unix(
+            socket_dir.join("client-test.sock"),
+            stub_session(),
+            EchoOpener,
+        )
+        .unwrap();
         let mode = std::fs::metadata(&socket_dir).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
         drop(guard);
@@ -1302,7 +1335,11 @@ mod tests {
     async fn connect_failures_come_back_as_errors() {
         let served = Served::start("nc-err");
         for (host, port, expected) in [
-            ("refused.internal", 22, "refused.internal:22: server rejected target"),
+            (
+                "refused.internal",
+                22,
+                "refused.internal:22: server rejected target",
+            ),
             ("echo.internal", 0, "port must be 1-65535"),
             ("bad..host", 22, "bad..host:22"),
         ] {

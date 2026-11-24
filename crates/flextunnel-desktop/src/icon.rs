@@ -13,8 +13,8 @@
 //! badge (grayscale while disconnected).
 
 use tiny_skia::{
-    BlendMode, Color, FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Paint, PathBuilder,
-    Pixmap, Point, PremultipliedColorU8, Rect, SpreadMode, Stroke, Transform,
+    BlendMode, Color, FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Paint,
+    PathBuilder, Pixmap, Point, PremultipliedColorU8, Rect, SpreadMode, Stroke, Transform,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -181,7 +181,13 @@ fn draw_mark(pixmap: &mut Pixmap, cx: f32, cy: f32, dot_r: f32, ring: Option<Col
         // The same weight as the check's stroke is left as the circle.
         pb.push_circle(cx, cy, dot_r * 0.70);
         if let Some(path) = pb.finish() {
-            pixmap.fill_path(&path, &check_paint, FillRule::Winding, Transform::identity(), None);
+            pixmap.fill_path(
+                &path,
+                &check_paint,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
         }
         return;
     }
@@ -336,7 +342,12 @@ pub fn tray_rgba(state: TrayState) -> (Vec<u8>, u32, u32) {
             } else {
                 Color::from_rgba8(52, 199, 89, 255)
             };
-            draw_status_dot(&mut pixmap, dot, Some(Color::from_rgba8(255, 255, 255, 255)), mark);
+            draw_status_dot(
+                &mut pixmap,
+                dot,
+                Some(Color::from_rgba8(255, 255, 255, 255)),
+                mark,
+            );
         }
         (to_rgba(pixmap), 32, 32)
     }
@@ -355,7 +366,10 @@ mod tests {
     fn tray_icon_has_expected_dimensions_and_content() {
         let (rgba, w, h) = tray_rgba(TrayState::Running);
         assert_eq!(rgba.len(), (w * h * 4) as usize);
-        assert!(rgba.chunks(4).any(|px| px[3] > 0), "icon is fully transparent");
+        assert!(
+            rgba.chunks(4).any(|px| px[3] > 0),
+            "icon is fully transparent"
+        );
     }
 
     #[test]
