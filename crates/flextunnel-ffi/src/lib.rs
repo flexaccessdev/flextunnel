@@ -1061,7 +1061,7 @@ fn write_cstr(buf: *mut c_char, len: usize, s: &str) -> bool {
     // Reserve one byte for the trailing NUL.
     let copy = bytes.len().min(len - 1);
     unsafe {
-        ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, copy);
+        ptr::copy_nonoverlapping(bytes.as_ptr(), buf.cast::<u8>(), copy);
         *buf.add(copy) = 0;
     }
     copy == bytes.len()
