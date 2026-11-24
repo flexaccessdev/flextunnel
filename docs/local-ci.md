@@ -23,7 +23,7 @@ script is stale. Nothing enforces this; keep them in step by hand.
 
 | Platform | Default SSH alias | Host override |
 | --- | --- | --- |
-| macOS | `macwork` | `FLEXTUNNEL_MACCI_HOST` |
+| macOS | `macvm` | `FLEXTUNNEL_MACCI_HOST` |
 | Linux | `workstation-wsl` | `FLEXTUNNEL_UNIXCI_HOST` |
 | Windows | `windows-ci-build` | `FLEXTUNNEL_WINCI_HOST` |
 

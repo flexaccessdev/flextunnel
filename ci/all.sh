@@ -5,7 +5,7 @@
 # over ssh:
 #
 #   mac      natively on a Mac, else the FLEXTUNNEL_MACCI_HOST alias
-#            (default 'macwork')                ci/unix/{ci,remote}.sh
+#            (default 'macvm')                  ci/unix/{ci,remote}.sh
 #   linux    natively on Linux, else the FLEXTUNNEL_UNIXCI_HOST alias
 #            (default 'workstation-wsl')        ci/unix/{ci,remote}.sh
 #   windows  the FLEXTUNNEL_WINCI_HOST alias
@@ -37,7 +37,7 @@ run_job() {
     case $1 in
         mac)
             if [ "$native" = Darwin ]; then ./ci/unix/ci.sh
-            else ./ci/unix/remote.sh -H "${FLEXTUNNEL_MACCI_HOST:-macwork}" ci; fi ;;
+            else ./ci/unix/remote.sh -H "${FLEXTUNNEL_MACCI_HOST:-macvm}" ci; fi ;;
         linux)
             if [ "$native" = Linux ]; then ./ci/unix/ci.sh
             else ./ci/unix/remote.sh ci; fi ;;
