@@ -542,10 +542,10 @@ this is the difference between sessions and builds again, not the setting.
 A client grants its server no bidirectional streams either, since only the
 client opens them. With that added, against the build above it, ten rounds
 in turn: 2067 / 2079 against 2093 / 2030 as installed, and 3687 / 3627
-against 3698 / 3609 with the limit raised and the offload on. The last
-leaves out one round of the ten, in which the new build's direct path was
-the machines' Tailscale address (607 / 496); with it the medians are 3685 /
-3544.
+against 3713 / 3613 with the limit raised and the offload on. The last is
+nine rounds for both builds: in the seventh the new build's direct path was
+the machines' Tailscale address (607 / 496), so that round is left out of
+both. Over all ten the medians are 3685 / 3544 against 3698 / 3609.
 
 ### No false MTU black hole
 
