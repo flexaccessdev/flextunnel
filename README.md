@@ -87,6 +87,13 @@ The QUIC ALPN is a fixed protocol identifier (`flextunnel/1`), not a secret: it
 ensures both peers speak the flextunnel protocol but provides no access control
 on its own.
 
+Clients and servers are compatible when they speak the same wire protocol
+version (`PROTOCOL_VERSION` in `crates/flextunnel-core/src/proxy/signaling.rs`),
+not when they run the same release: the handshake compares only that number,
+so different releases on one protocol version work together. There is no
+compatibility across protocol versions; a release that bumps it needs every
+client and server it talks to upgraded too.
+
 All payload is end-to-end encrypted by QUIC/TLS 1.3.
 
 ## Install

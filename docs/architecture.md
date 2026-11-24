@@ -84,7 +84,10 @@ handshake authenticates it. An empty allowlist disables the quick ALPN
 entirely (a normal server rejects every quick dial).
 
 ### 2. Auth handshake (control stream)
-The protocol version is `PROTOCOL_VERSION = 14`. On the first bi-stream a
+The protocol version is `PROTOCOL_VERSION = 14`. It is the only compatibility
+check between peers — release numbers are never compared, so any two releases
+on the same protocol version interoperate, and a peer on another one is turned
+away before authentication. On the first bi-stream a
 client sends
 `Hello { version, auth?, client_instance_nonce, duplicate_server_observed }`
 where `auth` is `ClientAuthPayload { public_key, endpoint_id, signature }`
