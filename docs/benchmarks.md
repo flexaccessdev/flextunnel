@@ -7,26 +7,38 @@ the next, and one technique against another, on the same machines. They show
 proportions, not what your hardware will do. How the data path is built is in
 [architecture.md](architecture.md#5-byte-piping).
 
-## v0.0.107 against v0.0.106
+## v0.0.109 against v0.0.108
 
-Mbit/s, down / up, one TCP connection through a port forward, 2026-11-23. Each
-column is one session in which the rows were measured in turn, round after
-round; the numbers are medians. Each flextunnel row ran that version at both
-ends.
+Mbit/s, down / up, one TCP connection through a port forward, 2026-11-23. In
+each column the rows were measured in turn, round after round; the numbers
+are medians. Each flextunnel row ran that version at both ends.
 
 | | Linux pair, as installed | UDP offload on | UDP buffer limit raised | Limit raised, offload on | macOS client | Windows client |
 |---|---:|---:|---:|---:|---:|---:|
-| No tunnel | 20151 / 20609 | 20264 / 20381 | 20334 / 20605 | 20249 / 20318 | 1946 / 2354 | 2096 / 2369 |
-| flextunnel v0.0.106 | 1360 / 1357 | 1790 / 1817 | 1400 / 1411 | 1742 / 1845 | 400 / 223 | 1847 / 1349 |
-| **flextunnel v0.0.107** | **2014 / 2037** | **2822 / 2847** | **2601 / 2633** | **3705 / 3634** | **1823 / 1100** | **1808 / 1700** |
+| No tunnel | 21399 / 20768 | 20770 / 20679 | 20846 / 20576 | 21065 / 20965 | 1946 / 2353 | 2098 / 2369 |
+| flextunnel v0.0.108 | 2067 / 2104 | 2892 / 2899 | 2632 / 2620 | 3766 / 3724 | 1844 / 1300 | 1862 / 1677 |
+| **flextunnel v0.0.109** | **2011 / 2032** | **2929 / 2896** | **2622 / 2504** | **3611 / 3718** | **1862 / 1272** | **1944 / 1711** |
 
-v0.0.107 runs on forks of iroh, noq and netwatch carrying the changes ezvpn's
-forks do (the same commits, on flextunnel's own branches), and
-on two runtime worker threads where v0.0.106 ran one per core. The netwatch
-fork's connected socket per peer is what the first column gains, and all of
-what the macOS client gains; the other two forks show once the NIC takes
-whole UDP batches or the kernel's limit on UDP socket buffers is out of the
-way. Each is under "What the measurements showed" below.
+v0.0.109 changes what a stream may buffer, not what carries it. A stream's
+flow-control window now starts at 1.25 MB and grows to 8 MiB while its reader
+keeps up, where v0.0.108 gave every stream 8 MiB at once. That is for the
+client's memory, and [Long paths](#long-paths) has what it measured. The
+table is here to show what it costs: over all their rounds the two versions
+are within 5% of each other in every column and neither is ahead throughout.
+A single session put them further apart than that, by up to 7% in these
+columns' Linux sessions, 15% on macOS uploads and 13% over a 53 ms path, and
+the next session did not repeat it ([Results](#results)); two builds that behave the same were up to 2.4% apart
+themselves
+([Windows that grow on a short path too](#windows-that-grow-on-a-short-path-too)).
+
+What the numbers themselves are made of came with v0.0.107: forks of iroh,
+noq and netwatch carrying the changes ezvpn's forks do (the same commits, on
+flextunnel's own branches), and two runtime worker threads where v0.0.106 ran
+one per core. The netwatch fork's connected socket per peer is what the first
+column is owed to, and all of what the macOS client gained; the other two
+forks show once the NIC takes whole UDP batches or the kernel's limit on UDP
+socket buffers is out of the way. Each is under "What the measurements
+showed" below, measured against v0.0.106.
 
 ## What sets the ceiling
 
@@ -43,9 +55,9 @@ machines is the kernel's limit on UDP socket buffers, which the next section
 raises. A connection that iroh has to carry over a relay instead of directly
 is limited by the relay instead.
 
-`client nc` runs behind a forward on the same path, 1.6 Gbit/s down and 1.7
-up where the forward moved 2.0: its bytes make one more hop, between the
-running client and the `nc` process.
+`client nc` runs behind a forward on the same path, 1.7 Gbit/s each way
+where the forward moved 2.0: its bytes make one more hop, between the running
+client and the `nc` process.
 
 ## Linux: raise the UDP buffer limit
 
@@ -54,8 +66,8 @@ iroh asks the kernel for 7 MB UDP socket buffers. Linux grants at most
 milliseconds of a gigabit. On a fast path the receive buffer then overflows
 whenever the process is a moment late, QUIC sees loss, and the transfer slows
 down. Between the two virtual machines here, raising the limits on both took
-a transfer from 2.0 to 2.6 Gbit/s; over a path across the internet with 53 ms
-round trips it took an upload from 540 to 1080 Mbit/s (v0.0.106).
+a transfer from 2.0 to 2.6 Gbit/s, and with 53 ms of round trip added between
+them from 677 to 1057 Mbit/s.
 
 ```sh
 sudo sysctl -w net.core.rmem_max=7500000 net.core.wmem_max=7500000
@@ -82,34 +94,73 @@ it. It measured the same as the raised limit
 
 ## Long paths
 
-The two virtual machines are 0.4 ms apart, so nothing in the tables shows
-what distance costs. The figures in this section were measured with v0.0.106
-over a path across the internet with 53 ms round trips, and have not been
-repeated since.
+The two virtual machines are 0.4 ms apart, so nothing in the table shows what
+distance costs. For this section each machine delayed its outgoing packets by
+26.5 ms (`netem`, under the NIC's own transmit queues), which made the round
+trip 53.5 ms; everything else is as in [Setup](#setup-2026-11-23). Runs of
+20 s, in turn:
 
-A stream sends at most one flow-control window per round trip. The window is
-8 MiB, so the cap is 8 MiB ÷ RTT: about 1.2 Gbit/s at 53 ms, 640 Mbit/s at
-100 ms, 320 Mbit/s at 200 ms.
+| 53 ms round trip, down / up | As installed | UDP buffer limit raised |
+|---|---:|---:|
+| flextunnel v0.0.108 | 653 / 658 | 1055 / 1075 |
+| flextunnel v0.0.109 | 677 / 668 | 1057 / 1067 |
 
-The window is also memory: a stream whose reader is slower than the path, or
-has stopped reading, holds up to 8 MiB of received data until it is read —
-about 9 MB of process memory each when measured, so 70 stalled readers on one
-connection took a client to 570–690 MB and 95 to 900 MB (a connection carries
-at most 100 streams). A window half the size would halve that, and the cap
-above with it: at 53 ms an upload ran at 1040 Mbit/s with 8 MiB, 560 with
-4 MiB and 290 with 2 MiB.
+Fifteen rounds as installed, where a run's speed is set by when it loses
+packets to the receive buffer (the ranges are under
+[Results](#53-ms-round-trip)), and five with the limit raised.
+
+A stream sends at most one flow-control window per round trip. Every stream
+starts with a window of 1.25 MB, and the window doubles, up to 8 MiB, each
+time half of it was read within two round trips (of 5 ms at least): that is,
+while the reader keeps up with a sender the window is holding back. A bulk
+transfer is
+therefore capped at 8 MiB ÷ RTT, about 1.2 Gbit/s at 53 ms, 640 Mbit/s at
+100 ms, 320 Mbit/s at 200 ms, and it has its 8 MiB within its first second:
+second by second, a v0.0.109 transfer over this path was not told apart from
+a v0.0.108 one.
+
+The window is earned rather than given because it is also memory. A stream
+whose reader is slower than the path, or has stopped reading, holds up to a
+window of received data until it is read, and credit once granted cannot be
+taken back. v0.0.108 granted every stream 8 MiB:
+
+| Client memory, readers on one connection | v0.0.108 | v0.0.109 |
+|---|---:|---:|
+| 95 that never read | 1146–1169 MB | 173–190 MB |
+| 95 that never read, 53 ms round trip | 1105–1139 MB | 255–262 MB |
+| 30 that read 60 MB each at full speed and then stop, 53 ms round trip | 374–387 MB | 232–276 MB |
+
+The client's resident memory after the readers had sat for 20 s or more, two
+runs of each version in turn; an idle client holds about 20 MB. A reader is a
+TCP connection to a forward whose far end sends for as long as it is taken,
+with the reader's own socket buffer held to 256 KiB so that what piles up
+does so in the tunnel.
+
+What a connection's streams hold beyond their starting windows is limited to
+64 MiB between them, returned as streams end. A connection carries the 100
+bidirectional streams a server grants its client and no others: a client
+grants its server none, and neither grants unidirectional ones. So either
+end can be made to buffer about 183 MiB of stream data and no more.
+The second row is presumably that bound being met, at about
+70 MB over the first: on a long path the first megabytes of a stream go into
+the reader's socket buffers within two round trips, which counts as keeping
+up, so streams that then stall have grown until the 64 MiB was spent. A
+stream there is nothing left for keeps the window it has, and goes on
+receiving at that.
 
 The iOS client is the exception: the system ends an app that holds too much
-memory, so its window stays at 1.25 MB. Its downloads are capped at 1.25 MB ÷
-RTT (190 Mbit/s at 53 ms, 100 at 100 ms) and its streams hold under 2 MB
-each. Uploads from it are not affected, since the window that caps a
-direction is the receiver's.
+memory, and a window that grew stays grown when its reader stalls, so its
+windows stay at 1.25 MB until a device has been measured. Its downloads are
+capped at 1.25 MB ÷ RTT (190 Mbit/s at 53 ms, 100 at 100 ms) and its streams
+hold under 2 MB each. Uploads from it are not affected, since the window that
+caps a direction is the receiver's.
 
-There is no limit across a connection's streams, because slow readers would
-then hold up every other stream, the heartbeat included. With a 128 MiB limit,
-18 stalled readers made the client drop the connection and every tunnel on it,
-and 24 readers taking 100 kB/s each made a new stream wait 3–15 s where it
-otherwise took 12 ms.
+QUIC's own limit across a connection's streams is not used. It is credit
+that every stream draws on, the heartbeat included, so slow readers would
+hold up the rest: with such a limit of 128 MiB (v0.0.106, every stream at
+8 MiB), 18 stalled readers made the client drop the connection and every
+tunnel on it, and 24 readers taking 100 kB/s each made a new stream wait
+3–15 s where it otherwise took 12 ms.
 
 Congestion control is CUBIC, which grows its window by the clock rather than
 by the round trip. After a loss on a long path it takes seconds to tens of
@@ -126,7 +177,7 @@ and speed up as it goes.
 | Guest | Debian 13, kernel 6.12.117, 2 GB RAM |
 | NIC | `virtio_net`, 6 queues (multi-queue), XPS at its default of one transmit queue per CPU, `tx-udp-segmentation` off by default |
 | Kernel UDP buffer limit | `net.core.rmem_max` and `wmem_max` at their default of 212992 bytes, or raised to 7500000 where a column says so |
-| flextunnel | v0.0.106 and v0.0.107, the same version at both ends, run as an unprivileged user; direct path, Cubic |
+| flextunnel | v0.0.108 and v0.0.109, the same version at both ends, run as an unprivileged user; direct path, Cubic |
 | Tool | iperf3 3.18, one TCP connection, 6 s per run after a 1 s warm-up; "up" is client to server, "down" is server to client (`-R`) |
 
 A flextunnel run goes through a port forward: `iperf3 -s` listens on the
@@ -142,47 +193,43 @@ table were taken in turn, one round after another, and the tunnel was
 restarted for every flextunnel run. Every flextunnel run was on a direct
 path, read off the client's log before the run began.
 
-The v0.0.107 rows were measured two fork fixes short of the build that
-ships: the netwatch fork's sockets now take turns on receive, and the iroh
-fork keeps its send backpressure to UDP sockets. Neither changes what a
-single direct transfer does, and reruns with the limit raised and the offload
-on did not tell the builds apart: one stream stayed within 2% and three
-clients at once within 4%, in either direction.
-
 ## Results
 
-Mbit/s, medians of five rounds. "Dropped" is the median count of receives
-the receiving machine's kernel refused for want of socket buffer during a
-run (`UdpRcvbufErrors`), on the client for a download and on the server for
-an upload. One of them can be a batch of datagrams.
+Mbit/s, medians. The Linux pair's tables are fifteen rounds each, from two
+sessions of five and of ten, because five could not tell the versions apart:
+in the sessions of five either was ahead by up to 7% (v0.0.109 by 6.6% on
+downloads with offload on, v0.0.108 by 5.5% on uploads as installed), and
+the sessions of ten had them within 3%. "Dropped"
+is the median count of receives the receiving machine's kernel refused for
+want of socket buffer during a run (`UdpRcvbufErrors`), on the client for a
+download and on the server for an upload. One of them can be a batch of
+datagrams.
 
 ### Linux pair, as installed
 
 | | Down | Up | Dropped (down / up) |
 |---|---:|---:|---:|
-| No tunnel (TCP with TSO over the bridge) | 20151 | 20609 | |
-| flextunnel v0.0.106 | 1360 | 1357 | 348 / 355 |
-| flextunnel v0.0.107 | 2014 | 2037 | 198 / 1101 |
+| No tunnel (TCP with TSO over the bridge) | 21399 | 20768 | |
+| flextunnel v0.0.108 | 2067 | 2104 | 429 / 1126 |
+| flextunnel v0.0.109 | 2011 | 2032 | 379 / 1021 |
 
-The first two rounds were slow for every row (no tunnel 14768 and 17231 down
-against 20151–20735 in the other three); they are among the five behind each
-median.
+The session of five had v0.0.109 behind (1969 / 2002 against 2060 / 2118)
+and the session of ten had them level (2070 / 2042 against 2070 / 2039).
 
 ### Linux pair, `tx-udp-segmentation` on
 
 | | Down | Up | Dropped (down / up) |
 |---|---:|---:|---:|
-| No tunnel | 20264 | 20381 | |
-| flextunnel v0.0.106 | 1790 | 1817 | 142 / 125 |
-| flextunnel v0.0.107 | 2822 | 2847 | 92 / 181 |
+| No tunnel | 20770 | 20679 | |
+| flextunnel v0.0.108 | 2892 | 2899 | 111 / 171 |
+| flextunnel v0.0.109 | 2929 | 2896 | 101 / 169 |
 
 `virtio_net` supports UDP segmentation offload but leaves it off by default
 (`ethtool -K eth0 tx-udp-segmentation on`). With it on, a UDP GSO batch
 crosses to the host as one buffer instead of being segmented in the guest.
 It is a setting of the underlay NIC, outside any tunnel's control. The
-buffer limit is at its default here. The third round was slow for the
-no-tunnel row and for v0.0.106's download (no tunnel 18061 and 17234,
-v0.0.106 937 down).
+buffer limit is at its default here. By session: 2941 / 2881 against 2760 /
+2856 in the five, 2908 / 2900 against 2906 / 2937 in the ten.
 
 ### Linux pair, UDP buffer limit raised
 
@@ -191,24 +238,40 @@ setting [recommended above](#linux-raise-the-udp-buffer-limit).
 
 | | Down | Up | Dropped (down / up) |
 |---|---:|---:|---:|
-| No tunnel | 20334 | 20605 | |
-| flextunnel v0.0.106 | 1400 | 1411 | 0 / 0 |
-| flextunnel v0.0.107 | 2601 | 2633 | 0 / 0 |
+| No tunnel | 20846 | 20576 | |
+| flextunnel v0.0.108 | 2632 | 2620 | 0 / 0 |
+| flextunnel v0.0.109 | 2622 | 2504 | 0 / 0 |
 
-The last round was slow for both versions (v0.0.106 387 and 487, v0.0.107
-1227 and 1373).
+By session: 2598 / 2477 against 2653 / 2586 in the five, 2644 / 2581 against
+2626 / 2654 in the ten. Uploads ranged from 1596 to 2775 for v0.0.109 and
+from 1730 to 2824 for v0.0.108.
 
 ### Linux pair, buffer limit raised and `tx-udp-segmentation` on
 
 | | Down | Up |
 |---|---:|---:|
-| No tunnel | 20249 | 20318 |
-| flextunnel v0.0.106 | 1742 | 1845 |
-| flextunnel v0.0.107 | 3705 | 3634 |
+| No tunnel | 21065 | 20965 |
+| flextunnel v0.0.108 | 3766 | 3724 |
+| flextunnel v0.0.109 | 3611 | 3718 |
 
-Nothing was dropped for want of buffer in any flextunnel run. The first
-round was slow for every row (no tunnel 12023 and 12596, v0.0.107 2032 and
-2511).
+Nothing was dropped for want of buffer in any flextunnel run. By session:
+3583 / 3623 against 3772 / 3695 in the five, 3684 / 3718 against 3704 / 3765
+in the ten. The no-tunnel row is the five.
+
+### 53 ms round trip
+
+The delay of [Long paths](#long-paths) on both machines, runs of 20 s.
+
+| | As installed (down / up) | Dropped (down / up) | Buffer limit raised (down / up) |
+|---|---:|---:|---:|
+| flextunnel v0.0.108 | 653 / 658 | 53 / 25 | 1055 / 1075 |
+| flextunnel v0.0.109 | 677 / 668 | 51 / 27 | 1057 / 1067 |
+
+As installed, fifteen rounds: downloads ranged from 330 to 839 for v0.0.108
+and from 465 to 815 for v0.0.109, and by session the versions read 640 / 618
+against 735 / 664 in the five and 684 / 676 against 630 / 627 in the ten:
+v0.0.109's downloads 13% behind in one session and 9% ahead in the other.
+With the limit raised, five rounds, all within 9% of each other.
 
 ### `client nc`
 
@@ -218,8 +281,8 @@ pair as installed, three rounds in turn:
 
 | | Forward (down / up) | `client nc` (down / up) |
 |---|---:|---:|
-| flextunnel v0.0.106 | 1379 / 1405 | 1226 / 1279 |
-| flextunnel v0.0.107 | 1986 / 2048 | 1615 / 1689 |
+| flextunnel v0.0.108 | 2084 / 2039 | 1590 / 1724 |
+| flextunnel v0.0.109 | 1974 / 2088 | 1677 / 1739 |
 
 `nc`'s bytes make one more hop than a forward's, between the running client
 and the `nc` process, and its figure includes attaching to the client and
@@ -234,24 +297,29 @@ tunnel number against its own baseline.
 
 | Client | | Down | Up | Client CPU, cores (down / up) |
 |---|---|---:|---:|---:|
-| macOS 26.7 VM (Apple M2 Max host, 8 vCPUs, arm64), behind its host's NAT | No tunnel | 1946 | 2354 | |
-| | flextunnel v0.0.106 | 400 | 223 | 2.3 / 1.3 |
-| | flextunnel v0.0.107 | 1823 | 1100 | 1.3 / 1.2 |
-| Windows VM (build 26100, Hyper-V, 4 vCPUs, 2 GB, 2.5 Gbit/s link, another host) | No tunnel | 2096 | 2369 | |
-| | flextunnel v0.0.106 | 1847 | 1349 | 1.7 / 1.4 |
-| | flextunnel v0.0.107 | 1808 | 1700 | 1.3 / 1.1 |
+| macOS 26.7 VM (Apple M2 Max host, 8 vCPUs, arm64), behind its host's NAT | No tunnel | 1946 | 2353 | |
+| | flextunnel v0.0.108 | 1844 | 1300 | 1.3 / 1.3 |
+| | flextunnel v0.0.109 | 1862 | 1272 | 1.4 / 1.3 |
+| Windows VM (build 26100, Hyper-V, 4 vCPUs, 2 GB, 2.5 Gbit/s link, another host) | No tunnel | 2098 | 2369 | |
+| | flextunnel v0.0.108 | 1862 | 1677 | 1.3 / 1.1 |
+| | flextunnel v0.0.109 | 1944 | 1711 | 1.3 / 1.1 |
 
-Five rounds each, iperf3 run on the client (3.21 on macOS, 3.22.1 on
-Windows). Every tunnel run used a direct path. The CPU column is the client
-process's CPU time over a run divided by the run's 7 s.
+Thirteen rounds for the macOS client and five for the Windows one, iperf3
+run on the client (3.21 on macOS, 3.22.1 on Windows). Every tunnel run used a
+direct path. The CPU column is the client process's CPU time over a run
+divided by the run's 7 s.
 
-The Windows downloads are the same within their spread (1536–1954 for
-v0.0.106, 1675–1991 for v0.0.107) and close to what the path carries; the
-uploads did not overlap (1317–1439 against 1671–1710). The macOS no-tunnel
-download was identical on every run, which suggests a cap in the VM's NAT
-path, and v0.0.107's download is within 7% of it.
+Neither client tells the versions apart. The macOS uploads ranged from 889
+to 1414 for v0.0.109 and from 984 to 1340 for v0.0.108, and the first five
+rounds alone had read 1114 against 1304; the Windows ranges overlap in both
+directions. The macOS no-tunnel download was identical on every run, which
+suggests a cap in the VM's NAT path, and both versions' downloads are within
+6% of it.
 
 ## What the measurements showed
+
+All but the last of these are what v0.0.107 changed, measured against
+v0.0.106 on the same machines when it was made.
 
 ### The limit was loss, not CPU
 
@@ -451,6 +519,34 @@ other one. Here that changed nothing: the receiving side was already sending
 an ACK only when its connection task ran, about one per 50–70 packets
 (2,100–2,900 ACKs a second for 150,000 packets).
 
+v0.0.109 also grants a peer no unidirectional streams, where QUIC's default
+is 100: flextunnel opens none, and each is a stream window more that a peer
+could have a connection hold. The v0.0.109 rows above were taken before that
+was added. Against a build with it, twenty rounds in two sessions of ten,
+and in the second session a build of the same source with the constant back
+at 100:
+
+| | As installed (down / up) | Limit raised, offload on (down / up) |
+|---|---:|---:|
+| v0.0.109 as measured above (100 granted) | 2027 / 2032 | 3674 / 3650 |
+| None granted, as shipped | 1989 / 2038 | 3616 / 3582 |
+| The same source with 100 granted, ten rounds | 2012 / 1990 | 3635 / 3586 |
+
+Within 2% over the twenty. The first session had the shipped build behind by
+1–4% in all four figures (1969 / 2022 against 2037 / 2039, 3526 / 3574
+against 3670 / 3658); the second had it level with or ahead of both others
+(2059 / 2050 and 3666 / 3666, against 2020 / 2019 and 3674 / 3641, and the
+third row). A build that differs in that constant alone was not faster, so
+this is the difference between sessions and builds again, not the setting.
+
+A client grants its server no bidirectional streams either, since only the
+client opens them. With that added, against the build above it, ten rounds
+in turn: 2067 / 2079 against 2093 / 2030 as installed, and 3687 / 3627
+against 3713 / 3613 with the limit raised and the offload on. The last is
+nine rounds for both builds: in the seventh the new build's direct path was
+the machines' Tailscale address (607 / 496), so that round is left out of
+both. Over all ten the medians are 3685 / 3544 against 3698 / 3609.
+
 ### No false MTU black hole
 
 ezvpn's long transfers used to stall when noq took congestion loss for an MTU
@@ -460,13 +556,47 @@ each direction on v0.0.106's dependencies, at 1.6% loss throughout, kept the
 path MTU at 1452 with no black hole reported in any second. Nothing here
 shows flextunnel was affected.
 
+### Windows that grow on a short path too
+
+v0.0.109's windows grow when half a window was read within two round trips.
+Between these machines a round trip is 0.3 ms, no reader is that fast, and
+judged that way no window grew: every stream stayed at 1.25 MB, which at
+3.7 Gbit/s leaves the sender without credit whenever the receiving process
+is 3 ms late. On a path that short the round trip is not what a window has
+to cover, so one counts as 5 ms at least. Three builds of one source that
+differ in a constant each, with the buffer limit raised and the offload on,
+ten rounds in turn with the two releases:
+
+| | Down | Up |
+|---|---:|---:|
+| Every stream at 8 MiB from the start | 3718 | 3676 |
+| Windows that grow, a round trip counted as 5 ms at least | 3683 | 3701 |
+| Windows that grow, judged against the round trip alone | 3602 | 3581 |
+| v0.0.108 | 3704 | 3765 |
+| v0.0.109 | 3684 | 3718 |
+
+The first row behaves as v0.0.108 does and the second is what v0.0.109
+ships. Each of those pairs is one behaviour built twice, and they are up to
+2.4% apart: that is what a different build is worth here, and the size of
+the differences between the versions in the table at the top. Judged against
+the round trip alone the transfer was 2–3% slower in this session, and 5–8%
+slower on download in two earlier ones against v0.0.108 (3570 against 3763,
+3497 against 3790). In the three slower columns the same build was not told
+apart from v0.0.108.
+
+On loopback, where the tests run, a window reaches its 8 MiB at an average
+of 20–35 MB/s: delivery in bursts is enough to read half a window within
+10 ms a few times over. So a short path's windows are earned more easily
+than its average rate suggests, and what bounds them is the 64 MiB a
+connection has to give.
+
 ## Opportunities left
 
 What these runs left open, with what is known about each. None of it is
 scheduled work.
 
 - **The receive buffer with neither the sysctl nor a capability.** As
-  installed, v0.0.107 is held at about 2 Gbit/s by a 208 KB socket buffer,
+  installed, a transfer is held at about 2 Gbit/s by a 208 KB socket buffer,
   and the full buffer is worth another 30%. Both ways to get it need root
   once. Nothing was tried for a process that has neither, such as draining
   the socket from a thread of its own so that less waits in the kernel.
@@ -484,16 +614,18 @@ scheduled work.
   that overcommit their host two to one, with at most three clients. A
   dedicated machine, or a server with many busy clients, may want a
   different number; `TOKIO_WORKER_THREADS` is the knob.
-- **macOS uploads.** A macOS client's upload is 1.1 Gbit/s on a path that
-  carries 2.35, at 1.2 cores. It was not profiled. ezvpn's notes on the same
+- **macOS uploads.** A macOS client's upload is 1.3 Gbit/s on a path that
+  carries 2.35, at 1.3 cores. It was not profiled. ezvpn's notes on the same
   machine put what is left of a macOS sender's time in one `sendmsg` per
   datagram, which has no batched form there.
-- **Windows is not profiled.** Its download did not change between the
-  versions and sits within 15% of the path, so the path may be what holds
-  it; its upload gained a quarter and nothing is known about where the rest
-  of its time goes.
-- **iOS is unmeasured.** The library runs on the same forks and worker count
-  as of this version, and nothing here ran on a device.
+- **Windows is not profiled.** Its download did not change with the forks
+  and sits within 12% of the path, so the path may be what holds it; its
+  upload gained a quarter then and nothing is known about where the rest of
+  its time goes.
+- **iOS is unmeasured.** The library runs on the same forks and worker
+  count, and nothing here ran on a device. That is also why its stream
+  windows do not grow: how much a device lets the app hold before the system
+  ends it would say what budget, if any, it could be given.
 
 ## Reproducing
 
@@ -562,6 +694,25 @@ The `client nc` rows piped `head -c 1500M /dev/zero` into
 (`nc -l -d >/dev/null`), and read the same amount back from one that sends it
 (`head -c 1500M /dev/zero | nc -l -N`) with `client nc`'s stdin held open,
 because that listener stops sending once it sees the client's half-close.
+
+The 53 ms rows delayed each machine's outgoing packets under the NIC's
+transmit queues, so that those stay as they are:
+
+```bash
+sudo tc qdisc replace dev eth0 root handle 1: mq
+for q in 1 2 3 4 5 6; do sudo tc qdisc replace dev eth0 parent 1:$q netem delay 26.5ms limit 200000; done
+sudo tc qdisc del dev eth0 root    # afterwards
+```
+
+If the machines share another network (these are also on a tailnet), iroh
+may take that as its direct path once the two are equally far, so check the
+address in the `Connection: Direct …` line.
+
+The memory rows need a second forward, to a listener on the server machine
+that writes to every connection for as long as it is taken. Open the readers
+against that forward with a small `SO_RCVBUF`, read as much as the row says
+and then stop without closing, and read the client's `VmRSS` from
+`/proc/<pid>/status` once it has stopped climbing.
 
 `nstat -az UdpRcvbufErrors Udp6RcvbufErrors` before and after a run gives
 the dropped count, and `cat /sys/class/net/<dev>/queues/tx-*/xps_cpus` shows

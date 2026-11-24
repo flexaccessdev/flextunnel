@@ -31,7 +31,9 @@ use crate::proxy::{
 use crate::transport::endpoint::{ClientEndpoint, RelayConfig, server_setup};
 use crate::transport::{ALPN, QUICK_ALPN, build_quic_transport_config};
 use iroh::address_lookup::MemoryLookup;
-use iroh::endpoint::{presets, Builder as EndpointBuilder, Connection, RecvStream, SendStream};
+use iroh::endpoint::{
+    presets, Builder as EndpointBuilder, Connection, RecvStream, SendStream, Side,
+};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -76,10 +78,10 @@ async fn loopback_endpoint(secret: SecretKey, is_server: bool) -> Endpoint {
 /// The hermetic base every test endpoint is built on, in place of the relay
 /// setup: relay off, no discovery, `127.0.0.1:0`. `lookup` holds out-of-band
 /// addresses for the peers the endpoint dials by id alone.
-fn loopback_base(lookup: MemoryLookup) -> EndpointBuilder {
+fn loopback_base(side: Side, lookup: MemoryLookup) -> EndpointBuilder {
     Endpoint::builder(presets::Empty)
         .relay_mode(RelayMode::Disabled)
-        .transport_config(build_quic_transport_config().unwrap())
+        .transport_config(build_quic_transport_config(side).unwrap())
         .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
         .unwrap()
@@ -95,7 +97,8 @@ async fn loopback_endpoint_full(
     lookup: MemoryLookup,
     quick_clients: HashSet<EndpointId>,
 ) -> Endpoint {
-    let base = loopback_base(lookup);
+    let side = if is_server { Side::Server } else { Side::Client };
+    let base = loopback_base(side, lookup);
     let builder = if is_server {
         server_setup(base, secret, quick_clients)
     } else {
@@ -1293,7 +1296,7 @@ async fn a_peer_granting_no_stream_times_the_handshake_out() {
         .max_concurrent_bidi_streams(0u32.into())
         .build();
     let server = server_setup(
-        loopback_base(MemoryLookup::new()).transport_config(no_streams),
+        loopback_base(Side::Server, MemoryLookup::new()).transport_config(no_streams),
         SecretKey::generate(),
         HashSet::new(),
     )
@@ -1593,7 +1596,7 @@ async fn prepared_server_serves_an_authorized_client() {
     .unwrap();
     assert_eq!(prepared.own_id(), secret.public());
 
-    let running = Arc::new(prepared.bind_with(loopback_base(MemoryLookup::new())).await);
+    let running = Arc::new(prepared.bind_with(loopback_base(Side::Server, MemoryLookup::new())).await);
     let server_ep = running.endpoint();
     assert_eq!(server_ep.id(), secret.public(), "bound under the configured identity");
     let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
@@ -2031,7 +2034,7 @@ async fn prepared_quick_server_admits_only_the_entered_client() {
         blocklist_file: bl_path.clone(),
     })
     .unwrap();
-    let running = Arc::new(prepared.bind_with(loopback_base(MemoryLookup::new())).await);
+    let running = Arc::new(prepared.bind_with(loopback_base(Side::Server, MemoryLookup::new())).await);
     let server_ep = running.endpoint();
     let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
     let served = tokio::spawn({
@@ -2191,4 +2194,142 @@ async fn startup_guard_recognizes_conflicted_own_id() {
     assert!(reloaded.is_server_conflicted(&own_id.to_string()));
 
     let _ = std::fs::remove_file(&bl_path);
+}
+
+/// A peer is granted the streams tunnels use and no others, so it cannot have
+/// this side hold a window for any other: a client opens a bidirectional
+/// stream to its server at once, where a unidirectional stream from either
+/// end, or any stream from the server, waits.
+#[tokio::test]
+async fn a_peer_is_granted_only_the_streams_tunnels_use() {
+    const TEST_ALPN: &[u8] = b"flextunnel-test/streams-granted";
+    const WAIT: Duration = Duration::from_millis(500);
+
+    let server = loopback_base(Side::Server, MemoryLookup::new())
+        .secret_key(SecretKey::from_bytes(&[73; 32]))
+        .alpns(vec![TEST_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let server_addr = EndpointAddr::new(server.id()).with_ip_addr(server.bound_sockets()[0]);
+    let client = loopback_base(Side::Client, MemoryLookup::new())
+        .secret_key(SecretKey::from_bytes(&[74; 32]))
+        .bind()
+        .await
+        .unwrap();
+
+    let from_server = tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let bi = matches!(tokio::time::timeout(WAIT, conn.open_bi()).await, Ok(Ok(_)));
+        let uni = matches!(tokio::time::timeout(WAIT, conn.open_uni()).await, Ok(Ok(_)));
+        conn.closed().await;
+        (bi, uni)
+    });
+
+    let conn = with_timeout(client.connect(server_addr, TEST_ALPN)).await.unwrap();
+    with_timeout(conn.open_bi()).await.unwrap();
+    let uni = tokio::time::timeout(WAIT, conn.open_uni()).await;
+    assert!(uni.is_err(), "the client opened a unidirectional stream");
+
+    // Past both of the server's waits before the connection goes.
+    tokio::time::sleep(2 * WAIT).await;
+    conn.close(0u32.into(), b"done");
+    let (bi, uni) = with_timeout(from_server).await.unwrap();
+    assert!(!bi, "the server opened a bidirectional stream");
+    assert!(!uni, "the server opened a unidirectional stream");
+}
+
+/// A stream's flow-control window follows its reader. Unread, a stream holds
+/// what every stream starts with and no more: the peer gets
+/// [`STREAM_RECEIVE_WINDOW`](crate::transport::STREAM_RECEIVE_WINDOW) ahead of
+/// the reader and is held there. Read as fast as loopback delivers, it is
+/// given more, and keeps it when the reader stops: the peer then gets further
+/// ahead than a starting window, though never past
+/// [`STREAM_RECEIVE_WINDOW_MAX`](crate::transport::STREAM_RECEIVE_WINDOW_MAX).
+#[tokio::test]
+async fn a_streams_window_follows_its_reader() {
+    use crate::transport::{STREAM_RECEIVE_WINDOW, STREAM_RECEIVE_WINDOW_MAX};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const TEST_ALPN: &[u8] = b"flextunnel-test/stream-window";
+    const START: u64 = STREAM_RECEIVE_WINDOW as u64;
+    const MAX: u64 = STREAM_RECEIVE_WINDOW_MAX as u64;
+    // What the reader takes at a stretch before it stops to see how far ahead
+    // the sender gets: several times what a window needs to reach its maximum.
+    const STRETCH: u64 = 4 * MAX;
+    // Long enough for a sender with credit to use all of it.
+    const SETTLE: Duration = Duration::from_millis(500);
+
+    let server = loopback_base(Side::Server, MemoryLookup::new())
+        .secret_key(SecretKey::from_bytes(&[71; 32]))
+        .alpns(vec![TEST_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let server_addr = EndpointAddr::new(server.id()).with_ip_addr(server.bound_sockets()[0]);
+    let client = loopback_base(Side::Client, MemoryLookup::new())
+        .secret_key(SecretKey::from_bytes(&[72; 32]))
+        .bind()
+        .await
+        .unwrap();
+
+    // The far side writes to the stream opened to it for as long as the
+    // stream takes it, counting what it has taken.
+    let sent = Arc::new(AtomicU64::new(0));
+    let sender = tokio::spawn({
+        let sent = Arc::clone(&sent);
+        async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let (mut send, _recv) = conn.accept_bi().await.unwrap();
+            let chunk = vec![5u8; 64 * 1024];
+            while let Ok(n) = send.write(&chunk).await {
+                sent.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }
+    });
+
+    let all = async {
+        let conn = client.connect(server_addr, TEST_ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"go").await.unwrap();
+
+        // Unread, the stream takes its starting window and stops there.
+        while sent.load(Ordering::Relaxed) < START {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(sent.load(Ordering::Relaxed), START);
+
+        // Read at full speed and then stopped, it has more than that. How fast
+        // a stretch has to be read for the window to grow is the transport's
+        // business; a slow machine gets several stretches to manage it.
+        let mut read = 0u64;
+        let mut chunks: [bytes::Bytes; 32] = std::array::from_fn(|_| bytes::Bytes::new());
+        let mut ahead = 0;
+        for _ in 0..8 {
+            let until = read + STRETCH;
+            while read < until {
+                let n = recv.read_many_chunks(&mut chunks).await.unwrap().unwrap();
+                read += chunks[..n].iter().map(|c| c.len() as u64).sum::<u64>();
+            }
+            tokio::time::sleep(SETTLE).await;
+            ahead = sent.load(Ordering::Relaxed) - read;
+            assert!(ahead <= MAX, "{ahead} bytes ahead of the reader");
+            if ahead > START {
+                break;
+            }
+        }
+        // Only the iOS build's windows stay as they start. Any other build
+        // has to show growth, whatever its maximum has been set to.
+        if cfg!(target_os = "ios") {
+            assert_eq!(MAX, START);
+        } else {
+            assert!(ahead > START, "the window never grew: {ahead} bytes ahead");
+        }
+        recv.stop(0u32.into()).unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(120), all)
+        .await
+        .expect("timed out");
+    sender.await.unwrap();
 }

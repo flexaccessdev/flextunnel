@@ -1916,7 +1916,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-cli"
-version = "0.0.108"
+version = "0.0.109"
 dependencies = [
  "anyhow",
  "clap",
@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-core"
-version = "0.0.108"
+version = "0.0.109"
 dependencies = [
  "anyhow",
  "askama",
@@ -1963,7 +1963,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-desktop"
-version = "0.0.108"
+version = "0.0.109"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
@@ -1995,7 +1995,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-ffi"
-version = "0.0.108"
+version = "0.0.109"
 dependencies = [
  "flextunnel-core",
  "iroh",
@@ -3298,7 +3298,7 @@ checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
 [[package]]
 name = "iroh"
 version = "1.5.0"
-source = "git+https://github.com/flexaccessdev/iroh.git?branch=flextunnel-1.5.0#502a86cbbdc0cbab5d0264c633c19c6945c5020e"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=flextunnel-1.5.0#4ed70fc0369d6008e45eba091e6f43ac4f63709d"
 dependencies = [
  "backon",
  "blake3",
@@ -3347,7 +3347,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "1.5.0"
-source = "git+https://github.com/flexaccessdev/iroh.git?branch=flextunnel-1.5.0#502a86cbbdc0cbab5d0264c633c19c6945c5020e"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=flextunnel-1.5.0#4ed70fc0369d6008e45eba091e6f43ac4f63709d"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -3366,7 +3366,7 @@ dependencies = [
 [[package]]
 name = "iroh-dns"
 version = "1.5.0"
-source = "git+https://github.com/flexaccessdev/iroh.git?branch=flextunnel-1.5.0#502a86cbbdc0cbab5d0264c633c19c6945c5020e"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=flextunnel-1.5.0#4ed70fc0369d6008e45eba091e6f43ac4f63709d"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -3435,7 +3435,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "1.5.0"
-source = "git+https://github.com/flexaccessdev/iroh.git?branch=flextunnel-1.5.0#502a86cbbdc0cbab5d0264c633c19c6945c5020e"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=flextunnel-1.5.0#4ed70fc0369d6008e45eba091e6f43ac4f63709d"
 dependencies = [
  "blake3",
  "bytes",
@@ -4322,7 +4322,7 @@ dependencies = [
 [[package]]
 name = "noq"
 version = "1.5.0"
-source = "git+https://github.com/flexaccessdev/noq.git?branch=flextunnel-1.5.0#2814c282a3c426844b25bf2256480a321b9f32e5"
+source = "git+https://github.com/flexaccessdev/noq.git?branch=flextunnel-1.5.0#0b92e60328ca87cdb3aea54f1d80be9ebfb44c2d"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -4343,7 +4343,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.5.0"
-source = "git+https://github.com/flexaccessdev/noq.git?branch=flextunnel-1.5.0#2814c282a3c426844b25bf2256480a321b9f32e5"
+source = "git+https://github.com/flexaccessdev/noq.git?branch=flextunnel-1.5.0#0b92e60328ca87cdb3aea54f1d80be9ebfb44c2d"
 dependencies = [
  "aes-gcm 0.10.3",
  "bytes",
@@ -4369,7 +4369,7 @@ dependencies = [
 [[package]]
 name = "noq-udp"
 version = "1.5.0"
-source = "git+https://github.com/flexaccessdev/noq.git?branch=flextunnel-1.5.0#2814c282a3c426844b25bf2256480a321b9f32e5"
+source = "git+https://github.com/flexaccessdev/noq.git?branch=flextunnel-1.5.0#0b92e60328ca87cdb3aea54f1d80be9ebfb44c2d"
 dependencies = [
  "cfg_aliases",
  "libc",

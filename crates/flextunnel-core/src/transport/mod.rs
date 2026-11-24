@@ -4,9 +4,11 @@
 //! QUIC bi-streams (not unreliable datagrams), so there is no datagram-buffer
 //! or congestion-controller tuning — the idle timeout, the app-level heartbeat
 //! cadence, a larger initial MTU, and two settings that a single bulk stream
-//! depends on: the flow-control windows ([`STREAM_RECEIVE_WINDOW`],
-//! [`SEND_WINDOW`]) and how much reordering loss detection tolerates
-//! ([`REORDERING_PACKET_THRESHOLD`], [`REORDERING_TIME_THRESHOLD`]).
+//! depends on: flow-control windows that grow with the stream's reader
+//! ([`STREAM_RECEIVE_WINDOW`], [`STREAM_RECEIVE_WINDOW_MAX`],
+//! [`STREAM_WINDOW_BUDGET`], [`SEND_WINDOW`]) and how much reordering loss
+//! detection tolerates ([`REORDERING_PACKET_THRESHOLD`],
+//! [`REORDERING_TIME_THRESHOLD`]).
 //!
 //! The stack underneath is forks of iroh, noq and netwatch carrying the
 //! changes ezvpn's forks do, patched in by the workspace manifest, whose
@@ -16,7 +18,7 @@ pub mod endpoint;
 pub mod paths;
 
 use anyhow::{Context, Result};
-use iroh::endpoint::QuicTransportConfig;
+use iroh::endpoint::{QuicTransportConfig, Side};
 use std::time::Duration;
 
 /// QUIC idle timeout. A connection with no activity for this long is considered
@@ -38,49 +40,81 @@ pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 /// (`1500 − 40 IPv6 − 8 UDP`) and matches quinn's DPLPMTUD upper-bound default.
 pub const QUIC_INITIAL_MTU: u16 = 1452;
 
-/// Flow-control window of one stream: how much the peer may send on it ahead
-/// of what the application has read.
+/// Flow-control window every stream starts with: how much the peer may send
+/// on it ahead of what the application has read. iroh's default.
 ///
 /// A stream cannot carry more than a window per round trip, whatever the path
-/// could take, so this caps a transfer at `window / RTT`. iroh's default of
-/// 1.25 MB is 100 Mbit/s at 100 ms; over a path with 53 ms round trips and
-/// room for far more, a forward measured 180 Mbit/s with it in either
-/// direction, and with this 370–450 down and 560–680 up. A larger window
-/// would only matter on a path both faster and longer than that, and the
-/// window is also what a stream buffers when its reader stalls or is merely
-/// slower than the path. That is its price: 70 stalled readers on one
-/// connection took a client to 570–690 MB of memory and 95 to 900 MB, about
-/// 9 MB each, where the default window held under 2 MB each (QUIC's default
-/// limit of 100 streams stands). Halving the window halves that and the cap
-/// alike: with 50 ms added to a 3 ms path and the UDP buffer limits raised, an
-/// upload ran at 1040 Mbit/s with this window, 560 with 4 MiB, 290 with 2 MiB.
+/// could take, so a window caps a transfer at `window / RTT`: this one at
+/// 100 Mbit/s per 100 ms. But the window is also what a stream buffers when
+/// its reader stalls or is merely slower than the path, and QUIC credit cannot
+/// be taken back once granted. So no stream is given more than this up front.
+/// A stream whose reader keeps up earns more, up to
+/// [`STREAM_RECEIVE_WINDOW_MAX`]; one that is read slowly or not at all, and
+/// the control stream, stay here. So does every stream of the iOS client.
+pub const STREAM_RECEIVE_WINDOW: u32 = 1_250_000;
+
+/// The most a stream's window grows to.
 ///
-/// The connection as a whole stays unlimited all the same, as it is by
-/// default. A connection-wide limit is shared by every stream, the control
-/// stream included, and comes back an eighth at a time as readers read. With
-/// one of 128 MiB, 18 stalled readers left the heartbeat unanswered and the
-/// client dropped the link with every tunnel on it; 24 readers that were only
-/// slow (100 kB/s each) made a new stream wait 3–15 s for its first 100 kB,
-/// or time out, where without the limit it took 12 ms.
+/// The noq fork widens a stream's window as the stream is read
+/// (`max_stream_receive_window`): each time half the window has been read
+/// within two round trips, the reader is keeping up with a sender the window
+/// is holding back, and the window doubles. A round trip counts as 5 ms at
+/// least: on a shorter path what the window has to cover is how late the
+/// receiving process runs, and held to the starting window a 3.7 Gbit/s
+/// transfer between two machines 0.3 ms apart lost 3–5%. It never shrinks
+/// again, since the credit behind it stays out until the peer has used it.
 ///
-/// What bounds the memory where it has to be bounded is a smaller window of
-/// the stream's own, which leaves every other stream and the heartbeat their
-/// credit. The iOS client is the one build the system kills for the memory it
-/// holds, so there the window is iroh's default, as it has always been: its
-/// downloads stay capped at 100 Mbit/s per 100 ms of round trip, and its
-/// streams at the under 2 MB each they held before. The window is each
-/// side's own, so a server still offers that client the full one for uploads.
-pub const STREAM_RECEIVE_WINDOW: u32 = if cfg!(target_os = "ios") {
-    1_250_000
+/// At this size a stream carries 1.2 Gbit/s at 53 ms. Every stream used to be
+/// given it from the start, on every build but iOS, and that was the price:
+/// 95 stalled readers on one connection took a client past 1 GB of memory,
+/// about 12 MB each, where streams held to [`STREAM_RECEIVE_WINDOW`] took
+/// under 2 MB each.
+///
+/// The iOS client's windows do not grow. A reader that was fast and then
+/// stalls keeps the window it earned, so with growth an ordinary download can
+/// leave a stream holding several times the 1.25 MB that build has always
+/// held its streams to, and iOS is the one build the system kills for the
+/// memory it holds: what budget is safe on a device has not been measured.
+/// Its downloads stay capped at 100 Mbit/s per 100 ms of round trip. The
+/// window is each side's own, so a server still grows the one it offers that
+/// client for uploads.
+pub const STREAM_RECEIVE_WINDOW_MAX: u32 = if cfg!(target_os = "ios") {
+    STREAM_RECEIVE_WINDOW
 } else {
-    8 * 1024 * 1024
+    WIDEST_STREAM_WINDOW
 };
 
+/// The widest window a stream grows to on any build, which is what a peer may
+/// offer whatever this build's own [`STREAM_RECEIVE_WINDOW_MAX`].
+const WIDEST_STREAM_WINDOW: u32 = 8 * 1024 * 1024;
+
+/// What the streams of one connection may hold between them beyond their
+/// starting windows (the noq fork's `stream_receive_window_budget`): enough
+/// for nine at [`STREAM_RECEIVE_WINDOW_MAX`]. A stream takes what its window
+/// grows by out of this and returns it when it ends.
+///
+/// It bounds what a peer can be made to buffer: a connection carries the 100
+/// bidirectional streams a server grants its client and no others
+/// ([`build_quic_transport_config`]), so `100 × STREAM_RECEIVE_WINDOW` plus
+/// this, about 183 MiB at either end, where the starting windows alone are
+/// the 119 MiB it always could.
+///
+/// It is not QUIC's own limit across a connection's streams, which stays
+/// unlimited as it is by default. That limit is credit every stream draws on,
+/// the control stream included, and it comes back an eighth at a time as
+/// readers read: with one of 128 MiB on 8 MiB streams, 18 stalled readers left
+/// the heartbeat unanswered and the client dropped the link with every tunnel
+/// on it, and 24 readers that were only slow (100 kB/s each) made a new stream
+/// wait 3–15 s for its first 100 kB, or time out, where without the limit it
+/// took 12 ms. A stream this budget has nothing left for keeps the window it
+/// has and its own credit, whatever the other streams' readers do.
+pub const STREAM_WINDOW_BUDGET: u64 = 64 * 1024 * 1024;
+
 /// How much sent-but-unacknowledged stream data a connection holds, across its
-/// streams. Twice the widest stream window a peer offers (8 MiB, whatever
-/// this build's own [`STREAM_RECEIVE_WINDOW`]), so one stream can fill its
+/// streams. Twice the widest window a peer offers a stream (8 MiB, whatever
+/// this build's own [`STREAM_RECEIVE_WINDOW_MAX`]), so one stream can fill its
 /// window while others still send.
-pub const SEND_WINDOW: u64 = 16 * 1024 * 1024;
+pub const SEND_WINDOW: u64 = 2 * WIDEST_STREAM_WINDOW as u64;
 
 /// How many later packets must be acknowledged before an unacknowledged one
 /// is declared lost on that ground alone (QUIC's packet reordering threshold,
@@ -190,9 +224,19 @@ pub const QUICK_ALPN: &[u8] = b"flextunnel-quick/1";
 /// the flow-control windows and the reordering thresholds — and **no transport
 /// keep-alive** (see [`QUIC_IDLE_TIMEOUT`]; the app-level heartbeat is the sole
 /// periodic sender). Shared by client and server endpoint creation so both
-/// sides apply identical settings: each side's windows bound what the other
+/// sides apply the same settings: each side's windows bound what the other
 /// sends, and each side's thresholds judge its own packets.
-pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
+///
+/// What differs by `side` is the streams a peer is granted, which are the
+/// ones tunnels use and no others: a client opens bidirectional streams to
+/// its server, so a server grants QUIC's default of 100 and a client grants
+/// none, and neither grants unidirectional ones. Each stream QUIC would
+/// otherwise allow (100 of each kind, from either end) is a stream receive
+/// window more that a peer could have this side hold.
+///
+/// The window growth settings exist only in the noq fork the workspace builds
+/// against, and reach here through the iroh fork's builder.
+pub fn build_quic_transport_config(side: Side) -> Result<QuicTransportConfig> {
     let mut transport_config = QuicTransportConfig::builder();
     let idle_timeout = QUIC_IDLE_TIMEOUT
         .try_into()
@@ -200,7 +244,14 @@ pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
     transport_config = transport_config.max_idle_timeout(Some(idle_timeout));
     transport_config = transport_config.initial_mtu(QUIC_INITIAL_MTU);
     transport_config = transport_config.stream_receive_window(STREAM_RECEIVE_WINDOW.into());
+    transport_config =
+        transport_config.max_stream_receive_window(STREAM_RECEIVE_WINDOW_MAX.into());
+    transport_config = transport_config.stream_receive_window_budget(STREAM_WINDOW_BUDGET);
     transport_config = transport_config.send_window(SEND_WINDOW);
+    transport_config = transport_config.max_concurrent_uni_streams(0u32.into());
+    if side == Side::Client {
+        transport_config = transport_config.max_concurrent_bidi_streams(0u32.into());
+    }
     transport_config = transport_config.packet_threshold(REORDERING_PACKET_THRESHOLD);
     transport_config = transport_config.time_threshold(REORDERING_TIME_THRESHOLD);
     Ok(transport_config.build())

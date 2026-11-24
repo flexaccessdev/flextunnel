@@ -80,12 +80,12 @@ impl EndpointHooks for AllowlistHook {
 /// The shared base builder with flextunnel's QUIC transport tuning. mDNS
 /// local-network discovery is on (the shared crate's `mdns` feature; compiled
 /// out on iOS by the crate itself).
-fn base_builder(relay_config: &RelayConfig, publish_address: bool) -> Result<EndpointBuilder> {
+fn base_builder(relay_config: &RelayConfig, side: Side) -> Result<EndpointBuilder> {
     Ok(endpoint_builder(
         relay_config,
         EndpointOptions {
-            transport_config: build_quic_transport_config()?,
-            publish_address,
+            transport_config: build_quic_transport_config(side)?,
+            publish_address: side == Side::Server,
             relay_only: false,
         },
     ))
@@ -126,13 +126,13 @@ pub async fn create_server_endpoint(
     // A server's runtime is the process's: a close the creation stops waiting
     // for finishes on it by itself.
     let closes = PendingCloses::new();
-    create_endpoint(relay_config, setup(base_builder(relay_config, true)?), &closes).await
+    create_endpoint(relay_config, setup(base_builder(relay_config, Side::Server)?), &closes).await
 }
 
 /// A client endpoint builder. A client never publishes its address (it only
 /// dials out), even with a quick-mode secret bound as its identity.
 fn client_builder(relay_config: &RelayConfig, secret: Option<SecretKey>) -> Result<EndpointBuilder> {
-    let mut builder = base_builder(relay_config, false)?;
+    let mut builder = base_builder(relay_config, Side::Client)?;
     if let Some(secret) = secret {
         builder = builder.secret_key(secret);
     }
