@@ -1026,7 +1026,9 @@ impl Destination {
                                 std::future::pending::<()>().await;
                             }
                             let now_online = *available.borrow_and_update();
-                            if now_online && !online {
+                            // Without an outage there is no retry time to
+                            // clear, and the status must not gain one.
+                            if now_online && !online && outage.next_attempt_at.is_some() {
                                 log::debug!("{}: network available again while idle", self.name());
                                 self.reset_backoff(outage);
                             }
@@ -1793,6 +1795,31 @@ mod tests {
         }
         assert_eq!(outage.attempt, 0, "a restored path starts a fresh series");
         assert!(outage.nudge, "the endpoint is nudged on the next attempt");
+    }
+
+    /// A path that drops and returns while an idle destination has no outage
+    /// leaves it as it was: its status gains no retry time.
+    #[tokio::test(start_paused = true)]
+    async fn a_path_restored_while_idle_without_an_outage_changes_nothing() {
+        let d = destination(false);
+        let mut outage = Outage::default();
+        let due = d.wait_until_due(&mut outage);
+        tokio::pin!(due);
+        d.shared.network_available.send_replace(false);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut due)
+                .await
+                .is_err()
+        );
+        d.shared.network_available.send_replace(true);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut due)
+                .await
+                .is_err()
+        );
+        let status = d.status();
+        assert_eq!(status.state, DestinationState::Idle);
+        assert_eq!(status.next_attempt_at, None);
     }
 
     /// With the network reported unavailable a wanted destination parks — no
