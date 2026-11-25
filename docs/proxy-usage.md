@@ -332,6 +332,11 @@ receives the hostname.
 > These browser paths were not tested here; verify the exact settings in your
 > browser version.
 
+On Android, the SOCKS5 proxy comes from the
+[flextunnel-android](https://github.com/flexaccessdev/flextunnel-android) app;
+its browser and app setup is in that repo's
+[docs/socks5-browsers.md](https://github.com/flexaccessdev/flextunnel-android/blob/main/docs/socks5-browsers.md).
+
 ### Other tools worth knowing
 
 - **`nc` (OpenBSD netcat)** — `nc -X 5 -x 127.0.0.1:1080 host port` dials
