@@ -25,7 +25,7 @@
 //! `panic = "abort"` anyway).
 
 use std::ffi::c_void;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 use jni::errors::ErrorPolicy;
 use jni::objects::{JClass, JObject, JString};
@@ -39,9 +39,11 @@ use crate::{FlextunnelHandle, fetch_server_routes_inner, start_session, stop_ses
 /// [`crate::flextunnel_init_logging`] uses.
 const DEFAULT_LOG_FILTER: &str = "warn,flextunnel_core=info,flextunnel_ffi=info";
 
-/// Set once `init` has registered the app context; later calls are no-ops
-/// (ndk-context panics on a second registration).
-static ANDROID_CONTEXT: OnceLock<()> = OnceLock::new();
+/// Whether `init` has registered the app context. Held across the check, the
+/// registration and the update, so two concurrent `init`s cannot both reach
+/// ndk-context's unsynchronized global write (which also panics on a second
+/// registration); later calls are no-ops.
+static ANDROID_CONTEXT: Mutex<bool> = Mutex::new(false);
 
 /// A native method's failure: the message for the Kotlin side, or a JNI error.
 #[derive(Debug)]
@@ -153,7 +155,12 @@ pub extern "system" fn Java_dev_flexaccess_flextunnel_FlextunnelNative_init<'cal
                     .with_tag("flextunnel")
                     .with_filter(android_logger::FilterBuilder::new().parse(&filter).build()),
             );
-            if ANDROID_CONTEXT.get().is_some() {
+            // A panic while holding it aborts the process (panic = "abort"),
+            // so a poisoned lock never holds a half-done registration.
+            let mut registered = ANDROID_CONTEXT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *registered {
                 return Ok(());
             }
             let vm = env.get_java_vm()?;
@@ -162,14 +169,15 @@ pub extern "system" fn Java_dev_flexaccess_flextunnel_FlextunnelNative_init<'cal
             let context = env.new_global_ref(&context)?.into_raw();
             // SAFETY: both pointers are valid for the life of the process (the
             // JVM's by construction, the context's through the leaked global
-            // ref), and the OnceLock makes this the only registration.
+            // ref), and the lock held since the check makes this the only
+            // registration.
             unsafe {
                 ndk_context::initialize_android_context(
                     vm.get_raw().cast::<c_void>(),
                     context.cast::<c_void>(),
                 )
             };
-            let _ = ANDROID_CONTEXT.set(());
+            *registered = true;
             Ok(())
         })
         .resolve::<ThrowIllegalState>()

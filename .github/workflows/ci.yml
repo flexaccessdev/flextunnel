@@ -79,23 +79,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-latest, abi: arm64-v8a }
-          - { os: ubuntu-latest, abi: x86_64 }
+          - { os: macos-latest, abi: arm64-v8a, target: aarch64-linux-android }
+          - { os: ubuntu-latest, abi: x86_64, target: x86_64-linux-android }
     runs-on: ${{ matrix.os }}
+    # The NDK is the runner's own: its ANDROID_NDK_ROOT, which cargo-ndk and
+    # build-android.sh both read.
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
         with:
           key: android-${{ matrix.abi }}
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
+      - name: Install cargo-ndk and the Rust target
+        run: |
+          cargo install cargo-ndk --locked
+          rustup target add ${{ matrix.target }}
       - name: Clippy
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
         run: cargo ndk -t ${{ matrix.abi }} --platform 34 clippy -p flextunnel-ffi --lib -- -D warnings
       - name: Build (debug)
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
         run: ./build-android.sh debug
 
   # The host clippy compiles flextunnel-desktop's Windows backend (tray +

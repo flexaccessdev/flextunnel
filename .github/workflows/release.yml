@@ -213,9 +213,9 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
+      # The runner's NDK (its ANDROID_NDK_ROOT); build-android.sh adds the
+      # Rust target itself.
       - name: Build libflextunnel.so
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
         run: ./build-android.sh release
 
       - uses: actions/upload-artifact@v4

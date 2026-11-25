@@ -79,15 +79,21 @@ echo "NDK: ${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}"
 rustup target list --installed | grep -qx "$TARGET" || rustup target add "$TARGET"
 
 JNILIBS="$SCRIPT_DIR/dist/android/jniLibs"
-rm -rf "${JNILIBS:?}/$ABI"
 mkdir -p "$JNILIBS"
+# Built into a staging dir beside it and moved into place only on success, so a
+# failed build leaves the ABI's previous library where it was.
+STAGE="$(mktemp -d "$SCRIPT_DIR/dist/android/.stage.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
 
 echo "Building libflextunnel.so [$PROFILE] for $ABI ..."
 # shellcheck disable=SC2086
-cargo ndk -t "$ABI" --platform "$ANDROID_API" -o "$JNILIBS" \
+cargo ndk -t "$ABI" --platform "$ANDROID_API" -o "$STAGE" \
   build -p flextunnel-ffi --lib $CARGO_FLAGS
 # cargo-ndk stages every shared library it finds; only libflextunnel.so is wanted.
-find "$JNILIBS/$ABI" -type f ! -name libflextunnel.so -delete
+find "$STAGE/$ABI" -type f ! -name libflextunnel.so -delete
+[ -f "$STAGE/$ABI/libflextunnel.so" ] || { echo "cargo-ndk staged no libflextunnel.so for $ABI" >&2; exit 1; }
+rm -rf "${JNILIBS:?}/$ABI"
+mv "$STAGE/$ABI" "$JNILIBS/$ABI"
 
 ls -la "$JNILIBS/$ABI/libflextunnel.so"
 echo

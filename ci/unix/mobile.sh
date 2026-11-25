@@ -34,10 +34,10 @@ ios() {
 }
 
 android() {
-    local abi ndk=
+    local abi target ndk=
     case "$(uname -m)" in
-        arm64|aarch64) abi=arm64-v8a ;;
-        x86_64|amd64) abi=x86_64 ;;
+        arm64|aarch64) abi=arm64-v8a target=aarch64-linux-android ;;
+        x86_64|amd64) abi=x86_64 target=x86_64-linux-android ;;
         *) echo "no Android ABI builds on a $(uname -m) host" >&2; return 1 ;;
     esac
     echo ''
@@ -63,6 +63,8 @@ android() {
         fi
     fi
     [ -n "$ndk" ] || { echo 'no Android NDK on this machine' >&2; return 1; }
+    # Clippy runs first, so it needs the target build-android.sh would add.
+    rustup target list --installed | grep -qx "$target" || rustup target add "$target"
     echo "   cargo ndk -t $abi --platform 34 clippy -p flextunnel-ffi --lib -- -D warnings"
     ANDROID_NDK_HOME=$ndk cargo ndk -t "$abi" --platform 34 clippy -p flextunnel-ffi --lib -- -D warnings
     echo '   ./build-android.sh debug'
