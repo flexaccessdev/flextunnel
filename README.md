@@ -101,9 +101,11 @@ All payload is end-to-end encrypted by QUIC/TLS 1.3.
 Prebuilt release assets are published on the
 [GitHub Releases](https://github.com/flexaccessdev/flextunnel/releases) page.
 Stable releases include `flextunnel` for Linux
-amd64/arm64, macOS arm64, and Windows amd64, plus the iOS xcframework asset.
-Automated prereleases currently include Linux amd64/arm64, macOS arm64, and the
-iOS xcframework, but skip Windows. The install scripts download the latest
+amd64/arm64, macOS arm64, and Windows amd64, plus the iOS xcframework and the
+Android `libflextunnel-android.zip` (the core of
+[flextunnel-android](https://github.com/flexaccessdev/flextunnel-android)) assets.
+Automated prereleases currently include Linux amd64/arm64, macOS arm64, the
+iOS xcframework and the Android zip, but skip Windows. The install scripts download the latest
 binary and verify its SHA-256 checksum. On Linux/macOS this installs to a
 per-user location (`~/.local/bin`, no root required). On Windows this installs
 system-wide to `C:\Program Files\flextunnel` and updates the machine PATH,
@@ -222,8 +224,16 @@ cargo build --release
 
 Requires a recent Rust toolchain (edition 2024). A bare `cargo build --release`
 uses the workspace's default members and builds the CLI, but not
-the iOS static library. To cross-build the CLI for Linux amd64 + arm64 via
-Docker, use `./build-linux.sh`.
+the iOS static library or the Android shared library. To cross-build the CLI
+for Linux amd64 + arm64 via Docker, use `./build-linux.sh`.
+
+The Android app's `libflextunnel.so` comes from `./build-android.sh` (cargo-ndk
+and an Android NDK), which builds only the ABI of the host's own CPU:
+arm64-v8a on an Apple-silicon Mac, x86_64 on an x86_64 Linux or Mac. From a
+machine of the other kind, `ci/unix/remote.sh -H macvm run ./build-android.sh
+release` builds the working tree on macvm, and `ci/unix/remote.sh -H macvm
+fetch dist/android/jniLibs/arm64-v8a dist/android/jniLibs/arm64-v8a` brings it
+back.
 
 ## Quick start
 

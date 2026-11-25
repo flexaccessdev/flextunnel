@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # The steps from .github/workflows/ci.yml, in the same order, with the same
-# flags — the `linux` + `miri` jobs on Linux, the `macos` + `miri` +
-# `verify-ios-xcframework` jobs on macOS. When this file and that workflow
-# disagree, the workflow is right and this is stale; it exists to say what CI
-# will say before CI is asked.
+# flags — the `linux` + `miri` jobs on Linux, the `macos` + `miri` jobs on
+# macOS. When this file and that workflow disagree, the workflow is right and
+# this is stale; it exists to say what CI will say before CI is asked.
+#
+# The mobile libraries' jobs (`verify-ios-xcframework`, `android`) are not
+# here: they are only needed when working on ../flextunnel-ios or
+# ../flextunnel-android, and need Xcode or an Android NDK. ci/unix/mobile.sh
+# runs them, on request.
 #
 # This runs natively on whatever Unix machine it is invoked on: a CI box (see
 # ci/unix/remote.sh) or a dev machine. It installs nothing beyond what
@@ -50,27 +54,6 @@ if [ "$(uname -s)" = Darwin ]; then
     step 'Clippy' clippy --workspace --all-targets -- -D warnings
     step 'Test' test -p flextunnel-core -p flextunnel-cli -p flextunnel-desktop
     miri
-
-    # The verify-ios-xcframework job. Needs Xcode (xcodebuild) and the two iOS
-    # Rust targets — build-ios.sh adds the targets itself, but nothing here can
-    # conjure up Xcode, so a machine without it skips loudly rather than failing.
-    # FLEXTUNNEL_CI_SKIP_IOS=1 skips it on a machine that does have Xcode.
-    if [ -n "${FLEXTUNNEL_CI_SKIP_IOS:-}" ]; then
-        echo ''
-        echo '== iOS xcframework (debug) =='
-        echo '   SKIPPED: FLEXTUNNEL_CI_SKIP_IOS is set'
-    elif ! command -v xcodebuild >/dev/null; then
-        echo ''
-        echo '== iOS xcframework (debug) =='
-        echo '   SKIPPED: no xcodebuild on this machine'
-    else
-        echo ''
-        echo '== iOS xcframework (debug) =='
-        echo '   ./build-ios.sh debug'
-        # build-ios.sh builds into ./target and stages ./dist/ios by relative
-        # path; CARGO_TARGET_DIR (set by remote.sh) still redirects the former.
-        ./build-ios.sh debug
-    fi
 else
     # The linux job: flextunnel-desktop is macOS/Windows only (tray + keychain
     # backends) and is excluded; flextunnel-ffi still type-checks here.

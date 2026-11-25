@@ -3,8 +3,9 @@ name: CI
 # On-demand (and push/PR) verification across every host platform, mirroring
 # ezvpn's ci.yml. The point is to type-check and test the platform-gated code
 # that Linux CI never sees — flextunnel-desktop's macOS/Windows tray + keychain
-# backends and the iOS FFI staticlib — before a release. Nothing is published;
-# packaging (.dmg/.msi) and the iOS release zip belong to release.yml.
+# backends, the iOS FFI staticlib and the Android JNI surface — before a
+# release. Nothing is published; packaging (.dmg/.msi) and the iOS and Android
+# release zips belong to release.yml.
 on:
   push:
     branches: ["main"]
@@ -68,6 +69,34 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build iOS xcframework + header (debug)
         run: ./build-ios.sh debug
+
+  # The Android .so, each ABI on a runner with its own CPU (build-android.sh
+  # builds no other): clippy on the FFI for that target — the JNI surface in
+  # src/android.rs compiles for Android only — then a debug build. Nothing is
+  # published; the release asset is release.yml's.
+  android:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, abi: arm64-v8a, target: aarch64-linux-android }
+          - { os: ubuntu-latest, abi: x86_64, target: x86_64-linux-android }
+    runs-on: ${{ matrix.os }}
+    # The NDK is the runner's own: its ANDROID_NDK_ROOT, which cargo-ndk and
+    # build-android.sh both read.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-${{ matrix.abi }}
+      - name: Install cargo-ndk and the Rust target
+        run: |
+          cargo install cargo-ndk --locked
+          rustup target add ${{ matrix.target }}
+      - name: Clippy
+        run: cargo ndk -t ${{ matrix.abi }} --platform 34 clippy -p flextunnel-ffi --lib -- -D warnings
+      - name: Build (debug)
+        run: ./build-android.sh debug
 
   # The host clippy compiles flextunnel-desktop's Windows backend (tray +
   # keychain), which Linux CI never type-checks.
