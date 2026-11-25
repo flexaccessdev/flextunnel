@@ -161,7 +161,9 @@ showing the endpoint id it gives — and *Create server* goes straight on to aut
 - **Applied on save** — every saved change takes effect at once. The server
   runs with the settings it started with, so a change (a client authorized or
   removed, the tunnel set edited, a new identity) restarts a running server,
-  which closes its clients' connections; they reconnect when next used.
+  which closes its clients' connections; they reconnect when next used —
+  except after a new identity, when each client must first switch its
+  destination to the new endpoint id.
   Removing the last client stops it, so a revoked client can't keep
   connecting.
 

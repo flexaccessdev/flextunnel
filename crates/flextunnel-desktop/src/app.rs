@@ -2204,9 +2204,13 @@ impl App {
         };
         // The referenced auth key stays — it's shared, managed in the Keys
         // pane. So do the forwards: one that pointed here now shows "no route".
-        self.client.destinations.remove(pos);
+        let removed = self.client.destinations.remove(pos);
         self.notice = None;
-        self.persist_store();
+        if !self.persist_store() {
+            // Not on disk: the destination stays, and so does the client.
+            self.client.destinations.insert(pos, removed);
+            return;
+        }
         if self.selection == Selection::Destination(id) {
             self.selection = self
                 .client

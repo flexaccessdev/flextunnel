@@ -493,7 +493,15 @@ mod tests {
         let fresh = handle.endpoint();
         assert_ne!(fresh.id(), first.id(), "the rebuild was installed");
         assert!(fresh.is_closed(), "and closed by the close");
-        assert!(first.is_closed());
+        // The replaced one closes on a task of its own, which nobody waited
+        // for once the caller was dropped.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !first.is_closed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the replaced endpoint closes");
         assert!(
             handle.rebuild().await.is_err(),
             "nothing is built after a close"
