@@ -5,10 +5,11 @@
 //! forwards — that connects to a destination when something is first sent to
 //! it; the server is a flextunnel server run in-process (the app hosts one;
 //! its lock, per identity, is shared with the CLI). Each is enabled or
-//! disabled, started with the app while enabled, and restarted to apply
-//! changed settings. The daemon owns all state, so closing the window (which
-//! destroys it) loses nothing — the tray re-opens it on demand. Tray/menu
-//! events are forwarded from tray-icon's handlers into a channel drained by a
+//! disabled, started with the app while enabled, and every save applies at
+//! once — the client's in place, the server's by restarting it. The daemon
+//! owns all state, so closing the window (which destroys it) loses nothing —
+//! the tray re-opens it on demand. Tray/menu events are forwarded from
+//! tray-icon's handlers into a channel drained by a
 //! [`Subscription`], so a tray click wakes the runtime even while no window
 //! exists; a 500 ms tick keeps the snapshots and the tray state fresh the rest
 //! of the time.
@@ -79,9 +80,12 @@ pub enum Selection {
 pub enum DestinationLive<'a> {
     /// The client is not running: nothing reaches any destination.
     Stopped,
-    /// The client runs, but not with this destination as saved — it was added
-    /// or edited since the session started, and applies on a restart.
-    Pending,
+    /// The client runs, but not with this destination as saved — it was just
+    /// added or edited, and the session is taking it in.
+    Applying,
+    /// The client runs, but not with this destination as saved, and won't
+    /// until what this says is fixed: it runs on as it was.
+    NotApplied(String),
     /// The destination's state in the running session.
     Live(&'a DestinationStatus),
 }
@@ -129,8 +133,6 @@ pub enum Message {
     /// the client's only on/off control: enabled, it runs (starting with the
     /// app); disabled, it stops and stays stopped across launches.
     SetClientEnabled(bool),
-    /// Restart the running client so changed settings take effect.
-    RestartClient,
     /// Open the client pane's proxy-ports form.
     EditProxies,
     SocksEnabledToggled(bool),
@@ -208,8 +210,6 @@ pub enum Message {
     /// the server's only on/off control: enabled, it runs (starting with the
     /// app); disabled, it stops and stays stopped across launches.
     SetServerEnabled(bool),
-    /// Restart the running server so changed settings take effect.
-    RestartServer,
     /// The setup form's identity: import an existing key (`true`) or use the
     /// generated one.
     ServerImportToggled(bool),
@@ -485,16 +485,6 @@ fn check_relays(relay_urls: &[String], relay_auth_token: Option<String>) -> Resu
     )
     .map(|_| ())
     .map_err(|e| format!("{e:#}"))
-}
-
-/// Whether the session behind `snapshot` was started with exactly the saved
-/// settings: the same ports, destinations and key secrets.
-fn runs_saved_settings(
-    snapshot: &ClientSnapshot,
-    client: &ClientSettings,
-    keys: &[AuthKey],
-) -> bool {
-    snapshot.spec.as_deref() == ClientSpec::resolve(client, keys).as_ref()
 }
 
 /// Where the destination form's "Fetch from server" stands.
@@ -1050,6 +1040,9 @@ impl ServerForm {
         if relay_auth_token.is_some() && relay_urls.is_empty() {
             return Err("A relay auth token requires at least one relay URL".into());
         }
+        // Checked here, as for a destination: a save applies at once, and a
+        // server restarted on relays it cannot start with would stop.
+        check_relays(&relay_urls, relay_auth_token.clone())?;
         Ok(ServerConfig {
             endpoint_id,
             secret,
@@ -1270,9 +1263,6 @@ pub struct App {
     pub confirm_remove_client: Option<String>,
     /// Two-click guard for copying the server's identity secret.
     pub confirm_export_server_secret: bool,
-    /// The config the server session was last started with, so the pane can
-    /// tell when the saved settings differ from the running ones.
-    server_applied: Option<ServerConfig>,
     /// The client pane's open forward form.
     pub forward_form: Option<ForwardForm>,
     /// Two-click delete guard: the destination whose Delete was clicked once.
@@ -1380,7 +1370,6 @@ impl App {
             identity_form: None,
             confirm_remove_client: None,
             confirm_export_server_secret: false,
-            server_applied: None,
             forward_form: None,
             confirm_delete: None,
             confirm_delete_key: None,
@@ -1438,7 +1427,7 @@ impl App {
                 None => log::info!("Starting the configured server"),
                 Some(blocker) => log::warn!("Not starting the server yet: {blocker}"),
             }
-            app.resume_server();
+            app.apply_server();
         }
         // So is an enabled client. Starting it binds its local ports only: it
         // connects to a destination when something is first sent there.
@@ -1448,7 +1437,7 @@ impl App {
                 None => log::info!("Starting the client"),
                 Some(blocker) => log::warn!("Not starting the client yet: {blocker}"),
             }
-            app.resume_client();
+            app.apply_client();
         }
         // Launched as a login item, the app stays in the tray; the window is
         // a click away — unless the store reset warning needs answering.
@@ -1578,10 +1567,6 @@ impl App {
                 Task::none()
             }
             Message::SetClientEnabled(enabled) => self.set_client_enabled(enabled),
-            Message::RestartClient => {
-                self.restart_client();
-                Task::none()
-            }
             Message::EditProxies => {
                 self.forward_form = None;
                 self.notice = None;
@@ -1917,24 +1902,6 @@ impl App {
                 Task::none()
             }
             Message::SetServerEnabled(enabled) => self.set_server_enabled(enabled),
-            Message::RestartServer => {
-                let Some(server) = self.server.clone() else {
-                    return Task::none();
-                };
-                match server.start_blocker() {
-                    None => {
-                        self.controller.restart_server(server.clone());
-                        self.server_applied = Some(server);
-                    }
-                    // E.g. the identity was lost: it would not start again, so
-                    // stop the stale session rather than leave it running.
-                    Some(blocker) => {
-                        self.controller.stop_server();
-                        self.notice = Some(blocker.into());
-                    }
-                }
-                Task::none()
-            }
             Message::ServerImportToggled(import) => {
                 if let Some(identity) = self.server_form.as_mut().and_then(|f| f.identity.as_mut())
                 {
@@ -2093,7 +2060,7 @@ impl App {
     /// How `destination` stands in the client session: live only when the
     /// session was started with it exactly as saved — the same settings and
     /// the same credential. Both are read from the session's own snapshot, so
-    /// a destination whose key was edited since is pending, not live under
+    /// a destination whose key was just edited is applying, not live under
     /// the new key.
     pub fn destination_live(&self, destination: &Destination) -> DestinationLive<'_> {
         if self.client_snapshot.phase != ClientPhase::Running {
@@ -2109,7 +2076,29 @@ impl App {
             .iter()
             .any(|d| d.destination == *destination && Some(d.auth_secret.as_str()) == secret);
         if !applied {
-            return DestinationLive::Pending;
+            // Held for what it lacks, refused for the routes, or refused by
+            // the session for this very version of it; otherwise its apply is
+            // still on its way.
+            let refused = self
+                .client_snapshot
+                .destinations_refused
+                .as_ref()
+                .filter(|(asked, _)| {
+                    asked.iter().any(|d| {
+                        d.destination == *destination && Some(d.auth_secret.as_str()) == secret
+                    })
+                })
+                .map(|(_, reason)| reason.clone());
+            let reason = config::destination_blocker(destination, &self.keys)
+                .or_else(|| {
+                    let routes = self.routed_cache.error.as_ref();
+                    routes.map(|e| format!("Fix the destinations' names and routes: {e}"))
+                })
+                .or(refused);
+            return match reason {
+                Some(reason) => DestinationLive::NotApplied(reason),
+                None => DestinationLive::Applying,
+            };
         }
         match self
             .client_snapshot
@@ -2147,58 +2136,32 @@ impl App {
         }
     }
 
-    /// Whether the running client was started with other settings than the
-    /// saved ones — its ports, its destinations or a key they use — so a
-    /// restart is needed to apply them. Forwards never need one.
-    pub fn client_needs_restart(&self) -> bool {
-        // A client just disabled is stopping, not waiting for a restart.
-        matches!(
-            self.client_snapshot.phase,
-            ClientPhase::Starting | ClientPhase::Running
-        ) && self.client.enabled
-            && !runs_saved_settings(&self.client_snapshot, &self.client, &self.keys)
-    }
-
-    /// Start a client session with the saved settings, if they resolve. What
-    /// a session runs with is what it reports in its snapshot, not what was
-    /// asked for here.
-    fn start_client(&mut self) {
-        if let Some(spec) = ClientSpec::resolve(&self.client, &self.keys) {
+    /// Apply the saved client settings — how every saved change takes effect.
+    /// An enabled client runs them: started when it is down, and otherwise
+    /// taking them in place — a changed or removed destination is closed (a
+    /// changed one connects afresh when next used), the others keep their
+    /// connections, and changed proxy ports are rebound. A destination that
+    /// cannot be used yet — one imported without its key, say — is held
+    /// ([`ClientSpec::held`]): a running client takes every other change,
+    /// deletions included, and refuses what the held one routes rather than
+    /// connecting it directly; its own row says what it lacks. A client that
+    /// is down does not start so: it waits for every destination. With none
+    /// usable it is stopped. A disabled client stays stopped.
+    /// The supervisor decides between those by what it actually runs, not by
+    /// the polled snapshot. Forwards are not part of it: they apply on their
+    /// own (see [`App::commit_forwards`]).
+    fn apply_client(&mut self) {
+        if !self.client.enabled {
+            return;
+        }
+        let spec = ClientSpec::resolve(&self.client, &self.keys);
+        if self.client.is_ready(&self.keys) {
             self.controller
-                .start_client(spec, self.client.forwards.clone());
-        }
-    }
-
-    /// Start the client if it is enabled, down, and can start: at launch, and
-    /// after a change that may have made it startable — its first destination
-    /// added, a lost key secret re-entered, a taken port changed. A client
-    /// still stopping gets the start queued behind the stop.
-    fn resume_client(&mut self) {
-        let down = matches!(
-            self.controller.client_snapshot().phase,
-            ClientPhase::Stopped | ClientPhase::Failed | ClientPhase::Stopping
-        );
-        if down && self.client.enabled && self.client.is_ready(&self.keys) {
-            self.start_client();
-        }
-    }
-
-    /// Restart the running client with the saved settings — or, when they no
-    /// longer start (the last destination deleted, a key lost), stop the stale
-    /// session rather than leave it running.
-    fn restart_client(&mut self) {
-        self.notice = None;
-        match self.client.start_blocker(&self.keys) {
-            None => {
-                if let Some(spec) = ClientSpec::resolve(&self.client, &self.keys) {
-                    self.controller
-                        .restart_client(spec, self.client.forwards.clone());
-                }
-            }
-            Some(blocker) => {
-                self.controller.stop_client();
-                self.notice = Some(blocker);
-            }
+                .apply_client(spec, self.client.forwards.clone());
+        } else if spec.destinations.is_empty() {
+            self.controller.stop_client();
+        } else {
+            self.controller.narrow_client(spec);
         }
     }
 
@@ -2216,7 +2179,7 @@ impl App {
             return Task::none();
         }
         let Some(blocker) = self.client.start_blocker(&self.keys) else {
-            self.start_client();
+            self.apply_client();
             return Task::none();
         };
         // Show what is missing; with nowhere to go yet, that is a destination
@@ -2241,9 +2204,13 @@ impl App {
         };
         // The referenced auth key stays — it's shared, managed in the Keys
         // pane. So do the forwards: one that pointed here now shows "no route".
-        self.client.destinations.remove(pos);
+        let removed = self.client.destinations.remove(pos);
         self.notice = None;
-        self.persist_store();
+        if !self.persist_store() {
+            // Not on disk: the destination stays, and so does the client.
+            self.client.destinations.insert(pos, removed);
+            return;
+        }
         if self.selection == Selection::Destination(id) {
             self.selection = self
                 .client
@@ -2252,15 +2219,10 @@ impl App {
                 .map(|d| Selection::Destination(d.id.clone()))
                 .unwrap_or(Selection::Client);
         }
-        // The running session still routes to it until it restarts (the
-        // panes say so). Without any destination left there is nothing to
-        // restart into: stop. And a client that was held back by this very
-        // destination — no key picked for it, say — can start now.
-        if self.client.destinations.is_empty() {
-            self.controller.stop_client();
-        } else {
-            self.resume_client();
-        }
+        // Closed in the running client — which stops with no destination
+        // left. And a client that was held back by this very destination (no
+        // key picked for it, say) can start now.
+        self.apply_client();
     }
 
     /// Close every form and two-click guard of the detail pane.
@@ -2293,30 +2255,27 @@ impl App {
         self.show_window()
     }
 
-    /// Whether the running server was started with other settings than the
-    /// saved ones, so a restart is needed to apply them.
-    pub fn server_needs_restart(&self) -> bool {
-        // A server just disabled is stopping, not waiting for a restart.
-        matches!(
-            self.server_snapshot.phase,
-            ServerPhase::Starting | ServerPhase::Running
-        ) && self.server.as_ref().is_some_and(|s| s.enabled)
-            && self.server_applied.as_ref() != self.server.as_ref()
-    }
-
-    /// Start the server if it is enabled, down, and can start: at launch, and
-    /// after a change that may have made it startable — the first client
-    /// authorized, a lost identity re-imported. A server still stopping (its
-    /// last client just removed) gets the start queued behind the stop.
-    fn resume_server(&mut self) {
-        let down = matches!(
-            self.controller.server_snapshot().phase,
-            ServerPhase::Stopped | ServerPhase::Failed | ServerPhase::Stopping
-        );
-        if down && let Some(server) = self.server.clone().filter(|s| s.enabled && s.is_ready()) {
-            self.controller.start_server(server.clone());
-            self.server_applied = Some(server);
+    /// Apply the saved server settings — how every saved change takes effect:
+    /// an enabled server runs them (started, or restarted when it runs
+    /// others: it takes its settings only at start), or is stopped when
+    /// they no longer start (the last client removed, the identity lost). A
+    /// revocation must not wait: a server still running the old settings
+    /// lets the removed client in. Returns whether a session is up — one a
+    /// changed config restarts.
+    fn apply_server(&mut self) -> bool {
+        let Some(server) = self.server.clone().filter(|s| s.enabled) else {
+            return false;
+        };
+        if !server.is_ready() {
+            self.controller.stop_server();
+            return false;
         }
+        let up = matches!(
+            self.controller.server_snapshot().phase,
+            ServerPhase::Starting | ServerPhase::Running
+        );
+        self.controller.apply_server(server);
+        up
     }
 
     /// Enable or disable the server, persisted: enabling starts it — or shows
@@ -2339,8 +2298,7 @@ impl App {
             return Task::none();
         };
         if server.is_ready() {
-            self.controller.start_server(server.clone());
-            self.server_applied = Some(server);
+            self.apply_server();
             return Task::none();
         }
         // Show what is missing: the identity secret was lost from the
@@ -2366,7 +2324,6 @@ impl App {
         }
         self.controller.remove_server();
         self.server_snapshot = ServerSnapshot::default();
-        self.server_applied = None;
         self.close_forms();
         if self.log_filter == LogFilter::Server {
             self.log_filter = LogFilter::All;
@@ -2397,12 +2354,18 @@ impl App {
             return;
         };
         let setting_up = self.server.is_none();
-        self.server = Some(server);
-        // A save failure's notice wins over the outcome below.
+        let changed = self.server.as_ref() != Some(&server);
+        let previous = self.server.replace(server);
         self.notice = None;
-        self.persist_store();
+        // Not on disk, not applied: the server would run settings the next
+        // launch forgets. The form stays open, under the failure's notice.
+        if !self.persist_store() {
+            self.server = previous;
+            return;
+        }
         self.selection = Selection::Server;
         self.server_form = None;
+        let restarted = self.apply_server() && changed;
         if self.notice.is_some() {
             return;
         }
@@ -2418,7 +2381,18 @@ impl App {
                 "Saved. Authorize a client to start the server.".into()
             });
         } else {
-            self.notice = Some("Saved.".into());
+            self.notice = Some(Self::server_saved_notice("Saved", restarted));
+        }
+    }
+
+    /// The notice for a server save: `done`, and whether a running server was
+    /// asked to restart to apply it, which closes its clients' connections.
+    /// Asked, not done: the replacement's own state is in the server pane.
+    fn server_saved_notice(done: &str, restarted: bool) -> String {
+        if restarted {
+            format!("{done} — the server is restarting to apply it.")
+        } else {
+            format!("{done}.")
         }
     }
 
@@ -2431,13 +2405,25 @@ impl App {
         };
         let name = client.name.clone();
         server.authorized_clients.push(client);
-        self.client_form = None;
         self.notice = None;
-        self.persist_store();
-        if self.notice.is_none() {
-            self.notice = Some(format!("Authorized \"{name}\"."));
+        // A grant that is not on disk is not applied: the server would let the
+        // client in until the next launch forgets it. The form stays open,
+        // with what was typed into it, under the failure's notice.
+        if !self.persist_store() {
+            if let Some(server) = &mut self.server {
+                server.authorized_clients.pop();
+            }
+            return;
         }
-        self.resume_server();
+        self.client_form = None;
+        // The first client is what a server without one was waiting for.
+        let restarted = self.apply_server();
+        if self.notice.is_none() {
+            self.notice = Some(Self::server_saved_notice(
+                &format!("Authorized \"{name}\""),
+                restarted,
+            ));
+        }
     }
 
     fn remove_client(&mut self, public_key: String) {
@@ -2459,19 +2445,8 @@ impl App {
         }
         self.notice = None;
         self.persist_store();
-        // A revocation can't wait for a restart: the running server still
-        // lets the removed client in. Restart it without the client — which
-        // also replaces a restart already in flight — or stop it when no
-        // client is left (it starts again once one is added). The supervisor
-        // leaves a server that is not running alone.
-        if let Some(server) = self.server.clone().filter(|s| s.enabled) {
-            if server.is_ready() {
-                self.controller.restart_server(server.clone());
-                self.server_applied = Some(server);
-            } else {
-                self.controller.stop_server();
-            }
-        }
+        // Restarted without the client, or stopped when none is left.
+        self.apply_server();
     }
 
     /// Two-click export: the second click puts the identity secret on the
@@ -2508,11 +2483,18 @@ impl App {
             return;
         };
         let changed = endpoint_id != server.endpoint_id;
+        let previous = server.clone();
         server.secret = secret;
         server.endpoint_id = endpoint_id;
-        self.identity_form = None;
         self.notice = None;
-        self.persist_store();
+        // Not on disk, not applied: a server under an identity the next
+        // launch forgets would send its clients to the wrong endpoint id. The
+        // form stays open, under the failure's notice.
+        if !self.persist_store() {
+            self.server = Some(previous);
+            return;
+        }
+        self.identity_form = None;
         if self.notice.is_none() {
             self.notice = Some(if changed {
                 "New identity saved — every client must switch to the new endpoint id.".into()
@@ -2520,8 +2502,9 @@ impl App {
                 "Identity key restored.".into()
             });
         }
-        // A re-imported identity makes a stopped server startable again.
-        self.resume_server();
+        // A re-imported identity makes a stopped server startable again; a
+        // new one restarts a running server under it.
+        self.apply_server();
     }
 
     fn handle_menu_event(&mut self, id: &str) -> Task<Message> {
@@ -2581,10 +2564,10 @@ impl App {
         let running = self.client_snapshot.spec.as_deref();
         view::refresh_routed_cache(
             &mut self.running_routed_cache,
-            running
-                .into_iter()
-                .flat_map(|spec| &spec.destinations)
-                .map(|d| &d.destination),
+            // In the core's order: the held ones route too, after the others.
+            running.into_iter().flat_map(|spec| {
+                (spec.destinations.iter().map(|d| &d.destination)).chain(&spec.held)
+            }),
         );
 
         let revision = logging::revision();
@@ -2611,19 +2594,24 @@ impl App {
             return;
         };
         let id = destination.id.clone();
+        let previous = self.client.destinations.clone();
         match self.client.destinations.iter_mut().find(|d| d.id == id) {
             Some(slot) => *slot = destination,
             None => self.client.destinations.push(destination),
         }
-        // A save failure's notice wins over the outcome below.
         self.notice = None;
-        self.persist_store();
+        // A change that is not on disk is not applied: the form stays open,
+        // with what was typed into it, under the failure's notice.
+        if !self.persist_store() {
+            self.client.destinations = previous;
+            return;
+        }
         self.selection = Selection::Destination(id);
         self.destination_form = None;
         // The first destination is what an enabled client was waiting for.
-        self.resume_client();
+        self.apply_client();
         if self.notice.is_none() {
-            self.notice = self.saved_notice();
+            self.notice = Some("Saved.".into());
         }
     }
 
@@ -2657,22 +2645,6 @@ impl App {
         })
     }
 
-    /// Whether a save just now left a running client on the settings from
-    /// before. Asks the controller rather than the polled snapshot, which a
-    /// start made a moment ago has not reached yet.
-    fn restart_pending(&self) -> bool {
-        let snapshot = self.controller.client_snapshot();
-        matches!(snapshot.phase, ClientPhase::Starting | ClientPhase::Running)
-            && self.client.enabled
-            && !runs_saved_settings(&snapshot, &self.client, &self.keys)
-    }
-
-    /// The notice for a save on a pane that shows the restart banner: "Saved."
-    /// unless that banner is about to say more.
-    fn saved_notice(&self) -> Option<String> {
-        (!self.restart_pending()).then(|| "Saved.".into())
-    }
-
     fn save_proxy_form(&mut self) {
         let Some(form) = &self.proxy_form else {
             return;
@@ -2680,15 +2652,20 @@ impl App {
         let Ok((socks_port, http_port)) = form.validate(&self.client) else {
             return;
         };
+        let previous = (self.client.socks_port, self.client.http_port);
         self.client.socks_port = socks_port;
         self.client.http_port = http_port;
-        self.proxy_form = None;
         self.notice = None;
-        self.persist_store();
+        // Not on disk, not applied: the form stays open for another try.
+        if !self.persist_store() {
+            (self.client.socks_port, self.client.http_port) = previous;
+            return;
+        }
+        self.proxy_form = None;
         // A taken port is what a failed client was waiting to have changed.
-        self.resume_client();
+        self.apply_client();
         if self.notice.is_none() {
-            self.notice = self.saved_notice();
+            self.notice = Some("Saved.".into());
         }
     }
 
@@ -2733,23 +2710,24 @@ impl App {
         let Ok(key) = form.validate(&self.keys) else {
             return;
         };
+        let previous = self.keys.clone();
         match self.keys.iter_mut().find(|k| k.id == key.id) {
             Some(slot) => *slot = key,
             None => self.keys.push(key),
         }
         self.notice = None;
-        self.persist_store();
+        // Not on disk, not applied: the form stays open for another try.
+        if !self.persist_store() {
+            self.keys = previous;
+            return;
+        }
         self.key_form = None;
         // A re-entered secret is what a client blocked on it was waiting for;
-        // a running one takes an edited secret on its next restart, offered
-        // on the client's pane — this one has no banner to say so.
-        self.resume_client();
+        // in a running one, the destinations using an edited secret reconnect
+        // with it.
+        self.apply_client();
         if self.notice.is_none() {
-            self.notice = Some(if self.restart_pending() {
-                "Saved — restart the client (under Proxy & forwards) to apply.".into()
-            } else {
-                "Saved.".into()
-            });
+            self.notice = Some("Saved.".into());
         }
     }
 
@@ -2878,7 +2856,7 @@ impl App {
         if !shown {
             self.selection = Selection::Client;
         }
-        self.resume_client();
+        self.apply_client();
     }
 
     /// Re-join the log ring for the Logs pane, keeping only the client's or
@@ -3961,6 +3939,17 @@ mod tests {
         let mut form = valid_server_form();
         form.relay_auth_token = "psk".into();
         assert!(form.validate(None).is_err(), "token without relays");
+
+        let mut form = valid_server_form();
+        form.relay_urls = "not a url, https://relay.example".into();
+        assert!(
+            form.validate(None).is_err(),
+            "a relay URL that doesn't parse"
+        );
+        form.relay_urls = "https://relay.example".into();
+        assert!(form.validate(None).is_err(), "one custom relay");
+        form.relay_urls = "https://a.relay.example, https://b.relay.example".into();
+        assert!(form.validate(None).is_ok());
     }
 
     #[test]

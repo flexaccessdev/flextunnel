@@ -14,7 +14,9 @@
 //! destination it goes to, the other destinations' rules it lies inside or
 //! that lie inside it, and whether its server routes it too — as the server
 //! said on the destination's latest connection that read it ("last known"
-//! when a later read failed), or "unchecked" for one not yet used.
+//! when a later read failed), or "unchecked" for one not yet used. A held
+//! destination's rules (see [`super::HeldDestination`]) show as "held": the
+//! client refuses what they match until the destination is set up.
 //!
 //! On `/` (and `/servers/<destination>/`) an `Accept: application/json` or
 //! `text/plain` header picks the format, as the path suffix does. A
@@ -30,7 +32,8 @@
 //! own (and no scripts), apart from the client's pages and the other servers'.
 
 use super::client::{
-    ClientStatus, HoldBudget, LocalProto, LocalStream, Router, TUNNEL_OPEN_TIMEOUT, open_tunnel,
+    ClientStatus, HoldBudget, LocalProto, LocalStream, Router, Routing, TUNNEL_OPEN_TIMEOUT,
+    open_tunnel,
 };
 use super::destination::{DestinationState, DestinationStatus};
 use super::reserved;
@@ -46,7 +49,6 @@ use askama::Template;
 use iroh::endpoint::Connection;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -138,6 +140,8 @@ enum ServerCheck {
     Graded(Coverage),
     /// Not read from the server yet.
     Unchecked,
+    /// A held destination's: refused, never sent to its server or direct.
+    Held,
 }
 
 impl ServerCheck {
@@ -146,6 +150,7 @@ impl ServerCheck {
             Self::Loopback => "loopback",
             Self::Graded(coverage) => coverage.as_str(),
             Self::Unchecked => "unchecked",
+            Self::Held => "held",
         }
     }
 }
@@ -159,8 +164,9 @@ struct RouteView {
     kind: &'static str,
     destination: String,
     /// `loopback` (always served), `allowed`, `partly allowed`, `not allowed`
-    /// (by the server's own lists), or `unchecked` (not read from the server
-    /// yet).
+    /// (by the server's own lists), `unchecked` (not read from the server
+    /// yet), or `held` (the destination is not set up on this client yet, so
+    /// what the rule matches is refused).
     server: &'static str,
     /// `server` as the pages act on it.
     #[serde(skip)]
@@ -185,7 +191,13 @@ impl RouteView {
             ServerCheck::Graded(Coverage::Partial) => "backoff",
             ServerCheck::Graded(Coverage::None) => "failed",
             ServerCheck::Unchecked => "idle",
+            ServerCheck::Held => "failed",
         }
+    }
+
+    /// Whether the row's destination is held: its matches are refused.
+    fn held(&self) -> bool {
+        matches!(self.check, ServerCheck::Held)
     }
 }
 
@@ -218,8 +230,11 @@ fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
         .map(|row| {
             let within = within.remove(&row).unwrap_or_default();
             let narrower = narrower.remove(&row).unwrap_or_default();
+            // The status lists the live destinations only: the held ones
+            // follow them in the table.
             let destination = status.destinations.get(row.dest);
             let (kind, check) = match &row.rule {
+                TableRule::Loopback(_) if destination.is_none() => ("loopback", ServerCheck::Held),
                 TableRule::Loopback(_) => ("loopback", ServerCheck::Loopback),
                 TableRule::Routed(rule) => {
                     let kind = match rule {
@@ -228,9 +243,10 @@ fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
                         Rule::Exact(_) => "exact",
                         Rule::Cidr(_) => "network",
                     };
-                    let check = match destination.and_then(|d| d.server_coverage.get(rule)) {
-                        Some(coverage) => ServerCheck::Graded(*coverage),
-                        None => ServerCheck::Unchecked,
+                    let check = match destination.map(|d| d.server_coverage.get(rule)) {
+                        None => ServerCheck::Held,
+                        Some(Some(coverage)) => ServerCheck::Graded(*coverage),
+                        Some(None) => ServerCheck::Unchecked,
                     };
                     (kind, check)
                 }
@@ -239,7 +255,7 @@ fn routes(status: &ClientStatus, table: &RouteTable) -> Vec<RouteView> {
             // be out of date.
             let graded = match check {
                 ServerCheck::Graded(_) => true,
-                ServerCheck::Loopback | ServerCheck::Unchecked => false,
+                ServerCheck::Loopback | ServerCheck::Unchecked | ServerCheck::Held => false,
             };
             let server_last_known = graded
                 && destination
@@ -499,7 +515,8 @@ pub(super) async fn serve<P: LocalProto, S: LocalStream>(
     proto: &P,
     tcp: &mut S,
     preamble: Option<Vec<u8>>,
-    router: &Arc<Router>,
+    router: &Router,
+    routing: &Routing,
     reserved_other: bool,
     holds: &HoldBudget,
 ) -> Result<()> {
@@ -533,12 +550,13 @@ pub(super) async fn serve<P: LocalProto, S: LocalStream>(
         .await;
     }
     if let Some(rest) = request.path.strip_prefix(SERVERS_PATH_PREFIX) {
-        return serve_server_status(tcp, router, rest, request.accept, holds).await;
+        return serve_server_status(tcp, routing, rest, request.accept, holds).await;
     }
     match request.path.as_str() {
         "/" | STATUS_TEXT_PATH | STATUS_JSON_PATH => {
             let format = status_page::status_format_for(&request.path, request.accept);
-            let (status_line, content_type, body) = render(&router.status(), &router.table, format);
+            let (status_line, content_type, body) =
+                render(&router.status_of(routing), &routing.table, format);
             respond(tcp, status_line, content_type, &body).await
         }
         other => not_found(tcp, &format!("no such page: {other}")).await,
@@ -556,7 +574,7 @@ pub(super) async fn serve<P: LocalProto, S: LocalStream>(
 /// before the local app is written to.
 async fn serve_server_status<S: LocalStream>(
     tcp: &mut S,
-    router: &Arc<Router>,
+    routing: &Routing,
     rest: &str,
     accept: Option<StatusFormat>,
     holds: &HoldBudget,
@@ -568,10 +586,12 @@ async fn serve_server_status<S: LocalStream>(
     if !matches!(tail.as_str(), "/" | STATUS_TEXT_PATH | STATUS_JSON_PATH) {
         return not_found(tcp, &format!("no such page: {SERVERS_PATH_PREFIX}{rest}")).await;
     }
-    let Some(dest) = router.table.index_of(name) else {
+    let Some(dest) = routing.table.index_of(name) else {
         return not_found(tcp, &format!("no destination named {name:?}")).await;
     };
-    let destination = &router.destinations[dest];
+    let Some(destination) = routing.destinations.get(dest) else {
+        return not_found(tcp, &format!("destination {name:?} is not set up yet")).await;
+    };
 
     let fetched = async {
         let lease = destination
@@ -757,6 +777,7 @@ mod tests {
     use crate::proxy::route_table::RouteSpec;
     use crate::proxy::routed_set::RoutedSet;
     use crate::proxy::server_routes::ServerRoutes;
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn strings(items: &[&str]) -> Vec<String> {
@@ -995,6 +1016,67 @@ mod tests {
 
     /// A failed read after a good one keeps the earlier answer, shown as the
     /// last known, with why the latest read failed.
+    /// A held destination's rules, which follow the live ones in the table
+    /// but have no status, show as held: refused, not unchecked or served.
+    #[test]
+    fn a_held_destination_shows_its_rules_as_held() {
+        let (status, now) = status();
+        let held_domains = strings(&["held.example"]);
+        let mut specs: Vec<RouteSpec<'_>> = status
+            .destinations
+            .iter()
+            .map(|d| RouteSpec {
+                name: &d.name,
+                routed_domains: &d.routed_domains,
+                routed_cidrs: &d.routed_cidrs,
+            })
+            .collect();
+        specs.push(RouteSpec {
+            name: "h1",
+            routed_domains: &held_domains,
+            routed_cidrs: &[],
+        });
+        let table = RouteTable::new(&specs).unwrap();
+
+        let (_, _, body) = render_at(&status, &table, StatusFormat::Json, now);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let held: Vec<(&str, &str)> = json["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["destination"] == "h1")
+            .map(|r| (r["rule"].as_str().unwrap(), r["server"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            held,
+            [
+                ("h1.localhost.flextunnel.internal", "held"),
+                ("held.example", "held"),
+            ]
+        );
+
+        let (_, _, text) = render_at(&status, &table, StatusFormat::Text, now);
+        assert!(
+            text.contains(
+                "h1.localhost.flextunnel.internal -> h1's server loopback, held: not set up on this client yet, refused"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "held.example (exact) -> h1, held: not set up on this client yet, refused"
+            ),
+            "{text}"
+        );
+        let (_, _, html) = render_at(&status, &table, StatusFormat::Html, now);
+        assert!(
+            html.contains(
+                "held <span class=\"muted\">not set up on this client yet; refused</span>"
+            ),
+            "{html}"
+        );
+    }
+
     #[test]
     fn a_failed_refresh_keeps_the_last_known_answer() {
         let (mut status, now) = status();

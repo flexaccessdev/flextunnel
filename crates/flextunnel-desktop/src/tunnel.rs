@@ -8,9 +8,14 @@
 //! The client session is one [`ProxyClient`] over every destination: it binds
 //! the local proxy ports and the port forwards, and connects to a destination
 //! only when something is sent to it — closing the connection again once it
-//! has gone unused (see [`flextunnel_core::proxy::ProxyClient::run`]). The
-//! session owns its client future, so dropping it (stop/shutdown) tears down
-//! the accept loops and every destination's manager together, followed by a
+//! has gone unused (see [`flextunnel_core::proxy::ProxyClient::run`]). Saved
+//! changes apply to the running session in place: the destinations are
+//! reconfigured — the unchanged ones keep their connections — and changed
+//! proxy ports are rebound, so nothing is restarted for them. A change that
+//! cannot be applied (a port that is taken, say) is reported and leaves the
+//! session running as it was in that respect. The session
+//! owns its client futures, so dropping them (stop/shutdown) tears down the
+//! accept loops and every destination's manager together, followed by a
 //! graceful close of the endpoints in use. The app's server
 //! ([`crate::server_session`]) is routed through the same supervisor, so one
 //! controller owns both sessions and one shutdown stops them.
@@ -21,12 +26,13 @@ use flextunnel_core::config::DEFAULT_IDLE_TIMEOUT;
 use flextunnel_core::error::ProxyError;
 use flextunnel_core::forwards::{ForwardManager, ForwardStatus, PortForward};
 use flextunnel_core::proxy::{
-    ClientAuth, ClientConfig, DestinationConfig, DestinationStatus, LocalListeners, ProxyClient,
-    ServerRoutes,
+    ClientAuth, ClientConfig, DestinationConfig, DestinationStatus, HeldDestination,
+    LocalListeners, ProxyClient, ServerRoutes,
 };
 use flextunnel_core::transport::endpoint::RelayConfig;
 use flextunnel_core::transport::paths::ConnectionSnapshot;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -45,8 +51,8 @@ const CONN_PATH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Bound on the client's graceful endpoint close at teardown. The close waits
 /// out an endpoint still being built (see `ProxyClient::close`), which a stop
-/// or a restart during a slow dial must not hang behind; an ordinary close
-/// finishes well inside it.
+/// during a slow dial must not hang behind; an ordinary close finishes well
+/// inside it.
 const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -59,7 +65,7 @@ pub enum ClientPhase {
     /// The proxy ports and forwards are listening; each destination connects
     /// when something is sent to it.
     Running,
-    /// Closing the endpoints in use; a restart waits for this to finish.
+    /// Closing the endpoints in use; a start waits for this to finish.
     Stopping,
     /// The session could not start (a local port is taken, say) or lost its
     /// listeners.
@@ -77,6 +83,11 @@ pub struct ClientSnapshot {
     pub spec: Option<Arc<ClientSpec>>,
     pub running_since: Option<Instant>,
     pub last_error: Option<String>,
+    /// The destinations the latest apply asked for, when the session refused
+    /// to run them, and why. A saved destination among them is not applied
+    /// for that reason; one that is neither among them nor running is still
+    /// on its way.
+    pub destinations_refused: Option<(Vec<DestinationSpec>, String)>,
     /// Live state per destination of the running session, in its order; empty
     /// while none runs.
     pub destinations: Vec<DestinationStatus>,
@@ -93,38 +104,48 @@ pub struct DestinationSpec {
     pub auth_secret: String,
 }
 
-/// Everything a client session is started with and keeps for its lifetime:
-/// the proxy ports and the destinations. Comparing two tells whether saved
-/// settings differ from the running ones (forwards are not part of it — they
-/// apply live).
+/// What a client session runs with: the proxy ports and the destinations.
+/// Comparing two tells whether saved settings differ from the running ones,
+/// which the session then applies in place (forwards are not part of it —
+/// they apply on their own).
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClientSpec {
     pub socks_port: Option<u16>,
     pub http_port: Option<u16>,
     pub destinations: Vec<DestinationSpec>,
+    /// The destinations that cannot be used yet (see
+    /// [`config::destination_blocker`]): routed but refused, never connected
+    /// directly (see [`flextunnel_core::proxy::HeldDestination`]). A spec
+    /// with any is only ever applied to a running session
+    /// ([`Command::NarrowClient`]), never started with.
+    pub held: Vec<Destination>,
 }
 
 impl ClientSpec {
-    /// Resolve the settings against the key list. `None` when a destination's
-    /// key is missing or has lost its secret — see
-    /// [`ClientSettings::start_blocker`], which says so in words.
-    pub fn resolve(client: &ClientSettings, keys: &[AuthKey]) -> Option<Self> {
-        let destinations = client
-            .destinations
-            .iter()
-            .map(|destination| {
-                let key = config::find_key(keys, &destination.auth_key_id)?;
-                (!key.secret.is_empty()).then(|| DestinationSpec {
+    /// Resolve the settings against the key list: each destination with its
+    /// key's secret, or held when it cannot be used — no server, or a key
+    /// missing or without its secret ([`ClientSettings::start_blocker`] says
+    /// so in words).
+    pub fn resolve(client: &ClientSettings, keys: &[AuthKey]) -> Self {
+        let mut destinations = Vec::new();
+        let mut held = Vec::new();
+        for destination in &client.destinations {
+            let key = config::find_key(keys, &destination.auth_key_id)
+                .filter(|_| config::destination_blocker(destination, keys).is_none());
+            match key {
+                Some(key) => destinations.push(DestinationSpec {
                     destination: destination.clone(),
                     auth_secret: key.secret.clone(),
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(Self {
+                }),
+                None => held.push(destination.clone()),
+            }
+        }
+        Self {
             socks_port: client.socks_port,
             http_port: client.http_port,
             destinations,
-        })
+            held,
+        }
     }
 }
 
@@ -132,13 +153,19 @@ impl ClientSpec {
 type ClientStart = Box<(ClientSpec, Vec<PortForward>)>;
 
 enum Command {
-    /// Start the client session (the auth secrets travel inside the spec).
-    StartClient(ClientStart),
-    /// Stop the running client and start this one once it has stopped — how
-    /// changed settings are applied. A restart already waiting for its stop
-    /// takes this newer start instead; a client that is not running, or is
-    /// stopping for good, is left alone.
-    RestartClient(ClientStart),
+    /// Run the client with these settings (the auth secrets travel inside the
+    /// spec) — how it is started and how saved changes apply: started when
+    /// no session runs; a running session takes them in place
+    /// ([`SessionCmd::Reconfigure`]), applying what differs from what it runs.
+    /// A start waiting for a stop takes this newer one instead. The forwards
+    /// are only started with: a running session gets them from
+    /// [`Command::SetForwards`].
+    ApplyClient(ClientStart),
+    /// Take these settings, which hold destinations that cannot be used yet
+    /// ([`ClientSpec::held`]), if a session runs: never a start of its own,
+    /// and a start waiting for a stop is called off, so a client that is
+    /// down (failed, say, or restarting) waits for every destination.
+    NarrowClient(Box<ClientSpec>),
     StopClient,
     /// Replace the desired forward list (the UI sends the full list after
     /// every add/edit/delete/toggle); applied live mid-session.
@@ -149,13 +176,11 @@ enum Command {
     /// A `std` channel (not tokio `oneshot`) so the GUI caller can wait with a
     /// bounded [`std::sync::mpsc::Receiver::recv_timeout`].
     QueryConnPath(String, std::sync::mpsc::Sender<ConnectionSnapshot>),
-    /// Start the server session (its identity secret travels inside).
-    StartServer(Box<ServerConfig>),
-    /// Stop the running server and start this config once it has stopped —
-    /// how changed settings are applied. A restart already waiting for its
-    /// stop takes this newer config instead; a server that is not running, or
-    /// is stopping for good, is left alone.
-    RestartServer(Box<ServerConfig>),
+    /// Run the server with this config (its identity secret travels inside):
+    /// started when no session runs; a session running another config is
+    /// stopped and this one started once it has — the server takes its
+    /// settings only at start — and one already running it is left alone.
+    ApplyServer(Box<ServerConfig>),
     StopServer,
     /// Stop the server and reset its snapshot once it has stopped (the
     /// server was deleted).
@@ -165,6 +190,11 @@ enum Command {
 
 enum SessionCmd {
     Stop,
+    /// Run with this spec from now on: the destinations reconfigured (the
+    /// unchanged ones keep their connections), changed proxy ports rebound.
+    /// What cannot be applied is reported in the snapshot's `last_error` and
+    /// left as it ran. Counted in [`SessionHandle::handled`] once handled.
+    Reconfigure(ClientSpec),
     SetForwards(Vec<PortForward>),
     /// Answer the reply channel with the destination's path snapshot, once.
     QueryConnPath(String, std::sync::mpsc::Sender<ConnectionSnapshot>),
@@ -250,16 +280,10 @@ impl Controller {
             .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
     }
 
-    pub fn start_server(&self, server: ServerConfig) {
+    pub fn apply_server(&self, server: ServerConfig) {
         let _ = self
             .tx
-            .blocking_send(Command::StartServer(Box::new(server)));
-    }
-
-    pub fn restart_server(&self, server: ServerConfig) {
-        let _ = self
-            .tx
-            .blocking_send(Command::RestartServer(Box::new(server)));
+            .blocking_send(Command::ApplyServer(Box::new(server)));
     }
 
     pub fn stop_server(&self) {
@@ -270,16 +294,14 @@ impl Controller {
         let _ = self.tx.blocking_send(Command::RemoveServer);
     }
 
-    pub fn start_client(&self, spec: ClientSpec, forwards: Vec<PortForward>) {
+    pub fn apply_client(&self, spec: ClientSpec, forwards: Vec<PortForward>) {
         let _ = self
             .tx
-            .blocking_send(Command::StartClient(Box::new((spec, forwards))));
+            .blocking_send(Command::ApplyClient(Box::new((spec, forwards))));
     }
 
-    pub fn restart_client(&self, spec: ClientSpec, forwards: Vec<PortForward>) {
-        let _ = self
-            .tx
-            .blocking_send(Command::RestartClient(Box::new((spec, forwards))));
+    pub fn narrow_client(&self, spec: ClientSpec) {
+        let _ = self.tx.blocking_send(Command::NarrowClient(Box::new(spec)));
     }
 
     pub fn stop_client(&self) {
@@ -370,9 +392,44 @@ async fn bind_local(addr: SocketAddr, label: &str) -> Result<tokio::net::TcpList
 
 struct SessionHandle {
     tx: mpsc::Sender<SessionCmd>,
+    /// What the session was last told to run with, and the forwards: what a
+    /// replacement starts with when it ends before reading that ([`reap`]).
+    spec: ClientSpec,
+    forwards: Vec<PortForward>,
+    /// Whether `spec` came from a [`Command::NarrowClient`], which no
+    /// replacement starts on.
+    narrowed: bool,
+    /// [`SessionCmd::Reconfigure`]s sent, and those the session handled.
+    sent: u64,
+    handled: Arc<AtomicU64>,
     /// Resolves when the session's thread finishes. The session keeps its
     /// command receiver until then, so `tx.is_closed()` also means "done".
     done: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl SessionHandle {
+    /// Whether an apply sent to the session is still unread.
+    fn unhandled(&self) -> bool {
+        self.sent > self.handled.load(Ordering::SeqCst)
+    }
+}
+
+/// Clear `client` once its session has ended. A session that ended with an
+/// apply unread — sent while it was closing after a failure, which reads no
+/// more commands — is started again with what that apply asked for, unless a
+/// stop was asked for meanwhile or another start already waits.
+fn reap(
+    client: &mut Option<SessionHandle>,
+    stopping: &mut bool,
+    pending: &mut Option<ClientStart>,
+) {
+    let Some(handle) = client.take_if(|handle| handle.tx.is_closed()) else {
+        return;
+    };
+    if !*stopping && pending.is_none() && !handle.narrowed && handle.unhandled() {
+        *pending = Some(Box::new((handle.spec, handle.forwards)));
+    }
+    *stopping = false;
 }
 
 /// Spawn the client session on its own OS thread with its own runtime, all
@@ -389,6 +446,9 @@ fn spawn_client(
     let slot = ClientSlot {
         shared: shared.clone(),
     };
+    let started = (spec.clone(), forwards.clone());
+    let handled = Arc::new(AtomicU64::new(0));
+    let session_handled = handled.clone();
     let error_slot = slot.clone();
     let spawned = std::thread::Builder::new()
         .name(CLIENT_THREAD_NAME.into())
@@ -402,13 +462,27 @@ fn spawn_client(
                 .enable_all()
                 .build();
             match runtime {
-                Ok(rt) => rt.block_on(run_client(spec, forwards, session_rx, slot)),
+                Ok(rt) => rt.block_on(run_client(
+                    spec,
+                    forwards,
+                    session_rx,
+                    slot,
+                    session_handled,
+                )),
                 Err(e) => slot.fail(format!("Failed to build the client runtime: {e:#}")),
             }
             let _ = done_tx.send(());
         });
     match spawned {
-        Ok(_) => Some(SessionHandle { tx, done }),
+        Ok(_) => Some(SessionHandle {
+            tx,
+            spec: started.0,
+            forwards: started.1,
+            narrowed: false,
+            sent: 0,
+            handled,
+            done,
+        }),
         Err(e) => {
             error_slot.fail(format!("Failed to spawn the client thread: {e:#}"));
             None
@@ -435,8 +509,8 @@ async fn run_loop(
     server_shared: SharedServerSnapshot,
 ) {
     let mut client: Option<SessionHandle> = None;
-    // A restart's start, run once the old session has ended: until then it
-    // still holds the local ports and its connections to the servers.
+    // A start waiting for the old session to end: until then it still holds
+    // the local ports and its connections to the servers.
     let mut pending_client: Option<ClientStart> = None;
     // Whether the current client session was told to stop: it reads no
     // further commands, and a start meanwhile waits in `pending_client`.
@@ -450,15 +524,18 @@ async fn run_loop(
     let mut stopping = false;
     loop {
         // An ended session drops its receiver, closing the sender.
-        if client.as_ref().is_some_and(|handle| handle.tx.is_closed()) {
-            client = None;
-        }
+        reap(&mut client, &mut client_stopping, &mut pending_client);
         if client.is_none() {
             client_stopping = false;
-            if let Some(start) = pending_client.take() {
-                let (spec, forwards) = *start;
-                client = spawn_client(spec, forwards, &client_shared);
-            }
+        }
+        // Commands already queued are read first: one may replace or call off
+        // the waiting start (a narrow, a stop), which must not run before it.
+        if client.is_none()
+            && rx.is_empty()
+            && let Some(start) = pending_client.take()
+        {
+            let (spec, forwards) = *start;
+            client = spawn_client(spec, forwards, &client_shared);
         }
         if server.as_ref().is_some_and(|handle| handle.tx.is_closed()) {
             server = None;
@@ -466,22 +543,25 @@ async fn run_loop(
         if server.is_none() {
             stopping = false;
         }
+        // As for the client: a newer config, or a stop, already queued is
+        // read before the waiting start runs.
         if server.is_none()
+            && rx.is_empty()
             && let Some(config) = pending_start.take()
         {
             server = server_session::spawn_server(config, &server_shared);
         }
-        // Waiting out a restart's stop: wake when the old session ends, so
-        // the new one starts without waiting for the next command.
+        // Waiting out a stop that a start is queued behind, or a session that
+        // has an apply to read: wake when the old session ends, so the new
+        // one starts without waiting for the next command.
+        let restart_client =
+            pending_client.is_some() || client.as_ref().is_some_and(SessionHandle::unhandled);
         let cmd = tokio::select! {
             cmd = rx.recv() => cmd,
-            _ = ended(client.as_mut().map(|h| &mut h.done), pending_client.is_some()) => continue,
+            _ = ended(client.as_mut().map(|h| &mut h.done), restart_client) => continue,
             _ = ended(server.as_mut().map(|h| &mut h.done), pending_start.is_some()) => continue,
         };
-        if client.as_ref().is_some_and(|handle| handle.tx.is_closed()) {
-            client = None;
-            client_stopping = false;
-        }
+        reap(&mut client, &mut client_stopping, &mut pending_client);
         if server.as_ref().is_some_and(|handle| handle.tx.is_closed()) {
             server = None;
             stopping = false;
@@ -490,46 +570,66 @@ async fn run_loop(
         // reads no more, so nothing is queued behind its close.
         let live_client = client.as_ref().filter(|_| !client_stopping);
         match cmd {
-            Some(Command::StartClient(start)) => match &client {
-                // Still closing (disabled and enabled again in quick
-                // succession): start once it has.
+            // Decided here rather than from the UI's snapshot, which lags the
+            // session by a poll.
+            Some(Command::ApplyClient(start)) => match &mut client {
+                // Still closing — disabled and enabled again in quick
+                // succession: start this once it has.
                 Some(_) if client_stopping => pending_client = Some(start),
-                Some(_) => log::warn!("The client is still running"),
-                None => {
-                    // This start is the newest word: a restart whose old
-                    // session ended just now must not start after it.
-                    pending_client = None;
+                // The session compares it with what it runs. Counted, so that
+                // one it never reads is not lost (see `reap`).
+                Some(handle) => {
                     let (spec, forwards) = *start;
-                    client = spawn_client(spec, forwards, &client_shared);
-                }
-            },
-            Some(Command::RestartClient(start)) => match &client {
-                // Decided here rather than from the UI's snapshot, which lags
-                // the session by a poll.
-                Some(_) if client_stopping => {
-                    if pending_client.is_some() {
-                        pending_client = Some(start);
+                    handle.spec = spec.clone();
+                    handle.forwards = forwards.clone();
+                    handle.narrowed = false;
+                    if handle.tx.send(SessionCmd::Reconfigure(spec)).await.is_ok() {
+                        handle.sent += 1;
+                    } else {
+                        // It has just ended: start one with these instead.
+                        pending_client = Some(Box::new((handle.spec.clone(), forwards)));
                     }
                 }
-                Some(handle) => {
-                    let _ = handle.tx.send(SessionCmd::Stop).await;
-                    client_stopping = true;
-                    pending_client = Some(start);
-                }
-                None => {}
+                // This start is the newest word: it replaces one waiting for a
+                // session that ended just now, and starts once the commands
+                // queued behind it are read (one may call it off).
+                None => pending_client = Some(start),
             },
+            Some(Command::NarrowClient(spec)) => {
+                // A start waiting for the old session — still stopping, or
+                // ended just now — would start on settings this replaces: it
+                // waits for every destination instead.
+                pending_client = None;
+                match &mut client {
+                    Some(_) if client_stopping => {}
+                    Some(handle) => {
+                        handle.spec = (*spec).clone();
+                        handle.narrowed = true;
+                        if handle.tx.send(SessionCmd::Reconfigure(*spec)).await.is_ok() {
+                            handle.sent += 1;
+                        }
+                    }
+                    // No session: nothing to narrow.
+                    None => {}
+                }
+            }
             Some(Command::StopClient) => {
-                // Also calls off a restart that is waiting for the old stop.
+                // Also calls off a start that is waiting for the old stop.
                 pending_client = None;
                 if let Some(handle) = live_client {
                     let _ = handle.tx.send(SessionCmd::Stop).await;
                     client_stopping = true;
                 }
             }
-            Some(Command::SetForwards(forwards)) => match (live_client, &mut pending_client) {
-                // A restart in flight starts with the newer list.
+            Some(Command::SetForwards(forwards)) => match (
+                client.as_mut().filter(|_| !client_stopping),
+                &mut pending_client,
+            ) {
+                // A start waiting for the old session starts with the newer
+                // list.
                 (_, Some(start)) => start.1 = forwards,
                 (Some(handle), None) => {
+                    handle.forwards = forwards.clone();
                     let _ = handle.tx.send(SessionCmd::SetForwards(forwards)).await;
                 }
                 // No session: nothing to do — the next start carries them.
@@ -541,36 +641,22 @@ async fn run_loop(
                 }
                 // No session: `reply` drops, and the caller gets an empty one.
             }
-            Some(Command::StartServer(config)) => {
-                match &server {
-                    // A server still stopping holds the identity and the
-                    // per-user lock until its endpoint is closed: start once
-                    // it has (e.g. disabled and enabled again in quick
-                    // succession).
-                    Some(_) if stopping => pending_start = Some(*config),
-                    Some(_) => log::warn!("The server is still running"),
-                    None => {
-                        // As for the client: no stale restart behind this.
-                        pending_start = None;
-                        server = server_session::spawn_server(*config, &server_shared);
-                    }
-                }
-            }
-            Some(Command::RestartServer(config)) => match &server {
-                // Decided here rather than from the UI's snapshot, which reads
-                // Stopped between a restart's two sessions: a change made
-                // meanwhile (a client revoked) must still reach the new one.
-                Some(_) if stopping => {
-                    if pending_start.is_some() {
-                        pending_start = Some(*config);
-                    }
-                }
+            // As for the client, decided here: the UI's snapshot reads
+            // Stopped between a restart's two sessions, and a change made
+            // meanwhile (a client revoked) must still reach the new one.
+            Some(Command::ApplyServer(config)) => match &server {
+                // A server still stopping holds the identity and the per-user
+                // lock until its endpoint is closed: start once it has.
+                Some(_) if stopping => pending_start = Some(*config),
+                Some(handle) if handle.config == *config => {}
                 Some(handle) => {
                     let _ = handle.tx.send(ServerCmd::Stop).await;
                     stopping = true;
                     pending_start = Some(*config);
                 }
-                None => {}
+                // The newest config, started once the commands queued behind
+                // it are read.
+                None => pending_start = Some(*config),
             },
             Some(Command::StopServer) => {
                 // Also calls off a restart that is waiting for the old stop.
@@ -626,6 +712,146 @@ fn reset_server_snapshot(shared: &SharedServerSnapshot) {
     *snapshot = ServerSnapshot::default();
 }
 
+/// One proxy front-end being served; replaced when its port changes.
+type Serve<'a> = std::pin::Pin<Box<dyn Future<Output = Result<(), ProxyError>> + 'a>>;
+
+/// The proxy front-ends, each served on its own so that moving one to another
+/// port leaves the other's listener, and the connections waiting in it, as
+/// they are: SOCKS, then HTTP.
+const FRONTS: [&str; 2] = ["SOCKS", "HTTP"];
+
+/// The front-ends' ports in `spec`, in [`FRONTS`] order.
+fn ports(spec: &ClientSpec) -> [Option<u16>; 2] {
+    [spec.socks_port, spec.http_port]
+}
+
+/// Serve front-end `front` on `listener`; with none, it serves nothing.
+fn serve_front<'a>(
+    client: &'a ProxyClient,
+    front: usize,
+    listener: Option<tokio::net::TcpListener>,
+) -> Serve<'a> {
+    let Some(listener) = listener else {
+        return Box::pin(std::future::pending());
+    };
+    let listeners = match front {
+        0 => LocalListeners::tcp(Some(listener), None),
+        _ => LocalListeners::tcp(None, Some(listener)),
+    };
+    Box::pin(client.serve(listeners))
+}
+
+/// Bind the proxy front-ends `spec` enables, on loopback — all of them before
+/// any is served — and serve them.
+async fn serve_proxies<'a>(
+    client: &'a ProxyClient,
+    spec: &ClientSpec,
+) -> Result<[Serve<'a>; 2], String> {
+    let [socks, http] = ports(spec);
+    let socks = bind_port(socks, FRONTS[0]).await?;
+    let http = bind_port(http, FRONTS[1]).await?;
+    Ok([serve_front(client, 0, socks), serve_front(client, 1, http)])
+}
+
+/// Why the proxy front-ends could not be moved to new ports.
+enum Rebind {
+    /// They serve on the ports they had.
+    Refused(String),
+    /// A front-end whose port changed serves nothing now: its old port could
+    /// not be bound again either.
+    Lost(String),
+}
+
+/// Move the proxy front-ends being served (`serves`) from `from`'s ports to
+/// `to`'s; one whose port is unchanged is left alone. The new ports nothing
+/// listens on yet are bound first, with every front-end still serving, so a
+/// taken one refuses the move with nothing changed. The others are held by
+/// front-ends that move too (the two swapped, say): those are released, then
+/// bound again; should that fail, the moved front-ends are bound on their old
+/// ports instead. The connections the old listeners accepted carry on.
+async fn rebind_proxies<'a>(
+    client: &'a ProxyClient,
+    serves: &mut [Serve<'a>; 2],
+    from: &ClientSpec,
+    to: &ClientSpec,
+) -> Result<(), Rebind> {
+    let (old, new) = (ports(from), ports(to));
+    let moved: Vec<usize> = (0..FRONTS.len()).filter(|&f| old[f] != new[f]).collect();
+    let mut bound: [Option<tokio::net::TcpListener>; 2] = [None, None];
+    for &f in &moved {
+        if let Some(port) = new[f].filter(|port| !old.contains(&Some(*port))) {
+            bound[f] = bind_port(Some(port), FRONTS[f])
+                .await
+                .map_err(Rebind::Refused)?;
+        }
+    }
+    for &f in &moved {
+        serves[f] = Box::pin(std::future::pending());
+    }
+    let mut failure = None;
+    for &f in &moved {
+        if bound[f].is_none() && new[f].is_some() {
+            match bind_port(new[f], FRONTS[f]).await {
+                Ok(listener) => bound[f] = listener,
+                Err(reason) => {
+                    failure = Some(reason);
+                    break;
+                }
+            }
+        }
+    }
+    let Some(reason) = failure else {
+        for &f in &moved {
+            serves[f] = serve_front(client, f, bound[f].take());
+        }
+        return Ok(());
+    };
+    // What was bound may hold the old ports of the other moved front-end.
+    drop(bound);
+    for &f in &moved {
+        match bind_port(old[f], FRONTS[f]).await {
+            Ok(listener) => serves[f] = serve_front(client, f, listener),
+            Err(lost) => {
+                return Err(Rebind::Lost(format!(
+                    "{reason}, and the {} proxy's previous port could not be bound again: {lost}",
+                    FRONTS[f]
+                )));
+            }
+        }
+    }
+    Err(Rebind::Refused(reason))
+}
+
+/// How a session whose front-end stopped serving ends: failed, with why.
+fn serve_ended(res: Result<(), ProxyError>) -> Option<String> {
+    let e = res.err()?;
+    log::error!("Client error: {e}");
+    Some(e.to_string())
+}
+
+/// Bind a proxy front-end on `port` of loopback, if it has one.
+async fn bind_port(
+    port: Option<u16>,
+    label: &str,
+) -> Result<Option<tokio::net::TcpListener>, String> {
+    match port {
+        Some(port) => bind_local(SocketAddr::from(([127, 0, 0, 1], port)), label)
+            .await
+            .map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The core's view of a destination that cannot be used yet: its routes, to
+/// refuse.
+fn held_destination(destination: &Destination) -> HeldDestination {
+    HeldDestination {
+        name: destination.name.clone(),
+        routed_domains: destination.routed_domains.clone(),
+        routed_cidrs: destination.routed_cidrs.clone(),
+    }
+}
+
 /// The core's configuration of one destination, or why its settings cannot be
 /// used. The forms check all of it on save, but a hand-edited file or a
 /// corrupted keychain entry can still surface here.
@@ -660,11 +886,9 @@ async fn run_client(
     mut forwards: Vec<PortForward>,
     mut rx: mpsc::Receiver<SessionCmd>,
     slot: ClientSlot,
+    handled: Arc<AtomicU64>,
 ) {
-    let loopback = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
-    let socks_addr = spec.socks_port.map(loopback);
-    let http_addr = spec.http_port.map(loopback);
-    let spec = Arc::new(spec);
+    let mut spec = Arc::new(spec);
     slot.update(|s| {
         *s = ClientSnapshot {
             phase: ClientPhase::Starting,
@@ -691,20 +915,12 @@ async fn run_client(
     };
 
     // Bind enabled proxy front-ends before any forward listener exists. A
-    // taken proxy port fails the session before forwards come up.
-    let listeners = async {
-        let socks = match socks_addr {
-            Some(addr) => Some(bind_local(addr, "SOCKS").await?),
-            None => None,
-        };
-        let http = match http_addr {
-            Some(addr) => Some(bind_local(addr, "HTTP").await?),
-            None => None,
-        };
-        Ok::<_, String>((socks, http))
-    };
-    let (socks_listener, http_listener) = match listeners.await {
-        Ok(listeners) => listeners,
+    // taken proxy port fails the session before forwards come up. Boxed so
+    // they can be dropped before the endpoints are closed below; served apart
+    // from the managers, so changed ports are rebound without touching the
+    // destinations.
+    let mut serves = match serve_proxies(&client, &spec).await {
+        Ok(serves) => serves,
         // No endpoint exists yet, so there is nothing to close.
         Err(reason) => return slot.fail(reason),
     };
@@ -718,8 +934,8 @@ async fn run_client(
         &forwards,
     );
 
-    // Boxed so it can be dropped before the endpoints are closed below.
-    let mut run = Box::pin(client.run(LocalListeners::tcp(socks_listener, http_listener)));
+    // The managers run for the whole session.
+    let mut manage = Box::pin(client.manage());
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     log::info!(
         "The client is running with {} destination(s)",
@@ -732,14 +948,11 @@ async fn run_client(
 
     // How the session ended, for its final snapshot.
     let failure = loop {
+        let [socks_serve, http_serve] = &mut serves;
         tokio::select! {
-            res = &mut run => break match res {
-                Ok(()) => None,
-                Err(e) => {
-                    log::error!("Client error: {e}");
-                    Some(e.to_string())
-                }
-            },
+            () = &mut manage => break None,
+            res = socks_serve => break serve_ended(res),
+            res = http_serve => break serve_ended(res),
             _ = ticker.tick() => {
                 let destinations = client.status().destinations;
                 let statuses = fwd_mgr.statuses();
@@ -749,6 +962,71 @@ async fn run_client(
                 });
             }
             cmd = rx.recv() => match cmd {
+                Some(SessionCmd::Reconfigure(next)) => {
+                    // Read, so not to be started again should the session end
+                    // now (see `reap`).
+                    handled.fetch_add(1, Ordering::SeqCst);
+                    // Each part applies on its own; the spec published is what
+                    // runs, so a part refused reads as not applied.
+                    let mut applied = (*spec).clone();
+                    let mut refused = Vec::new();
+                    let mut destinations_refused = None;
+                    if (&next.destinations, &next.held) != (&spec.destinations, &spec.held) {
+                        let held = next.held.iter().map(held_destination).collect();
+                        let reconfigured = next
+                            .destinations
+                            .iter()
+                            .map(destination_config)
+                            .collect::<Result<Vec<_>, _>>()
+                            .and_then(|configs| {
+                                client.reconfigure(configs, held).map_err(|e| e.to_string())
+                            });
+                        match reconfigured {
+                            Ok(()) => {
+                                applied.destinations = next.destinations.clone();
+                                applied.held = next.held.clone();
+                            }
+                            Err(reason) => {
+                                destinations_refused =
+                                    Some((next.destinations.clone(), reason.clone()));
+                                refused.push(reason);
+                            }
+                        }
+                    }
+                    if (next.socks_port, next.http_port) != (spec.socks_port, spec.http_port) {
+                        match rebind_proxies(&client, &mut serves, &spec, &next).await {
+                            Ok(()) => {
+                                applied.socks_port = next.socks_port;
+                                applied.http_port = next.http_port;
+                            }
+                            Err(Rebind::Refused(reason)) => refused.push(reason),
+                            Err(Rebind::Lost(reason)) => {
+                                log::error!("{reason}");
+                                break Some(reason);
+                            }
+                        }
+                    }
+                    let error = (!refused.is_empty()).then(|| {
+                        format!(
+                            "Not applied: {}. The client runs on as it was in that respect.",
+                            refused.join("; ")
+                        )
+                    });
+                    if let Some(error) = &error {
+                        log::error!("{error}");
+                    }
+                    spec = Arc::new(applied);
+                    // With the destinations it now runs, so none reads as missing
+                    // until the next tick.
+                    let applied = spec.clone();
+                    let destinations = client.status().destinations;
+                    slot.update(|s| {
+                        s.spec = Some(applied);
+                        s.destinations = destinations;
+                        s.last_error = error;
+                        s.destinations_refused = destinations_refused;
+                    });
+                }
                 Some(SessionCmd::SetForwards(f)) => {
                     forwards = f;
                     fwd_mgr.apply(&forwards);
@@ -787,7 +1065,8 @@ async fn run_client(
         s.forwards.clear();
     });
     drop(fwd_mgr);
-    drop(run);
+    drop(serves);
+    drop(manage);
     if tokio::time::timeout(SESSION_CLOSE_TIMEOUT, client.close())
         .await
         .is_err()
@@ -841,7 +1120,8 @@ mod tests {
             destinations: vec![destination("a", "k2"), destination("b", "k1")],
             ..ClientSettings::default()
         };
-        let spec = ClientSpec::resolve(&client, &keys).expect("every key resolves");
+        let spec = ClientSpec::resolve(&client, &keys);
+        assert!(spec.held.is_empty(), "every key resolves");
         assert_eq!((spec.socks_port, spec.http_port), (Some(1085), None));
         let secrets: Vec<&str> = spec
             .destinations
@@ -850,13 +1130,22 @@ mod tests {
             .collect();
         assert_eq!(secrets, ["secret-2", "secret-1"]);
 
-        // A missing key, or one whose secret was lost, resolves to nothing.
-        assert!(ClientSpec::resolve(&client, &keys[..1]).is_none());
-        assert!(ClientSpec::resolve(&client, &[key("k1", ""), key("k2", "s")]).is_none());
+        // A missing key, or one whose secret was lost, holds its destination.
+        let held = |keys: &[AuthKey]| {
+            let spec = ClientSpec::resolve(&client, keys);
+            let names: Vec<String> = spec.held.into_iter().map(|d| d.name).collect();
+            (spec.destinations.len(), names)
+        };
+        assert_eq!(held(&keys[..1]), (1, vec!["a".to_string()]));
+        assert_eq!(
+            held(&[key("k1", ""), key("k2", "s")]),
+            (1, vec!["b".to_string()])
+        );
     }
 
-    /// What tells the UI a restart is due: the ports, the destinations and the
-    /// secrets they authenticate with — not the forwards, which apply live.
+    /// What an apply reconfigures the client for: the ports, the destinations
+    /// and the secrets they authenticate with — not the forwards, which apply
+    /// on their own.
     #[test]
     fn a_spec_changes_with_what_a_session_keeps() {
         let keys = [key("k1", "secret-1")];
@@ -864,7 +1153,7 @@ mod tests {
             destinations: vec![destination("a", "k1")],
             ..ClientSettings::default()
         };
-        let spec = ClientSpec::resolve(&client, &keys).unwrap();
+        let spec = ClientSpec::resolve(&client, &keys);
 
         let mut with_forward = client.clone();
         with_forward.forwards.push(PortForward {
@@ -876,17 +1165,21 @@ mod tests {
             enabled: true,
         });
         with_forward.enabled = false;
-        assert!(ClientSpec::resolve(&with_forward, &keys).unwrap() == spec);
+        assert!(ClientSpec::resolve(&with_forward, &keys) == spec);
 
         let mut other_port = client.clone();
         other_port.http_port = Some(18080);
-        assert!(ClientSpec::resolve(&other_port, &keys).unwrap() != spec);
+        assert!(ClientSpec::resolve(&other_port, &keys) != spec);
         let mut routed = client.clone();
         routed.destinations[0]
             .routed_domains
             .push("*.corp.example".into());
-        assert!(ClientSpec::resolve(&routed, &keys).unwrap() != spec);
-        assert!(ClientSpec::resolve(&client, &[key("k1", "rotated")]).unwrap() != spec);
+        assert!(ClientSpec::resolve(&routed, &keys) != spec);
+        assert!(ClientSpec::resolve(&client, &[key("k1", "rotated")]) != spec);
+        assert!(
+            ClientSpec::resolve(&client, &[]) != spec,
+            "held without its key"
+        );
     }
 
     #[test]

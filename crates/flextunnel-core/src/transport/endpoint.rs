@@ -270,6 +270,7 @@ pub struct ClientEndpoint {
     /// Serializes [`Self::rebuild`]'s build-and-swap: the handle is shared,
     /// and two callers noticing the same outage must not each build an
     /// endpoint and have the second discard (and close) the first's good one.
+    /// [`Self::close`] takes it too, so it waits a rebuild in flight out.
     rebuilding: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -278,6 +279,9 @@ pub struct ClientEndpoint {
 struct Current {
     generation: u64,
     endpoint: Endpoint,
+    /// Latched by [`ClientEndpoint::close`]: no rebuild installs an endpoint
+    /// after it.
+    closed: bool,
 }
 
 impl ClientEndpoint {
@@ -287,6 +291,7 @@ impl ClientEndpoint {
             current: Arc::new(std::sync::RwLock::new(Current {
                 generation: 0,
                 endpoint,
+                closed: false,
             })),
             factory,
             rebuilding: Arc::new(tokio::sync::Mutex::new(())),
@@ -318,25 +323,44 @@ impl ClientEndpoint {
     /// returns `Ok` without building another — its trigger was the same dead
     /// endpoint, and [`Self::endpoint`] now yields the replacement. Only if
     /// the in-flight rebuild failed does the waiter build one itself.
+    ///
+    /// The build-and-swap runs as its own task, so a caller dropped half-way
+    /// never drops the fresh endpoint with it (a bound endpoint must be
+    /// closed, never just dropped): the task installs it — or, once
+    /// [`Self::close`] has run, closes it — and closes the one it replaced.
     pub async fn rebuild(&self) -> Result<()> {
         let seen = self.generation();
-        let old = {
-            let _serialized = self.rebuilding.lock().await;
-            if self.generation() != seen {
+        let this = self.clone();
+        let swap = tokio::spawn(async move {
+            let _serialized = this.rebuilding.lock().await;
+            if this.current.read().expect("endpoint lock").closed {
+                anyhow::bail!("the endpoint is closed");
+            }
+            if this.generation() != seen {
                 log::info!(
                     "Endpoint already rebuilt by a concurrent caller; endpoint id: {}",
-                    self.id()
+                    this.id()
                 );
-                return Ok(());
+                return Ok(None);
             }
-            let fresh = (self.factory)().await?;
-            let mut current = self.current.write().expect("endpoint lock");
-            current.generation += 1;
-            std::mem::replace(&mut current.endpoint, fresh)
+            // `close` waits for this lock, so it cannot run before the swap.
+            let fresh = (this.factory)().await?;
+            let old = {
+                let mut current = this.current.write().expect("endpoint lock");
+                current.generation += 1;
+                std::mem::replace(&mut current.endpoint, fresh)
+            };
+            // Graceful close on its own task: bounded wait below, but the task
+            // is never cancelled (see [`REBUILD_CLOSE_TIMEOUT`]).
+            Ok(Some(tokio::spawn(async move { old.close().await })))
+        });
+        let close = match swap.await {
+            Ok(swapped) => swapped?,
+            Err(e) => anyhow::bail!("the endpoint rebuild task failed: {e}"),
         };
-        // Graceful close on its own task: bounded wait here, but the task is
-        // never cancelled (see [`REBUILD_CLOSE_TIMEOUT`]).
-        let mut close = tokio::task::spawn(async move { old.close().await });
+        let Some(mut close) = close else {
+            return Ok(());
+        };
         if tokio::time::timeout(REBUILD_CLOSE_TIMEOUT, &mut close)
             .await
             .is_err()
@@ -347,9 +371,17 @@ impl ClientEndpoint {
         Ok(())
     }
 
-    /// Close the current endpoint gracefully (session teardown).
+    /// Close the current endpoint gracefully (session teardown). A rebuild in
+    /// flight is waited out first, so the endpoint it installs is the one
+    /// closed here; none is installed after.
     pub async fn close(&self) {
-        self.endpoint().close().await;
+        let _serialized = self.rebuilding.lock().await;
+        let endpoint = {
+            let mut current = self.current.write().expect("endpoint lock");
+            current.closed = true;
+            current.endpoint.clone()
+        };
+        endpoint.close().await;
     }
 }
 
@@ -424,5 +456,55 @@ mod tests {
         handle.rebuild().await.unwrap();
         assert_eq!(builds.load(Ordering::SeqCst), 2);
         handle.close().await;
+    }
+
+    /// A caller dropped mid-rebuild (its destination closed, say) leaves the
+    /// fresh endpoint installed, and a close waits that rebuild out and
+    /// closes it; no rebuild installs one after the close.
+    #[tokio::test]
+    async fn a_rebuild_whose_caller_is_dropped_still_ends_closed() {
+        let first = loopback().bind().await.unwrap();
+        // The build says when it has started, then waits to be let go.
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handle = ClientEndpoint::from_parts(first.clone(), {
+            let (started, release) = (started.clone(), release.clone());
+            Arc::new(move || {
+                let (started, release) = (started.clone(), release.clone());
+                Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                    loopback().bind().await.map_err(Into::into)
+                })
+            })
+        });
+        {
+            let rebuild = handle.rebuild();
+            tokio::pin!(rebuild);
+            tokio::select! {
+                _ = &mut rebuild => panic!("the build was held"),
+                () = started.notified() => {}
+            }
+            // Dropped here, with the build under way.
+        }
+        release.notify_one();
+
+        handle.close().await;
+        let fresh = handle.endpoint();
+        assert_ne!(fresh.id(), first.id(), "the rebuild was installed");
+        assert!(fresh.is_closed(), "and closed by the close");
+        // The replaced one closes on a task of its own, which nobody waited
+        // for once the caller was dropped.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !first.is_closed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the replaced endpoint closes");
+        assert!(
+            handle.rebuild().await.is_err(),
+            "nothing is built after a close"
+        );
     }
 }

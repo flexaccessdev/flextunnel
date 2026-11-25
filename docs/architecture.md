@@ -1,7 +1,7 @@
 # Architecture
 
 flextunnel carries TCP connections over iroh QUIC streams. A client names its
-servers as *destinations* and routes each request by its own static table: a
+servers as *destinations* and routes each request by its own table: a
 target a destination routes goes through that destination's server, and
 anything else connects from the client. Port forwards and `client nc` always go
 through a destination. Tunneled hostnames are resolved from the server's
@@ -288,9 +288,17 @@ its connections are held the same way.
 
 ## Routing (client)
 
-`proxy/route_table.rs` holds the client's static table, built and validated
-once in `ProxyClient::new` from the configured destinations. `RouteTable::route`
-maps a target to one of:
+`proxy/route_table.rs` holds the client's table, built and validated in
+`ProxyClient::new` from the configured destinations. An embedder that edits
+them while the client runs (the desktop app) hands the new list to
+`ProxyClient::reconfigure`, which validates it the same way and swaps in a new
+table: a destination left unchanged keeps its connection, while a changed or
+removed one is closed (a changed one connects afresh on its next use). It
+can also take *held* destinations: names and routes the embedder cannot
+serve yet (one still waiting for its auth key), routed like the others but
+refused, so their targets never connect directly meanwhile. Each request
+routes by the table it started with. `RouteTable::route` maps a target
+to one of:
 
 1. a destination's loopback, for its `<name>.localhost.flextunnel.internal`
    (sent as a loopback stream request);
@@ -508,14 +516,3 @@ flextunnel reuses ezvpn's iroh transport and
 secret-key identity, but replaces the IP-over-QUIC-datagrams + TUN data path
 (which needs root) with SOCKS5/HTTP proxy front-ends over reliable QUIC streams
 (which don't). See the project `README.md` for the user-facing comparison.
-
-## Roadmap
-
-HTTP proxy support is implemented on the client side; the wire protocol and
-server remain front-end-agnostic. See
-[`http-proxy-roadmap.md`](./http-proxy-roadmap.md).
-
-Future work on duplicate-id detection — non-ephemeral client ids and their
-pitfalls, the signaling-server path for prompt server-dup detection, and
-client-side dup acknowledgement/flagging — is in
-[`duplicate-detection-roadmap.md`](./duplicate-detection-roadmap.md).

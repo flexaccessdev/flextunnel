@@ -88,7 +88,7 @@ fn client_line(client: &ClientSettings, snapshot: &ClientSnapshot) -> Option<Str
                 .iter()
                 .filter(|d| d.state == DestinationState::Connected)
                 .count();
-            // What the session runs with, which a restart may yet change.
+            // What the session runs with, which a save just now may yet change.
             match snapshot.destinations.len() {
                 1 if connected == 1 => "Client running · connected".into(),
                 1 => "Client running · not connected".into(),

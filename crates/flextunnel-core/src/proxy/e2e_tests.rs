@@ -25,8 +25,8 @@ use crate::error::ProxyError;
 use crate::proxy::signaling::{self, Hello, HelloResponse, StreamRequest, Target};
 use crate::proxy::{
     ClientAuth, ClientConfig, DestinationConfig, DestinationState, DestinationStatus,
-    EndpointProvider, ForwardManager, ForwardSpec, LocalListeners, ProxyClient, ProxyServer,
-    ProxyServerParams, RoutedSet, ServerRoutes, server_routes,
+    EndpointProvider, ForwardManager, ForwardSpec, HeldDestination, LocalListeners, ProxyClient,
+    ProxyServer, ProxyServerParams, RoutedSet, ServerRoutes, server_routes,
 };
 use crate::transport::endpoint::{ClientEndpoint, RelayConfig, server_setup};
 use crate::transport::{ALPN, QUICK_ALPN, build_quic_transport_config};
@@ -677,6 +677,175 @@ async fn each_destination_reaches_its_own_server() {
         client.status("m1").client_node_id,
         client.status("m2").client_node_id
     );
+}
+
+/// A reconfigure keeps each destination it leaves unchanged as it is — its
+/// connection and the streams open on it carry on — and replaces the others:
+/// a changed one is closed, its streams ending, and connects afresh on its
+/// next use; a removed one is gone.
+#[tokio::test]
+async fn a_reconfigure_keeps_the_unchanged_destinations_connected() {
+    let echo_port = spawn_echo().await;
+    let (ep1, addr1) = server_endpoint(SecretKey::generate()).await;
+    let (ep2, addr2) = server_endpoint(SecretKey::generate()).await;
+    let (id1, id2) = (ep1.id(), ep2.id());
+    spawn_server_handle(ep1, base_params(id1, temp_blocklist("reconfigure-1")));
+    spawn_server_handle(ep2, base_params(id2, temp_blocklist("reconfigure-2")));
+
+    let client = start_client(
+        vec![destination("m1", id1), destination("m2", id2)],
+        None,
+        MemoryLookup::from_endpoint_info(vec![addr1, addr2]),
+    )
+    .await;
+    let mut app1 = socks_echo(client.socks, "m1.localhost.flextunnel.internal", echo_port).await;
+    let mut app2 = socks_echo(client.socks, "m2.localhost.flextunnel.internal", echo_port).await;
+    assert_eq!(client.built(), 2);
+    let m1_since = client.status("m1").connected_since;
+
+    // m1 as it was; m2 with a route more.
+    let mut m2 = destination("m2", id2);
+    m2.routed_domains = strings(&["m2.example"]);
+    client
+        .client
+        .reconfigure(vec![destination("m1", id1), m2], Vec::new())
+        .unwrap();
+
+    // m2's connection is closed with it, and its stream ends.
+    let mut buf = [0u8; 4];
+    let ended = with_timeout(async {
+        let _ = app2.write_all(b"ping").await;
+        app2.read(&mut buf).await
+    })
+    .await;
+    assert!(matches!(ended, Ok(0) | Err(_)), "m2's stream ended");
+    assert_eq!(client.state("m2"), DestinationState::Idle, "m2 is new");
+    // m1 is untouched: the same connection, its stream still open.
+    app1.write_all(b"pong").await.unwrap();
+    with_timeout(app1.read_exact(&mut buf)).await.unwrap();
+    assert_eq!(&buf, b"pong");
+    let m1 = client.status("m1");
+    assert_eq!(m1.state, DestinationState::Connected);
+    assert_eq!(m1.connected_since, m1_since);
+    assert_eq!(m1.open_streams, 1);
+
+    // The new m2 connects on its next use, with an endpoint of its own.
+    let _app2 = socks_echo(client.socks, "m2.localhost.flextunnel.internal", echo_port).await;
+    assert_eq!(client.state("m2"), DestinationState::Connected);
+    assert_eq!(client.built(), 3);
+
+    // Removed, m1 is gone, and its stream with it.
+    let mut m2_config = destination("m2", id2);
+    m2_config.routed_domains = strings(&["m2.example"]);
+    client
+        .client
+        .reconfigure(vec![m2_config], Vec::new())
+        .unwrap();
+    let ended = with_timeout(async {
+        let _ = app1.write_all(b"ping").await;
+        app1.read(&mut buf).await
+    })
+    .await;
+    assert!(matches!(ended, Ok(0) | Err(_)), "m1's stream ended");
+    let names: Vec<String> = client
+        .client
+        .status()
+        .destinations
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert_eq!(names, ["m2"]);
+    assert_eq!(client.state("m2"), DestinationState::Connected, "m2 kept");
+
+    // A configuration the client cannot run is refused, changing nothing.
+    assert!(client.client.reconfigure(Vec::new(), Vec::new()).is_err());
+    assert_eq!(client.state("m2"), DestinationState::Connected);
+}
+
+/// The client's close waits for the close of a destination a reconfigure
+/// took out, so its endpoint is closed once the client's close returns.
+#[tokio::test]
+async fn a_close_waits_for_a_destination_taken_out() {
+    let echo_port = spawn_echo().await;
+    let (ep1, addr1) = server_endpoint(SecretKey::generate()).await;
+    let (ep2, addr2) = server_endpoint(SecretKey::generate()).await;
+    let (id1, id2) = (ep1.id(), ep2.id());
+    spawn_server_handle(ep1, base_params(id1, temp_blocklist("retired-close-1")));
+    spawn_server_handle(ep2, base_params(id2, temp_blocklist("retired-close-2")));
+    let client = start_client(
+        vec![destination("m1", id1), destination("m2", id2)],
+        None,
+        MemoryLookup::from_endpoint_info(vec![addr1, addr2]),
+    )
+    .await;
+    let _app1 = socks_echo(client.socks, "m1.localhost.flextunnel.internal", echo_port).await;
+    let m1_endpoint = client.endpoint(0);
+
+    client
+        .client
+        .reconfigure(vec![destination("m2", id2)], Vec::new())
+        .unwrap();
+    with_timeout(client.client.close()).await;
+    assert!(m1_endpoint.is_closed(), "the close waited for m1's");
+}
+
+/// A held destination's routes are refused — never dialed directly — while the
+/// live destinations serve as ever; a reconfigure without it lets its targets
+/// go direct again.
+#[tokio::test]
+async fn a_held_destination_refuses_what_it_routes() {
+    let echo_port = spawn_echo().await;
+    let (ep, addr) = server_endpoint(SecretKey::generate()).await;
+    let id = ep.id();
+    spawn_server_handle(ep, base_params(id, temp_blocklist("held")));
+    let client = start_client(
+        vec![destination("m1", id)],
+        None,
+        MemoryLookup::from_endpoint_info(vec![addr]),
+    )
+    .await;
+
+    let held = HeldDestination {
+        name: "pending".into(),
+        routed_domains: Vec::new(),
+        routed_cidrs: strings(&["127.0.0.1/32"]),
+    };
+    client
+        .client
+        .reconfigure(vec![destination("m1", id)], vec![held])
+        .unwrap();
+    // 127.0.0.1 would connect directly, to the echo server: held, it is refused.
+    let (_app, rep) = socks_connect(client.socks, "127.0.0.1", echo_port).await;
+    assert_eq!(rep, signaling::REP_NET_UNREACHABLE);
+    let (_app, rep) = socks_connect(
+        client.socks,
+        "pending.localhost.flextunnel.internal",
+        echo_port,
+    )
+    .await;
+    assert_eq!(rep, signaling::REP_NET_UNREACHABLE);
+    let dialer = client.client.dialer();
+    let target = Target::Domain("127.0.0.1".into(), echo_port);
+    assert_eq!(dialer.destination_for(&target).as_deref(), Some("pending"));
+    let refused = with_timeout(dialer.connect(&target))
+        .await
+        .err()
+        .expect("held");
+    assert!(refused.to_string().contains("not set up"), "{refused:#}");
+    // The live destination serves on.
+    let _app = socks_echo(client.socks, "m1.localhost.flextunnel.internal", echo_port).await;
+    assert_eq!(
+        client.client.status().destinations.len(),
+        1,
+        "held is not a destination"
+    );
+
+    client
+        .client
+        .reconfigure(vec![destination("m1", id)], Vec::new())
+        .unwrap();
+    let (_app, rep) = socks_connect(client.socks, "127.0.0.1", echo_port).await;
+    assert_eq!(rep, signaling::REP_SUCCESS, "direct again");
 }
 
 /// The client's routes pick the destination — the most specific rule across
@@ -1494,7 +1663,7 @@ async fn listener_addresses_are_reported_only_while_served() {
         .await
         .err()
         .expect("closed");
-    assert!(refused.to_string().contains("shutting down"), "{refused:#}");
+    assert!(refused.to_string().contains("was closed"), "{refused:#}");
 }
 
 /// Port forwards bypass the local proxy front-ends: the listener hands an

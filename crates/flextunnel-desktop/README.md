@@ -63,12 +63,22 @@ they reach. It is one session for all of them.
   first destination added. Disabling stops it and keeps it stopped across
   launches. After a failure (a local port already taken), change what failed,
   or switch it off and on to retry.
-- **Restart to apply** — the client runs with the proxy ports and destinations
-  it started with. After a change to either — or to a key a destination uses —
-  its pane and every destination's offer *Restart now*, which closes the
-  connections that are open. A destination added or edited since shows
-  **restart to apply** until then. Port forwards are the exception: they apply
-  at once.
+- **Applied on save** — every saved change takes effect at once, in the
+  running client: nothing restarts. Only what the change touches is
+  reconnected — a destination that was edited (or whose key was) closes its
+  connection and connects afresh when next used, a deleted one is closed, and
+  every other destination keeps its connection and the traffic on it. Changed
+  proxy ports are rebound without touching any destination; port forwards
+  apply the same way. A change the client can't apply (a new port another
+  program holds) is shown as not applied, and the client keeps running as it
+  was in that respect — except when moved proxies can neither take their new
+  ports nor get their old ones back (two swapped ports, one taken meanwhile),
+  which stops the client and shows it failed: free the port, then switch the
+  client off and on. A destination that can't be used yet (imported
+  without its key) shows what it lacks and is held: a running client takes
+  every other change, deletions included, and refuses what the held one
+  routes instead of connecting it directly. A stopped or failed client waits
+  for every destination. With no usable destination left the client stops.
 - **A refused key** — a server that does not authorize a destination's key
   fails that destination alone, which shows **refused** with the server's
   reason; the others keep working, and it is tried again when next needed.
@@ -84,7 +94,8 @@ they reach. It is one session for all of them.
   local. A forward never connects directly, so its remote host must be a
   destination's `<name>.localhost.flextunnel.internal` or one of its routes:
   its row says which destination carries it (**via nas**), or shows a
-  **no route** badge.
+  **no route** badge — or **refused: nas held** while that destination waits
+  for its key, when the client refuses what the forward sends.
 - **Status pages** — `http://flextunnel.internal/` through either proxy is the
   client's own status, answered locally without connecting anything;
   `http://flextunnel.internal/servers/<name>/` is that server's, with its
@@ -147,11 +158,14 @@ showing the endpoint id it gives — and *Create server* goes straight on to aut
   `<name>.localhost.flextunnel.internal`, and this server's status page at
   `http://flextunnel.internal/servers/<name>/` (through a proxy the client has
   enabled).
-- **Restart to apply** — the server runs with the settings it started with;
-  after a change (a client authorized, the tunnel set edited, a new identity)
-  its pane offers *Restart now*. Removing a client applies at once: the server
-  restarts without it (or stops, when it was the last one), so a revoked
-  client can't keep connecting.
+- **Applied on save** — every saved change takes effect at once. The server
+  runs with the settings it started with, so a change (a client authorized or
+  removed, the tunnel set edited, a new identity) restarts a running server,
+  which closes its clients' connections; they reconnect when next used —
+  except after a new identity, when each client must first switch its
+  destination to the new endpoint id.
+  Removing the last client stops it, so a revoked client can't keep
+  connecting.
 
 ## Tray
 

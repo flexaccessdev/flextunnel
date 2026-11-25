@@ -77,7 +77,7 @@
       <tr><th>Rule</th><th>Goes to</th><th>Server</th></tr>
       <tr><td class="mono">flextunnel.internal</td><td>this client <span class="muted">status page</span></td><td></td></tr>
       {% for r in routes %}{% if r.kind == "loopback" %}
-      <tr><td><span class="mono">{{ r.rule }}</span> <span class="muted">loopback</span></td><td class="mono">{{ r.destination }}</td><td class="connected">server's loopback</td></tr>
+      <tr><td><span class="mono">{{ r.rule }}</span> <span class="muted">loopback</span></td><td class="mono">{{ r.destination }}</td>{% if r.held() %}<td class="failed">held <span class="muted">not set up on this client yet; refused</span></td>{% else %}<td class="connected">server's loopback</td>{% endif %}</tr>
       {% endif %}{% endfor %}
       <tr><td class="mono">*.flextunnel.internal</td><td>this client <span class="muted">reserved, answers 404</span></td><td></td></tr>
       {% for r in routes %}{% if r.kind != "loopback" %}
@@ -87,7 +87,7 @@
           {% for o in r.narrower %}<span class="note">contains <span class="mono">{{ o.destination }}</span>'s narrower <span class="mono">{{ o.rule }}</span></span>{% endfor %}
         </td>
         <td class="mono">{{ r.destination }}</td>
-        <td class="{{ r.server_class() }}">{{ r.server }}{% if r.server_last_known %} <span class="muted">last known</span>{% endif %}</td>
+        <td class="{{ r.server_class() }}">{{ r.server }}{% if r.held() %} <span class="muted">not set up on this client yet; refused</span>{% endif %}{% if r.server_last_known %} <span class="muted">last known</span>{% endif %}</td>
       </tr>
       {% endif %}{% endfor %}
       <tr><td class="muted">anything else</td><td>direct <span class="muted">from this device</span></td><td></td></tr>

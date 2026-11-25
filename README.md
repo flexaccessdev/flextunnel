@@ -404,7 +404,9 @@ lie inside it, and whether that destination's server routes it too. A
 destination reads its server's lists each time it connects, so until a
 destination's first use its rules show as `unchecked`; while a later
 connection reads them again, or when that read fails, the earlier answer is
-shown as last known. The browser view is HTML; `/status.txt` is plain text and
+shown as last known. The rules of a destination held by an embedder that
+cannot set it up yet (the desktop app, awaiting its key) show as `held`: the
+client refuses what they match rather than connect it directly. The browser view is HTML; `/status.txt` is plain text and
 `/status.json` is structured JSON for scripts:
 
 ```sh
@@ -422,7 +424,7 @@ The JSON response includes `version`, `socks_listen`, `http_listen`,
 `idle_timeout_secs`, the table under `routes`, and one entry per destination
 under `destinations`. Each `routes` entry has `rule`, `kind` (`loopback`, `exact`,
 `wildcard`, `catch-all` or `network`), `destination`, `server` (`loopback`,
-`allowed`, `partly allowed`, `not allowed` or `unchecked`), `server_last_known`
+`allowed`, `partly allowed`, `not allowed`, `unchecked` or `held`), `server_last_known`
 (`server` comes from an earlier read: the latest is still running or failed), `within`
 (other destinations' broader rules it lies inside) and `narrower` (their
 narrower rules that lie inside it), each a list of `{rule, destination}`. A
@@ -935,6 +937,9 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
   carries, what limits it, the Linux UDP buffer limit worth raising, and the
   measurements: one version against the last, and what each change to the
   data path measured.
+- [`docs/roadmap.md`](docs/roadmap.md) — the roadmap: an index of the topic
+  roadmaps, and the items under consideration that have no document of their
+  own (dynamic configuration, for when uptime matters).
 - [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) — remaining HTTP
   proxy work.
 - [`docs/proxy-usage.md`](docs/proxy-usage.md) — using the SOCKS5 and HTTP
