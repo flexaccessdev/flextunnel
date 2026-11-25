@@ -1,0 +1,12 @@
+# Test filters scripts/miri.sh runs under Miri: the flextunnel-ffi tests that
+# drive the C surface's unsafe code — the handle it boxes and frees, the C
+# strings it reads, the caller buffers it writes — without the network (Miri
+# cannot open sockets or call getrlimit). `any` runs on every host, `linux`
+# only on Linux: a session's tokio runtime needs epoll, which Miri emulates,
+# where macOS would need kqueue, which it does not.
+any tests::write_cstr_
+any tests::a_sized_write_
+any tests::key_exports_
+any tests::null_handles_
+any tests::a_failed_routes_request_
+linux tests::a_session_runs_

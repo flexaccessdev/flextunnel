@@ -63,9 +63,16 @@ Windows also this repo's snapshots in the build cache's restic repository.
 
 | Platform | Clippy | Tests | Additional check |
 | --- | --- | --- | --- |
-| Linux | `cargo clippy --workspace --exclude flextunnel-desktop --all-targets -- -D warnings` | `cargo test -p flextunnel-core -p flextunnel-cli` | — |
-| macOS | `cargo clippy --workspace --all-targets -- -D warnings` | `cargo test -p flextunnel-core -p flextunnel-cli -p flextunnel-desktop` | `./build-ios.sh debug` |
+| Linux | `cargo clippy --workspace --exclude flextunnel-desktop --all-targets -- -D warnings` | `cargo test -p flextunnel-core -p flextunnel-cli` | `scripts/miri.sh` |
+| macOS | `cargo clippy --workspace --all-targets -- -D warnings` | `cargo test -p flextunnel-core -p flextunnel-cli -p flextunnel-desktop` | `scripts/miri.sh`, `./build-ios.sh debug` |
 | Windows | Same as macOS | Same as macOS | — |
+
+`scripts/miri.sh` runs the iOS FFI tests listed in
+[`scripts/miri-tests.txt`](../scripts/miri-tests.txt) under Miri, installing
+its pinned nightly with Miri if missing. The session test runs on Linux only:
+its tokio runtime needs epoll, which Miri emulates, and not kqueue. Windows has
+no Miri leg: its only unsafe is the Win32 calls in the CLI's pipe security,
+which Miri cannot run.
 
 The macOS script reports the xcframework check as skipped if `xcodebuild` is
 missing or `FLEXTUNNEL_CI_SKIP_IOS` is set. A green run with that skip does not
