@@ -465,8 +465,7 @@ impl SessionState {
             // Every forward was checked to have one at startup.
             destination: dialer
                 .destination_for(&forward_target(forward))
-                .unwrap_or_default()
-                .to_string(),
+                .unwrap_or_default(),
             state,
             error,
             active,

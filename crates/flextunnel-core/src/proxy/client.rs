@@ -1,8 +1,11 @@
 //! flextunnel client: local SOCKS5 and optional HTTP proxy listeners, port
-//! forwards and `nc`, whose requests are routed by a static table
-//! ([`RouteTable`]) to one of several *destinations* — each a server reached
-//! over its own iroh QUIC connection, opened on first use and closed when idle
-//! (see [`super::destination`]). One bi-stream per proxied connection.
+//! forwards and `nc`, whose requests are routed by a table ([`RouteTable`])
+//! to one of several *destinations* — each a server reached over its own iroh
+//! QUIC connection, opened on first use and closed when idle (see
+//! [`super::destination`]). One bi-stream per proxied connection. The
+//! destinations can be replaced while the client runs
+//! ([`ProxyClient::reconfigure`]): the ones left unchanged keep their
+//! connections.
 
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::destination::{
@@ -15,6 +18,7 @@ use crate::proxy::{client_status, dial, http, socks5, splice};
 use crate::transport::paths::ConnectionSnapshot;
 use crate::transport::{HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL_IDLE, liveness_window};
 use anyhow::Result;
+use futures::stream::{FuturesUnordered, StreamExt};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
 use rand::RngExt;
@@ -257,47 +261,105 @@ struct ListenAddrs {
     http: Option<SocketAddr>,
 }
 
-/// The client's routing state, shared by every request path: the static
-/// table, and the destinations it indexes.
-pub(crate) struct Router {
+/// One configuration's routing: the table, and the destinations it indexes.
+/// A request routes by the snapshot it took ([`Router::routing`]) from start
+/// to end, so a reconfigure meanwhile never mixes two tables' indexes.
+pub(crate) struct Routing {
     pub(crate) table: RouteTable,
-    /// Indexed by [`Route::Tunnel::dest`].
+    /// Indexed by [`Route::Tunnel::dest`]. The table's held destinations
+    /// ([`HeldDestination`]) come after these, and have none.
     pub(crate) destinations: Vec<Arc<Destination>>,
+}
+
+impl Routing {
+    fn destination(&self, name: &str) -> Option<&Arc<Destination>> {
+        self.table
+            .index_of(name)
+            .and_then(|dest| self.destinations.get(dest))
+    }
+
+    /// The name of the table's destination at `dest`, held or not.
+    pub(crate) fn name_of(&self, dest: usize) -> &str {
+        self.table.names().nth(dest).unwrap_or_default()
+    }
+}
+
+/// A destination whose routes a client keeps while it cannot serve them — the
+/// embedder has no usable settings for it yet (an auth key still to be
+/// picked, say). What it routes is refused, never connected directly: its
+/// targets were meant for a tunnel. Validated with the destinations, as one
+/// of them, but it has no server and never connects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldDestination {
+    pub name: String,
+    pub routed_domains: Vec<String>,
+    pub routed_cidrs: Vec<String>,
+}
+
+/// The client's routing state, shared by every request path.
+pub(crate) struct Router {
+    /// The current routing, replaced whole by [`ProxyClient::reconfigure`];
+    /// the managers ([`ProxyClient::manage`]) watch it for destinations to
+    /// start managing.
+    routing: watch::Sender<Arc<Routing>>,
+    /// The closes of destinations a reconfigure took out, each a task of its
+    /// own so that it finishes however the client is torn down;
+    /// [`ProxyClient::close`] waits for them.
+    retiring: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     shared: Arc<Shared>,
     listen: Mutex<ListenAddrs>,
 }
 
 impl Router {
+    /// The current routing, to route one request by.
+    pub(crate) fn routing(&self) -> Arc<Routing> {
+        self.routing.borrow().clone()
+    }
+
     pub(crate) fn status(&self) -> ClientStatus {
+        self.status_of(&self.routing())
+    }
+
+    /// The status, with the destinations of `routing`.
+    pub(crate) fn status_of(&self, routing: &Routing) -> ClientStatus {
         let listen = *self.listen.lock().expect("listen addrs lock");
         ClientStatus {
             socks_listen: listen.socks,
             http_listen: listen.http,
             idle_timeout: self.shared.idle_timeout,
-            destinations: self.destinations.iter().map(|d| d.status()).collect(),
+            destinations: routing.destinations.iter().map(|d| d.status()).collect(),
         }
     }
 
-    fn destination(&self, name: &str) -> Option<&Arc<Destination>> {
-        self.table
-            .index_of(name)
-            .map(|dest| &self.destinations[dest])
+    /// Report `served`'s addresses, keeping those another [`ProxyClient::serve`]
+    /// reports for the front-ends it leaves out.
+    fn advertise(&self, served: ListenAddrs) {
+        let mut listen = self.listen.lock().expect("listen addrs lock");
+        listen.socks = served.socks.or(listen.socks);
+        listen.http = served.http.or(listen.http);
     }
 
-    /// Stop reporting the front-end addresses: nothing listens on them now.
-    fn withdraw_listen_addrs(&self) {
-        *self.listen.lock().expect("listen addrs lock") = ListenAddrs::default();
+    /// Stop reporting `served`'s addresses, if they are still the ones reported.
+    fn withdraw(&self, served: ListenAddrs) {
+        let mut listen = self.listen.lock().expect("listen addrs lock");
+        if served.socks.is_some() && listen.socks == served.socks {
+            listen.socks = None;
+        }
+        if served.http.is_some() && listen.http == served.http {
+            listen.http = None;
+        }
     }
 }
 
 /// Withdraws the advertised front-end addresses when a [`ProxyClient::run`]
 /// ends, however it ends — returned, or dropped mid-flight — since its
-/// listeners end with it.
-struct AdvertisedAddrs<'a>(&'a Router);
+/// listeners end with it. Only its own: another serve's front-ends stay
+/// reported.
+struct AdvertisedAddrs<'a>(&'a Router, ListenAddrs);
 
 impl Drop for AdvertisedAddrs<'_> {
     fn drop(&mut self) {
-        self.0.withdraw_listen_addrs();
+        self.0.withdraw(self.1);
     }
 }
 
@@ -351,12 +413,13 @@ pub struct TunnelDialer {
 }
 
 impl TunnelDialer {
-    /// The name of the destination that would carry `target`, or `None` when
-    /// no destination routes it (including the reserved `flextunnel.internal`
-    /// names, which the client answers itself).
-    pub fn destination_for(&self, target: &Target) -> Option<&str> {
-        match self.router.table.route(target) {
-            Route::Tunnel { dest, .. } => Some(self.router.destinations[dest].name()),
+    /// The name of the destination that would carry `target` now, or `None`
+    /// when no destination routes it (including the reserved
+    /// `flextunnel.internal` names, which the client answers itself).
+    pub fn destination_for(&self, target: &Target) -> Option<String> {
+        let routing = self.router.routing();
+        match routing.table.route(target) {
+            Route::Tunnel { dest, .. } => Some(routing.name_of(dest).to_owned()),
             Route::ClientStatus | Route::Reserved | Route::Direct => None,
         }
     }
@@ -364,8 +427,15 @@ impl TunnelDialer {
     /// Open `target` through the destination that routes it and return its raw
     /// bidirectional byte stream.
     pub async fn connect(&self, target: &Target) -> Result<TunnelStream> {
-        let (destination, request) = match self.router.table.route(target) {
-            Route::Tunnel { dest, request } => (&self.router.destinations[dest], request),
+        let routing = self.router.routing();
+        let (destination, request) = match routing.table.route(target) {
+            Route::Tunnel { dest, request } => match routing.destinations.get(dest) {
+                Some(destination) => (destination, request),
+                None => anyhow::bail!(
+                    "{}: the destination is not set up on this client yet",
+                    routing.name_of(dest)
+                ),
+            },
             Route::ClientStatus | Route::Reserved => anyhow::bail!(
                 "{} is the client's own status endpoint; reach it through a proxy listener",
                 target_host(target)
@@ -464,14 +534,9 @@ impl ProxyClient {
         provider: EndpointProvider,
     ) -> ProxyResult<Self> {
         let ClientConfig {
-            mut destinations,
+            destinations,
             idle_timeout,
         } = config;
-        if destinations.is_empty() {
-            return Err(ProxyError::config(
-                "the client has no destinations configured",
-            ));
-        }
         if let Some(idle_timeout) = idle_timeout
             && idle_timeout > MAX_IDLE_TIMEOUT
         {
@@ -482,46 +547,7 @@ impl ProxyClient {
                 MAX_IDLE_TIMEOUT.as_secs()
             )));
         }
-        let specs: Vec<RouteSpec<'_>> = destinations
-            .iter()
-            .map(|d| RouteSpec {
-                name: &d.name,
-                routed_domains: &d.routed_domains,
-                routed_cidrs: &d.routed_cidrs,
-            })
-            .collect();
-        let table = RouteTable::new(&specs).map_err(|e| ProxyError::config(format!("{e:#}")))?;
-        // Nesting is allowed, but say where: a broad rule gives up whatever a
-        // narrower one on another destination takes.
-        let name = |dest: usize| table.names().nth(dest).unwrap_or_default().to_string();
-        for overlap in table.overlaps() {
-            log::info!(
-                "Routing: {} ({}) is within {} ({}); the most specific rule that matches a target takes it",
-                overlap.inner.rule,
-                name(overlap.inner.dest),
-                overlap.outer.rule,
-                name(overlap.outer.dest)
-            );
-        }
-        // Store each name the way the table spells it (trimmed, lowercased).
-        let names: Vec<String> = table.names().map(str::to_owned).collect();
-        for (destination, name) in destinations.iter_mut().zip(names) {
-            destination.name = name;
-        }
-        // Two names for one server would be two connections to it from one
-        // process, each with its own endpoint and no reason to exist.
-        for (i, destination) in destinations.iter().enumerate() {
-            if let Some(earlier) = destinations[..i]
-                .iter()
-                .find(|d| d.server_id == destination.server_id)
-            {
-                return Err(ProxyError::config(format!(
-                    "destinations {:?} and {:?} name the same server ({})",
-                    earlier.name, destination.name, destination.server_id
-                )));
-            }
-        }
-
+        let (table, destinations) = validate_destinations(destinations, &[])?;
         let shared = Arc::new(Shared {
             instance_nonce: rand::rng().random(),
             idle_timeout,
@@ -536,13 +562,71 @@ impl ProxyClient {
             .collect();
         Ok(Self {
             router: Arc::new(Router {
-                table,
-                destinations,
+                routing: watch::Sender::new(Arc::new(Routing {
+                    table,
+                    destinations,
+                })),
+                retiring: Mutex::new(Vec::new()),
                 shared,
                 listen: Mutex::new(ListenAddrs::default()),
             }),
             local_close: watch::Sender::new(false),
         })
+    }
+
+    /// Replace the destinations while the client runs, validated as
+    /// [`Self::new`] validates them; on an error nothing changes.
+    ///
+    /// A destination whose configuration is unchanged — the same name,
+    /// server, credential, relays, routes and keep-connected flag — is kept
+    /// as it is, its connection and the streams open on it included. Every
+    /// other one is new, connected on first use like any destination. One
+    /// that is gone, or changed, is closed: its requests are turned away and
+    /// its open streams end, and its endpoint is closed on a task of its own,
+    /// which [`Self::close`] waits for. A request already routed finishes by
+    /// the table it was routed by.
+    ///
+    /// `held` are routed too, after the destinations, but refused (see
+    /// [`HeldDestination`]): what the embedder cannot serve yet does not go
+    /// direct meanwhile.
+    ///
+    /// Must be called from within a Tokio runtime (for those closes).
+    pub fn reconfigure(
+        &self,
+        destinations: Vec<DestinationConfig>,
+        held: Vec<HeldDestination>,
+    ) -> ProxyResult<()> {
+        // Held throughout, so two reconfigures never start from one routing.
+        let mut retiring = self.router.retiring.lock().expect("retiring lock");
+        if self.router.shared.closed.load(Ordering::SeqCst) {
+            return Err(ProxyError::config("the client is closed"));
+        }
+        let (table, configs) = validate_destinations(destinations, &held)?;
+        let current = self.router.routing();
+        let mut left: Vec<Arc<Destination>> = current.destinations.clone();
+        let destinations: Vec<Arc<Destination>> = configs
+            .into_iter()
+            .map(|cfg| match left.iter().position(|d| d.config_is(&cfg)) {
+                Some(i) => left.swap_remove(i),
+                None => Destination::new(cfg, self.router.shared.clone()),
+            })
+            .collect();
+        let kept = current.destinations.len() - left.len();
+        log::info!(
+            "Reconfigured: {} destination(s), {kept} kept as they were: {}",
+            destinations.len(),
+            table.names().collect::<Vec<_>>().join(", ")
+        );
+        self.router.routing.send_replace(Arc::new(Routing {
+            table,
+            destinations,
+        }));
+        retiring.retain(|close| !close.is_finished());
+        for destination in left {
+            log::info!("{}: removed or changed; closing it", destination.name());
+            retiring.push(tokio::spawn(async move { destination.close().await }));
+        }
+        Ok(())
     }
 
     /// Report the embedding app's scene state. Backgrounded, the heartbeat
@@ -590,7 +674,8 @@ impl ProxyClient {
     /// — for a status UI. Empty when `name` is not a destination or is not
     /// connected right now; asking never connects it.
     pub async fn connection_snapshot(&self, name: &str) -> ConnectionSnapshot {
-        match self.router.destination(name) {
+        let destination = self.router.routing().destination(name).cloned();
+        match destination {
             Some(destination) => destination.connection_snapshot().await,
             None => ConnectionSnapshot::default(),
         }
@@ -605,7 +690,8 @@ impl ProxyClient {
     }
 
     /// Serve the given local front-ends and manage the destinations until the
-    /// future is dropped (or a front-end listener is lost for good).
+    /// future is dropped (or a front-end listener is lost for good): both
+    /// [`Self::manage`] and [`Self::serve`].
     ///
     /// Nothing is dialed up front. A destination connects when a request for
     /// it arrives — from a listener here or through [`Self::dialer`] — and
@@ -623,6 +709,76 @@ impl ProxyClient {
     /// future stops everything but leaves the endpoints of the destinations in
     /// use open: call [`Self::close`] afterwards.
     pub async fn run(&self, listeners: LocalListeners) -> ProxyResult<()> {
+        tokio::select! {
+            () = self.manage() => Ok(()),
+            r = self.serve(listeners) => r,
+        }
+    }
+
+    /// Run the destinations' connection managers — the current ones, and
+    /// each one a [`Self::reconfigure`] adds — until the future is dropped;
+    /// it never finishes. Half of [`Self::run`], for an embedder that serves
+    /// its front-ends with [`Self::serve`] so it can replace them while the
+    /// destinations stay connected. One task, N concurrent futures: an
+    /// embedder's `task.abort()` tears everything down, no orphaned task.
+    pub async fn manage(&self) {
+        let mut changes = self.router.routing.subscribe();
+        let mut managers = FuturesUnordered::new();
+        // The destinations with a manager in `managers`, by identity.
+        let mut managed: Vec<Arc<Destination>> = Vec::new();
+        log::info!(
+            "{} destination(s), connected on demand: {}",
+            self.router.routing().destinations.len(),
+            self.router
+                .routing()
+                .table
+                .names()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        loop {
+            let routing = changes.borrow_and_update().clone();
+            for destination in &routing.destinations {
+                // A closed one (the client was closed) would end its manager
+                // at once, and be started again here, round and round.
+                if destination.is_closed() || managed.iter().any(|m| Arc::ptr_eq(m, destination)) {
+                    continue;
+                }
+                managed.push(destination.clone());
+                let destination = destination.clone();
+                // A manager never returns; it ends when its destination is
+                // closed — taken out by a reconfigure.
+                managers.push(async move {
+                    tokio::select! {
+                        () = destination.clone().run() => {}
+                        () = destination.closed() => {}
+                    }
+                    destination
+                });
+            }
+            tokio::select! {
+                Some(ended) = managers.next() => {
+                    managed.retain(|m| !Arc::ptr_eq(m, &ended));
+                }
+                changed = changes.changed() => {
+                    // The router holds the sender: it cannot go while `self`
+                    // is borrowed here.
+                    if changed.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Serve the given local front-ends, routing each request by the
+    /// destinations of the moment, until the future is dropped or a listener
+    /// is lost for good. Half of [`Self::run`]: requests for a destination
+    /// connect it only while [`Self::manage`] runs too. Dropping this future
+    /// closes its listeners; the connections they accepted carry on. Several
+    /// can run at once, each with some of the front-ends, so that one can be
+    /// replaced while the others keep their listeners.
+    pub async fn serve(&self, listeners: LocalListeners) -> ProxyResult<()> {
         let LocalListeners {
             socks,
             http,
@@ -649,15 +805,10 @@ impl ProxyClient {
                 l.local_addr()?
             );
         }
-        *self.router.listen.lock().expect("listen addrs lock") = listen;
+        self.router.advertise(listen);
         // The addresses are advertised for as long as they are served: until
         // this future ends or is dropped, or the listeners are closed.
-        let _advertised = AdvertisedAddrs(&self.router);
-        log::info!(
-            "{} destination(s), connected on demand: {}",
-            self.router.destinations.len(),
-            self.router.table.names().collect::<Vec<_>>().join(", ")
-        );
+        let _advertised = AdvertisedAddrs(&self.router, listen);
 
         let router = &self.router;
         // An absent front-end is an inert branch (never resolves), so the
@@ -681,22 +832,18 @@ impl ProxyClient {
             }
             std::future::pending::<ProxyResult<()>>().await
         };
-        // The destination managers never finish; they are here so they run —
-        // and stop — with this future. One task, N concurrent futures: an
-        // embedder's `task.abort()` tears everything down, no orphaned task.
-        let managers =
-            futures::future::join_all(router.destinations.iter().map(|d| d.clone().run()));
 
         // On the close signal every accept loop drops its listener and parks,
-        // so the session lives on with nothing listening: say so.
+        // so the session lives on with nothing listening here: say so — for
+        // this serve's front-ends, whose loops see the signal with this; any
+        // other serve's withdraws its own as its loops see it.
         let listeners_closed = async {
             listener_closed(&mut self.local_close.subscribe()).await;
-            router.withdraw_listen_addrs();
+            router.withdraw(listen);
             std::future::pending::<ProxyResult<()>>().await
         };
 
         tokio::select! {
-            _ = managers => Ok(()),
             r = socks_accept => r,
             r = http_accept => r,
             r = unix_accept => r,
@@ -709,10 +856,85 @@ impl ProxyClient {
     /// endpoint must be closed, never just dropped. An endpoint still being
     /// built at that moment is waited for and then closed, so this can take as
     /// long as a build does — bound the wait if the caller cannot afford it.
+    /// Destinations a reconfigure took out are closed already, or being
+    /// closed: this waits for those closes as well.
     pub async fn close(&self) {
-        self.router.shared.closed.store(true, Ordering::SeqCst);
-        futures::future::join_all(self.router.destinations.iter().map(|d| d.close())).await;
+        // Latched under the reconfigure lock, so the routing taken here is the
+        // last one: a reconfigure either committed before (its destinations
+        // are the ones closed here, and the ones it took out are retiring) or
+        // finds the client closed.
+        let (routing, retiring) = {
+            let mut retiring = self.router.retiring.lock().expect("retiring lock");
+            self.router.shared.closed.store(true, Ordering::SeqCst);
+            (self.router.routing(), std::mem::take(&mut *retiring))
+        };
+        futures::future::join(
+            futures::future::join_all(routing.destinations.iter().map(|d| d.close())),
+            futures::future::join_all(retiring),
+        )
+        .await;
     }
+}
+
+/// Check a client's destinations — at least one, each name a valid and
+/// unique destination name, each server configured once, and no routing rule
+/// shared between two destinations — and build their table, with the `held`
+/// ones after them (checked as destinations, but serverless). Returns the
+/// configurations with each name spelled the way the table stores it
+/// (trimmed, lowercased).
+fn validate_destinations(
+    mut destinations: Vec<DestinationConfig>,
+    held: &[HeldDestination],
+) -> ProxyResult<(RouteTable, Vec<DestinationConfig>)> {
+    if destinations.is_empty() {
+        return Err(ProxyError::config(
+            "the client has no destinations configured",
+        ));
+    }
+    let specs: Vec<RouteSpec<'_>> = destinations
+        .iter()
+        .map(|d| RouteSpec {
+            name: &d.name,
+            routed_domains: &d.routed_domains,
+            routed_cidrs: &d.routed_cidrs,
+        })
+        .chain(held.iter().map(|h| RouteSpec {
+            name: &h.name,
+            routed_domains: &h.routed_domains,
+            routed_cidrs: &h.routed_cidrs,
+        }))
+        .collect();
+    let table = RouteTable::new(&specs).map_err(|e| ProxyError::config(format!("{e:#}")))?;
+    // Nesting is allowed, but say where: a broad rule gives up whatever a
+    // narrower one on another destination takes.
+    let name = |dest: usize| table.names().nth(dest).unwrap_or_default().to_string();
+    for overlap in table.overlaps() {
+        log::info!(
+            "Routing: {} ({}) is within {} ({}); the most specific rule that matches a target takes it",
+            overlap.inner.rule,
+            name(overlap.inner.dest),
+            overlap.outer.rule,
+            name(overlap.outer.dest)
+        );
+    }
+    let names: Vec<String> = table.names().map(str::to_owned).collect();
+    for (destination, name) in destinations.iter_mut().zip(names) {
+        destination.name = name;
+    }
+    // Two names for one server would be two connections to it from one
+    // process, each with its own endpoint and no reason to exist.
+    for (i, destination) in destinations.iter().enumerate() {
+        if let Some(earlier) = destinations[..i]
+            .iter()
+            .find(|d| d.server_id == destination.server_id)
+        {
+            return Err(ProxyError::config(format!(
+                "destinations {:?} and {:?} name the same server ({})",
+                earlier.name, destination.name, destination.server_id
+            )));
+        }
+    }
+    Ok((table, destinations))
 }
 
 /// Client-side heartbeat loop over the retained control stream: send a
@@ -1041,6 +1263,36 @@ async fn listener_closed(close: &mut watch::Receiver<bool>) {
     }
 }
 
+/// A listener's routing: the snapshot new requests route by, and the budget
+/// of held requests sized and indexed for its destinations — renewed when a
+/// reconfigure replaces the routing. Requests held under the old budget keep
+/// it until they end, so for that while the holds can add up past
+/// [`MAX_HELD_CONNS`].
+struct ListenerRouting {
+    routing: Arc<Routing>,
+    holds: Arc<HoldBudget>,
+}
+
+impl ListenerRouting {
+    fn new(router: &Router) -> Self {
+        let routing = router.routing();
+        let holds = Arc::new(HoldBudget::new(routing.destinations.len()));
+        Self { routing, holds }
+    }
+
+    /// The routing to route the next request by, and its budget.
+    fn current(&mut self, router: &Router) -> (Arc<Routing>, Arc<HoldBudget>) {
+        let routing = router.routing();
+        if !Arc::ptr_eq(&routing, &self.routing) {
+            *self = Self {
+                holds: Arc::new(HoldBudget::new(routing.destinations.len())),
+                routing,
+            };
+        }
+        (self.routing.clone(), self.holds.clone())
+    }
+}
+
 /// Accept loop for a local front-end listener. Each accepted connection is
 /// handled by [`handle_local_conn`] parameterized on `proto`. Shared verbatim by
 /// the SOCKS5 and HTTP listeners.
@@ -1063,7 +1315,7 @@ async fn accept_loop<P: LocalProto>(
     let addr = listener.local_addr()?;
     let mut retry = AcceptRetry::new("Local proxy");
     let limiter = Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_CONNS));
-    let hold_limiter = Arc::new(HoldBudget::new(router.destinations.len()));
+    let mut routing = ListenerRouting::new(router);
     let mut warned_saturated = false;
     loop {
         let accepted = tokio::select! {
@@ -1105,10 +1357,10 @@ async fn accept_loop<P: LocalProto>(
         };
         let router = router.clone();
         let proto = proto.clone();
-        let hold_limiter = hold_limiter.clone();
+        let (routing, hold_limiter) = routing.current(&router);
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = handle_local_conn(proto, tcp, router, hold_limiter).await {
+            if let Err(e) = handle_local_conn(proto, tcp, router, routing, hold_limiter).await {
                 log::debug!("proxy connection from {peer} ended: {e}");
             }
         });
@@ -1139,7 +1391,7 @@ async fn accept_loop_unix(
         .and_then(|a| a.as_pathname().map(|p| p.to_path_buf()));
     let mut retry = AcceptRetry::new("Unix SOCKS5");
     let limiter = Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_CONNS));
-    let hold_limiter = Arc::new(HoldBudget::new(router.destinations.len()));
+    let mut routing = ListenerRouting::new(router);
     let mut warned_saturated = false;
     loop {
         let accepted = tokio::select! {
@@ -1181,10 +1433,12 @@ async fn accept_loop_unix(
             }
         };
         let router = router.clone();
-        let hold_limiter = hold_limiter.clone();
+        let (routing, hold_limiter) = routing.current(&router);
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = handle_local_conn(Socks5Proto, stream, router, hold_limiter).await {
+            if let Err(e) =
+                handle_local_conn(Socks5Proto, stream, router, routing, hold_limiter).await
+            {
                 log::debug!("unix proxy connection ended: {e}");
             }
         });
@@ -1222,6 +1476,7 @@ async fn handle_local_conn<P: LocalProto, S: LocalStream>(
     proto: P,
     mut tcp: S,
     router: Arc<Router>,
+    routing: Arc<Routing>,
     hold_limiter: Arc<HoldBudget>,
 ) -> Result<()> {
     // Bound the local handshake so a peer that connects and sends nothing can't
@@ -1233,7 +1488,7 @@ async fn handle_local_conn<P: LocalProto, S: LocalStream>(
         .await
         .map_err(|_| anyhow::anyhow!("timed out during local proxy handshake"))??;
 
-    let (dest, request) = match router.table.route(&target) {
+    let (dest, request) = match routing.table.route(&target) {
         Route::Tunnel { dest, request } => (dest, request),
         // Split-tunnel: a target on no destination's list is dialed directly
         // from this device's own network (its DNS, its IP) — whatever state
@@ -1249,6 +1504,7 @@ async fn handle_local_conn<P: LocalProto, S: LocalStream>(
                 &mut tcp,
                 upstream_preamble,
                 &router,
+                &routing,
                 route == Route::Reserved,
                 &hold_limiter,
             )
@@ -1262,7 +1518,16 @@ async fn handle_local_conn<P: LocalProto, S: LocalStream>(
     // never lands answers with an error reply, so the app shows a connection
     // error for this target instead of hanging forever. A destination that is
     // connected takes no hold at all.
-    let destination = &router.destinations[dest];
+    let Some(destination) = routing.destinations.get(dest) else {
+        // Held: meant for a tunnel that is not set up yet, so refused rather
+        // than connected directly.
+        log::debug!(
+            "{}: not set up yet; refusing {target:?}",
+            routing.name_of(dest)
+        );
+        let _ = proto.reply(&mut tcp, signaling::REP_NET_UNREACHABLE).await;
+        return Ok(());
+    };
     let lease = match destination
         .acquire(Some(hold_limiter.for_destination(dest)))
         .await
@@ -1506,13 +1771,16 @@ mod tests {
         let domain = |host: &str| Target::Domain(host.to_string(), 80);
         assert_eq!(
             dialer.destination_for(&domain("M1.localhost.flextunnel.internal")),
-            Some("m1")
+            Some("m1".to_string())
         );
         assert_eq!(
             dialer.destination_for(&domain("api.corp.example")),
-            Some("m1")
+            Some("m1".to_string())
         );
-        assert_eq!(dialer.destination_for(&domain("10.2.3.4")), Some("m2"));
+        assert_eq!(
+            dialer.destination_for(&domain("10.2.3.4")),
+            Some("m2".to_string())
+        );
         assert_eq!(dialer.destination_for(&domain("example.org")), None);
         assert_eq!(dialer.destination_for(&domain("flextunnel.internal")), None);
 
@@ -1666,6 +1934,53 @@ mod tests {
     /// `close_local_listeners` must drop the front-end listener — local
     /// connects turn into refusals — while the accept future stays pending, so
     /// the session `select!` it lives in keeps the destinations running.
+    /// Front-ends served apart (the desktop moves one port at a time) are
+    /// each reported while served, and ending one leaves the other's.
+    #[tokio::test]
+    async fn each_serve_reports_and_withdraws_only_its_own_front_ends() {
+        let client = test_client();
+        let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (socks_addr, http_addr) = (socks.local_addr().unwrap(), http.local_addr().unwrap());
+        let mut serve_socks = Box::pin(client.serve(LocalListeners::tcp(Some(socks), None)));
+        let mut serve_http = Box::pin(client.serve(LocalListeners::tcp(None, Some(http))));
+        assert!(futures::poll!(serve_socks.as_mut()).is_pending());
+        assert!(futures::poll!(serve_http.as_mut()).is_pending());
+        let status = client.status();
+        assert_eq!(
+            (status.socks_listen, status.http_listen),
+            (Some(socks_addr), Some(http_addr))
+        );
+
+        drop(serve_http);
+        let status = client.status();
+        assert_eq!(
+            (status.socks_listen, status.http_listen),
+            (Some(socks_addr), None)
+        );
+        drop(serve_socks);
+        assert_eq!(client.status().socks_listen, None);
+
+        // On the close signal each withdraws its own, as its loops see it.
+        let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_addr = http.local_addr().unwrap();
+        let mut serve_socks = Box::pin(client.serve(LocalListeners::tcp(Some(socks), None)));
+        let mut serve_http = Box::pin(client.serve(LocalListeners::tcp(None, Some(http))));
+        assert!(futures::poll!(serve_socks.as_mut()).is_pending());
+        assert!(futures::poll!(serve_http.as_mut()).is_pending());
+        client.close_local_listeners();
+        assert!(futures::poll!(serve_socks.as_mut()).is_pending());
+        let status = client.status();
+        assert_eq!(
+            (status.socks_listen, status.http_listen),
+            (None, Some(http_addr)),
+            "the HTTP listener has not seen the signal yet"
+        );
+        assert!(futures::poll!(serve_http.as_mut()).is_pending());
+        assert_eq!(client.status().http_listen, None);
+    }
+
     #[tokio::test]
     async fn close_signal_drops_listener_without_ending_loop() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1920,9 +2235,10 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         let router = test_client().router.clone();
         tokio::spawn(async move {
-            let holds = Arc::new(HoldBudget::new(router.destinations.len()));
+            let routing = router.routing();
+            let holds = Arc::new(HoldBudget::new(routing.destinations.len()));
             let (tcp, _) = proxy.accept().await.unwrap();
-            handle_local_conn(HttpProto, tcp, router, holds)
+            handle_local_conn(HttpProto, tcp, router, routing, holds)
                 .await
                 .unwrap();
         });
@@ -1954,8 +2270,9 @@ mod tests {
     async fn exchange<P: LocalProto>(proto: P, router: Arc<Router>, request: Vec<u8>) -> String {
         let (mut app, server) = tokio::io::duplex(64 * 1024);
         let handler = tokio::spawn(async move {
-            let holds = Arc::new(HoldBudget::new(router.destinations.len()));
-            handle_local_conn(proto, server, router, holds).await
+            let routing = router.routing();
+            let holds = Arc::new(HoldBudget::new(routing.destinations.len()));
+            handle_local_conn(proto, server, router, routing, holds).await
         });
         app.write_all(&request).await.unwrap();
         let mut response = Vec::new();

@@ -21,7 +21,8 @@ pub mod status_page;
 mod e2e_tests;
 
 pub use client::{
-    ClientConfig, ClientStatus, LocalListeners, ProxyClient, TunnelDialer, TunnelStream,
+    ClientConfig, ClientStatus, HeldDestination, LocalListeners, ProxyClient, TunnelDialer,
+    TunnelStream,
 };
 pub use destination::{
     ClientAuth, DestinationConfig, DestinationState, DestinationStatus, EndpointProvider,

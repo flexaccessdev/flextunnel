@@ -112,6 +112,25 @@ pub struct DestinationConfig {
     pub keep_connected: bool,
 }
 
+impl DestinationConfig {
+    /// Whether `other` configures the same destination in every respect —
+    /// what a reconfigure keeps a destination's connection for.
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        let same_auth = match (&self.auth, &other.auth) {
+            (ClientAuth::Key(a), ClientAuth::Key(b)) => a.secret_str() == b.secret_str(),
+            (ClientAuth::Quick(a), ClientAuth::Quick(b)) => a.to_bytes() == b.to_bytes(),
+            _ => false,
+        };
+        same_auth
+            && self.name == other.name
+            && self.server_id == other.server_id
+            && self.relay == other.relay
+            && self.routed_domains == other.routed_domains
+            && self.routed_cidrs == other.routed_cidrs
+            && self.keep_connected == other.keep_connected
+    }
+}
+
 /// Builds a destination's endpoint. The default creates a real client endpoint
 /// from the destination's relay config; tests substitute loopback endpoints.
 pub type EndpointProvider = Arc<
@@ -317,8 +336,9 @@ enum Link {
         reason: String,
         retry_at: Instant,
     },
-    /// The client was closed ([`Destination::close`]). Terminal: requests are
-    /// turned away, and no later transition replaces it.
+    /// The destination was closed ([`Destination::close`]) — with the
+    /// client, or taken out by a reconfigure. Terminal: requests are turned
+    /// away, and no later transition replaces it.
     Closed,
 }
 
@@ -475,7 +495,8 @@ pub(crate) enum AcquireError {
     HoldCap,
     /// The server refused this client; retrying now would fail the same way.
     Failed(String),
-    /// The client is shutting down.
+    /// The destination was closed: the client is shutting down, or a
+    /// reconfigure took the destination out.
     Closed,
 }
 
@@ -489,7 +510,7 @@ impl std::fmt::Display for AcquireError {
             ),
             Self::HoldCap => f.write_str("too many requests are already waiting for a connection"),
             Self::Failed(reason) => f.write_str(reason),
-            Self::Closed => f.write_str("the client is shutting down"),
+            Self::Closed => f.write_str("the destination was closed"),
         }
     }
 }
@@ -552,6 +573,10 @@ pub(crate) struct Destination {
     /// can wait a build in flight out instead of leaving it to be cut off.
     building: tokio::sync::Mutex<()>,
     nonce_tracker: Mutex<ServerNonceTracker>,
+    /// Latched by [`Self::close`], as [`Shared::closed`] is for the whole
+    /// client: an endpoint whose build finishes after it is closed by its own
+    /// build task instead of being installed.
+    closed: AtomicBool,
     /// Latches once a duplicate server has been observed; thereafter every
     /// `Hello` to this server carries the advisory so it can self-block.
     duplicate_server: AtomicBool,
@@ -574,6 +599,7 @@ impl Destination {
             endpoint: Mutex::new(None),
             building: tokio::sync::Mutex::new(()),
             nonce_tracker: Mutex::new(ServerNonceTracker::default()),
+            closed: AtomicBool::new(false),
             duplicate_server: AtomicBool::new(false),
             status: Mutex::new(StatusFields::default()),
         })
@@ -581,6 +607,22 @@ impl Destination {
 
     pub(crate) fn name(&self) -> &str {
         &self.cfg.name
+    }
+
+    /// Whether this destination runs with exactly `cfg`.
+    pub(crate) fn config_is(&self, cfg: &DestinationConfig) -> bool {
+        self.cfg.same_as(cfg)
+    }
+
+    /// Whether this destination, or the whole client, was closed.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst) || self.shared.closed.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once the destination is closed ([`Self::close`]).
+    pub(crate) async fn closed(&self) {
+        let mut state = self.state.subscribe();
+        let _ = state.wait_for(|s| matches!(s.link, Link::Closed)).await;
     }
 
     /// Whether anything wants this destination connected right now.
@@ -774,14 +816,16 @@ impl Destination {
         }
     }
 
-    /// Close the endpoint at client shutdown, first waiting out an endpoint
-    /// build in flight. `Shared::closed` is already latched, so that build
-    /// closes the endpoint it produced, and no later one starts.
+    /// Close the destination — at client shutdown, or when a reconfigure
+    /// takes it out — first waiting out an endpoint build in flight. The
+    /// close latch comes first, so that build closes the endpoint it
+    /// produced, and no later one starts.
     ///
-    /// The link goes to its terminal state first: requests held for this
-    /// destination end at once, and a dialer that outlives the client is
-    /// turned away instead of leasing a connection about to be closed.
+    /// The link goes to its terminal state next: requests held for this
+    /// destination end at once, its manager stops, and a dialer that outlives
+    /// it is turned away instead of leasing a connection about to be closed.
     pub(crate) async fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
         self.state.send_modify(|s| {
             s.link = Link::Closed;
             s.connected_since = None;
@@ -1100,17 +1144,17 @@ impl Destination {
         let build = tokio::spawn(async move {
             let _building = this.building.lock().await;
             // `close` latches the flag before it takes the build lock: having
-            // the lock with the flag set means the client is gone already.
-            if this.shared.closed.load(Ordering::SeqCst) {
-                anyhow::bail!("the client is shutting down");
+            // the lock with the flag set means the destination is gone.
+            if this.is_closed() {
+                anyhow::bail!("the destination is closed");
             }
             let endpoint = (this.shared.provider)(&this.cfg).await?;
             let installed = {
                 let mut slot = this.endpoint.lock().expect("endpoint slot lock");
-                // Checked under the slot lock: `ProxyClient::close` latches the
-                // flag before it empties the slots, so either it finds this
-                // endpoint there or we see the flag here.
-                if this.shared.closed.load(Ordering::SeqCst) {
+                // Checked under the slot lock: `close` latches the flag before
+                // it empties the slot, so either it finds this endpoint there
+                // or we see the flag here.
+                if this.is_closed() {
                     false
                 } else {
                     *slot = Some(endpoint.clone());
@@ -1119,7 +1163,7 @@ impl Destination {
             };
             if !installed {
                 endpoint.close().await;
-                anyhow::bail!("the client is shutting down");
+                anyhow::bail!("the destination is closed");
             }
             Ok(endpoint)
         });

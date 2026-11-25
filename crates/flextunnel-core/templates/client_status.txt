@@ -6,9 +6,9 @@ idle timeout: {{ idle_timeout }}
 
 routing (most specific first; a request takes the first rule that matches it):
   flextunnel.internal -> this client (status page)
-{% for r in routes %}{% if r.kind == "loopback" %}  {{ r.rule }} -> {{ r.destination }}'s server loopback
+{% for r in routes %}{% if r.kind == "loopback" %}  {{ r.rule }} -> {{ r.destination }}'s server loopback{% if r.held() %}, held: not set up on this client yet, refused{% endif %}
 {% endif %}{% endfor %}  any other *.flextunnel.internal -> this client (reserved, answers 404)
-{% for r in routes %}{% if r.kind != "loopback" %}  {{ r.rule }} ({{ r.kind }}) -> {{ r.destination }}, server: {{ r.server }}{% if r.server_last_known %} (last known){% endif %}
+{% for r in routes %}{% if r.kind != "loopback" %}  {{ r.rule }} ({{ r.kind }}) -> {{ r.destination }}, {% if r.held() %}held: not set up on this client yet, refused{% else %}server: {{ r.server }}{% if r.server_last_known %} (last known){% endif %}{% endif %}
 {% for o in r.within %}      inside {{ o.destination }}'s broader {{ o.rule }}
 {% endfor %}{% for o in r.narrower %}      contains {{ o.destination }}'s narrower {{ o.rule }}
 {% endfor %}{% endif %}{% endfor %}  anything else -> direct from this device
