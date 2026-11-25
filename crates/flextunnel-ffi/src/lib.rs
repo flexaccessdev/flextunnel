@@ -1,6 +1,9 @@
-//! C FFI surface for the iOS app (`aarch64-apple-ios`).
+//! C FFI surface for the iOS app (`aarch64-apple-ios`), and through the same
+//! safe Rust beneath it, the JNI surface for the Android app (`android`
+//! module, `target_os = "android"` only; the same JSON shapes, as the
+//! `external fun`s of `dev.flexaccess.flextunnel.FlextunnelNative`).
 //!
-//! The app links `libflextunnel.xcframework` (containing `libflextunnel.a`
+//! The iOS app links `libflextunnel.xcframework` (containing `libflextunnel.a`
 //! slices) and drives the in-process client primarily with these calls:
 //!
 //! 1. [`flextunnel_start`] — parse the JSON config, optionally bind a loopback
@@ -95,6 +98,9 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
+#[cfg(target_os = "android")]
+mod android;
+
 use flextunnel_core::config::DEFAULT_IDLE_TIMEOUT;
 use flextunnel_core::error::ProxyResult;
 use flextunnel_core::proxy::signaling::Target;
@@ -121,8 +127,8 @@ const STOP_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// failure path).
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// Opaque handle owned by the Swift side. Created by [`flextunnel_start`], freed
-/// by [`flextunnel_stop`].
+/// Opaque handle owned by the app (Swift, or Kotlin through JNI). Created by
+/// [`flextunnel_start`], freed by [`flextunnel_stop`].
 pub struct FlextunnelHandle {
     runtime: tokio::runtime::Runtime,
     /// The client. Shared with the spawned `task` (which holds a clone) so
@@ -223,24 +229,24 @@ pub unsafe extern "C" fn flextunnel_generate_client_key(
     out_buf: *mut c_char,
     out_len: usize,
 ) -> c_int {
-    let key = match flextunnel_core::auth::ClientKey::generate() {
-        Ok(key) => key,
-        Err(e) => {
-            write_cstr(out_buf, out_len, &format!("{e:#}"));
-            return 0;
+    match generate_client_key_json() {
+        Ok(json) => c_int::from(write_cstr(out_buf, out_len, &json)),
+        Err(message) => {
+            write_cstr(out_buf, out_len, &message);
+            0
         }
-    };
-    let json = serde_json::json!({
+    }
+}
+
+/// The [`flextunnel_generate_client_key`] JSON for a fresh keypair.
+fn generate_client_key_json() -> Result<String, String> {
+    let key = flextunnel_core::auth::ClientKey::generate().map_err(|e| format!("{e:#}"))?;
+    Ok(serde_json::json!({
         "created": flextunnel_core::flexaccess_keys::rfc3339_utc(std::time::SystemTime::now()),
         "public_key": key.public_str(),
         "secret_key": key.secret_str(),
     })
-    .to_string();
-    if write_cstr(out_buf, out_len, &json) {
-        1
-    } else {
-        0
-    }
+    .to_string())
 }
 
 /// Derive the public key (`ed25519-pub:...`) of a stored secret key, so
@@ -270,19 +276,20 @@ pub unsafe extern "C" fn flextunnel_client_public_key(
             return 0;
         }
     };
-    match flextunnel_core::auth::ClientKey::from_secret_str(secret.trim()) {
-        Ok(key) => {
-            if write_cstr(out_buf, out_len, &key.public_str()) {
-                1
-            } else {
-                0
-            }
-        }
-        Err(e) => {
-            write_cstr(out_buf, out_len, &format!("invalid secret key: {e:#}"));
+    match client_public_key_str(secret) {
+        Ok(public) => c_int::from(write_cstr(out_buf, out_len, &public)),
+        Err(message) => {
+            write_cstr(out_buf, out_len, &message);
             0
         }
     }
+}
+
+/// The public key (`ed25519-pub:...`) of the secret key `secret`.
+fn client_public_key_str(secret: &str) -> Result<String, String> {
+    flextunnel_core::auth::ClientKey::from_secret_str(secret.trim())
+        .map(|key| key.public_str())
+        .map_err(|e| format!("invalid secret key: {e:#}"))
 }
 
 /// Start the in-process client, optionally with a SOCKS5 front-end. Validates
@@ -318,21 +325,7 @@ pub unsafe extern "C" fn flextunnel_start(
         }
     };
 
-    // Enforce a single running instance. Claim the guard before doing any work;
-    // every failure path below releases it so a later start can succeed.
-    if RUNNING
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        write_cstr(
-            out_buf,
-            out_len,
-            "a flextunnel proxy is already running; stop it first",
-        );
-        return ptr::null_mut();
-    }
-
-    match start_inner(json) {
+    match start_session(json) {
         Ok((handle, result_json)) => {
             // Refuse to hand back a handle if the result JSON did not fit: the
             // caller would not learn the port. Stop the loop, free, and signal
@@ -340,18 +333,38 @@ pub unsafe extern "C" fn flextunnel_start(
             if write_cstr(out_buf, out_len, &result_json) {
                 Box::into_raw(Box::new(handle))
             } else {
-                stop_handle(handle);
-                RUNNING.store(false, Ordering::Release);
+                stop_session(handle);
                 write_cstr(out_buf, out_len, "out_buf too small for result JSON");
                 ptr::null_mut()
             }
         }
         Err(msg) => {
-            RUNNING.store(false, Ordering::Release);
             write_cstr(out_buf, out_len, &msg);
             ptr::null_mut()
         }
     }
+}
+
+/// Claim the single-instance guard and start a session from `json`; the
+/// guard is released again on failure. A started session ends with
+/// [`stop_session`], which releases it.
+fn start_session(json: &str) -> Result<(FlextunnelHandle, String), String> {
+    // Enforce a single running instance. Claim the guard before doing any work;
+    // the failure path releases it so a later start can succeed.
+    if RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err("a flextunnel proxy is already running; stop it first".to_string());
+    }
+    start_inner(json).inspect_err(|_| RUNNING.store(false, Ordering::Release))
+}
+
+/// Stop a session [`start_session`] started and release the single-instance
+/// guard, so a subsequent start can succeed.
+fn stop_session(handle: FlextunnelHandle) {
+    stop_handle(handle);
+    RUNNING.store(false, Ordering::Release);
 }
 
 /// Bind the browser's loopback SOCKS listener. A nonzero `requested` port is a
@@ -586,64 +599,16 @@ pub unsafe extern "C" fn flextunnel_set_forwards(
             return 0;
         }
     };
-    let configured: Vec<FfiForward> = match serde_json::from_str(json) {
-        Ok(configured) => configured,
-        Err(e) => {
-            write_cstr(out_buf, out_len, &format!("invalid forwards JSON: {e}"));
-            return 0;
+    match unsafe { &*handle }.set_forwards(json) {
+        Ok(()) => {
+            write_cstr(out_buf, out_len, "");
+            1
         }
-    };
-    let mut ids = HashSet::new();
-    let mut ports = HashSet::new();
-    let mut specs = Vec::new();
-    for forward in configured.into_iter().filter(|forward| forward.enabled) {
-        if forward.id.is_empty() || !ids.insert(forward.id.clone()) {
-            write_cstr(out_buf, out_len, "forward ids must be non-empty and unique");
-            return 0;
-        }
-        if forward.local_port == 0 || !ports.insert(forward.local_port) {
-            write_cstr(
-                out_buf,
-                out_len,
-                "enabled forward local ports must be nonzero and unique",
-            );
-            return 0;
-        }
-        let remote_host = forward.remote_host.trim();
-        if remote_host.is_empty() || forward.remote_port == 0 {
-            write_cstr(
-                out_buf,
-                out_len,
-                "forward targets require a host and nonzero port",
-            );
-            return 0;
-        }
-        specs.push(ForwardSpec {
-            id: forward.id,
-            local_port: forward.local_port,
-            target: Target::Domain(remote_host.to_string(), forward.remote_port),
-        });
-    }
-    let handle = unsafe { &*handle };
-    let dialer = handle.client.dialer();
-    for spec in &specs {
-        if dialer.destination_for(&spec.target).is_none() {
-            let Target::Domain(host, _) = &spec.target else {
-                unreachable!("forward targets are built in domain form above");
-            };
-            write_cstr(out_buf, out_len, &format!("no destination routes {host}"));
-            return 0;
+        Err(message) => {
+            write_cstr(out_buf, out_len, &message);
+            0
         }
     }
-    match handle.forwards.lock() {
-        Ok(mut manager) => manager.apply(&specs),
-        Err(_) => {
-            write_cstr(out_buf, out_len, "forward manager lock failed");
-            return 0;
-        }
-    }
-    write_cstr(out_buf, out_len, "");
-    1
 }
 
 /// Snapshot forward states as JSON.
@@ -667,33 +632,13 @@ pub unsafe extern "C" fn flextunnel_forward_statuses(
         write_cstr(out_buf, out_len, "");
         return -1;
     }
-    let handle = unsafe { &*handle };
-    let statuses = match handle.forwards.lock() {
-        Ok(manager) => manager.statuses(),
-        Err(_) => {
+    match unsafe { &*handle }.forward_statuses_json() {
+        Some(json) => write_sized(out_buf, out_len, &json),
+        None => {
             write_cstr(out_buf, out_len, "");
-            return -1;
+            -1
         }
-    };
-    let statuses: Vec<_> = statuses
-        .into_iter()
-        .map(|status| {
-            let (state, error) = match status.state {
-                ForwardState::Starting => ("starting", None),
-                ForwardState::Listening => ("listening", None),
-                ForwardState::Failed(error) => ("failed", Some(error)),
-            };
-            serde_json::json!({
-                "id": status.id,
-                "state": state,
-                "error": error,
-                "active": status.active,
-                "last_conn_error": status.last_conn_error,
-            })
-        })
-        .collect();
-    let json = serde_json::json!({ "forwards": statuses }).to_string();
-    write_sized(out_buf, out_len, &json)
+    }
 }
 
 /// Close every local listener — the SOCKS5 front-end and all forward
@@ -720,15 +665,7 @@ pub unsafe extern "C" fn flextunnel_close_listeners(handle: *const FlextunnelHan
     if handle.is_null() {
         return -1;
     }
-    let handle = unsafe { &*handle };
-    handle.client.close_local_listeners();
-    match handle.forwards.lock() {
-        Ok(mut manager) => {
-            manager.apply(&[]);
-            1
-        }
-        Err(_) => 0,
-    }
+    c_int::from(unsafe { &*handle }.close_listeners())
 }
 
 /// Report the app's scene state so the core can pace itself: `1` when the app
@@ -794,9 +731,7 @@ pub unsafe extern "C" fn flextunnel_stop(handle: *mut FlextunnelHandle) {
     if handle.is_null() {
         return;
     }
-    stop_handle(*unsafe { Box::from_raw(handle) });
-    // Release the single-instance guard so a subsequent start can succeed.
-    RUNNING.store(false, Ordering::Release);
+    stop_session(*unsafe { Box::from_raw(handle) });
 }
 
 /// Liveness probe for the running proxy.
@@ -816,8 +751,7 @@ pub unsafe extern "C" fn flextunnel_health(handle: *const FlextunnelHandle) -> c
     if handle.is_null() {
         return -1;
     }
-    let handle = unsafe { &*handle };
-    if handle.task.is_finished() { 0 } else { 1 }
+    c_int::from(unsafe { &*handle }.is_serving())
 }
 
 /// Snapshot the client's destinations as JSON into `out_buf`:
@@ -881,13 +815,8 @@ pub unsafe extern "C" fn flextunnel_status(
         write_cstr(out_buf, out_len, "");
         return -1;
     }
-    let handle = unsafe { &*handle };
-    let json = status_json(&handle.client.status(), Instant::now());
-    if write_cstr(out_buf, out_len, &json) {
-        1
-    } else {
-        0
-    }
+    let json = unsafe { &*handle }.status_json();
+    c_int::from(write_cstr(out_buf, out_len, &json))
 }
 
 /// The [`flextunnel_status`] JSON for `status` as of `now`.
@@ -985,41 +914,135 @@ pub unsafe extern "C" fn flextunnel_conn_path(
         write_cstr(out_buf, out_len, "");
         return -1;
     };
-    let handle = unsafe { &*handle };
-    // The relay health check performs on-demand HTTP, so drive the async snapshot
-    // on the embedded runtime. Called from the app's own thread (never a runtime
-    // worker), so `block_on` is safe and does not stall the running tunnel task.
-    let snapshot = handle
-        .runtime
-        .block_on(handle.client.connection_snapshot(name.trim()));
-    let paths: Vec<_> = snapshot
-        .paths
-        .into_iter()
-        .map(|p| {
-            let kind = match p.kind {
-                ConnPathKind::Direct => "direct",
-                ConnPathKind::Relay => "relay",
-                ConnPathKind::Other => "other",
-            };
-            serde_json::json!({ "kind": kind, "display": p.display, "selected": p.selected })
+    let json = unsafe { &*handle }.conn_path_json(name);
+    c_int::from(write_cstr(out_buf, out_len, &json))
+}
+
+/// The session operations behind the C ABI above, as safe Rust: the same
+/// checks and JSON, without the pointers and buffers. The Android JNI layer
+/// calls them too.
+impl FlextunnelHandle {
+    /// [`flextunnel_set_forwards`]: replace the forward set with `json`, a JSON
+    /// array of [`FfiForward`]s. An error is invalid input.
+    fn set_forwards(&self, json: &str) -> Result<(), String> {
+        let configured: Vec<FfiForward> =
+            serde_json::from_str(json).map_err(|e| format!("invalid forwards JSON: {e}"))?;
+        let mut ids = HashSet::new();
+        let mut ports = HashSet::new();
+        let mut specs = Vec::new();
+        for forward in configured.into_iter().filter(|forward| forward.enabled) {
+            if forward.id.is_empty() || !ids.insert(forward.id.clone()) {
+                return Err("forward ids must be non-empty and unique".to_string());
+            }
+            if forward.local_port == 0 || !ports.insert(forward.local_port) {
+                return Err("enabled forward local ports must be nonzero and unique".to_string());
+            }
+            let remote_host = forward.remote_host.trim();
+            if remote_host.is_empty() || forward.remote_port == 0 {
+                return Err("forward targets require a host and nonzero port".to_string());
+            }
+            specs.push(ForwardSpec {
+                id: forward.id,
+                local_port: forward.local_port,
+                target: Target::Domain(remote_host.to_string(), forward.remote_port),
+            });
+        }
+        let dialer = self.client.dialer();
+        for spec in &specs {
+            if dialer.destination_for(&spec.target).is_none() {
+                let Target::Domain(host, _) = &spec.target else {
+                    unreachable!("forward targets are built in domain form above");
+                };
+                return Err(format!("no destination routes {host}"));
+            }
+        }
+        self.forwards
+            .lock()
+            .map_err(|_| "forward manager lock failed".to_string())?
+            .apply(&specs);
+        Ok(())
+    }
+
+    /// [`flextunnel_forward_statuses`]' JSON, or `None` if the forward
+    /// manager's lock is poisoned.
+    fn forward_statuses_json(&self) -> Option<String> {
+        let statuses = self.forwards.lock().ok()?.statuses();
+        let statuses: Vec<_> = statuses
+            .into_iter()
+            .map(|status| {
+                let (state, error) = match status.state {
+                    ForwardState::Starting => ("starting", None),
+                    ForwardState::Listening => ("listening", None),
+                    ForwardState::Failed(error) => ("failed", Some(error)),
+                };
+                serde_json::json!({
+                    "id": status.id,
+                    "state": state,
+                    "error": error,
+                    "active": status.active,
+                    "last_conn_error": status.last_conn_error,
+                })
+            })
+            .collect();
+        Some(serde_json::json!({ "forwards": statuses }).to_string())
+    }
+
+    /// [`flextunnel_close_listeners`]: `false` if the forward manager's lock
+    /// is poisoned (the front-end listeners are closed regardless).
+    fn close_listeners(&self) -> bool {
+        self.client.close_local_listeners();
+        match self.forwards.lock() {
+            Ok(mut manager) => {
+                manager.apply(&[]);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// [`flextunnel_health`]: whether the client is still serving.
+    fn is_serving(&self) -> bool {
+        !self.task.is_finished()
+    }
+
+    /// [`flextunnel_status`]' JSON, as of now.
+    fn status_json(&self) -> String {
+        status_json(&self.client.status(), Instant::now())
+    }
+
+    /// [`flextunnel_conn_path`]'s JSON for the destination called `name`.
+    fn conn_path_json(&self, name: &str) -> String {
+        // The relay health check performs on-demand HTTP, so drive the async
+        // snapshot on the embedded runtime. Called from the app's own thread
+        // (never a runtime worker), so `block_on` is safe and does not stall
+        // the running tunnel task.
+        let snapshot = self
+            .runtime
+            .block_on(self.client.connection_snapshot(name.trim()));
+        let paths: Vec<_> = snapshot
+            .paths
+            .into_iter()
+            .map(|p| {
+                let kind = match p.kind {
+                    ConnPathKind::Direct => "direct",
+                    ConnPathKind::Relay => "relay",
+                    ConnPathKind::Other => "other",
+                };
+                serde_json::json!({ "kind": kind, "display": p.display, "selected": p.selected })
+            })
+            .collect();
+        let custom_relays: Vec<_> = snapshot
+            .custom_relays
+            .into_iter()
+            .map(|r| serde_json::json!({ "url": r.url, "working": r.working, "error": r.error }))
+            .collect();
+        serde_json::json!({
+            "paths": paths,
+            "custom_relays": custom_relays,
+            "udp_tx_datagrams": snapshot.udp_tx_datagrams,
+            "udp_rx_datagrams": snapshot.udp_rx_datagrams,
         })
-        .collect();
-    let custom_relays: Vec<_> = snapshot
-        .custom_relays
-        .into_iter()
-        .map(|r| serde_json::json!({ "url": r.url, "working": r.working, "error": r.error }))
-        .collect();
-    let json = serde_json::json!({
-        "paths": paths,
-        "custom_relays": custom_relays,
-        "udp_tx_datagrams": snapshot.udp_tx_datagrams,
-        "udp_rx_datagrams": snapshot.udp_rx_datagrams,
-    })
-    .to_string();
-    if write_cstr(out_buf, out_len, &json) {
-        1
-    } else {
-        0
+        .to_string()
     }
 }
 

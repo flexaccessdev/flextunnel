@@ -6,10 +6,13 @@ description.workspace = true
 license.workspace = true
 
 # `name = "flextunnel"` so the static archive is `libflextunnel.a`, the name the
-# iOS Xcode project (../flextunnel-ios) links against.
+# iOS Xcode project (../flextunnel-ios) links against, and the shared library
+# `libflextunnel.so`, which the Android app (../flextunnel-android) loads with
+# `System.loadLibrary("flextunnel")` and reaches through the JNI surface in
+# `src/android.rs`. Built for Android by `build-android.sh`.
 [lib]
 name = "flextunnel"
-crate-type = ["staticlib"]
+crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
 flextunnel-core.workspace = true
@@ -18,3 +21,11 @@ log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+# Android only: the JNI bridge (`src/android.rs`), logcat output for `log`
+# (stderr is discarded on Android), and the JVM/Context global iroh's Android
+# DNS and interface discovery (hickory, netwatch) reach the system through.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.22"
+android_logger = "0.15"
+ndk-context = "0.1"

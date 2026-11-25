@@ -4,6 +4,10 @@
  * Build the static library slices with ./build-ios.sh (produces
  * dist/ios/libflextunnel.xcframework alongside a copy of this header).
  *
+ * The Android app (flextunnel-android) reaches the same session calls through
+ * JNI (crates/flextunnel-ffi/src/android.rs, built by ./build-android.sh), with
+ * the JSON shapes documented here.
+ *
  * Unlike a VPN, there is no Network Extension and no utun fd. Browser sessions
  * may run a SOCKS5 listener for WKWebView; forwarding-only sessions omit it and
  * use local forward listeners owned by the Rust core.

@@ -193,6 +193,60 @@ jobs:
           name: release-ios
           path: dist/ios/libflextunnel-ios.xcframework.zip
 
+  # libflextunnel.so, each ABI on a runner with its own CPU (build-android.sh
+  # builds no other). package-android merges the halves into one zip.
+  build-android:
+    needs: setup
+    strategy:
+      matrix:
+        include:
+          - { os: macos-latest, abi: arm64-v8a }
+          - { os: ubuntu-latest, abi: x86_64 }
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-${{ matrix.abi }}
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Build libflextunnel.so
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: ./build-android.sh release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-jnilibs-${{ matrix.abi }}
+          path: dist/android/jniLibs
+
+  # One jniLibs tree for every ABI: the release asset the Android app
+  # (../flextunnel-android) pins and downloads.
+  package-android:
+    needs: build-android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: android-jnilibs-*
+          path: jniLibs
+          merge-multiple: true
+
+      - name: Package jniLibs
+        run: |
+          ls -lR jniLibs
+          test -f jniLibs/arm64-v8a/libflextunnel.so
+          test -f jniLibs/x86_64/libflextunnel.so
+          zip -r libflextunnel-android.zip jniLibs
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: libflextunnel-android.zip
+
   build-windows:
     needs: setup
     if: needs.setup.outputs.is_prerelease == 'false'
@@ -235,8 +289,8 @@ jobs:
           path: target/release/flextunnel-desktop-windows-amd64.msi
 
   publish-release:
-    needs: [setup, build-linux, build-macos, build-ios, build-windows]
-    if: always() && needs.setup.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-ios.result == 'success' && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped')
+    needs: [setup, build-linux, build-macos, build-ios, package-android, build-windows]
+    if: always() && needs.setup.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-ios.result == 'success' && needs.package-android.result == 'success' && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
