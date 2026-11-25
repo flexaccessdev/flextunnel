@@ -250,34 +250,41 @@ impl ClientSettings {
         if self.destinations.is_empty() {
             return Some("Add a destination to start the client.".into());
         }
-        for destination in &self.destinations {
-            let name = &destination.name;
-            if destination.server_node_id.is_empty() {
-                return Some(format!(
-                    "Destination \"{name}\" has no server node id — edit it."
-                ));
-            }
-            match find_key(keys, &destination.auth_key_id) {
-                None => {
-                    return Some(format!(
-                        "Destination \"{name}\" has no auth key — edit it to pick one."
-                    ));
-                }
-                Some(key) if key.secret.is_empty() => {
-                    return Some(format!(
-                        "The secret of key \"{}\" (used by \"{name}\") is missing — re-enter \
-                         it in the Keys pane.",
-                        key.name
-                    ));
-                }
-                Some(_) => {}
-            }
+        if let Some(blocker) = self
+            .destinations
+            .iter()
+            .find_map(|destination| destination_blocker(destination, keys))
+        {
+            return Some(blocker);
         }
         routes_error().map(|e| format!("Fix the destinations' names and routes: {e}"))
     }
 
     pub fn is_ready(&self, keys: &[AuthKey]) -> bool {
         self.start_blocker(keys).is_none()
+    }
+}
+
+/// Why `destination` cannot be used, if it can't: it lacks its server or a
+/// usable key (the secret goes missing when the key's keychain entry was lost
+/// — re-entered in the Keys pane).
+pub fn destination_blocker(destination: &Destination, keys: &[AuthKey]) -> Option<String> {
+    let name = &destination.name;
+    if destination.server_node_id.is_empty() {
+        return Some(format!(
+            "Destination \"{name}\" has no server node id — edit it."
+        ));
+    }
+    match find_key(keys, &destination.auth_key_id) {
+        None => Some(format!(
+            "Destination \"{name}\" has no auth key — edit it to pick one."
+        )),
+        Some(key) if key.secret.is_empty() => Some(format!(
+            "The secret of key \"{}\" (used by \"{name}\") is missing — re-enter it in the \
+             Keys pane.",
+            key.name
+        )),
+        Some(_) => None,
     }
 }
 

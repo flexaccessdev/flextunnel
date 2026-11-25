@@ -97,6 +97,8 @@ impl ServerSlot {
 
 pub(crate) struct ServerHandle {
     pub tx: mpsc::Sender<ServerCmd>,
+    /// What the session was started with, which an apply compares against.
+    pub config: ServerConfig,
     /// Resolves when the session's thread finishes. The session keeps its
     /// command receiver until then, so `tx.is_closed()` also means "done".
     pub done: tokio::sync::oneshot::Receiver<()>,
@@ -149,6 +151,7 @@ pub(crate) fn spawn_server(
     let slot = ServerSlot {
         shared: shared.clone(),
     };
+    let config = server.clone();
     let error_slot = slot.clone();
     let spawned = std::thread::Builder::new()
         .name(THREAD_NAME.into())
@@ -165,7 +168,7 @@ pub(crate) fn spawn_server(
             let _ = done_tx.send(());
         });
     match spawned {
-        Ok(_) => Some(ServerHandle { tx, done }),
+        Ok(_) => Some(ServerHandle { tx, config, done }),
         Err(e) => {
             error_slot.fail(format!("Failed to start: {e:#}"));
             None

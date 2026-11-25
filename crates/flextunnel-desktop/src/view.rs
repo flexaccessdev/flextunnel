@@ -112,8 +112,9 @@ fn forward_route<'a>(
 /// What a forward's row says about its route: the one in effect — by the
 /// running client's table when there is one, else by the saved destinations,
 /// which are what a start will use — and, when the running client routes it
-/// differently than the saved destinations would, what a restart changes it
-/// to. A saved route is never shown as the one a running forward takes.
+/// differently than the saved destinations would, what the save being
+/// applied changes it to. A saved route is never shown as the one a running
+/// forward takes.
 fn forward_route_labels<'a>(
     running: Option<Option<&'a str>>,
     saved: Option<Option<&'a str>>,
@@ -121,13 +122,13 @@ fn forward_route_labels<'a>(
     let Some(running) = running else {
         return (saved, None);
     };
-    let after_restart = saved
+    let applying = saved
         .filter(|saved| *saved != running)
         .map(|saved| match saved {
-            Some(name) => format!("after restart: via {name}"),
-            None => "after restart: no route".to_string(),
+            Some(name) => format!("applying: via {name}"),
+            None => "applying: no route".to_string(),
         });
-    (Some(running), after_restart)
+    (Some(running), applying)
 }
 
 /// Live state pill for a forward row: gray "stopped", amber "starting…",
@@ -184,7 +185,8 @@ fn client_phase_label(phase: ClientPhase) -> &'static str {
 fn destination_state(live: &DestinationLive<'_>) -> (&'static str, Color) {
     match live {
         DestinationLive::Stopped => ("client off", GRAY),
-        DestinationLive::Pending => ("restart to apply", AMBER),
+        DestinationLive::Applying => ("applying…", AMBER),
+        DestinationLive::NotApplied(_) => ("not applied", RED),
         DestinationLive::Live(status) => match status.state {
             DestinationState::Idle if status.last_error.is_some() => ("last attempt failed", AMBER),
             DestinationState::Idle => ("idle", GRAY),
@@ -760,16 +762,6 @@ fn banner<'a>(
         .into()
 }
 
-/// The banner offering the restart that applies saved settings to a running
-/// client. Shown on the client pane and on every destination's.
-fn restart_banner<'a>() -> Element<'a, Message> {
-    banner(
-        AMBER,
-        "Saved changes apply once the client restarts, which closes its open connections.",
-        Some(("Restart now", Message::RestartClient)),
-    )
-}
-
 /// The client pane: its on/off switch and state, the proxy front-ends, and
 /// the port forwards. Where it goes is the destinations' business.
 fn client_detail(app: &App) -> Element<'_, Message> {
@@ -821,20 +813,22 @@ fn client_detail(app: &App) -> Element<'_, Message> {
         );
     }
     // The routes' check comes from the saved table's cache, which every
-    // message brings up to date: a redraw builds no table.
+    // message brings up to date: a redraw builds no table. A running client
+    // is not given settings that cannot start: it runs on as it was.
     if client.enabled
-        && !running
         && let Some(blocker) =
             client.start_blocker_with(&app.keys, || app.routed_cache.error.clone())
     {
+        let blocker = if running {
+            format!("{blocker} The client runs on meanwhile.")
+        } else {
+            blocker
+        };
         let add = client
             .destinations
             .is_empty()
             .then_some(("Add destination", Message::AddDestination));
         col = col.push(banner(AMBER, blocker, add));
-    }
-    if app.client_needs_restart() {
-        col = col.push(restart_banner());
     }
     if running {
         col = col.push(
@@ -863,22 +857,28 @@ fn client_detail(app: &App) -> Element<'_, Message> {
         col = col.push(proxy_form_view(app, form));
     } else {
         let loopback = |port: u16| SocketAddr::from(([127, 0, 0, 1], port)).to_string();
+        // Where the client listens while it runs — a refused port change
+        // leaves it on the old port — and otherwise where it will.
+        let (socks_port, http_port) = match snapshot.spec.as_deref().filter(|_| running) {
+            Some(spec) => (spec.socks_port, spec.http_port),
+            None => (client.socks_port, client.http_port),
+        };
         let mut info = column![].spacing(8);
-        info = info.push(match client.socks_port.map(loopback) {
+        info = info.push(match socks_port.map(loopback) {
             Some(addr) => {
                 let copy = Some(format!("socks5h://{addr}"));
                 info_row("SOCKS5 proxy", addr, copy)
             }
             None => info_row("SOCKS5 proxy", "off".into(), None),
         });
-        info = info.push(match client.http_port.map(loopback) {
+        info = info.push(match http_port.map(loopback) {
             Some(addr) => {
                 let copy = Some(format!("http://{addr}"));
                 info_row("HTTP proxy", addr, copy)
             }
             None => info_row("HTTP proxy", "off".into(), None),
         });
-        if client.socks_port.is_some() || client.http_port.is_some() {
+        if socks_port.is_some() || http_port.is_some() {
             // The client's own status page lives under the reserved name,
             // answered locally through either proxy — surface it so it is
             // discoverable (and copyable).
@@ -1103,22 +1103,31 @@ fn forward_card<'a>(app: &'a App, forward: &'a PortForward) -> Element<'a, Messa
         .spacing(8)
         .align_y(Center);
     // Which destination carries it — or the problem: nothing does. A running
-    // client carries it by the destinations it started with, which saved
-    // changes have not reached yet.
+    // client carries it by the destinations it started with, which a save
+    // just now has not reached yet.
     let running = app
         .running_route_table()
         .and_then(|table| forward_route(Some(table), forward));
     let saved = forward_route(app.routed_cache.table.as_ref(), forward);
-    let (route, after_restart) = forward_route_labels(running, saved);
+    let (route, applying) = forward_route_labels(running, saved);
+    // A running route to a held destination carries nothing: it is refused.
+    let held = |name: &str| {
+        running.is_some()
+            && (app.client_snapshot.spec.as_ref())
+                .is_some_and(|spec| spec.held.iter().any(|d| d.name.eq_ignore_ascii_case(name)))
+    };
     match route {
+        Some(Some(name)) if held(name) => {
+            title = title.push(pill(format!("refused: {name} held"), AMBER));
+        }
         Some(Some(name)) => {
             title = title.push(text(format!("via {name}")).size(11).style(style::dim_text));
         }
         Some(None) => title = title.push(pill("no route".to_string(), AMBER)),
         None => {}
     }
-    if let Some(after_restart) = after_restart {
-        title = title.push(text(after_restart).size(11).color(AMBER));
+    if let Some(applying) = applying {
+        title = title.push(text(applying).size(11).color(AMBER));
     }
 
     let route = arrow_copy_row(forward.local_endpoint(), forward.remote_endpoint(), true);
@@ -1206,7 +1215,26 @@ fn destination_detail<'a>(app: &'a App, destination: &'a Destination) -> Element
             };
             col = col.push(text(why).size(12).style(style::dim_text));
         }
-        DestinationLive::Pending => {}
+        DestinationLive::Applying => {}
+        DestinationLive::NotApplied(reason) => {
+            col = col.push(text(reason.clone()).size(12).color(RED));
+            // A refusal is promised only once the session holds it; until
+            // then a held destination's apply is still on its way.
+            let held = (app.client_snapshot.spec.as_ref())
+                .is_some_and(|spec| spec.held.contains(destination));
+            let meanwhile = if held {
+                Some(
+                    "Until then the client refuses what it routes, rather than connect it directly.",
+                )
+            } else if config::destination_blocker(destination, &app.keys).is_none() {
+                Some("The client runs on with its previous settings for it until then.")
+            } else {
+                None
+            };
+            if let Some(meanwhile) = meanwhile {
+                col = col.push(text(meanwhile).size(12).style(style::dim_text));
+            }
+        }
         DestinationLive::Live(status) => {
             if let Some(error) = &status.last_error {
                 let color = if status.state == DestinationState::Failed {
@@ -1237,9 +1265,6 @@ fn destination_detail<'a>(app: &'a App, destination: &'a Destination) -> Element
                 col = col.push(text(explain).size(12).style(style::dim_text));
             }
         }
-    }
-    if app.client_needs_restart() {
-        col = col.push(restart_banner());
     }
 
     // DESTINATION card
@@ -1830,26 +1855,6 @@ fn server_detail<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
                 row![dot(AMBER, 8.0), text(blocker).size(12)]
                     .spacing(8)
                     .align_y(Center),
-            )
-            .padding([9, 12])
-            .width(Fill)
-            .style(style::banner(AMBER)),
-        );
-    }
-    if app.server_needs_restart() {
-        col = col.push(
-            container(
-                row![
-                    dot(AMBER, 8.0),
-                    text("Saved changes apply once the server restarts.").size(12),
-                    space().width(Fill),
-                    button(text("Restart now").size(11).font(semibold()))
-                        .padding([3, 10])
-                        .style(style::tinted)
-                        .on_press(Message::RestartServer),
-                ]
-                .spacing(8)
-                .align_y(Center),
             )
             .padding([9, 12])
             .width(Fill)
@@ -3046,7 +3051,8 @@ mod tests {
     }
 
     /// A forward's row shows the route in use; the saved one is only ever
-    /// shown as what a restart will bring, never as the running client's.
+    /// shown as what the save being applied brings, never as the running
+    /// client's.
     #[test]
     fn a_forward_shows_the_running_route_and_the_pending_one() {
         let (a, b) = (Some(Some("a")), Some(Some("b")));
@@ -3060,18 +3066,19 @@ mod tests {
         );
         // Running with the saved settings: one route, nothing pending.
         assert_eq!(forward_route_labels(a, a), (a, None));
-        // Running on older settings: the running route, and the change to come.
+        // Running on the settings from before a save: the running route, and
+        // the change being applied.
         assert_eq!(
             forward_route_labels(a, b),
-            (a, Some("after restart: via b".to_string()))
+            (a, Some("applying: via b".to_string()))
         );
         assert_eq!(
             forward_route_labels(a, Some(None)),
-            (a, Some("after restart: no route".to_string()))
+            (a, Some("applying: no route".to_string()))
         );
         assert_eq!(
             forward_route_labels(Some(None), b),
-            (Some(None), Some("after restart: via b".to_string()))
+            (Some(None), Some("applying: via b".to_string()))
         );
         // The saved destinations no longer make a table: only what runs.
         assert_eq!(forward_route_labels(a, None), (a, None));
@@ -3174,8 +3181,12 @@ mod tests {
             ("client off", GRAY)
         );
         assert_eq!(
-            destination_state(&DestinationLive::Pending),
-            ("restart to apply", AMBER)
+            destination_state(&DestinationLive::Applying),
+            ("applying…", AMBER)
+        );
+        assert_eq!(
+            destination_state(&DestinationLive::NotApplied("no key".into())),
+            ("not applied", RED)
         );
     }
 
