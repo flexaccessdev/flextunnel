@@ -337,6 +337,13 @@ On Android, the SOCKS5 proxy comes from the
 its browser and app setup is in that repo's
 [docs/socks5-browsers.md](https://github.com/flexaccessdev/flextunnel-android/blob/main/docs/socks5-browsers.md).
 
+On iOS, the [flextunnel-ios](https://github.com/flexaccessdev/flextunnel-ios)
+app browses through its own in-app browser and gives other apps no SOCKS5
+proxy. That repo covers the browser's routing in
+[docs/split-tunnel-routing.md](https://github.com/flexaccessdev/flextunnel-ios/blob/main/docs/split-tunnel-routing.md)
+and the localhost forwards it offers other apps in
+[docs/port-forwarding.md](https://github.com/flexaccessdev/flextunnel-ios/blob/main/docs/port-forwarding.md).
+
 ### Other tools worth knowing
 
 - **`nc` (OpenBSD netcat)** — `nc -X 5 -x 127.0.0.1:1080 host port` dials
