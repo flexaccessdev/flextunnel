@@ -47,13 +47,20 @@ android() {
         return 1
     fi
     command -v cargo-ndk >/dev/null || { echo 'cargo-ndk is not installed (cargo install cargo-ndk)' >&2; return 1; }
-    # The NDK the way build-android.sh finds it (an SDK's newest over
-    # Homebrew's); clippy needs it too.
+    # The NDK exactly as build-android.sh finds it, so clippy checks against
+    # the one the build uses: an explicit ANDROID_NDK_HOME/ROOT, else the
+    # newest under the SDK (ANDROID_HOME, ANDROID_SDK_ROOT, or the OS's
+    # default), else Homebrew's.
     ndk=${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}
     if [ -z "$ndk" ]; then
-        for d in /opt/homebrew/share/android-ndk "$HOME"/Library/Android/sdk/ndk/* "$HOME"/Android/Sdk/ndk/*; do
-            [ -d "$d" ] && ndk=$d
-        done
+        local sdk sdk_default
+        if [ "$(uname -s)" = Darwin ]; then sdk_default="$HOME/Library/Android/sdk"; else sdk_default="$HOME/Android/Sdk"; fi
+        sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$sdk_default}}"
+        if [ -d "$sdk/ndk" ] && [ -n "$(ls -A "$sdk/ndk")" ]; then
+            ndk="$(ls -d "$sdk"/ndk/* | sort -V | tail -1)"
+        elif [ -d /opt/homebrew/share/android-ndk ]; then
+            ndk=/opt/homebrew/share/android-ndk
+        fi
     fi
     [ -n "$ndk" ] || { echo 'no Android NDK on this machine' >&2; return 1; }
     echo "   cargo ndk -t $abi --platform 34 clippy -p flextunnel-ffi --lib -- -D warnings"
