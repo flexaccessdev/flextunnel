@@ -27,8 +27,7 @@ script is stale. Nothing enforces this; keep them in step by hand.
 | Linux | `workstation-wsl` | `FLEXTUNNEL_UNIXCI_HOST` |
 | Windows | `windows-ci-build` | `FLEXTUNNEL_WINCI_HOST` |
 
-Hosts need Rust, clippy and a native C toolchain. The macOS xcframework check
-also needs Xcode; `build-ios.sh` installs the required Rust targets if missing.
+Hosts need Rust, clippy and a native C toolchain.
 Windows remoting needs PowerShell 7 on both ends and an SSH PowerShell
 subsystem on the remote host.
 
@@ -64,7 +63,7 @@ Windows also this repo's snapshots in the build cache's restic repository.
 | Platform | Clippy | Tests | Additional check |
 | --- | --- | --- | --- |
 | Linux | `cargo clippy --workspace --exclude flextunnel-desktop --all-targets -- -D warnings` | `cargo test -p flextunnel-core -p flextunnel-cli` | `scripts/miri.sh` |
-| macOS | `cargo clippy --workspace --all-targets -- -D warnings` | `cargo test -p flextunnel-core -p flextunnel-cli -p flextunnel-desktop` | `scripts/miri.sh`, `./build-ios.sh debug` |
+| macOS | `cargo clippy --workspace --all-targets -- -D warnings` | `cargo test -p flextunnel-core -p flextunnel-cli -p flextunnel-desktop` | `scripts/miri.sh` |
 | Windows | Same as macOS | Same as macOS | — |
 
 `scripts/miri.sh` runs the iOS FFI tests listed in
@@ -74,9 +73,26 @@ its tokio runtime needs epoll, which Miri emulates, and not kqueue. Windows has
 no Miri leg: its only unsafe is the Win32 calls in the CLI's pipe security,
 which Miri cannot run.
 
-The macOS script reports the xcframework check as skipped if `xcodebuild` is
-missing or `FLEXTUNNEL_CI_SKIP_IOS` is set. A green run with that skip does not
-verify the iOS build.
+## Mobile libraries (on request)
+
+The iOS xcframework and the Android `libflextunnel.so` are not part of
+`ci/unix/ci.sh` or `ci/all.sh`, so a local run for a CLI or desktop change never
+needs the hosts and tools they do (Xcode, an Android NDK, macvm for arm64-v8a).
+They are only needed when working on `../flextunnel-ios` or
+`../flextunnel-android`, and those apps pin a flextunnel release of their own
+instead of following this tree.
+`ci/unix/mobile.sh` runs their CI jobs (`verify-ios-xcframework`, `android`)
+when asked:
+
+```sh
+ci/unix/remote.sh -H macvm run ci/unix/mobile.sh   # iOS + Android arm64-v8a, on macvm
+ci/unix/mobile.sh android                          # Android x86_64, here on x86_64 Linux
+```
+
+Android builds each ABI on a host with its own CPU only (see `build-android.sh`).
+A job the host cannot run fails rather than skips, since it was asked for. On
+GitHub nothing changes: `ci.yml` runs the same jobs, and `release.yml` builds
+both mobile assets for every release.
 
 The xcframework check builds the Rust library for iOS; it does not build or run
 the Swift app. For app integration, run `ci/ci.sh ffi` in `../flextunnel-ios`;
