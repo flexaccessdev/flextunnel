@@ -937,6 +937,9 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
   carries, what limits it, the Linux UDP buffer limit worth raising, and the
   measurements: one version against the last, and what each change to the
   data path measured.
+- [`docs/roadmap.md`](docs/roadmap.md) — the roadmap: an index of the topic
+  roadmaps, and the items under consideration that have no document of their
+  own (dynamic configuration, for when uptime matters).
 - [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) — remaining HTTP
   proxy work.
 - [`docs/proxy-usage.md`](docs/proxy-usage.md) — using the SOCKS5 and HTTP

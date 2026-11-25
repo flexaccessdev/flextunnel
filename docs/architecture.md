@@ -516,14 +516,3 @@ flextunnel reuses ezvpn's iroh transport and
 secret-key identity, but replaces the IP-over-QUIC-datagrams + TUN data path
 (which needs root) with SOCKS5/HTTP proxy front-ends over reliable QUIC streams
 (which don't). See the project `README.md` for the user-facing comparison.
-
-## Roadmap
-
-HTTP proxy support is implemented on the client side; the wire protocol and
-server remain front-end-agnostic. See
-[`http-proxy-roadmap.md`](./http-proxy-roadmap.md).
-
-Future work on duplicate-id detection — non-ephemeral client ids and their
-pitfalls, the signaling-server path for prompt server-dup detection, and
-client-side dup acknowledgement/flagging — is in
-[`duplicate-detection-roadmap.md`](./duplicate-detection-roadmap.md).
