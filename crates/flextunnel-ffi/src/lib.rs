@@ -365,7 +365,9 @@ async fn bind_socks_listener(requested: u16) -> std::io::Result<TcpListener> {
 
 fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
     // The proxy holds a socket per connection; lift the app process's soft fd
-    // limit (per-process, best-effort) before serving.
+    // limit (per-process, best-effort) before serving. Not under Miri, which
+    // has no getrlimit.
+    #[cfg(not(miri))]
     flextunnel_core::app::raise_fd_limit();
 
     let cfg: FfiConfig =
@@ -1246,6 +1248,230 @@ mod tests {
             "relay_urls": ["https://relay.example"],
         });
         assert!(err(one_relay).contains("invalid relay configuration"));
+    }
+
+    // Byte the caller-side buffers below start out holding, so a test can tell
+    // a byte the call wrote from one it left alone.
+    const FILL: c_char = 0x55;
+
+    /// The NUL-terminated string at the start of `buf`; panics if `buf` holds
+    /// no NUL, so it reads only inside the buffer (unlike `CStr::from_ptr`).
+    fn cstr(buf: &[c_char]) -> &str {
+        // SAFETY: `c_char` and `u8` have the same size and alignment.
+        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf.len()) };
+        CStr::from_bytes_until_nul(bytes)
+            .expect("no NUL inside the buffer")
+            .to_str()
+            .expect("not UTF-8")
+    }
+
+    // Every buffer below is allocated at exactly the length passed, so under
+    // Miri a write past it is reported rather than landing in spare capacity.
+    #[test]
+    fn write_cstr_stays_inside_the_buffer() {
+        let mut exact = vec![FILL; 7];
+        assert!(write_cstr(exact.as_mut_ptr(), exact.len(), "abcdef"));
+        assert_eq!(cstr(&exact), "abcdef");
+
+        let mut short = vec![FILL; 7];
+        assert!(!write_cstr(short.as_mut_ptr(), short.len(), "abcdefg"));
+        assert_eq!(cstr(&short), "abcdef");
+
+        let mut nul_only = vec![FILL; 1];
+        assert!(!write_cstr(nul_only.as_mut_ptr(), nul_only.len(), "abc"));
+        assert_eq!(nul_only[0], 0);
+        assert!(write_cstr(nul_only.as_mut_ptr(), nul_only.len(), ""));
+
+        // Unusable buffers are left alone.
+        let mut untouched = vec![FILL; 4];
+        assert!(!write_cstr(untouched.as_mut_ptr(), 0, "abc"));
+        assert_eq!(untouched, vec![FILL; 4]);
+        assert!(!write_cstr(ptr::null_mut(), 8, "abc"));
+    }
+
+    /// The key exports through their buffer contracts: a buffer of exactly the
+    /// right size, one byte short, room for only the NUL, none at all, and
+    /// refused secrets — so under Miri a write past `out_len` (or a read past
+    /// the secret's NUL) is reported as undefined behavior.
+    #[test]
+    fn key_exports_keep_to_their_buffers() {
+        let mut doc = vec![FILL; 512];
+        assert_eq!(
+            unsafe { flextunnel_generate_client_key(doc.as_mut_ptr(), doc.len()) },
+            1
+        );
+        let doc: serde_json::Value = serde_json::from_str(cstr(&doc)).unwrap();
+        let secret = std::ffi::CString::new(doc["secret_key"].as_str().unwrap()).unwrap();
+        let public = doc["public_key"].as_str().unwrap();
+        let public_key = |out: &mut [c_char]| unsafe {
+            flextunnel_client_public_key(secret.as_ptr(), out.as_mut_ptr(), out.len())
+        };
+
+        let mut exact = vec![FILL; public.len() + 1];
+        assert_eq!(public_key(&mut exact), 1);
+        assert_eq!(cstr(&exact), public);
+
+        // One byte short: truncated, and the NUL still lands inside.
+        let mut short = vec![FILL; public.len()];
+        assert_eq!(public_key(&mut short), 0);
+        assert_eq!(cstr(&short), &public[..public.len() - 1]);
+
+        let mut nul_only = vec![FILL; 1];
+        assert_eq!(
+            unsafe { flextunnel_generate_client_key(nul_only.as_mut_ptr(), nul_only.len()) },
+            0
+        );
+        assert_eq!(nul_only[0], 0);
+        assert_eq!(
+            unsafe { flextunnel_generate_client_key(ptr::null_mut(), 0) },
+            0
+        );
+        assert_eq!(public_key(&mut []), 0);
+
+        let mut err = vec![FILL; 128];
+        let refused = |secret: *const c_char, err: &mut [c_char]| {
+            let status =
+                unsafe { flextunnel_client_public_key(secret, err.as_mut_ptr(), err.len()) };
+            assert_eq!(status, 0);
+            cstr(err).to_owned()
+        };
+        assert_eq!(refused(ptr::null(), &mut err), "secret_key is null");
+        let not_utf8 = [0xffu8 as c_char, 0];
+        assert_eq!(
+            refused(not_utf8.as_ptr(), &mut err),
+            "secret_key is not valid UTF-8"
+        );
+        let message = refused(c"not-a-key".as_ptr(), &mut err);
+        assert!(message.starts_with("invalid secret key"), "{message}");
+    }
+
+    /// Every handle call refuses a null handle without touching anything but
+    /// the caller's buffer, which it leaves NUL-terminated.
+    #[test]
+    fn null_handles_are_refused() {
+        let null = ptr::null::<FlextunnelHandle>();
+        let mut out = vec![FILL; 64];
+        let (buf, len) = (out.as_mut_ptr(), out.len());
+        unsafe {
+            assert_eq!(flextunnel_set_forwards(null, c"[]".as_ptr(), buf, len), -1);
+            assert_eq!(flextunnel_forward_statuses(null, buf, len), -1);
+            assert_eq!(flextunnel_status(null, buf, len), -1);
+            assert_eq!(cstr(&out), "");
+            assert_eq!(flextunnel_conn_path(null, c"m1".as_ptr(), buf, len), -1);
+            assert_eq!(flextunnel_close_listeners(null), -1);
+            assert_eq!(flextunnel_set_background(null, 1), -1);
+            assert_eq!(flextunnel_set_network_available(null, 0), -1);
+            assert_eq!(flextunnel_health(null), -1);
+            flextunnel_stop(ptr::null_mut());
+        }
+        let mut out = vec![FILL; 64];
+        let status = unsafe { flextunnel_start(ptr::null(), out.as_mut_ptr(), out.len()) };
+        assert!(status.is_null());
+        assert_eq!(cstr(&out), "config_json is null");
+    }
+
+    /// A session driven from the C side, start to stop: the handle the start
+    /// boxes is borrowed by every call and freed by the stop, and each output
+    /// lands inside a buffer of exactly the length passed. The only test that
+    /// goes through `flextunnel_start`, whose single-instance guard is
+    /// process-wide.
+    #[test]
+    fn a_session_runs_through_its_handle() {
+        let json = std::ffi::CString::new(config(serde_json::json!([
+            { "name": "m1", "server_node_id": node_id(1), "routed_domains": ["*.corp.example"] },
+        ])))
+        .unwrap();
+        let result = r#"{"socks_port":null}"#;
+
+        // Too small for the result: no handle, and the guard is released.
+        let mut short = vec![FILL; result.len()];
+        let handle = unsafe { flextunnel_start(json.as_ptr(), short.as_mut_ptr(), short.len()) };
+        assert!(handle.is_null());
+        assert_eq!(
+            cstr(&short),
+            &"out_buf too small for result JSON"[..result.len() - 1]
+        );
+
+        let mut out = vec![FILL; result.len() + 1];
+        let handle = unsafe { flextunnel_start(json.as_ptr(), out.as_mut_ptr(), out.len()) };
+        assert!(!handle.is_null());
+        assert_eq!(cstr(&out), result);
+
+        let mut out = vec![FILL; 128];
+        let second = unsafe { flextunnel_start(json.as_ptr(), out.as_mut_ptr(), out.len()) };
+        assert!(second.is_null());
+        assert!(cstr(&out).contains("already running"), "{}", cstr(&out));
+
+        unsafe {
+            assert_eq!(flextunnel_health(handle), 1);
+            assert_eq!(flextunnel_set_background(handle, 1), 1);
+            assert_eq!(flextunnel_set_network_available(handle, 0), 1);
+            assert_eq!(flextunnel_set_network_available(handle, 1), 1);
+        }
+
+        let mut status = vec![FILL; 1024];
+        assert_eq!(
+            unsafe { flextunnel_status(handle, status.as_mut_ptr(), status.len()) },
+            1
+        );
+        let full = cstr(&status).to_owned();
+        let status: serde_json::Value = serde_json::from_str(&full).unwrap();
+        assert_eq!(status["destinations"][0]["state"], "idle");
+        let mut short = vec![FILL; full.len()];
+        assert_eq!(
+            unsafe { flextunnel_status(handle, short.as_mut_ptr(), short.len()) },
+            0
+        );
+        assert_eq!(cstr(&short), &full[..full.len() - 1]);
+
+        let mut out = vec![FILL; 128];
+        let set_forwards = |forwards: &std::ffi::CStr, out: &mut [c_char]| unsafe {
+            flextunnel_set_forwards(handle, forwards.as_ptr(), out.as_mut_ptr(), out.len())
+        };
+        assert_eq!(set_forwards(c"[]", &mut out), 1);
+        assert_eq!(cstr(&out), "");
+        let unrouted = cr#"[{"id":"a","local_port":1,"remote_host":"elsewhere.example","remote_port":22,"enabled":true}]"#;
+        assert_eq!(set_forwards(unrouted, &mut out), 0);
+        assert_eq!(cstr(&out), "no destination routes elsewhere.example");
+        assert_eq!(set_forwards(c"{", &mut out), 0);
+        assert!(
+            cstr(&out).starts_with("invalid forwards JSON"),
+            "{}",
+            cstr(&out)
+        );
+
+        let forwards = r#"{"forwards":[]}"#;
+        let mut exact = vec![FILL; forwards.len() + 1];
+        assert_eq!(
+            unsafe { flextunnel_forward_statuses(handle, exact.as_mut_ptr(), exact.len()) },
+            exact.len() as isize
+        );
+        assert_eq!(cstr(&exact), forwards);
+
+        // Not connected, so the snapshot is empty; an unknown name likewise.
+        for name in [c"m1", c"nope"] {
+            let mut paths = vec![FILL; 256];
+            assert_eq!(
+                unsafe {
+                    flextunnel_conn_path(handle, name.as_ptr(), paths.as_mut_ptr(), paths.len())
+                },
+                1
+            );
+            let paths: serde_json::Value = serde_json::from_str(cstr(&paths)).unwrap();
+            assert_eq!(paths["paths"], serde_json::json!([]));
+        }
+
+        unsafe {
+            assert_eq!(flextunnel_close_listeners(handle), 1);
+            assert_eq!(flextunnel_health(handle), 1);
+            flextunnel_stop(handle);
+        }
+
+        // The stop released the guard.
+        let mut out = vec![FILL; result.len() + 1];
+        let handle = unsafe { flextunnel_start(json.as_ptr(), out.as_mut_ptr(), out.len()) };
+        assert!(!handle.is_null());
+        unsafe { flextunnel_stop(handle) };
     }
 
     #[test]

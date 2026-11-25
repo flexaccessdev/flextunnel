@@ -1,6 +1,7 @@
 - strict no backward compatibility or legacy code path no matter what
 - run cargo clippy and test after rust code changes; a `cargo fmt` reformat alone runs neither
 - to run the CI workflow's clippy + test steps on all three host platforms against the working tree, use `ci/all.sh` — see `docs/local-ci.md`. Worth doing before a release, or after touching platform-gated code (`flextunnel-desktop`'s macOS/Windows backends), which Linux-only checks never compile. If host is Linux, run linux ci on the same host.
+- after touching `flextunnel-ffi`'s unsafe code, run it under Miri: `scripts/miri.sh` on Linux and on macvm. For new unsafe there that stays off the network, add its test to `scripts/miri-tests.txt`.
 - Rust is kept as `cargo fmt` formats it under `rustfmt.toml`, and CI checks it.
 - For codex only no `cargo fmt` because when it does git diff, it gets stuck after cargo fmt.
 - always use uv to run python scripts if needed

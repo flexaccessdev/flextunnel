@@ -40,6 +40,24 @@ jobs:
       - name: Test
         run: cargo test -p flextunnel-core -p flextunnel-cli -p flextunnel-desktop
 
+  # The tests in scripts/miri-tests.txt under Miri: the iOS FFI's unsafe, off
+  # the network. macOS is the nearest host to the app's aarch64-apple-ios; the
+  # session test runs on Linux only (Miri emulates epoll, not kqueue). The
+  # script installs its pinned nightly itself.
+  miri:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri
+      - name: Miri
+        run: scripts/miri.sh
+
   # Verify-only mirror of the release workflow's build-ios job: build the iOS
   # device + Simulator xcframework slices (debug profile for speed). Nothing is
   # published; this exists to catch FFI breakage before a release.
