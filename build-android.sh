@@ -80,8 +80,10 @@ rustup target list --installed | grep -qx "$TARGET" || rustup target add "$TARGE
 
 JNILIBS="$SCRIPT_DIR/dist/android/jniLibs"
 mkdir -p "$JNILIBS"
-# Built into a staging dir beside it and moved into place only on success, so a
-# failed build leaves the ABI's previous library where it was.
+# Built into a staging dir beside it (the same filesystem), and the library is
+# renamed over the ABI's previous one only on success: a failed build leaves
+# that one where it was, and the rename replaces it atomically, so overlapping
+# builds each land a whole library in the one place the app reads.
 STAGE="$(mktemp -d "$SCRIPT_DIR/dist/android/.stage.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
 
@@ -92,8 +94,8 @@ cargo ndk -t "$ABI" --platform "$ANDROID_API" -o "$STAGE" \
 # cargo-ndk stages every shared library it finds; only libflextunnel.so is wanted.
 find "$STAGE/$ABI" -type f ! -name libflextunnel.so -delete
 [ -f "$STAGE/$ABI/libflextunnel.so" ] || { echo "cargo-ndk staged no libflextunnel.so for $ABI" >&2; exit 1; }
-rm -rf "${JNILIBS:?}/$ABI"
-mv "$STAGE/$ABI" "$JNILIBS/$ABI"
+mkdir -p "$JNILIBS/$ABI"
+mv -f "$STAGE/$ABI/libflextunnel.so" "$JNILIBS/$ABI/libflextunnel.so"
 
 ls -la "$JNILIBS/$ABI/libflextunnel.so"
 echo
