@@ -67,12 +67,19 @@
 //! stream open on it: absent means the default (300), `0` means never close
 //! one for idleness.
 //!
+//! `relay_quic_addr_discovery` says whether the custom relays serve QUIC
+//! address discovery, all of them or none: absent or `null` means they do
+//! (the default); `false` is for relays behind a Cloudflare Tunnel or another
+//! HTTP-only front, which otherwise delay each start by up to 3 s. Only valid
+//! with custom `relay_urls`.
+//!
 //! ```json
 //! {
 //!   "auth_key": "ed25519-sec:...",
 //!   "socks_port": null,
 //!   "relay_urls": ["https://relay-a.example/", "https://relay-b.example/"],
 //!   "relay_auth_token": null,
+//!   "relay_quic_addr_discovery": null,
 //!   "idle_timeout_secs": 300,
 //!   "destinations": [
 //!     { "name": "machine1", "server_node_id": "<iroh endpoint id>",
@@ -108,18 +115,24 @@ use flextunnel_core::proxy::{
     ClientAuth, ClientConfig, DestinationConfig, ForwardManager, ForwardSpec, ForwardState,
     LocalListeners, ProxyClient,
 };
-use flextunnel_core::transport::endpoint::RelayConfig;
+use flextunnel_core::transport::endpoint::{RelayConfig, tear_down_runtime};
 use flextunnel_core::transport::paths::ConnPathKind;
 
 /// The thread a routes request runs on (see
 /// [`flextunnel_fetch_server_routes`]).
 const ROUTES_THREAD_NAME: &str = "flextunnel-routes";
 
-/// Bound on [`flextunnel_stop`]'s graceful close of the client's endpoints.
-/// Closing waits out an endpoint still being built (see
-/// `ProxyClient::close`), which in the worst case takes as long as a relay
-/// probe plus the online wait; the app's calling thread must not hang on that.
+/// How long [`flextunnel_stop`] waits for the graceful close of the client's
+/// endpoints. Closing waits out an endpoint still being built (see
+/// `ProxyClient::close`), which in the worst case takes as long as the relay
+/// probes plus the online wait; the app's calling thread must not hang on
+/// that. A close that takes longer is not given up on: it is finished on a
+/// thread of its own, which keeps the runtime until then (see [`stop_handle`]).
 const STOP_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Name of the thread that finishes a close [`flextunnel_stop`] stopped
+/// waiting for.
+const CLOSE_THREAD_NAME: &str = "flextunnel-close";
 
 /// Process-global guard enforcing **at most one** running proxy instance. A
 /// second [`flextunnel_start`] while one is live is rejected rather than racing.
@@ -158,6 +171,10 @@ struct FfiConfig {
     /// valid with custom `relay_urls`; rejected with the default iroh relays.
     #[serde(default)]
     relay_auth_token: Option<String>,
+    /// Whether the custom relays serve QUIC address discovery, all of them or
+    /// none. Absent: they do. Only valid with custom `relay_urls`.
+    #[serde(default)]
+    relay_quic_addr_discovery: Option<bool>,
     /// Seconds a destination's connection is kept with no stream open on it.
     /// Absent: the default; `0`: never closed for idleness.
     #[serde(default)]
@@ -190,6 +207,8 @@ struct FfiRoutesRequest {
     relay_urls: Vec<String>,
     #[serde(default)]
     relay_auth_token: Option<String>,
+    #[serde(default)]
+    relay_quic_addr_discovery: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -405,8 +424,12 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
         None => (None, None),
     };
 
-    let relay = RelayConfig::from_urls_with_token(&cfg.relay_urls, cfg.relay_auth_token)
-        .map_err(|e| format!("invalid relay configuration: {e}"))?;
+    let relay = RelayConfig::from_settings(
+        &cfg.relay_urls,
+        cfg.relay_auth_token,
+        cfg.relay_quic_addr_discovery,
+    )
+    .map_err(|e| format!("invalid relay configuration: {e}"))?;
     let client_key = flextunnel_core::auth::ClientKey::from_secret_str(cfg.auth_key.trim())
         .map_err(|e| format!("invalid auth key: {e:#}"))?;
     let idle_timeout = match cfg.idle_timeout_secs {
@@ -478,11 +501,13 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
 ///
 /// ```json
 /// { "auth_key": "ed25519-sec:...", "server_node_id": "<iroh endpoint id>",
-///   "relay_urls": [], "relay_auth_token": null }
+///   "relay_urls": [], "relay_auth_token": null,
+///   "relay_quic_addr_discovery": null }
 /// ```
 ///
-/// `relay_urls` and `relay_auth_token` are optional. The server must already
-/// authorize the key's public half. The server's answer is
+/// `relay_urls`, `relay_auth_token` and `relay_quic_addr_discovery` are
+/// optional, with the rules they have in a session's config. The server must
+/// already authorize the key's public half. The server's answer is
 ///
 /// ```json
 /// { "routed_domains": ["*.corp.example"], "routed_cidrs": ["10.0.0.0/8"] }
@@ -538,8 +563,12 @@ pub unsafe extern "C" fn flextunnel_fetch_server_routes(
 fn fetch_server_routes_inner(json: &str) -> Result<String, String> {
     let request: FfiRoutesRequest =
         serde_json::from_str(json).map_err(|e| format!("invalid request JSON: {e}"))?;
-    let relay = RelayConfig::from_urls_with_token(&request.relay_urls, request.relay_auth_token)
-        .map_err(|e| format!("invalid relay configuration: {e}"))?;
+    let relay = RelayConfig::from_settings(
+        &request.relay_urls,
+        request.relay_auth_token,
+        request.relay_quic_addr_discovery,
+    )
+    .map_err(|e| format!("invalid relay configuration: {e}"))?;
     let key = flextunnel_core::auth::ClientKey::from_secret_str(request.auth_key.trim())
         .map_err(|e| format!("invalid auth key: {e:#}"))?;
     let server_id = request
@@ -722,6 +751,11 @@ pub unsafe extern "C" fn flextunnel_set_network_available(
 
 /// Stop the proxy and free the handle. After this call `handle` is invalid and
 /// must not be used again. Passing null is a safe no-op.
+///
+/// Blocks for the close of the endpoints in use, for at most
+/// [`STOP_CLOSE_TIMEOUT`]. A close that takes longer is finished on a thread
+/// of its own after this returns; the session is stopped either way, and
+/// [`flextunnel_start`] can be called again at once.
 ///
 /// # Safety
 /// `handle` must be a valid pointer returned by [`flextunnel_start`] and not
@@ -1061,19 +1095,23 @@ fn stop_handle(handle: FlextunnelHandle) {
     // Close the endpoints of the destinations in use before they drop.
     // Skipping this makes iroh tear down its relay tasks ungracefully (a
     // JoinSet abort that panics — fatal under panic=abort). The session task is
-    // awaited first so nothing is still using them; `block_on` is safe here,
-    // on the app's own thread. Bounded: the close waits out an endpoint build
-    // in flight, and stopping must not hang the caller on a slow one.
-    runtime.block_on(async {
+    // awaited first so nothing is still using them; blocking on the runtime
+    // is safe here, on the app's own thread. The wait is bounded — the close
+    // waits out an endpoint build in flight, and stopping must not hang the
+    // caller on a slow one — but only the wait: a close still running when it
+    // is up is finished on a thread of its own, which keeps the runtime until
+    // then (see `tear_down_runtime`). Shutting the runtime down here would
+    // cut the close short, with the build or a relay probe still on it.
+    let close = async move {
         let _ = task.await;
-        if tokio::time::timeout(STOP_CLOSE_TIMEOUT, client.close())
-            .await
-            .is_err()
-        {
-            log::warn!("Closing the client's endpoints is taking too long; stopping anyway");
-        }
-    });
-    runtime.shutdown_background();
+        client.close().await;
+    };
+    if !tear_down_runtime(runtime, close, STOP_CLOSE_TIMEOUT, CLOSE_THREAD_NAME) {
+        log::warn!(
+            "Closing the client's endpoints is taking long; stopped, and the close goes on \
+             in the background"
+        );
+    }
 }
 
 /// Write `s` (always NUL-terminated) into the caller buffer. Returns `true` if
@@ -1175,6 +1213,58 @@ mod tests {
         stop_handle(handle);
     }
 
+    /// `relay_quic_addr_discovery` is taken with custom relays, set or left
+    /// out, and refused with the default relays, which it cannot apply to.
+    #[test]
+    fn start_takes_the_relay_quic_addr_discovery_setting() {
+        let key = flextunnel_core::auth::ClientKey::generate().unwrap();
+        let config = |relay_urls: &[&str], discovery: Option<bool>| {
+            let mut json = serde_json::json!({
+                "auth_key": key.secret_str(),
+                "relay_urls": relay_urls,
+                "destinations": [{ "name": "m1", "server_node_id": node_id(1) }],
+            });
+            if let Some(discovery) = discovery {
+                json["relay_quic_addr_discovery"] = discovery.into();
+            }
+            json.to_string()
+        };
+        for discovery in [None, Some(true), Some(false)] {
+            let (handle, _) =
+                start_inner(&config(&["https://only.example"], discovery)).expect("starts");
+            stop_handle(handle);
+        }
+        for discovery in [true, false] {
+            let Err(message) = start_inner(&config(&[], Some(discovery))) else {
+                panic!("the default relays take no setting");
+            };
+            assert!(message.contains("invalid relay configuration"), "{message}");
+        }
+    }
+
+    /// One custom relay starts a session (reduced-redundancy mode).
+    #[test]
+    fn start_accepts_a_single_custom_relay() {
+        let key = flextunnel_core::auth::ClientKey::generate().unwrap();
+        let json = serde_json::json!({
+            "auth_key": key.secret_str(),
+            "relay_urls": ["https://only.example"],
+            "destinations": [{ "name": "m1", "server_node_id": node_id(1) }],
+        })
+        .to_string();
+        let (handle, _) = start_inner(&json).expect("starts");
+        let status: serde_json::Value =
+            serde_json::from_str(&status_json(&handle.client.status(), Instant::now())).unwrap();
+        assert_eq!(
+            status["destinations"][0]["relay_urls"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        stop_handle(handle);
+    }
+
     #[test]
     fn idle_timeout_zero_means_never() {
         let key = flextunnel_core::auth::ClientKey::generate().unwrap();
@@ -1265,12 +1355,20 @@ mod tests {
             err(serde_json::json!({ "auth_key": "nope", "server_node_id": node_id(1) }))
                 .contains("invalid auth key")
         );
-        let one_relay = serde_json::json!({
+        let bad_relay = serde_json::json!({
             "auth_key": key,
             "server_node_id": node_id(1),
-            "relay_urls": ["https://relay.example"],
+            "relay_urls": ["not a url"],
         });
-        assert!(err(one_relay).contains("invalid relay configuration"));
+        assert!(err(bad_relay).contains("invalid relay configuration"));
+        // The QUIC address discovery setting needs custom relays, as in a
+        // session's config.
+        let stray_discovery = serde_json::json!({
+            "auth_key": key,
+            "server_node_id": node_id(1),
+            "relay_quic_addr_discovery": false,
+        });
+        assert!(err(stray_discovery).contains("invalid relay configuration"));
     }
 
     // Byte the caller-side buffers below start out holding, so a test can tell

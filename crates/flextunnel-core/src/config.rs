@@ -32,6 +32,12 @@ pub struct ServerConfig {
     /// Shared bearer token sent to every custom relay's WebSocket upgrade. Only
     /// valid with custom `relay_urls`; rejected with the default iroh relays.
     pub relay_auth_token: Option<String>,
+    /// Whether the custom relays serve QUIC address discovery, all of them or
+    /// none (default: they do). `false` for relays behind a Cloudflare Tunnel
+    /// or another HTTP-only front: left on, iroh probes them for it and each
+    /// start can wait out its 3 s probe timeout. Only valid with custom
+    /// `relay_urls`.
+    pub relay_quic_addr_discovery: Option<bool>,
     /// Hostname aliases resolved on the server side: a requested host that
     /// matches a key is rewritten to its value (an IP or another hostname on the
     /// server's network) before connecting. Keeps the requested port. Lets a
@@ -106,12 +112,16 @@ pub struct DestinationEntry {
     /// `auth_key_file`.
     pub auth_key_file: Option<PathBuf>,
     /// Custom relay URL(s) for this destination, overriding the top-level
-    /// `relay_urls` — and with them the top-level `relay_auth_token`: a
-    /// destination that names its own relays uses only its own token.
+    /// `relay_urls` — and with them the top-level `relay_auth_token` and
+    /// `relay_quic_addr_discovery`: a destination that names its own relays
+    /// uses only its own token and its own QUIC address discovery setting.
     pub relay_urls: Option<Vec<String>>,
     /// Bearer token for this destination's own `relay_urls`. Only valid
     /// alongside them.
     pub relay_auth_token: Option<String>,
+    /// Whether this destination's own `relay_urls` serve QUIC address
+    /// discovery (default: they do). Only valid alongside them.
+    pub relay_quic_addr_discovery: Option<bool>,
 }
 
 /// How long a destination's connection is kept with no stream open on it,
@@ -156,6 +166,12 @@ pub struct ClientConfig {
     /// Shared bearer token sent to every custom relay's WebSocket upgrade. Only
     /// valid with custom `relay_urls`; rejected with the default iroh relays.
     pub relay_auth_token: Option<String>,
+    /// Whether the custom relays serve QUIC address discovery, all of them or
+    /// none (default: they do). `false` for relays behind a Cloudflare Tunnel
+    /// or another HTTP-only front: left on, iroh probes them for it and each
+    /// start can wait out its 3 s probe timeout. Only valid with custom
+    /// `relay_urls`.
+    pub relay_quic_addr_discovery: Option<bool>,
     /// Close a destination's connection after this many seconds with no
     /// stream open on it (default [`DEFAULT_IDLE_TIMEOUT`]); `0` never closes
     /// one for idleness. Connections are opened on first use either way.
@@ -176,6 +192,9 @@ pub struct ResolvedServer {
     pub relay_urls: Vec<String>,
     /// Shared bearer token for custom relays (custom relays only).
     pub relay_auth_token: Option<String>,
+    /// Whether the custom relays serve QUIC address discovery (custom relays
+    /// only); `None` keeps the default, on.
+    pub relay_quic_addr_discovery: Option<bool>,
     /// Server-side host aliases, keys lowercased for case-insensitive matching.
     pub host_aliases: HashMap<String, String>,
     /// Raw routed-set entries (parsed into a `RoutedSet` at startup).
@@ -201,6 +220,10 @@ pub struct ResolvedClient {
     pub relay_urls: Vec<String>,
     /// Shared bearer token for the default custom relays.
     pub relay_auth_token: Option<String>,
+    /// Whether the default custom relays serve QUIC address discovery; `None`
+    /// keeps the default, on. Like the token it goes with the default relays
+    /// only: a destination that names its own `relay_urls` has its own.
+    pub relay_quic_addr_discovery: Option<bool>,
     /// `None`: never close a connection for idleness.
     pub idle_timeout: Option<Duration>,
     /// Declared destinations, in config order (validated by
@@ -215,7 +238,8 @@ impl ResolvedClient {
     /// Turn the resolved settings into the core client's configuration:
     /// parse each destination's server id, load its key (its own
     /// `auth_key_file`, else the default credential) and build its relay
-    /// config (its own `relay_urls` + token, else the defaults). Errors name
+    /// config (its own `relay_urls`, token and QUIC address discovery
+    /// setting, else the defaults). Errors name
     /// the destination at fault. Host and routing validation happens when the
     /// client is built from the result.
     pub fn proxy_config(&self) -> Result<crate::proxy::ClientConfig> {
@@ -231,10 +255,19 @@ impl ResolvedClient {
         if self.auth_key.is_some() && self.auth_key_file.is_some() {
             anyhow::bail!("Both an inline client key and a client key file are set; use one");
         }
-        // The default credential and relays are loaded once, and only if some
-        // destination actually falls back to them.
+        // The default relays are checked whether or not a destination falls
+        // back to them: a top-level token or QUIC address discovery setting
+        // with no top-level relays to apply to is a mistake either way, and
+        // would pass unnoticed when every destination names its own.
+        let default_relay = RelayConfig::from_settings(
+            &self.relay_urls,
+            self.relay_auth_token.clone(),
+            self.relay_quic_addr_discovery,
+        )
+        .context("Invalid top-level relay settings")?;
+        // The default credential is loaded once, and only if some destination
+        // actually falls back to it.
         let mut default_key: Option<crate::auth::ClientKey> = None;
-        let mut default_relay: Option<RelayConfig> = None;
 
         let mut destinations = Vec::with_capacity(self.destinations.len());
         for entry in &self.destinations {
@@ -260,10 +293,12 @@ impl ResolvedClient {
             };
 
             let relay = match &entry.relay_urls {
-                Some(urls) => {
-                    RelayConfig::from_urls_with_token(urls, entry.relay_auth_token.clone())
-                        .with_context(context)?
-                }
+                Some(urls) => RelayConfig::from_settings(
+                    urls,
+                    entry.relay_auth_token.clone(),
+                    entry.relay_quic_addr_discovery,
+                )
+                .with_context(context)?,
                 None => {
                     if entry.relay_auth_token.is_some() {
                         anyhow::bail!(
@@ -272,16 +307,14 @@ impl ResolvedClient {
                             context()
                         );
                     }
-                    match &default_relay {
-                        Some(relay) => relay.clone(),
-                        None => {
-                            let relay = RelayConfig::from_urls_with_token(
-                                &self.relay_urls,
-                                self.relay_auth_token.clone(),
-                            )?;
-                            default_relay.insert(relay).clone()
-                        }
+                    if entry.relay_quic_addr_discovery.is_some() {
+                        anyhow::bail!(
+                            "{}: relay_quic_addr_discovery is set without relay_urls; a \
+                             destination's setting only applies to its own relays",
+                            context()
+                        );
                     }
+                    default_relay.clone()
                 }
             };
 
@@ -456,6 +489,9 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
         authorized_keys_file: authorized_keys_file.map(|p| expand_tilde(&p)),
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
         relay_auth_token: cli.relay_auth_token.or(file.relay_auth_token),
+        relay_quic_addr_discovery: cli
+            .relay_quic_addr_discovery
+            .or(file.relay_quic_addr_discovery),
         host_aliases,
         routed_domains: cli
             .routed_domains
@@ -542,6 +578,9 @@ pub fn resolve_client(cli: ClientConfig, file: Option<ClientConfig>) -> Resolved
         auth_key_file: auth_key_file.map(|p| expand_tilde(&p)),
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
         relay_auth_token: cli.relay_auth_token.or(file.relay_auth_token),
+        relay_quic_addr_discovery: cli
+            .relay_quic_addr_discovery
+            .or(file.relay_quic_addr_discovery),
         idle_timeout,
         destinations,
         forwards: cli.forwards.or(file.forwards).unwrap_or_default(),
@@ -648,6 +687,7 @@ mod tests {
             auth_key_file: None,
             relay_urls: Vec::new(),
             relay_auth_token: None,
+            relay_quic_addr_discovery: None,
             idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
             destinations,
             forwards: Vec::new(),
@@ -665,6 +705,7 @@ mod tests {
             auth_key_file: None,
             relay_urls: None,
             relay_auth_token: None,
+            relay_quic_addr_discovery: None,
         }
     }
 
@@ -697,6 +738,88 @@ mod tests {
         assert!(config.destinations.iter().all(|d| !d.keep_connected));
     }
 
+    /// One custom relay is accepted as the default set (`--relay-url` once)
+    /// and as a destination's own.
+    #[test]
+    fn proxy_config_accepts_a_single_custom_relay() {
+        let mut own = entry("m2", 2);
+        own.relay_urls = Some(vec!["https://own.example".to_string()]);
+        let mut resolved = resolved_with(vec![entry("m1", 1), own]);
+        resolved.relay_urls = vec!["https://only.example".to_string()];
+        let config = resolved.proxy_config().unwrap();
+        for destination in &config.destinations {
+            assert_eq!(destination.relay.custom_urls().len(), 1);
+        }
+    }
+
+    /// The top-level QUIC address discovery setting goes with the top-level
+    /// relays only: a destination that names its own relays has its own.
+    #[test]
+    fn proxy_config_takes_the_relay_quic_addr_discovery_setting() {
+        let mut own = entry("m2", 2);
+        own.relay_urls = Some(vec!["https://own.example".to_string()]);
+        let mut own_off = entry("m3", 3);
+        own_off.relay_urls = Some(vec!["https://off.example".to_string()]);
+        own_off.relay_quic_addr_discovery = Some(false);
+        let mut resolved = resolved_with(vec![entry("m1", 1), own, own_off]);
+        resolved.relay_urls = vec!["https://only.example".to_string()];
+        resolved.relay_quic_addr_discovery = Some(false);
+        let config = resolved.proxy_config().unwrap();
+        let discovery: Vec<_> = config
+            .destinations
+            .iter()
+            .map(|d| d.relay.quic_addr_discovery())
+            .collect();
+        assert_eq!(discovery, [Some(false), Some(true), Some(false)]);
+
+        // With the default relays the setting has nothing to apply to.
+        let mut stray = resolved_with(vec![entry("m1", 1)]);
+        stray.relay_quic_addr_discovery = Some(true);
+        let Err(err) = stray.proxy_config() else {
+            panic!("expected an error");
+        };
+        assert!(format!("{err:#}").contains("relay_urls"), "{err:#}");
+    }
+
+    /// The top-level relay settings are checked even when no destination
+    /// falls back to them: a setting or a token given without top-level
+    /// relays is refused, not dropped, when every destination names its own.
+    #[test]
+    fn proxy_config_checks_the_top_level_relay_settings_when_unused() {
+        let own = || {
+            let mut own = entry("m1", 1);
+            own.relay_urls = Some(vec!["https://own.example".to_string()]);
+            own
+        };
+        let err = |resolved: ResolvedClient| match resolved.proxy_config() {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => format!("{e:#}"),
+        };
+
+        let mut stray_discovery = resolved_with(vec![own()]);
+        stray_discovery.relay_quic_addr_discovery = Some(false);
+        let message = err(stray_discovery);
+        assert!(
+            message.contains("top-level") && message.contains("relay_urls"),
+            "{message}"
+        );
+
+        let mut stray_token = resolved_with(vec![own()]);
+        stray_token.relay_auth_token = Some("t".to_string());
+        assert!(err(stray_token).contains("top-level"));
+
+        // With top-level relays the setting is valid, and still not the
+        // destination's: its own relays keep their own.
+        let mut unused = resolved_with(vec![own()]);
+        unused.relay_urls = vec!["https://only.example".to_string()];
+        unused.relay_quic_addr_discovery = Some(false);
+        let config = unused.proxy_config().unwrap();
+        assert_eq!(
+            config.destinations[0].relay.quic_addr_discovery(),
+            Some(true)
+        );
+    }
+
     #[test]
     fn proxy_config_errors_name_the_destination() {
         let err = |resolved: ResolvedClient| match resolved.proxy_config() {
@@ -719,6 +842,14 @@ mod tests {
         let message = err(resolved_with(vec![stray_token]));
         assert!(
             message.contains("m1") && message.contains("relay_urls"),
+            "{message}"
+        );
+
+        let mut stray_discovery = entry("m1", 1);
+        stray_discovery.relay_quic_addr_discovery = Some(false);
+        let message = err(resolved_with(vec![stray_discovery]));
+        assert!(
+            message.contains("m1") && message.contains("relay_quic_addr_discovery"),
             "{message}"
         );
 
@@ -974,6 +1105,8 @@ mod tests {
             secret_file = "./server.key"
             authorized_keys_file = "/etc/flextunnel/authorized_keys"
             relay_urls = ["https://relay.example"]
+            relay_auth_token = "shared-relay-secret"
+            relay_quic_addr_discovery = false
             routed_domains = ["*.example.com"]
             routed_cidrs = ["10.0.0.0/8"]
 
@@ -982,6 +1115,7 @@ mod tests {
         "#;
         let s: ServerConfig = toml::from_str(server).expect("maximal server config parses");
         assert!(s.secret_file.is_some() && s.host_aliases.is_some());
+        assert_eq!(s.relay_quic_addr_discovery, Some(false));
 
         let client = r#"
             name = "work"
@@ -990,6 +1124,7 @@ mod tests {
             auth_key_file = "~/.config/flextunnel/client.key"
             relay_urls = ["https://relay.example"]
             relay_auth_token = "shared-relay-secret"
+            relay_quic_addr_discovery = false
             idle_timeout_secs = 300
 
             [[destinations]]
@@ -1000,6 +1135,7 @@ mod tests {
             auth_key_file = "~/.config/flextunnel/machine1.key"
             relay_urls = ["https://relay-a.example", "https://relay-b.example"]
             relay_auth_token = "machine1-relay-secret"
+            relay_quic_addr_discovery = true
 
             [[forwards]]
             label = "db"

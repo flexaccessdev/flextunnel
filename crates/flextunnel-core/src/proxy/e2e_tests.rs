@@ -1868,6 +1868,7 @@ async fn prepared_server_serves_an_authorized_client() {
         first_client: None,
         relay_urls: Vec::new(),
         relay_auth_token: None,
+        relay_quic_addr_discovery: None,
         host_aliases: HashMap::new(),
         routed_domains: Vec::new(),
         routed_cidrs,
@@ -1920,7 +1921,7 @@ async fn prepared_server_serves_an_authorized_client() {
     stop_tx.send(()).unwrap();
     let stopped = with_timeout(served).await.unwrap().unwrap();
     assert!(stopped, "serve ran until stopped");
-    running.endpoint().close().await;
+    running.close().await;
     let _ = std::fs::remove_file(bl_path);
 }
 
@@ -2364,6 +2365,7 @@ async fn prepared_quick_server_admits_only_the_entered_client() {
         first_client: None,
         relay_urls: Vec::new(),
         relay_auth_token: None,
+        relay_quic_addr_discovery: None,
         host_aliases: HashMap::new(),
         routed_domains: Vec::new(),
         routed_cidrs,
@@ -2397,7 +2399,7 @@ async fn prepared_quick_server_admits_only_the_entered_client() {
 
     served.abort();
     let _ = served.await;
-    running.endpoint().close().await;
+    running.close().await;
     let _ = std::fs::remove_file(bl_path);
 }
 

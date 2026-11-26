@@ -533,8 +533,9 @@ Client auth keypairs are generated with the standalone
 | `--default-config` | Load `~/.config/flextunnel/server.toml`. |
 | `--secret-file <FILE>` | Server identity key. |
 | `--authorized-keys-file <FILE>` | File of authorized client public keys, one `ed25519-pub:…` per line (optional trailing comment, ssh `authorized_keys` style). |
-| `--relay-url <URL>` | Custom relay URLs (repeatable; at least two distinct URLs). See the [shared relay guide](https://github.com/flexaccessdev/flexaccess-iroh/blob/main/docs/relays-and-address-lookup.md) for discovery and dialing requirements. |
+| `--relay-url <URL>` | Custom relay URLs (repeatable; a single URL runs in reduced-redundancy mode, with no home-relay failover). See the [shared relay guide](https://github.com/flexaccessdev/flexaccess-iroh/blob/main/docs/relays-and-address-lookup.md) for discovery and dialing requirements. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
+| `--relay-quic-addr-discovery <BOOL>` | Whether the custom relays serve QUIC address discovery, all of them or none (default `true`). Pass `false` for relays behind a Cloudflare Tunnel or another HTTP-only front, which otherwise delay startup by up to 3 s; see [self-hosting a relay](https://github.com/flexaccessdev/flexaccess-iroh/blob/main/docs/self-hosting.md). Only valid with `--relay-url`. |
 | `--quick` | Ephemeral one-off server: prompt for the client's EndpointId (shown by `client start --quick`) and natively allowlist it as the only allowed client — no auth keypair — then mint an in-memory identity, full-tunnel all traffic, print this server's EndpointId, and exit if the client doesn't connect within 5 minutes. Needs an interactive terminal. Takes no single-instance lock; nothing is persisted. Conflicts with `-c`/`--secret-file`/`--authorized-keys-file`. |
 
 The server takes a single-instance lock keyed by the prefix of its own
@@ -551,8 +552,9 @@ second start of the same identity is refused.
 | `--socks-port <PORT>` | Optional SOCKS5 listener port, e.g. `1080`. Binds `127.0.0.1` only. Disabled unless set. |
 | `--http-port <PORT>` | Optional HTTP proxy listener port (CONNECT + plain-HTTP forwarding). Binds `127.0.0.1` only. |
 | `--auth-key <SECRET>` / `--auth-key-file <FILE>` | Client auth keypair for every destination that names no key file of its own: the inline `ed25519-sec:…` secret, or the key file from `flexaccess-keys generate-auth-key`. |
-| `--relay-url <URL>` | Custom relay URLs (repeatable; at least two distinct URLs, matching the servers' set), for every destination that names no relays of its own. See the shared relay guide above. |
+| `--relay-url <URL>` | Custom relay URLs (repeatable, matching the servers' set), for every destination that names no relays of its own. See the shared relay guide above. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
+| `--relay-quic-addr-discovery <BOOL>` | Whether the `--relay-url` relays serve QUIC address discovery, all of them or none (default `true`). Pass `false` for relays behind a Cloudflare Tunnel or another HTTP-only front, which otherwise delay startup by up to 3 s; see [self-hosting a relay](https://github.com/flexaccessdev/flexaccess-iroh/blob/main/docs/self-hosting.md). Only valid with `--relay-url` or the config's top-level `relay_urls`, and it applies to the destinations that use those: one that names its own `relay_urls` has its own `relay_quic_addr_discovery`. |
 | `--idle-timeout <SECS>` | How long a destination's connection is kept with nothing using it (default 300; `0` never closes an idle connection). |
 | `--quick` | Self-contained ephemeral session (pairs with `server start --quick`): ignore any saved config, print this client's EndpointId (enter it at the quick server's prompt — that allowlist entry is the credential; no auth keypair), prompt for the server EndpointId, then run the live control panel in this terminal. Needs an interactive terminal. Takes no lock and opens no control socket; quitting the panel disconnects. Nothing is persisted. Conflicts with `-c`/`--auth-key(-file)`/`--idle-timeout`. |
 
@@ -571,10 +573,10 @@ panel disconnects instead of detaching. Nothing is saved.
 Each `[[destinations]]` table (see [`client.toml.example`](client.toml.example))
 has a `name` (one DNS label) and a `server_node_id`, and optionally `routed_domains` /
 `routed_cidrs` (see [Routing](#routing)) and its own `auth_key_file`,
-`relay_urls` and `relay_auth_token`, which override the top-level ones for that
-destination. Names and server ids must each be unique. The config is validated
-at startup; an invalid destination or an ambiguous route stops the client
-before anything is bound.
+`relay_urls`, `relay_auth_token` and `relay_quic_addr_discovery`, which
+override the top-level ones for that destination. Names and server ids must
+each be unique. The config is validated at startup; an invalid destination or
+an ambiguous route stops the client before anything is bound.
 
 Port forwards are declared in the config as `[[forwards]]` tables: each listens
 on `localhost:<local_port>` and opens a stream to `<remote_host>:<remote_port>`
@@ -900,10 +902,11 @@ and gives the connection up again once it is unused.
   state the destinations are in.
 
 The first request after an idle period pays for a fresh endpoint and
-connection. With the default relays that is a bind plus a relay connection;
-with custom relays every relay is probed first, and one that is down holds the
-probe to its 10s limit — on every such first request, where it used to be once
-at startup. If that shows, raise `idle_timeout_secs`.
+connection: a bind plus a relay connection. With custom relays every relay is
+also probed beside the endpoint, which costs nothing while the relay the
+endpoint homes on works; if that one is down, the request waits until its probe
+has failed (up to 10s) and the endpoint has moved to another relay. If that
+shows, raise `idle_timeout_secs`.
 
 The control panel and the [status page](#status-pages) show each destination's
 state: failed attempts so far, the last error, and when the next attempt is

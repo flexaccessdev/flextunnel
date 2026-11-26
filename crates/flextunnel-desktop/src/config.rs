@@ -177,6 +177,23 @@ pub struct Destination {
     /// [`DevFile::destination_relay_tokens`]. Never exported or imported.
     #[serde(skip)]
     pub relay_auth_token: Option<String>,
+    /// Whether the custom relays serve QUIC address discovery, all of them or
+    /// none (custom relays only; see [`relay_quic_addr_discovery_setting`]).
+    /// Not a secret: it describes the relays, and travels with their URLs.
+    #[serde(default = "on")]
+    pub relay_quic_addr_discovery: bool,
+}
+
+/// Serde's default for a setting that is on unless stored otherwise.
+fn on() -> bool {
+    true
+}
+
+/// A stored `relay_quic_addr_discovery` as the core takes it: left unset
+/// while on, which is the default, so that only turning it off is a setting.
+/// The core refuses one without custom relays, as it does a relay auth token.
+pub fn relay_quic_addr_discovery_setting(enabled: bool) -> Option<bool> {
+    (!enabled).then_some(false)
 }
 
 impl Destination {
@@ -416,6 +433,10 @@ pub struct ServerConfig {
     /// [`StoredServer`].
     #[serde(skip)]
     pub relay_auth_token: Option<String>,
+    /// Whether the custom relays serve QUIC address discovery, as
+    /// [`Destination::relay_quic_addr_discovery`].
+    #[serde(default = "on")]
+    pub relay_quic_addr_discovery: bool,
     /// Whether the server is meant to run: an enabled server starts with the
     /// app, and once it becomes startable; a disabled one stays stopped, at
     /// every launch, until enabled again.
@@ -1258,6 +1279,7 @@ mod tests {
             routed_cidrs: vec!["10.0.0.0/8".into()],
             relay_urls: vec!["https://relay.example".into()],
             relay_auth_token: Some("ftc-secret-serverpsk".into()),
+            relay_quic_addr_discovery: false,
             enabled: true,
         }
     }
@@ -1276,6 +1298,7 @@ mod tests {
             auth_key_id: "key1".into(),
             relay_urls: vec!["https://relay.example".into()],
             relay_auth_token: Some("ftc-secret-relaypsk".into()),
+            relay_quic_addr_discovery: false,
         }
     }
 
@@ -1565,6 +1588,7 @@ mod tests {
             auth_key_id: String::new(),
             relay_urls: Vec::new(),
             relay_auth_token: None,
+            relay_quic_addr_discovery: true,
         };
         let destinations = [
             dest("nas", &["*.corp.example"], &["10.0.0.0/8"]),
@@ -1843,6 +1867,9 @@ mod tests {
         assert!(d.auth_key_id.is_empty());
         assert_eq!(d.relay_auth_token, None);
         assert_eq!(d.relay_urls, destination().relay_urls);
+        // …and so does what it says of them.
+        assert!(!destination().relay_quic_addr_discovery);
+        assert!(!d.relay_quic_addr_discovery);
         assert_eq!(d.name, destination().name);
         assert_eq!(d.routed_domains, destination().routed_domains);
         assert_eq!(imported.forwards.len(), 1);
@@ -1876,6 +1903,8 @@ mod tests {
             imported.destinations[0].relay_urls,
             vec!["https://relay.example"]
         );
+        // Left out of the file, QUIC address discovery is on.
+        assert!(imported.destinations[0].relay_quic_addr_discovery);
         assert!(imported.forwards.is_empty());
 
         // A file of another shape — a bare list — is refused, not read as empty.

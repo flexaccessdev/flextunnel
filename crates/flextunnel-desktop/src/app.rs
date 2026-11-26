@@ -170,6 +170,7 @@ pub enum Message {
     NewKeyCancel,
     RelayUrlsChanged(String),
     RelayAuthTokenChanged(String),
+    RelayQuicAddrDiscoveryToggled(bool),
     DestinationFormSave,
     DestinationFormCancel,
     // Auth keys (the Keys pane)
@@ -220,6 +221,7 @@ pub enum Message {
     ServerRoutedCidrsChanged(String),
     ServerRelayUrlsChanged(String),
     ServerRelayAuthTokenChanged(String),
+    ServerRelayQuicAddrDiscoveryToggled(bool),
     ServerFormSave,
     ServerFormCancel,
     // Authorized clients (the server pane)
@@ -386,7 +388,12 @@ fn merge_imported(
         destination.server_node_id =
             parse_server_node_id(&destination.server_node_id).map_err(named)?;
         // An import carries no token, so its relays stand on their own.
-        check_relays(&destination.relay_urls, None).map_err(named)?;
+        check_relays(
+            &destination.relay_urls,
+            None,
+            destination.relay_quic_addr_discovery,
+        )
+        .map_err(named)?;
         if !names.insert(destination.name.clone()) {
             return Err(format!(
                 "the file has destination \"{}\" more than once",
@@ -475,16 +482,34 @@ fn parse_server_node_id(input: &str) -> Result<String, String> {
         .map_err(|e| format!("Server node id is not an endpoint id: {e}"))
 }
 
-/// The core's own relay rules — URLs that parse, enough of them, a token only
-/// with custom relays — so relay settings that are stored are ones the client
-/// can start with.
-fn check_relays(relay_urls: &[String], relay_auth_token: Option<String>) -> Result<(), String> {
-    flextunnel_core::transport::endpoint::RelayConfig::from_urls_with_token(
+/// The core's own relay rules — URLs that parse, a token and QUIC address
+/// discovery turned off only with custom relays — so relay settings that are
+/// stored are ones the client can start with.
+fn check_relays(
+    relay_urls: &[String],
+    relay_auth_token: Option<String>,
+    relay_quic_addr_discovery: bool,
+) -> Result<(), String> {
+    flextunnel_core::transport::endpoint::RelayConfig::from_settings(
         relay_urls,
         relay_auth_token,
+        config::relay_quic_addr_discovery_setting(relay_quic_addr_discovery),
     )
     .map(|_| ())
     .map_err(|e| format!("{e:#}"))
+}
+
+/// A form's QUIC address discovery tick as stored: the tick for custom
+/// relays, and on — the default — with none, where the setting applies to
+/// nothing and the form does not show it.
+fn stored_quic_addr_discovery(relay_urls: &[String], ticked: bool) -> bool {
+    relay_urls.is_empty() || ticked
+}
+
+/// Whether a form's relay URLs field names any relay, which is when the form
+/// shows its QUIC address discovery tick.
+pub fn names_relays(relay_urls: &str) -> bool {
+    !split_list(relay_urls).is_empty()
 }
 
 /// Where the destination form's "Fetch from server" stands.
@@ -503,7 +528,6 @@ pub enum RoutesFetch {
 
 /// Editable destination buffers (the add/edit form). `editing_id` is `None`
 /// when adding.
-#[derive(Default)]
 pub struct DestinationForm {
     editing_id: Option<DestinationId>,
     /// The destination's name (one DNS label):
@@ -521,9 +545,34 @@ pub struct DestinationForm {
     pub new_key_name: Option<String>,
     pub relay_urls: String,
     pub relay_auth_token: String,
+    /// Whether the custom relays serve QUIC address discovery; shown, and
+    /// stored as ticked, only while there are relay URLs (see
+    /// [`stored_quic_addr_discovery`]).
+    pub relay_quic_addr_discovery: bool,
     pub routes_fetch: RoutesFetch,
     /// What [`Self::routing`] last made, kept across the view's redraws.
     routing: RefCell<FormRouting>,
+}
+
+/// An empty form, for adding: QUIC address discovery is on, as it is for
+/// relays that say nothing of it.
+impl Default for DestinationForm {
+    fn default() -> Self {
+        Self {
+            editing_id: None,
+            name: String::new(),
+            server_node_id: String::new(),
+            routed_domains: String::new(),
+            routed_cidrs: String::new(),
+            auth_key_id: String::new(),
+            new_key_name: None,
+            relay_urls: String::new(),
+            relay_auth_token: String::new(),
+            relay_quic_addr_discovery: true,
+            routes_fetch: RoutesFetch::default(),
+            routing: RefCell::default(),
+        }
+    }
 }
 
 /// The form's name and routes checked with the other destinations' (see
@@ -557,9 +606,14 @@ impl DestinationForm {
             .ok_or("Pick an auth key the server authorizes first")?;
         let key = flextunnel_core::auth::ClientKey::from_secret_str(key.secret.trim())
             .map_err(|e| format!("Auth key \"{}\" is not usable: {e:#}", key.name))?;
-        let relay = flextunnel_core::transport::endpoint::RelayConfig::from_urls_with_token(
-            &split_list(&self.relay_urls),
+        let relay_urls = split_list(&self.relay_urls);
+        let relay = flextunnel_core::transport::endpoint::RelayConfig::from_settings(
+            &relay_urls,
             self.relay_auth_token(),
+            config::relay_quic_addr_discovery_setting(stored_quic_addr_discovery(
+                &relay_urls,
+                self.relay_quic_addr_discovery,
+            )),
         )
         .map_err(|e| format!("{e:#}"))?;
         Ok(RoutesQuery {
@@ -648,6 +702,7 @@ impl DestinationForm {
             new_key_name: None,
             relay_urls: destination.relay_urls.join(", "),
             relay_auth_token: destination.relay_auth_token.clone().unwrap_or_default(),
+            relay_quic_addr_discovery: destination.relay_quic_addr_discovery,
             routes_fetch: RoutesFetch::Idle,
             routing: RefCell::default(),
         }
@@ -764,7 +819,13 @@ impl DestinationForm {
         }
         let relay_urls = split_list(&self.relay_urls);
         let relay_auth_token = self.relay_auth_token();
-        check_relays(&relay_urls, relay_auth_token.clone())?;
+        let relay_quic_addr_discovery =
+            stored_quic_addr_discovery(&relay_urls, self.relay_quic_addr_discovery);
+        check_relays(
+            &relay_urls,
+            relay_auth_token.clone(),
+            relay_quic_addr_discovery,
+        )?;
         Ok(Destination {
             id: self.editing_id.clone().unwrap_or_else(Destination::new_id),
             name,
@@ -774,6 +835,7 @@ impl DestinationForm {
             auth_key_id: self.auth_key_id.clone(),
             relay_urls,
             relay_auth_token,
+            relay_quic_addr_discovery,
         })
     }
 }
@@ -982,7 +1044,6 @@ impl IdentityChoice {
 /// the server pane, not here. Which form it is follows whether the server
 /// has an identity yet: without one, setup chooses it (`identity` is `Some`)
 /// and creates the server; with one, it edits the tunnel set and relays.
-#[derive(Default)]
 pub struct ServerForm {
     /// `Some` when setting up (choosing the identity); `None` when editing the
     /// settings.
@@ -991,6 +1052,24 @@ pub struct ServerForm {
     pub routed_cidrs: String,
     pub relay_urls: String,
     pub relay_auth_token: String,
+    /// Whether the custom relays serve QUIC address discovery, as
+    /// [`DestinationForm::relay_quic_addr_discovery`].
+    pub relay_quic_addr_discovery: bool,
+}
+
+/// An empty form: QUIC address discovery is on, as it is for relays that say
+/// nothing of it.
+impl Default for ServerForm {
+    fn default() -> Self {
+        Self {
+            identity: None,
+            routed_domains: String::new(),
+            routed_cidrs: String::new(),
+            relay_urls: String::new(),
+            relay_auth_token: String::new(),
+            relay_quic_addr_discovery: true,
+        }
+    }
 }
 
 impl ServerForm {
@@ -1008,6 +1087,7 @@ impl ServerForm {
             routed_cidrs: server.routed_cidrs.join(", "),
             relay_urls: server.relay_urls.join(", "),
             relay_auth_token: server.relay_auth_token.clone().unwrap_or_default(),
+            relay_quic_addr_discovery: server.relay_quic_addr_discovery,
         }
     }
 
@@ -1040,9 +1120,15 @@ impl ServerForm {
         if relay_auth_token.is_some() && relay_urls.is_empty() {
             return Err("A relay auth token requires at least one relay URL".into());
         }
+        let relay_quic_addr_discovery =
+            stored_quic_addr_discovery(&relay_urls, self.relay_quic_addr_discovery);
         // Checked here, as for a destination: a save applies at once, and a
         // server restarted on relays it cannot start with would stop.
-        check_relays(&relay_urls, relay_auth_token.clone())?;
+        check_relays(
+            &relay_urls,
+            relay_auth_token.clone(),
+            relay_quic_addr_discovery,
+        )?;
         Ok(ServerConfig {
             endpoint_id,
             secret,
@@ -1051,6 +1137,7 @@ impl ServerForm {
             routed_cidrs,
             relay_urls,
             relay_auth_token,
+            relay_quic_addr_discovery,
             enabled,
         })
     }
@@ -1746,6 +1833,13 @@ impl App {
                 }
                 Task::none()
             }
+            Message::RelayQuicAddrDiscoveryToggled(value) => {
+                if let Some(form) = &mut self.destination_form {
+                    form.relay_quic_addr_discovery = value;
+                    form.server_changed();
+                }
+                Task::none()
+            }
             Message::DestinationFormSave => {
                 self.save_destination_form();
                 Task::none()
@@ -1948,6 +2042,12 @@ impl App {
             Message::ServerRelayAuthTokenChanged(value) => {
                 if let Some(form) = &mut self.server_form {
                     form.relay_auth_token = value;
+                }
+                Task::none()
+            }
+            Message::ServerRelayQuicAddrDiscoveryToggled(value) => {
+                if let Some(form) = &mut self.server_form {
+                    form.relay_quic_addr_discovery = value;
                 }
                 Task::none()
             }
@@ -3004,6 +3104,7 @@ mod tests {
             new_key_name: None,
             relay_urls: " https://a.example ,, https://b.example ".into(),
             relay_auth_token: String::new(),
+            relay_quic_addr_discovery: true,
             routes_fetch: RoutesFetch::Idle,
             routing: RefCell::default(),
         }
@@ -3042,6 +3143,7 @@ mod tests {
             auth_key_id: "k1".into(),
             relay_urls: Vec::new(),
             relay_auth_token: None,
+            relay_quic_addr_discovery: true,
         }
     }
 
@@ -3337,8 +3439,7 @@ mod tests {
         }
 
         // What the client could not start with is refused too, by name: a
-        // server node id that is not one, relays that do not parse or are
-        // too few.
+        // server node id that is not one, relays that do not parse.
         for bad_id in ["", "!", "node-b"] {
             let mut bad = existing_destination("b");
             bad.server_node_id = bad_id.into();
@@ -3348,22 +3449,14 @@ mod tests {
                 "{bad_id:?}: {err}"
             );
         }
-        for bad_relays in [
-            &["not a url", "https://b.example"][..],
-            &["https://only.example"][..],
-        ] {
-            let mut bad = existing_destination("b");
-            bad.relay_urls = bad_relays.iter().map(|u| u.to_string()).collect();
-            let err = import(vec![existing_destination("a"), bad]).unwrap_err();
-            assert!(
-                err.contains("\"b\"") && err.contains("relay"),
-                "{bad_relays:?}: {err}"
-            );
-        }
+        let mut bad = existing_destination("b");
+        bad.relay_urls = vec!["not a url".into(), "https://b.example".into()];
+        let err = import(vec![existing_destination("a"), bad]).unwrap_err();
+        assert!(err.contains("\"b\"") && err.contains("relay"), "{err}");
         // Replacing a working destination is held to the same: its relays
         // are not swapped for ones that would stop the client starting.
         let mut breaking = current.destinations[0].clone();
-        breaking.relay_urls = vec!["https://only.example".into()];
+        breaking.relay_urls = vec!["not a url".into()];
         assert!(import(vec![breaking]).is_err());
 
         // A server id spelled another way is the same server: it replaces
@@ -3516,16 +3609,25 @@ mod tests {
         form.routed_cidrs = String::new();
         assert!(form.validate(&[], &keys).is_ok());
 
-        // The core's relay rules: custom relays come in pairs at least, and a
-        // token needs them.
+        // The core's relay rules: a single custom relay is accepted, and a
+        // token needs custom relays.
         let mut form = valid_form();
         form.relay_urls = "https://only.example".into();
-        assert!(form.validate(&[], &keys).is_err(), "a single custom relay");
+        assert!(form.validate(&[], &keys).is_ok(), "a single custom relay");
         let mut form = valid_form();
         form.relay_urls = String::new();
         assert!(form.validate(&[], &keys).is_ok(), "the default relays");
         form.relay_auth_token = "psk".into();
         assert!(form.validate(&[], &keys).is_err(), "token without relays");
+
+        // QUIC address discovery is stored as ticked for custom relays, and
+        // as on with the default ones, where the tick is not shown.
+        let mut form = valid_form();
+        assert!(form.validate(&[], &keys).unwrap().relay_quic_addr_discovery);
+        form.relay_quic_addr_discovery = false;
+        assert!(!form.validate(&[], &keys).unwrap().relay_quic_addr_discovery);
+        form.relay_urls = String::new();
+        assert!(form.validate(&[], &keys).unwrap().relay_quic_addr_discovery);
     }
 
     /// Asking a server for its routes takes its id, a usable key and relays
@@ -3548,6 +3650,16 @@ mod tests {
         let query = form().routes_query(&keys).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(query.server_id.to_string(), node_id("form"));
         assert_eq!(query.relay.custom_urls().len(), 2);
+        assert_eq!(query.relay.quic_addr_discovery(), Some(true));
+        // The server is asked over the relays as the form describes them.
+        let unticked = DestinationForm {
+            relay_quic_addr_discovery: false,
+            ..form()
+        };
+        let query = unticked
+            .routes_query(&keys)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(query.relay.quic_addr_discovery(), Some(false));
 
         let missing = |form: DestinationForm, keys: &[AuthKey]| match form.routes_query(keys) {
             Ok(_) => panic!("expected the query to be refused"),
@@ -3566,9 +3678,9 @@ mod tests {
         }];
         assert!(missing(form(), &lost).contains("auth key"));
         assert!(missing(form(), &test_keys()).contains("not usable"));
-        let mut one_relay = form();
-        one_relay.relay_urls = "https://only.example".into();
-        assert!(form().routes_query(&keys).is_ok() && one_relay.routes_query(&keys).is_err());
+        let mut bad_relay = form();
+        bad_relay.relay_urls = "not a url".into();
+        assert!(form().routes_query(&keys).is_ok() && bad_relay.routes_query(&keys).is_err());
     }
 
     /// The form shows where its routes — typed, or filled from the server —
@@ -3585,6 +3697,7 @@ mod tests {
             auth_key_id: String::new(),
             relay_urls: Vec::new(),
             relay_auth_token: None,
+            relay_quic_addr_discovery: true,
         };
         let mut form = DestinationForm {
             name: "lab".into(),
@@ -3947,9 +4060,24 @@ mod tests {
             "a relay URL that doesn't parse"
         );
         form.relay_urls = "https://relay.example".into();
-        assert!(form.validate(None).is_err(), "one custom relay");
+        assert!(form.validate(None).is_ok(), "one custom relay");
         form.relay_urls = "https://a.relay.example, https://b.relay.example".into();
         assert!(form.validate(None).is_ok());
+    }
+
+    /// QUIC address discovery is stored as ticked for custom relays, and as
+    /// on with the default ones, where the tick is not shown.
+    #[test]
+    fn server_form_stores_quic_addr_discovery_for_custom_relays() {
+        let mut form = valid_server_form();
+        form.relay_urls = "https://relay.example".into();
+        assert!(form.validate(None).unwrap().relay_quic_addr_discovery);
+        form.relay_quic_addr_discovery = false;
+        let server = form.validate(None).unwrap();
+        assert!(!server.relay_quic_addr_discovery);
+        assert!(!ServerForm::edit(&server).relay_quic_addr_discovery);
+        form.relay_urls = String::new();
+        assert!(form.validate(None).unwrap().relay_quic_addr_discovery);
     }
 
     #[test]

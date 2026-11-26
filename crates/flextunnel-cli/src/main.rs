@@ -31,6 +31,7 @@ mod tui;
 use flextunnel_core::app;
 use flextunnel_core::iroh::{EndpointId, SecretKey};
 use flextunnel_core::secret::secret_to_endpoint_id;
+use flextunnel_core::transport::endpoint::PendingCloses;
 use flextunnel_core::{auth, config, secret, server};
 
 #[derive(Parser)]
@@ -113,6 +114,12 @@ enum ServerAction {
         /// Shared bearer token sent to every custom relay (custom relays only).
         #[arg(long)]
         relay_auth_token: Option<String>,
+        /// Whether the custom relays serve QUIC address discovery, all of them
+        /// or none (default: true; custom relays only). Pass false for relays
+        /// behind a Cloudflare Tunnel or another HTTP-only front, which
+        /// otherwise delay startup by up to 3 s.
+        #[arg(long, value_name = "BOOL")]
+        relay_quic_addr_discovery: Option<bool>,
         /// Ephemeral one-off server. Run `client start --quick` FIRST — it
         /// prints the client's EndpointId; enter that id at this server's
         /// prompt to allowlist it as the only allowed client (no auth
@@ -162,13 +169,21 @@ enum ClientAction {
         /// own.
         #[arg(long)]
         auth_key_file: Option<PathBuf>,
-        /// Custom relay server URL(s) for failover (repeatable; at least two),
+        /// Custom relay server URL(s) (repeatable; two or more for failover),
         /// for every destination that does not name its own.
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
         /// Shared bearer token sent to every custom relay (custom relays only).
         #[arg(long)]
         relay_auth_token: Option<String>,
+        /// Whether the --relay-url relays serve QUIC address discovery, all of
+        /// them or none (default: true; needs --relay-url or the config's
+        /// top-level relay_urls). Pass false for relays behind a Cloudflare
+        /// Tunnel or another HTTP-only front, which otherwise delay startup by
+        /// up to 3 s. A destination that names its own relays has its own
+        /// setting in the config.
+        #[arg(long, value_name = "BOOL")]
+        relay_quic_addr_discovery: Option<bool>,
         /// Seconds a destination's connection is kept with nothing using it
         /// (default 300; 0 never closes an idle connection).
         #[arg(long, value_name = "SECS", conflicts_with = "quick")]
@@ -301,6 +316,7 @@ async fn run_async(command: Command) -> Result<()> {
                     authorized_keys_file,
                     relay_urls,
                     relay_auth_token,
+                    relay_quic_addr_discovery,
                     quick,
                 },
         } => {
@@ -330,7 +346,8 @@ async fn run_async(command: Command) -> Result<()> {
                     )
                 })
                 .await??;
-                let (cli, secret) = quick_server_config(relay_urls, relay_auth_token);
+                let (cli, secret) =
+                    quick_server_config(relay_urls, relay_auth_token, relay_quic_addr_discovery);
                 print_quick_server_bootstrap(&secret_to_endpoint_id(&secret));
                 return run_server(
                     config::resolve_server(cli, None)?,
@@ -343,6 +360,7 @@ async fn run_async(command: Command) -> Result<()> {
                 authorized_keys_file,
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
                 relay_auth_token,
+                relay_quic_addr_discovery,
                 host_aliases: None,   // config-file only; no CLI flag
                 routed_domains: None, // config-file only; no CLI flag
                 routed_cidrs: None,   // config-file only; no CLI flag
@@ -360,6 +378,7 @@ async fn run_async(command: Command) -> Result<()> {
                     auth_key_file,
                     relay_urls,
                     relay_auth_token,
+                    relay_quic_addr_discovery,
                     idle_timeout,
                     quick,
                 },
@@ -400,6 +419,7 @@ async fn run_async(command: Command) -> Result<()> {
                         http_port: details.http_port,
                         relay_urls,
                         relay_auth_token,
+                        relay_quic_addr_discovery,
                     },
                     client_secret,
                 )
@@ -413,6 +433,7 @@ async fn run_async(command: Command) -> Result<()> {
                 auth_key_file,
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
                 relay_auth_token,
+                relay_quic_addr_discovery,
                 idle_timeout_secs: idle_timeout,
                 destinations: None, // config-file only; no CLI flag
                 forwards: None,     // config-file only; no CLI flag
@@ -452,10 +473,11 @@ const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// quick mode never goes through config files, so no key rides in the config.
 /// No client keys — the allowlisted client endpoint id is the sole credential.
 /// Nothing is written to disk. `--relay-url` stays compatible with `--quick`,
-/// so any relays are kept.
+/// so any relays are kept, with their token and QUIC address discovery setting.
 fn quick_server_config(
     relay_urls: Vec<String>,
     relay_auth_token: Option<String>,
+    relay_quic_addr_discovery: Option<bool>,
 ) -> (config::ServerConfig, SecretKey) {
     let secret = SecretKey::generate();
     let cli = config::ServerConfig {
@@ -463,6 +485,7 @@ fn quick_server_config(
         routed_cidrs: Some(vec!["0.0.0.0/0".to_string(), "::/0".to_string()]),
         relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
         relay_auth_token,
+        relay_quic_addr_discovery,
         ..Default::default()
     };
     (cli, secret)
@@ -512,12 +535,17 @@ async fn run_server(r: config::ResolvedServer, quick: Option<QuickServer>) -> Re
         first_client: first_client.clone(),
         relay_urls: r.relay_urls,
         relay_auth_token: r.relay_auth_token,
+        relay_quic_addr_discovery: r.relay_quic_addr_discovery,
         host_aliases: r.host_aliases,
         routed_domains: r.routed_domains,
         routed_cidrs: r.routed_cidrs,
         blocklist_file: r.blocklist_file,
     })?;
-    let running = prepared.bind().await?;
+    let closes = PendingCloses::new();
+    let running = match prepared.bind(closes.clone()).await {
+        Ok(running) => running,
+        Err(e) => return Err(closed_or_exit_failed(closes.finished(), e).await),
+    };
 
     match &quick {
         Some(_) => log::info!(
@@ -565,7 +593,7 @@ async fn run_server(r: config::ResolvedServer, quick: Option<QuickServer>) -> Re
         }
     };
 
-    close_or_exit(running.endpoint().close()).await;
+    close_or_exit(running.close()).await;
     res
 }
 
@@ -591,6 +619,26 @@ pub(crate) async fn close_or_exit(close: impl Future<Output = ()>) {
             std::process::exit(0);
         }
     }
+}
+
+/// [`close_or_exit`] for a start that failed with `error`, over what it left
+/// running (a relay probe, the close of an endpoint that never came online):
+/// returns the error once that is over. Past `SHUTDOWN_CLOSE_TIMEOUT` it
+/// reports the error and exits with a failure status itself, as returning it
+/// would have done, but without dropping the runtime under that work.
+async fn closed_or_exit_failed(
+    close: impl Future<Output = ()>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    if tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, close)
+        .await
+        .is_err()
+    {
+        log::warn!("Endpoint close is taking too long — exiting now");
+        eprintln!("Error: {error:?}");
+        std::process::exit(1);
+    }
+    error
 }
 
 #[cfg(test)]
@@ -737,6 +785,74 @@ mod cli_tests {
         ));
     }
 
+    /// `--relay-quic-addr-discovery` takes its value, on both roles and
+    /// alongside `--quick`, and is unset when not passed.
+    #[test]
+    fn start_parses_relay_quic_addr_discovery() {
+        let parse = |role: &str, rest: &[&str]| {
+            let args = [
+                "flextunnel",
+                role,
+                "start",
+                "--relay-url",
+                "https://r.example",
+            ]
+            .into_iter()
+            .chain(rest.iter().copied());
+            match Args::try_parse_from(args)
+                .unwrap_or_else(|error| panic!("{role} start {rest:?} should parse: {error}"))
+                .command
+            {
+                Command::Server {
+                    action:
+                        ServerAction::Start {
+                            relay_quic_addr_discovery,
+                            ..
+                        },
+                }
+                | Command::Client {
+                    action:
+                        ClientAction::Start {
+                            relay_quic_addr_discovery,
+                            ..
+                        },
+                } => relay_quic_addr_discovery,
+                _ => panic!("not a start command"),
+            }
+        };
+        for role in ["server", "client"] {
+            assert_eq!(parse(role, &[]), None);
+            assert_eq!(
+                parse(role, &["--relay-quic-addr-discovery", "false"]),
+                Some(false)
+            );
+            assert_eq!(
+                parse(role, &["--quick", "--relay-quic-addr-discovery", "true"]),
+                Some(true)
+            );
+        }
+    }
+
+    /// The flag overrides the config file's value, which stands otherwise.
+    #[test]
+    fn relay_quic_addr_discovery_flag_overrides_the_config() {
+        let file = || config::ServerConfig {
+            relay_quic_addr_discovery: Some(false),
+            ..Default::default()
+        };
+        let flag = |relay_quic_addr_discovery| config::ServerConfig {
+            relay_quic_addr_discovery,
+            ..Default::default()
+        };
+        let resolved = |cli| {
+            config::resolve_server(cli, Some(file()))
+                .expect("config must resolve")
+                .relay_quic_addr_discovery
+        };
+        assert_eq!(resolved(flag(None)), Some(false));
+        assert_eq!(resolved(flag(Some(true))), Some(true));
+    }
+
     #[test]
     fn server_start_parses_quick_flag() {
         let args = Args::try_parse_from(["flextunnel", "server", "start", "--quick"])
@@ -836,7 +952,7 @@ mod cli_tests {
 
     #[test]
     fn quick_server_config_is_full_tunnel_without_client_keys() {
-        let (cli, _secret) = quick_server_config(Vec::new(), None);
+        let (cli, _secret) = quick_server_config(Vec::new(), None, None);
         // No keypair auth in quick mode: the allowlisted client endpoint id is
         // the sole credential. The ephemeral identity is returned alongside —
         // never through the config, which carries no key at all.

@@ -89,7 +89,8 @@ int flextunnel_client_public_key(const char *secret_key, char *out_buf, size_t o
  *
  * config_json : NUL-terminated UTF-8 JSON, e.g.
  *   {"auth_key":"ed25519-sec:...","socks_port":0,
- *    "relay_urls":[],"relay_auth_token":null,"idle_timeout_secs":300,
+ *    "relay_urls":[],"relay_auth_token":null,
+ *    "relay_quic_addr_discovery":null,"idle_timeout_secs":300,
  *    "destinations":[
  *      {"name":"machine1","server_node_id":"<id>",
  *       "routed_domains":["*.corp.example"],"routed_cidrs":["10.0.0.0/8"]}]}
@@ -101,8 +102,12 @@ int flextunnel_client_public_key(const char *secret_key, char *out_buf, size_t o
  *   port is required (an in-use port fails the start).
  *   relay_auth_token is optional: a shared bearer token sent to every custom
  *   relay's WebSocket upgrade; it is only valid with custom relay_urls
- *   (rejected with the default iroh relays). Custom relays need at least two
- *   URLs.
+ *   (rejected with the default iroh relays).
+ *   relay_quic_addr_discovery is optional: whether the custom relays serve
+ *   QUIC address discovery, all of them or none. Omitted or null means they
+ *   do; false is for relays behind a Cloudflare Tunnel or another HTTP-only
+ *   front, which otherwise delay each start by up to 3 s. It is only valid
+ *   with custom relay_urls.
  *   idle_timeout_secs is optional: how long a destination's connection is kept
  *   with no stream open on it. Omitted means 300; 0 means never close one for
  *   idleness.
@@ -138,9 +143,10 @@ FlextunnelHandle *flextunnel_start(const char *config_json, char *out_buf, size_
  * request_json : NUL-terminated UTF-8 JSON naming the server and how to reach
  *   it, as a destination for it would:
  *   {"auth_key":"ed25519-sec:...","server_node_id":"<id>",
- *    "relay_urls":[],"relay_auth_token":null}
- *   relay_urls and relay_auth_token are optional, with the rules they have in
- *   flextunnel_start. The server must already authorize the key's public half.
+ *    "relay_urls":[],"relay_auth_token":null,
+ *    "relay_quic_addr_discovery":null}
+ *   relay_urls, relay_auth_token and relay_quic_addr_discovery are optional,
+ *   with the rules they have in flextunnel_start. The server must already authorize the key's public half.
  * out_buf/out_len : caller buffer. Once the server has answered it receives
  *   {"routed_domains":["*.corp.example"],"routed_cidrs":["10.0.0.0/8"]}
  *   in the syntax a destination's own lists use; both are empty for a server
@@ -331,6 +337,11 @@ int flextunnel_conn_path(const FlextunnelHandle *handle, const char *name,
  * Stop the client, close the endpoints of the destinations in use, and free
  * the handle. After this call the handle is invalid. Passing NULL is a safe
  * no-op.
+ *
+ * Blocks for the close, for at most about 5 seconds. A close that takes
+ * longer (one behind an endpoint still being built, say) is finished on a
+ * thread of its own after this returns; the session is stopped either way,
+ * and flextunnel_start can be called again at once.
  */
 void flextunnel_stop(FlextunnelHandle *handle);
 

@@ -384,6 +384,7 @@ mod tests {
             routed_cidrs: Vec::new(),
             relay_urls: Vec::new(),
             relay_auth_token: None,
+            relay_quic_addr_discovery: true,
             enabled,
         }
     }
@@ -398,6 +399,7 @@ mod tests {
             auth_key_id: String::new(),
             relay_urls: Vec::new(),
             relay_auth_token: None,
+            relay_quic_addr_discovery: true,
         }
     }
 

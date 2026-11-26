@@ -9,10 +9,11 @@
 
 use crate::transport::{ALPN, QUICK_ALPN, build_quic_transport_config};
 use anyhow::{Context, Result};
-pub use flexaccess_iroh::endpoint::PendingCloses;
 use flexaccess_iroh::endpoint::{
     CreatedEndpoint, EndpointOptions, create_endpoint, endpoint_builder,
 };
+pub use flexaccess_iroh::endpoint::{PendingCloses, tear_down_runtime};
+use flexaccess_iroh::relay::online_timeout;
 use futures::future::BoxFuture;
 use iroh::{
     Endpoint, EndpointId, SecretKey,
@@ -23,6 +24,7 @@ use iroh::{
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::task::TaskTracker;
 
 pub use flexaccess_iroh::relay::{RELAY_CONNECT_TIMEOUT, RelayConfig};
 
@@ -113,22 +115,25 @@ pub(crate) fn server_setup(
 /// A single endpoint serves both relay modes. With the default relays internet
 /// discovery is on, so the server publishes its current home relay and clients
 /// resolve it by endpoint ID. With custom relays discovery is off, so clients
-/// reach the server through relay hints. Every custom relay is probed
-/// (startup fails only if none answers), the endpoint is bound without the
-/// relays that failed and must come online. The relays left out come back in
-/// [`CreatedEndpoint::relays_left_out`] for the home-relay failover (run by
-/// the CLI's serve loop) to restore once they are connectable.
+/// reach the server through relay hints. The endpoint binds with every custom
+/// relay and must come online, while each relay is probed beside it and taken
+/// out of the relay map if it fails; startup fails only if none answers. The
+/// startup probe comes back in [`CreatedEndpoint::relays`] for the home-relay
+/// failover (run by [`crate::server::RunningServer::serve`]), which puts the
+/// relays it left out back once they are connectable.
+///
+/// The probe's task and endpoints, and any close the creation stops waiting
+/// for, are kept in `closes`, which the server drains at shutdown
+/// ([`crate::server::RunningServer::close`]): its runtime ends with it.
 pub async fn create_server_endpoint(
     relay_config: &RelayConfig,
+    closes: &PendingCloses,
     setup: impl FnOnce(EndpointBuilder) -> EndpointBuilder,
 ) -> Result<CreatedEndpoint> {
-    // A server's runtime is the process's: a close the creation stops waiting
-    // for finishes on it by itself.
-    let closes = PendingCloses::new();
     create_endpoint(
         relay_config,
         setup(base_builder(relay_config, Side::Server)?),
-        &closes,
+        closes,
     )
     .await
 }
@@ -198,7 +203,8 @@ async fn create_client(
             let relay_config = relay_config.clone();
             let secret = secret.clone();
             Box::pin(async move {
-                rebuild_client_endpoint(client_builder(&relay_config, secret)?).await
+                let builder = client_builder(&relay_config, secret)?;
+                rebuild_client_endpoint(&relay_config, builder).await
             })
         })
     };
@@ -216,19 +222,25 @@ async fn create_client(
 ///   hints and mDNS can still reach the server without a home relay — and the
 ///   reconnect loop that asked for the rebuild escalates again if the relays
 ///   stay unreachable.
-async fn rebuild_client_endpoint(builder: EndpointBuilder) -> Result<Endpoint> {
+///
+/// The wait is the shared crate's [`online_timeout`] for an endpoint waited on
+/// without the startup probe: [`RELAY_CONNECT_TIMEOUT`], plus iroh's QUIC
+/// address discovery probe timeout where the endpoint runs it, since it picks
+/// no home relay until those probes are done.
+async fn rebuild_client_endpoint(
+    relay_config: &RelayConfig,
+    builder: EndpointBuilder,
+) -> Result<Endpoint> {
     let endpoint = builder
         .bind()
         .await
         .context("Failed to create iroh endpoint")?;
-    if tokio::time::timeout(RELAY_CONNECT_TIMEOUT, endpoint.online())
-        .await
-        .is_err()
-    {
+    let wait = online_timeout(relay_config, &endpoint);
+    if tokio::time::timeout(wait, endpoint.online()).await.is_err() {
         log::warn!(
             "Rebuilt endpoint has no connected home relay after {}s; continuing (relay hints \
              and local discovery may still reach the server)",
-            RELAY_CONNECT_TIMEOUT.as_secs()
+            wait.as_secs()
         );
     }
     Ok(endpoint)
@@ -272,6 +284,11 @@ pub struct ClientEndpoint {
     /// endpoint and have the second discard (and close) the first's good one.
     /// [`Self::close`] takes it too, so it waits a rebuild in flight out.
     rebuilding: Arc<tokio::sync::Mutex<()>>,
+    /// The closes of the endpoints rebuilds replaced, each a task of its own,
+    /// for [`Self::close`] to wait for: one still running when the session's
+    /// runtime goes would be dropped with it. A wait given up on loses none
+    /// of them: the next one finds them all the same.
+    replaced: TaskTracker,
 }
 
 /// The installed endpoint plus how many rebuilds produced it, so a rebuild
@@ -295,6 +312,7 @@ impl ClientEndpoint {
             })),
             factory,
             rebuilding: Arc::new(tokio::sync::Mutex::new(())),
+            replaced: TaskTracker::new(),
         }
     }
 
@@ -351,8 +369,9 @@ impl ClientEndpoint {
                 std::mem::replace(&mut current.endpoint, fresh)
             };
             // Graceful close on its own task: bounded wait below, but the task
-            // is never cancelled (see [`REBUILD_CLOSE_TIMEOUT`]).
-            Ok(Some(tokio::spawn(async move { old.close().await })))
+            // is never cancelled (see [`REBUILD_CLOSE_TIMEOUT`]). It is
+            // tracked for `close`, which waits for this lock and so finds it.
+            Ok(Some(this.replaced.spawn(async move { old.close().await })))
         });
         let close = match swap.await {
             Ok(swapped) => swapped?,
@@ -373,7 +392,15 @@ impl ClientEndpoint {
 
     /// Close the current endpoint gracefully (session teardown). A rebuild in
     /// flight is waited out first, so the endpoint it installs is the one
-    /// closed here; none is installed after.
+    /// closed here; none is installed after. The closes of the endpoints that
+    /// rebuilds replaced are waited for as well, where still running.
+    ///
+    /// Run it to its end: it is not made to be dropped part-way and called
+    /// again. A second call still waits for the replaced endpoints, but not
+    /// for the current one once the first call began closing it, since iroh
+    /// returns at once for an endpoint that is already closing. A caller that
+    /// cannot wait keeps the one close running, on a task say, and stops
+    /// waiting for it.
     pub async fn close(&self) {
         let _serialized = self.rebuilding.lock().await;
         let endpoint = {
@@ -381,7 +408,9 @@ impl ClientEndpoint {
             current.closed = true;
             current.endpoint.clone()
         };
-        endpoint.close().await;
+        // Nothing is replaced from here on, so the wait can end.
+        self.replaced.close();
+        futures::future::join(endpoint.close(), self.replaced.wait()).await;
     }
 }
 
@@ -412,6 +441,40 @@ mod tests {
         assert!(first.is_closed(), "the replaced endpoint is closed");
         handle.close().await;
         assert!(handle.endpoint().is_closed());
+    }
+
+    /// A close waits for the close of an endpoint a rebuild replaced, which
+    /// runs on a task of its own: here one that is held open and let go only
+    /// once the close has had time to return without it. A close given up on
+    /// before that leaves it for the next one to wait for.
+    #[tokio::test]
+    async fn a_close_waits_for_the_close_of_a_replaced_endpoint() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let handle = ClientEndpoint::from_parts(
+            loopback().bind().await.unwrap(),
+            Arc::new(|| Box::pin(async { loopback().bind().await.map_err(Into::into) })),
+        );
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let over = Arc::new(AtomicBool::new(false));
+        handle.replaced.spawn({
+            let over = over.clone();
+            async move {
+                // Gives up if the close never lets this test get to release.
+                let _ = tokio::time::timeout(Duration::from_secs(30), released).await;
+                over.store(true, Ordering::SeqCst);
+            }
+        });
+        let given_up = tokio::time::timeout(Duration::from_millis(100), handle.close()).await;
+        assert!(given_up.is_err(), "the close waits while it is held");
+
+        // On this test's single thread the held task cannot run between its
+        // release and the join returning, unless the close is waiting for it.
+        tokio::join!(handle.close(), async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            release.send(()).unwrap();
+        });
+        assert!(over.load(Ordering::SeqCst), "the close waited for it");
     }
 
     #[tokio::test]
@@ -493,15 +556,9 @@ mod tests {
         let fresh = handle.endpoint();
         assert_ne!(fresh.id(), first.id(), "the rebuild was installed");
         assert!(fresh.is_closed(), "and closed by the close");
-        // The replaced one closes on a task of its own, which nobody waited
-        // for once the caller was dropped.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !first.is_closed() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the replaced endpoint closes");
+        // The replaced one closes on a task of its own, which the close
+        // waited for with the caller dropped.
+        assert!(first.is_closed(), "the replaced endpoint is closed");
         assert!(
             handle.rebuild().await.is_err(),
             "nothing is built after a close"

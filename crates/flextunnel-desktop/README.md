@@ -152,7 +152,10 @@ showing the endpoint id it gives — and *Create server* goes straight on to aut
   the new endpoint id).
 - **Tunnel set & relays** — the routed domains/CIDRs clients may reach through
   this server, enforced here, plus custom relays; optional, and edited any
-  time. Clients route by their own lists, so a client must also list a route
+  time. With relay URLs entered, the form — a destination's too — has a tick
+  for whether those relays serve QUIC address discovery: on unless unticked,
+  which is for relays behind a Cloudflare Tunnel or another HTTP-only front,
+  where it otherwise delays each start by up to 3 s. Clients route by their own lists, so a client must also list a route
   to send it here. Always reachable by its clients, under the name each gives
   this server: this computer's own `localhost` at
   `<name>.localhost.flextunnel.internal`, and this server's status page at

@@ -29,7 +29,7 @@ use flextunnel_core::proxy::{
     ClientAuth, ClientConfig, DestinationConfig, DestinationStatus, HeldDestination,
     LocalListeners, ProxyClient, ServerRoutes,
 };
-use flextunnel_core::transport::endpoint::RelayConfig;
+use flextunnel_core::transport::endpoint::{RelayConfig, tear_down_runtime};
 use flextunnel_core::transport::paths::ConnectionSnapshot;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,10 +49,12 @@ pub const CLIENT_THREAD_NAME: &str = "client";
 /// hang if a session stalls.
 const CONN_PATH_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bound on the client's graceful endpoint close at teardown. The close waits
-/// out an endpoint still being built (see `ProxyClient::close`), which a stop
-/// during a slow dial must not hang behind; an ordinary close finishes well
-/// inside it.
+/// How long a stopping client waits for its graceful endpoint close before it
+/// reports itself stopped. The close waits out an endpoint still being built
+/// (see `ProxyClient::close`), which a stop during a slow dial must not hang
+/// behind; an ordinary close finishes well inside it. A close that takes
+/// longer is not given up on: it runs on, and the session's runtime with it,
+/// after the session has said it stopped (see [`spawn_client`]).
 const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -461,15 +463,54 @@ fn spawn_client(
                 .thread_name(CLIENT_THREAD_NAME)
                 .enable_all()
                 .build();
-            match runtime {
-                Ok(rt) => rt.block_on(run_client(
-                    spec,
-                    forwards,
-                    session_rx,
-                    slot,
-                    session_handled,
-                )),
-                Err(e) => slot.fail(format!("Failed to build the client runtime: {e:#}")),
+            let runtime = match runtime {
+                Ok(runtime) => runtime,
+                Err(e) => {
+                    slot.fail(format!("Failed to build the client runtime: {e:#}"));
+                    let _ = done_tx.send(());
+                    return;
+                }
+            };
+            let ended = runtime.block_on(run_client(
+                spec,
+                forwards,
+                session_rx,
+                slot.clone(),
+                session_handled,
+            ));
+            if let Some(Ended {
+                client,
+                failure,
+                rx,
+            }) = ended
+            {
+                // Close the endpoints in use gracefully before they are
+                // dropped (see the CLI's close_or_exit for why an ungraceful
+                // drop is fatal under panic=abort). The wait is bounded, the
+                // close is not: one still running when the wait is up keeps
+                // this runtime, on a thread of its own, until it is over.
+                // Dropping the runtime instead would cut it short, with an
+                // endpoint build or a relay probe still on it.
+                let close = async move { client.close().await };
+                if !tear_down_runtime(runtime, close, SESSION_CLOSE_TIMEOUT, CLIENT_THREAD_NAME) {
+                    log::warn!(
+                        "Closing the client's endpoints is taking long; the client is \
+                         stopped, and the close goes on in the background"
+                    );
+                }
+                slot.update(|s| {
+                    *s = match failure {
+                        Some(reason) => ClientSnapshot {
+                            phase: ClientPhase::Failed,
+                            last_error: Some(reason),
+                            ..ClientSnapshot::default()
+                        },
+                        None => ClientSnapshot::default(),
+                    };
+                });
+                // Kept until here, so the supervisor starts nothing new
+                // before the close is done or given up waiting for.
+                drop(rx);
             }
             let _ = done_tx.send(());
         });
@@ -858,9 +899,10 @@ fn held_destination(destination: &Destination) -> HeldDestination {
 fn destination_config(spec: &DestinationSpec) -> Result<DestinationConfig, String> {
     let destination = &spec.destination;
     let name = &destination.name;
-    let relay = RelayConfig::from_urls_with_token(
+    let relay = RelayConfig::from_settings(
         &destination.relay_urls,
         destination.relay_auth_token.clone(),
+        crate::config::relay_quic_addr_discovery_setting(destination.relay_quic_addr_discovery),
     )
     .map_err(|e| format!("Destination \"{name}\": invalid relay configuration: {e:#}"))?;
     let client_key = flextunnel_core::auth::ClientKey::from_secret_str(spec.auth_secret.trim())
@@ -881,13 +923,29 @@ fn destination_config(spec: &DestinationSpec) -> Result<DestinationConfig, Strin
     })
 }
 
+/// A session that ran and is over, for [`spawn_client`] to close.
+struct Ended {
+    /// The client whose endpoints are still to be closed.
+    client: Arc<ProxyClient>,
+    /// Why the session failed, for its final snapshot; `None` when it was
+    /// stopped.
+    failure: Option<String>,
+    /// The session's command receiver: the supervisor takes the session for
+    /// gone once it is dropped.
+    rx: mpsc::Receiver<SessionCmd>,
+}
+
+/// Run the client session until it is stopped or fails. Returns what is left
+/// to close, with the snapshot at [`ClientPhase::Stopping`]; `None` when the
+/// session failed before any endpoint existed, its failure already in the
+/// snapshot.
 async fn run_client(
     spec: ClientSpec,
     mut forwards: Vec<PortForward>,
     mut rx: mpsc::Receiver<SessionCmd>,
     slot: ClientSlot,
     handled: Arc<AtomicU64>,
-) {
+) -> Option<Ended> {
     let mut spec = Arc::new(spec);
     slot.update(|s| {
         *s = ClientSnapshot {
@@ -901,7 +959,10 @@ async fn run_client(
     // a bad setting fails the session cleanly rather than panicking.
     let destinations = match spec.destinations.iter().map(destination_config).collect() {
         Ok(destinations) => destinations,
-        Err(reason) => return slot.fail(reason),
+        Err(reason) => {
+            slot.fail(reason);
+            return None;
+        }
     };
     // Building the client validates the names and routes together and dials
     // nothing.
@@ -911,7 +972,10 @@ async fn run_client(
         idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
     }) {
         Ok(client) => Arc::new(client),
-        Err(e) => return slot.fail(e.to_string()),
+        Err(e) => {
+            slot.fail(e.to_string());
+            return None;
+        }
     };
 
     // Bind enabled proxy front-ends before any forward listener exists. A
@@ -922,7 +986,10 @@ async fn run_client(
     let mut serves = match serve_proxies(&client, &spec).await {
         Ok(serves) => serves,
         // No endpoint exists yet, so there is nothing to close.
-        Err(reason) => return slot.fail(reason),
+        Err(reason) => {
+            slot.fail(reason);
+            return None;
+        }
     };
 
     // Forwards listen for the whole session, whatever the connections are
@@ -1053,10 +1120,7 @@ async fn run_client(
 
     // The select loop is done with `run`; dropping it cancels the client.
     // Tear the forward listeners down with the session so their rows read
-    // "stopped" immediately, then close the endpoints in use gracefully before
-    // they are dropped (see the CLI's close_or_exit for why an ungraceful drop
-    // is fatal under panic=abort). The command receiver lives until this
-    // returns, so the supervisor starts nothing new before the close is done.
+    // "stopped" immediately; the caller then closes the endpoints in use.
     slot.update(|s| {
         s.phase = ClientPhase::Stopping;
         s.spec = None;
@@ -1067,22 +1131,11 @@ async fn run_client(
     drop(fwd_mgr);
     drop(serves);
     drop(manage);
-    if tokio::time::timeout(SESSION_CLOSE_TIMEOUT, client.close())
-        .await
-        .is_err()
-    {
-        log::warn!("Closing the client's endpoints is taking too long; giving up");
-    }
-    slot.update(|s| {
-        *s = match failure {
-            Some(reason) => ClientSnapshot {
-                phase: ClientPhase::Failed,
-                last_error: Some(reason),
-                ..ClientSnapshot::default()
-            },
-            None => ClientSnapshot::default(),
-        };
-    });
+    Some(Ended {
+        client,
+        failure,
+        rx,
+    })
 }
 
 #[cfg(test)]
@@ -1108,6 +1161,7 @@ mod tests {
             auth_key_id: auth_key_id.into(),
             relay_urls: Vec::new(),
             relay_auth_token: None,
+            relay_quic_addr_discovery: true,
         }
     }
 
@@ -1203,8 +1257,21 @@ mod tests {
         let mut bad_server = good.clone();
         bad_server.server_node_id = "nope".into();
         assert!(err(spec(bad_server, &secret)).contains("invalid server node id"));
-        let mut one_relay = good;
-        one_relay.relay_urls = vec!["https://relay.example".into()];
-        assert!(err(spec(one_relay, &secret)).contains("invalid relay configuration"));
+        let mut one_relay = good.clone();
+        one_relay.relay_urls = vec!["https://only.example".into()];
+        let config = destination_config(&spec(one_relay.clone(), &secret)).expect("one relay");
+        assert_eq!(config.relay.custom_urls().len(), 1);
+        assert_eq!(config.relay.quic_addr_discovery(), Some(true));
+        // QUIC address discovery is as stored for custom relays; turned off
+        // with the default ones (a hand-edited file), it cannot be used.
+        let mut discovery_off = one_relay;
+        discovery_off.relay_quic_addr_discovery = false;
+        let config = destination_config(&spec(discovery_off.clone(), &secret)).expect("off");
+        assert_eq!(config.relay.quic_addr_discovery(), Some(false));
+        discovery_off.relay_urls.clear();
+        assert!(err(spec(discovery_off, &secret)).contains("invalid relay configuration"));
+        let mut bad_relay = good;
+        bad_relay.relay_urls = vec!["not a url".into()];
+        assert!(err(spec(bad_relay, &secret)).contains("invalid relay configuration"));
     }
 }

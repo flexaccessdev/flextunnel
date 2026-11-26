@@ -9,19 +9,22 @@
 //! nothing), [`PreparedServer::bind`] creates the iroh endpoint (may take a
 //! while — the relay online-wait), and [`RunningServer::serve`] runs until the
 //! server ends. The caller owns shutdown: it races `serve` against its own
-//! stop signal, then closes [`RunningServer::endpoint`] gracefully (an
-//! ungraceful drop panics under panic=abort).
+//! stop signal, then awaits [`RunningServer::close`] (an ungraceful drop
+//! panics under panic=abort).
 
 use crate::blocklist::BlockList;
 use crate::flexaccess_iroh::endpoint::CreatedEndpoint;
+use crate::flexaccess_iroh::relay::RelayProbes;
 use crate::flexaccess_iroh::relay_failover::fail_over_home_relay;
 use crate::lock::InstanceLock;
 use crate::proxy::{ProxyServer, ProxyServerParams, RoutedSet};
 use crate::secret::secret_to_endpoint_id;
-use crate::transport::endpoint::{RelayConfig, create_server_endpoint, server_setup};
+use crate::transport::endpoint::{
+    PendingCloses, RelayConfig, create_server_endpoint, server_setup,
+};
 use anyhow::{Context, Result};
 use iroh::endpoint::Builder as EndpointBuilder;
-use iroh::{Endpoint, EndpointId, RelayUrl, SecretKey};
+use iroh::{Endpoint, EndpointId, SecretKey};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,6 +45,9 @@ pub struct ServerOptions {
     pub relay_urls: Vec<String>,
     /// Shared bearer token for custom relays (custom relays only).
     pub relay_auth_token: Option<String>,
+    /// Whether the custom relays serve QUIC address discovery (custom relays
+    /// only); `None` keeps the default, on.
+    pub relay_quic_addr_discovery: Option<bool>,
     /// Server-side host aliases, keys lowercased.
     pub host_aliases: HashMap<String, String>,
     /// The tunnel set; may be empty (the server's own loopback and status
@@ -112,6 +118,7 @@ pub fn prepare(opts: ServerOptions) -> Result<PreparedServer> {
         first_client,
         relay_urls,
         relay_auth_token,
+        relay_quic_addr_discovery,
         host_aliases,
         routed_domains,
         routed_cidrs,
@@ -157,8 +164,9 @@ pub fn prepare(opts: ServerOptions) -> Result<PreparedServer> {
     let routed_set = RoutedSet::new(&routed_domains, &routed_cidrs)
         .context("Invalid routed-set configuration")?;
 
-    let relay_config = RelayConfig::from_urls_with_token(&relay_urls, relay_auth_token)
-        .context("Invalid relay configuration")?;
+    let relay_config =
+        RelayConfig::from_settings(&relay_urls, relay_auth_token, relay_quic_addr_discovery)
+            .context("Invalid relay configuration")?;
 
     if !host_aliases.is_empty() {
         log::info!("Loaded {} host alias(es)", host_aliases.len());
@@ -200,21 +208,27 @@ impl PreparedServer {
         server_setup(base, self.secret_key.clone(), self.quick_clients.clone())
     }
 
-    /// Bind the iroh endpoint (with the relays that pass the startup probe).
-    /// Can take several seconds (the relay online-wait).
-    pub async fn bind(self) -> Result<RunningServer> {
-        let CreatedEndpoint {
-            endpoint,
-            relays_left_out,
-        } = create_server_endpoint(&self.relay_config, |base| self.endpoint_on(base))
-            .await
-            .context("Failed to create iroh endpoint")?;
+    /// Bind the iroh endpoint (with every configured relay; the startup probe
+    /// runs beside it and takes out the relays that fail). Can take several
+    /// seconds (the relay online-wait).
+    ///
+    /// `closes` is the caller's, since a bind that fails leaves work in it
+    /// too: the startup probe's task and endpoints, and the close of an
+    /// endpoint that never came online, if it is slow. A caller whose runtime
+    /// ends with the failed start waits for [`PendingCloses::finished`] first.
+    /// On success the server keeps it, and [`RunningServer::close`] drains it.
+    pub async fn bind(self, closes: PendingCloses) -> Result<RunningServer> {
+        let CreatedEndpoint { endpoint, relays } =
+            create_server_endpoint(&self.relay_config, &closes, |base| self.endpoint_on(base))
+                .await
+                .context("Failed to create iroh endpoint")?;
         log::info!("flextunnel server Node ID: {}", endpoint.id());
         Ok(RunningServer {
             endpoint,
             server: self.server,
             relay_config: self.relay_config,
-            relays_left_out,
+            relays: Some(relays),
+            closes,
         })
     }
 
@@ -232,7 +246,8 @@ impl PreparedServer {
             endpoint,
             server: self.server,
             relay_config: self.relay_config,
-            relays_left_out: Vec::new(),
+            relays: None,
+            closes: PendingCloses::new(),
         }
     }
 }
@@ -242,7 +257,13 @@ pub struct RunningServer {
     endpoint: Endpoint,
     server: Arc<ProxyServer>,
     relay_config: RelayConfig,
-    relays_left_out: Vec<RelayUrl>,
+    /// The startup relay probe the failover waits for and restores from;
+    /// `None` on a test endpoint bound without the relay setup, which runs no
+    /// failover.
+    relays: Option<RelayProbes>,
+    /// The startup probe's task and endpoints, which may outlast the bind,
+    /// and any close the bind stopped waiting for: drained by [`Self::close`].
+    closes: PendingCloses,
 }
 
 impl RunningServer {
@@ -261,21 +282,43 @@ impl RunningServer {
     /// reachable from off the LAN only through its home relay (n0 discovery is
     /// off, clients dial by relay hint), and if that relay is lost for a minute
     /// without iroh re-homing on its own, the failover moves the endpoint onto
-    /// another configured relay in place. Nothing is torn down: the identity,
-    /// the quick-client allowlist, the direct paths and the established
-    /// connections all stay. Relays the startup probe could not connect (the
-    /// endpoint was bound without them) are put back by the same failover once
-    /// they are. With the default relays the failover future is pending
-    /// forever.
+    /// another configured relay in place (a single custom relay has none to
+    /// move to). Nothing is torn down: the identity, the quick-client
+    /// allowlist, the direct paths and the established connections all stay.
+    /// Relays the startup probe could not connect (taken out of the relay map)
+    /// are put back by the same failover once they are. With the default
+    /// relays the failover future is pending forever.
     ///
-    /// Cancel-safe: drop the future to stop serving, then close
-    /// [`endpoint`](Self::endpoint).
+    /// Cancel-safe: drop the future to stop serving, then await
+    /// [`close`](Self::close).
     pub async fn serve(&self) -> Result<()> {
         tokio::select! {
             res = Arc::clone(&self.server).run(&self.endpoint) => {
                 res.map_err(|e| anyhow::anyhow!("Server error: {e}"))
             }
-            () = fail_over_home_relay(&self.endpoint, &self.relay_config, &self.relays_left_out) => Ok(()),
+            () = self.fail_over() => Ok(()),
+        }
+    }
+
+    /// Close the endpoint gracefully, then wait for what its startup left
+    /// running: the relay probe, whose probe endpoints are still open for up
+    /// to [`RELAY_CONNECT_TIMEOUT`] after the start when a relay does not
+    /// answer (the endpoint's close stops the probe, which closes them), and
+    /// any close the bind stopped waiting for. A process or runtime that
+    /// ended sooner would drop them without `close()`. Neither close has a
+    /// deadline of its own: the caller bounds the whole.
+    ///
+    /// [`RELAY_CONNECT_TIMEOUT`]: crate::flexaccess_iroh::relay::RELAY_CONNECT_TIMEOUT
+    pub async fn close(&self) {
+        self.endpoint.close().await;
+        self.closes.finished().await;
+    }
+
+    /// The home-relay failover, pending forever without a startup probe.
+    async fn fail_over(&self) {
+        match &self.relays {
+            Some(relays) => fail_over_home_relay(&self.endpoint, &self.relay_config, relays).await,
+            None => std::future::pending().await,
         }
     }
 }
@@ -297,6 +340,7 @@ mod tests {
             first_client: None,
             relay_urls: Vec::new(),
             relay_auth_token: None,
+            relay_quic_addr_discovery: None,
             host_aliases: HashMap::new(),
             routed_domains: vec!["*".into()],
             routed_cidrs: Vec::new(),
@@ -339,6 +383,34 @@ mod tests {
             prepare(opts).is_ok(),
             "loopback and status need no routed set"
         );
+    }
+
+    /// One custom relay is reduced-redundancy mode (no failover), not an error.
+    #[test]
+    fn prepare_accepts_a_single_custom_relay() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = options(dir.path());
+        opts.relay_urls = vec!["https://only.example".into()];
+        let prepared = prepare(opts).unwrap();
+        assert_eq!(prepared.relay_config.custom_urls().len(), 1);
+        assert_eq!(prepared.relay_config.quic_addr_discovery(), Some(true));
+    }
+
+    /// QUIC address discovery follows the option for custom relays, and the
+    /// option is refused with the default relays, which keep iroh's own.
+    #[test]
+    fn prepare_takes_the_relay_quic_addr_discovery_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut off = options(dir.path());
+        off.relay_urls = vec!["https://only.example".into()];
+        off.relay_quic_addr_discovery = Some(false);
+        let prepared = prepare(off).unwrap();
+        assert_eq!(prepared.relay_config.quic_addr_discovery(), Some(false));
+
+        let mut stray = options(dir.path());
+        stray.relay_quic_addr_discovery = Some(false);
+        let err = prepare(stray).err().expect("default relays");
+        assert!(format!("{err:#}").contains("relay_urls"), "{err:#}");
     }
 
     #[test]

@@ -1913,8 +1913,8 @@ dependencies = [
 
 [[package]]
 name = "flexaccess-iroh"
-version = "0.0.19"
-source = "git+https://github.com/flexaccessdev/flexaccess-iroh?tag=v0.0.19#67bb55080dd62d32b0a69c836b9fbfa0dbc0d0cb"
+version = "0.0.29"
+source = "git+https://github.com/flexaccessdev/flexaccess-iroh?tag=v0.0.29#085b8ecc5a08cc7d71c68720dc48cd4030acb3b2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1943,7 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-cli"
-version = "0.0.112"
+version = "0.0.113"
 dependencies = [
  "anyhow",
  "clap",
@@ -1960,7 +1960,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-core"
-version = "0.0.112"
+version = "0.0.113"
 dependencies = [
  "anyhow",
  "askama",
@@ -1984,13 +1984,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "toml 1.2.1+spec-1.1.0",
  "url",
 ]
 
 [[package]]
 name = "flextunnel-desktop"
-version = "0.0.112"
+version = "0.0.113"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
@@ -2022,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-ffi"
-version = "0.0.112"
+version = "0.0.113"
 dependencies = [
  "android_logger",
  "flextunnel-core",
