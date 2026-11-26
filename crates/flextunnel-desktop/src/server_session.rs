@@ -91,6 +91,11 @@ impl ServerSlot {
 
     fn fail(&self, reason: String) {
         log::error!("{reason}");
+        self.failed(reason);
+    }
+
+    /// [`Self::fail`] for a failure already logged.
+    fn failed(&self, reason: String) {
         self.update(|s| {
             *s = ServerSnapshot {
                 phase: ServerPhase::Failed,
@@ -226,8 +231,16 @@ async fn run_server(server: ServerConfig, mut rx: mpsc::Receiver<ServerCmd>, slo
         bound = &mut bind => match bound.map_err(anyhow::Error::from) {
             Ok(Ok(running)) => running,
             Ok(Err(e)) | Err(e) => {
+                // The reason shows at once, with the server as stopping for
+                // as long as the wait takes.
+                let reason = format!("{e:#}");
+                log::error!("{reason}");
+                slot.update(|s| {
+                    s.phase = ServerPhase::Stopping;
+                    s.last_error = Some(reason.clone());
+                });
                 closed(closes.finished()).await;
-                return slot.fail(format!("{e:#}"));
+                return slot.failed(reason);
             }
         },
         cmd = rx.recv() => {
