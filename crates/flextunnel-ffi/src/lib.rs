@@ -115,7 +115,7 @@ use flextunnel_core::proxy::{
     ClientAuth, ClientConfig, DestinationConfig, ForwardManager, ForwardSpec, ForwardState,
     LocalListeners, ProxyClient,
 };
-use flextunnel_core::transport::endpoint::relay_config;
+use flextunnel_core::transport::endpoint::{RelayConfig, tear_down_runtime};
 use flextunnel_core::transport::paths::ConnPathKind;
 
 /// The thread a routes request runs on (see
@@ -424,7 +424,7 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
         None => (None, None),
     };
 
-    let relay = relay_config(
+    let relay = RelayConfig::from_settings(
         &cfg.relay_urls,
         cfg.relay_auth_token,
         cfg.relay_quic_addr_discovery,
@@ -563,7 +563,7 @@ pub unsafe extern "C" fn flextunnel_fetch_server_routes(
 fn fetch_server_routes_inner(json: &str) -> Result<String, String> {
     let request: FfiRoutesRequest =
         serde_json::from_str(json).map_err(|e| format!("invalid request JSON: {e}"))?;
-    let relay = relay_config(
+    let relay = RelayConfig::from_settings(
         &request.relay_urls,
         request.relay_auth_token,
         request.relay_quic_addr_discovery,
@@ -1095,40 +1095,22 @@ fn stop_handle(handle: FlextunnelHandle) {
     // Close the endpoints of the destinations in use before they drop.
     // Skipping this makes iroh tear down its relay tasks ungracefully (a
     // JoinSet abort that panics — fatal under panic=abort). The session task is
-    // awaited first so nothing is still using them; `block_on` is safe here,
-    // on the app's own thread. The wait is bounded — the close waits out an
-    // endpoint build in flight, and stopping must not hang the caller on a
-    // slow one — but only the wait: the close is a task of its own, and one
-    // still running when the wait is up is finished on a thread of its own,
-    // which keeps the runtime until then. Shutting the runtime down here would
+    // awaited first so nothing is still using them; blocking on the runtime
+    // is safe here, on the app's own thread. The wait is bounded — the close
+    // waits out an endpoint build in flight, and stopping must not hang the
+    // caller on a slow one — but only the wait: a close still running when it
+    // is up is finished on a thread of its own, which keeps the runtime until
+    // then (see `tear_down_runtime`). Shutting the runtime down here would
     // cut the close short, with the build or a relay probe still on it.
-    let mut closing = runtime.spawn(async move {
+    let close = async move {
         let _ = task.await;
         client.close().await;
-    });
-    let closed = runtime.block_on(async {
-        tokio::time::timeout(STOP_CLOSE_TIMEOUT, &mut closing)
-            .await
-            .is_ok()
-    });
-    if closed {
-        runtime.shutdown_background();
-        return;
-    }
-    log::warn!(
-        "Closing the client's endpoints is taking long; stopped, and the close goes on in \
-         the background"
-    );
-    // If the thread cannot be spawned its closure is dropped, and the runtime
-    // with it: the close is cut short, as it would be without the thread.
-    let spawned = std::thread::Builder::new()
-        .name(CLOSE_THREAD_NAME.into())
-        .spawn(move || {
-            let _ = runtime.block_on(closing);
-            runtime.shutdown_background();
-        });
-    if let Err(e) = spawned {
-        log::warn!("Could not finish closing the client's endpoints: {e}");
+    };
+    if !tear_down_runtime(runtime, close, STOP_CLOSE_TIMEOUT, CLOSE_THREAD_NAME) {
+        log::warn!(
+            "Closing the client's endpoints is taking long; stopped, and the close goes on \
+             in the background"
+        );
     }
 }
 

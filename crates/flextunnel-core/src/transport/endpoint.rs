@@ -9,10 +9,10 @@
 
 use crate::transport::{ALPN, QUICK_ALPN, build_quic_transport_config};
 use anyhow::{Context, Result};
-pub use flexaccess_iroh::endpoint::PendingCloses;
 use flexaccess_iroh::endpoint::{
     CreatedEndpoint, EndpointOptions, create_endpoint, endpoint_builder,
 };
+pub use flexaccess_iroh::endpoint::{PendingCloses, tear_down_runtime};
 use flexaccess_iroh::relay::online_timeout;
 use futures::future::BoxFuture;
 use iroh::{
@@ -26,23 +26,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use flexaccess_iroh::relay::{RELAY_CONNECT_TIMEOUT, RelayConfig};
-
-/// The relay configuration from the settings as configured: the relay URLs
-/// (none selects the default relays), the shared auth token, and whether the
-/// custom relays serve QUIC address discovery. `None` there keeps the crate's
-/// default, on; a value is an error with the default relays, like a token,
-/// since those keep iroh's own settings.
-pub fn relay_config(
-    urls: &[String],
-    auth_token: Option<String>,
-    quic_addr_discovery: Option<bool>,
-) -> Result<RelayConfig> {
-    let config = RelayConfig::from_urls_with_token(urls, auth_token)?;
-    match quic_addr_discovery {
-        Some(enabled) => config.with_quic_addr_discovery(enabled),
-        None => Ok(config),
-    }
-}
 
 /// QUIC application close code sent when a quick client on [`QUICK_ALPN`] is
 /// rejected by the endpoint-id allowlist (distinct from the in-band

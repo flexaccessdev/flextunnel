@@ -244,7 +244,7 @@ impl ResolvedClient {
     /// client is built from the result.
     pub fn proxy_config(&self) -> Result<crate::proxy::ClientConfig> {
         use crate::proxy::{ClientAuth, DestinationConfig};
-        use crate::transport::endpoint::{RelayConfig, relay_config};
+        use crate::transport::endpoint::RelayConfig;
 
         if self.destinations.is_empty() {
             anyhow::bail!(
@@ -259,7 +259,7 @@ impl ResolvedClient {
         // back to them: a top-level token or QUIC address discovery setting
         // with no top-level relays to apply to is a mistake either way, and
         // would pass unnoticed when every destination names its own.
-        let default_relay: RelayConfig = relay_config(
+        let default_relay = RelayConfig::from_settings(
             &self.relay_urls,
             self.relay_auth_token.clone(),
             self.relay_quic_addr_discovery,
@@ -293,7 +293,7 @@ impl ResolvedClient {
             };
 
             let relay = match &entry.relay_urls {
-                Some(urls) => relay_config(
+                Some(urls) => RelayConfig::from_settings(
                     urls,
                     entry.relay_auth_token.clone(),
                     entry.relay_quic_addr_discovery,

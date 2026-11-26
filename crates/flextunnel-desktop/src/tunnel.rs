@@ -29,7 +29,7 @@ use flextunnel_core::proxy::{
     ClientAuth, ClientConfig, DestinationConfig, DestinationStatus, HeldDestination,
     LocalListeners, ProxyClient, ServerRoutes,
 };
-use flextunnel_core::transport::endpoint::{RelayConfig, relay_config};
+use flextunnel_core::transport::endpoint::{RelayConfig, tear_down_runtime};
 use flextunnel_core::transport::paths::ConnectionSnapshot;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,7 +54,7 @@ const CONN_PATH_TIMEOUT: Duration = Duration::from_secs(5);
 /// (see `ProxyClient::close`), which a stop during a slow dial must not hang
 /// behind; an ordinary close finishes well inside it. A close that takes
 /// longer is not given up on: it runs on, and the session's runtime with it,
-/// after the session has said it stopped (see [`run_client`]).
+/// after the session has said it stopped (see [`spawn_client`]).
 const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -471,22 +471,48 @@ fn spawn_client(
                     return;
                 }
             };
-            let closing = runtime.block_on(run_client(
+            let ended = runtime.block_on(run_client(
                 spec,
                 forwards,
                 session_rx,
-                slot,
+                slot.clone(),
                 session_handled,
             ));
-            // The session is over for everyone waiting on it. A close it
-            // stopped waiting for still runs on this runtime, which is kept
-            // until that close is over: dropping it now would cut the close
-            // short, with an endpoint build or a relay probe still on it.
-            let _ = done_tx.send(());
-            if let Some(closing) = closing {
-                let _ = runtime.block_on(closing);
-                log::info!("The stopped client's endpoints have finished closing");
+            if let Some(Ended {
+                client,
+                failure,
+                rx,
+            }) = ended
+            {
+                // Close the endpoints in use gracefully before they are
+                // dropped (see the CLI's close_or_exit for why an ungraceful
+                // drop is fatal under panic=abort). The wait is bounded, the
+                // close is not: one still running when the wait is up keeps
+                // this runtime, on a thread of its own, until it is over.
+                // Dropping the runtime instead would cut it short, with an
+                // endpoint build or a relay probe still on it.
+                let close = async move { client.close().await };
+                if !tear_down_runtime(runtime, close, SESSION_CLOSE_TIMEOUT, CLIENT_THREAD_NAME) {
+                    log::warn!(
+                        "Closing the client's endpoints is taking long; the client is \
+                         stopped, and the close goes on in the background"
+                    );
+                }
+                slot.update(|s| {
+                    *s = match failure {
+                        Some(reason) => ClientSnapshot {
+                            phase: ClientPhase::Failed,
+                            last_error: Some(reason),
+                            ..ClientSnapshot::default()
+                        },
+                        None => ClientSnapshot::default(),
+                    };
+                });
+                // Kept until here, so the supervisor starts nothing new
+                // before the close is done or given up waiting for.
+                drop(rx);
             }
+            let _ = done_tx.send(());
         });
     match spawned {
         Ok(_) => Some(SessionHandle {
@@ -873,7 +899,7 @@ fn held_destination(destination: &Destination) -> HeldDestination {
 fn destination_config(spec: &DestinationSpec) -> Result<DestinationConfig, String> {
     let destination = &spec.destination;
     let name = &destination.name;
-    let relay = relay_config(
+    let relay = RelayConfig::from_settings(
         &destination.relay_urls,
         destination.relay_auth_token.clone(),
         crate::config::relay_quic_addr_discovery_setting(destination.relay_quic_addr_discovery),
@@ -897,16 +923,29 @@ fn destination_config(spec: &DestinationSpec) -> Result<DestinationConfig, Strin
     })
 }
 
-/// Run the client session to its end. Returns the close of its endpoints when
-/// that outlasted [`SESSION_CLOSE_TIMEOUT`] and is still running: the caller
-/// keeps this runtime until it is over.
+/// A session that ran and is over, for [`spawn_client`] to close.
+struct Ended {
+    /// The client whose endpoints are still to be closed.
+    client: Arc<ProxyClient>,
+    /// Why the session failed, for its final snapshot; `None` when it was
+    /// stopped.
+    failure: Option<String>,
+    /// The session's command receiver: the supervisor takes the session for
+    /// gone once it is dropped.
+    rx: mpsc::Receiver<SessionCmd>,
+}
+
+/// Run the client session until it is stopped or fails. Returns what is left
+/// to close, with the snapshot at [`ClientPhase::Stopping`]; `None` when the
+/// session failed before any endpoint existed, its failure already in the
+/// snapshot.
 async fn run_client(
     spec: ClientSpec,
     mut forwards: Vec<PortForward>,
     mut rx: mpsc::Receiver<SessionCmd>,
     slot: ClientSlot,
     handled: Arc<AtomicU64>,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<Ended> {
     let mut spec = Arc::new(spec);
     slot.update(|s| {
         *s = ClientSnapshot {
@@ -1081,11 +1120,7 @@ async fn run_client(
 
     // The select loop is done with `run`; dropping it cancels the client.
     // Tear the forward listeners down with the session so their rows read
-    // "stopped" immediately, then close the endpoints in use gracefully before
-    // they are dropped (see the CLI's close_or_exit for why an ungraceful drop
-    // is fatal under panic=abort). The command receiver lives until this
-    // returns, so the supervisor starts nothing new before the close is done
-    // or given up waiting for.
+    // "stopped" immediately; the caller then closes the endpoints in use.
     slot.update(|s| {
         s.phase = ClientPhase::Stopping;
         s.spec = None;
@@ -1096,31 +1131,11 @@ async fn run_client(
     drop(fwd_mgr);
     drop(serves);
     drop(manage);
-    // The close is a task of its own, so that the bounded wait here stops
-    // only the waiting: a close still running then — one behind an endpoint
-    // build, say — is handed back, for the runtime to be kept until it ends.
-    let mut closing = tokio::spawn(async move { client.close().await });
-    let closing = match tokio::time::timeout(SESSION_CLOSE_TIMEOUT, &mut closing).await {
-        Ok(_) => None,
-        Err(_) => {
-            log::warn!(
-                "Closing the client's endpoints is taking long; the client is stopped, and \
-                 the close goes on in the background"
-            );
-            Some(closing)
-        }
-    };
-    slot.update(|s| {
-        *s = match failure {
-            Some(reason) => ClientSnapshot {
-                phase: ClientPhase::Failed,
-                last_error: Some(reason),
-                ..ClientSnapshot::default()
-            },
-            None => ClientSnapshot::default(),
-        };
-    });
-    closing
+    Some(Ended {
+        client,
+        failure,
+        rx,
+    })
 }
 
 #[cfg(test)]

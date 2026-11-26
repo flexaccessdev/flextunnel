@@ -20,7 +20,7 @@ use crate::lock::InstanceLock;
 use crate::proxy::{ProxyServer, ProxyServerParams, RoutedSet};
 use crate::secret::secret_to_endpoint_id;
 use crate::transport::endpoint::{
-    self, PendingCloses, RelayConfig, create_server_endpoint, server_setup,
+    PendingCloses, RelayConfig, create_server_endpoint, server_setup,
 };
 use anyhow::{Context, Result};
 use iroh::endpoint::Builder as EndpointBuilder;
@@ -165,7 +165,7 @@ pub fn prepare(opts: ServerOptions) -> Result<PreparedServer> {
         .context("Invalid routed-set configuration")?;
 
     let relay_config =
-        endpoint::relay_config(&relay_urls, relay_auth_token, relay_quic_addr_discovery)
+        RelayConfig::from_settings(&relay_urls, relay_auth_token, relay_quic_addr_discovery)
             .context("Invalid relay configuration")?;
 
     if !host_aliases.is_empty() {

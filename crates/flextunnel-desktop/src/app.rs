@@ -490,7 +490,7 @@ fn check_relays(
     relay_auth_token: Option<String>,
     relay_quic_addr_discovery: bool,
 ) -> Result<(), String> {
-    flextunnel_core::transport::endpoint::relay_config(
+    flextunnel_core::transport::endpoint::RelayConfig::from_settings(
         relay_urls,
         relay_auth_token,
         config::relay_quic_addr_discovery_setting(relay_quic_addr_discovery),
@@ -607,7 +607,7 @@ impl DestinationForm {
         let key = flextunnel_core::auth::ClientKey::from_secret_str(key.secret.trim())
             .map_err(|e| format!("Auth key \"{}\" is not usable: {e:#}", key.name))?;
         let relay_urls = split_list(&self.relay_urls);
-        let relay = flextunnel_core::transport::endpoint::relay_config(
+        let relay = flextunnel_core::transport::endpoint::RelayConfig::from_settings(
             &relay_urls,
             self.relay_auth_token(),
             config::relay_quic_addr_discovery_setting(stored_quic_addr_discovery(
