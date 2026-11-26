@@ -15,6 +15,7 @@ use crate::proxy::destination::{
 use crate::proxy::route_table::{Route, RouteSpec, RouteTable};
 use crate::proxy::signaling::{self, ControlMsg, StreamRequest, Target};
 use crate::proxy::{client_status, dial, http, socks5, splice};
+use crate::transport::endpoint::PendingCloses;
 use crate::transport::paths::ConnectionSnapshot;
 use crate::transport::{HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL_IDLE, liveness_window};
 use anyhow::Result;
@@ -516,6 +517,9 @@ pub struct ProxyClient {
     /// [`Self::close_local_listeners`]. The accept loops watch the receiving
     /// side and drop their listener when it flips.
     local_close: watch::Sender<bool>,
+    /// The destinations' startup relay probes and the closes their endpoints'
+    /// creation stopped waiting for: drained by [`Self::close`].
+    closes: PendingCloses,
 }
 
 impl ProxyClient {
@@ -524,7 +528,11 @@ impl ProxyClient {
     /// routing rule shared between two destinations (see [`RouteTable::new`]).
     /// Nothing is bound or dialed here — or at all, until a request arrives.
     pub fn new(config: ClientConfig) -> ProxyResult<Self> {
-        Self::with_endpoint_provider(config, default_endpoint_provider())
+        let closes = PendingCloses::new();
+        let mut client =
+            Self::with_endpoint_provider(config, default_endpoint_provider(closes.clone()))?;
+        client.closes = closes;
+        Ok(client)
     }
 
     /// [`Self::new`] with a custom recipe for building a destination's
@@ -571,6 +579,7 @@ impl ProxyClient {
                 listen: Mutex::new(ListenAddrs::default()),
             }),
             local_close: watch::Sender::new(false),
+            closes: PendingCloses::new(),
         })
     }
 
@@ -857,7 +866,10 @@ impl ProxyClient {
     /// built at that moment is waited for and then closed, so this can take as
     /// long as a build does — bound the wait if the caller cannot afford it.
     /// Destinations a reconfigure took out are closed already, or being
-    /// closed: this waits for those closes as well.
+    /// closed: this waits for those closes as well, and then for what the
+    /// endpoints' creation left running — a relay probe stopped by its
+    /// endpoint's close, a close it stopped waiting for — so that none of it
+    /// is dropped with the runtime.
     pub async fn close(&self) {
         // Latched under the reconfigure lock, so the routing taken here is the
         // last one: a reconfigure either committed before (its destinations
@@ -873,6 +885,7 @@ impl ProxyClient {
             futures::future::join_all(retiring),
         )
         .await;
+        self.closes.finished().await;
     }
 }
 

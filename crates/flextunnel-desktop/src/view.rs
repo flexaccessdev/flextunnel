@@ -1616,7 +1616,7 @@ fn destination_form_view<'a>(app: &'a App, form: &'a DestinationForm) -> Element
         form_row(
             "Relay URLs",
             input(
-                "comma-separated, optional — at least two",
+                "comma-separated, optional — two or more for failover",
                 &form.relay_urls,
                 Message::RelayUrlsChanged,
             ),

@@ -382,11 +382,11 @@ nobody waiting (used when a request could not be held, and by embedders that
 want an attempt up front).
 
 **Endpoint.** A destination's endpoint exists only while the destination is in
-use: built on the first dial with the shared `create_client_endpoint` (relay
-probe, bind, online wait), closed when the destination goes idle. It is built
+use: built on the first dial with the shared `create_client_endpoint` (bind,
+relay probe beside it, online wait), closed when the destination goes idle. It is built
 in a detached task so that tearing the client down mid-build never drops a
-bound endpoint; `ProxyClient::close` waits for a build in flight and then
-closes what it produced. Normal clients get a new ephemeral id each time; quick
+bound endpoint; `ProxyClient::close` waits for a build in flight, closes what
+it produced, and then waits for the relay probes that close stopped. Normal clients get a new ephemeral id each time; quick
 mode binds its session secret so it remains allowlisted.
 
 **Failures.** `ConnectionLost`, `Network` and `Signaling` errors — including a
@@ -442,9 +442,12 @@ including its [relay-failover design](https://github.com/flexaccessdev/flexacces
 The client's endpoint rebuild described above is implemented in flextunnel.
 
 Callers close endpoints after serving stops, including error and cancellation
-paths: a server with `endpoint.close().await`, a client with
+paths: a server with `RunningServer::close().await`, a client with
 `ProxyClient::close().await`, which closes the endpoint of every destination in
-use. Dropping an endpoint without closing it
+use. Both then wait for the startup relay probes' own endpoints to close
+(`flexaccess_iroh::endpoint::PendingCloses`): the probe runs beside the
+endpoint and may still be going when a stop follows a start closely. Dropping
+an endpoint without closing it
 tears down iroh's relay tasks ungracefully, a `JoinSet` panic that aborts the
 process under the release profile's `panic = "abort"`.
 

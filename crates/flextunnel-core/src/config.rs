@@ -697,6 +697,20 @@ mod tests {
         assert!(config.destinations.iter().all(|d| !d.keep_connected));
     }
 
+    /// One custom relay is accepted as the default set (`--relay-url` once)
+    /// and as a destination's own.
+    #[test]
+    fn proxy_config_accepts_a_single_custom_relay() {
+        let mut own = entry("m2", 2);
+        own.relay_urls = Some(vec!["https://own.example".to_string()]);
+        let mut resolved = resolved_with(vec![entry("m1", 1), own]);
+        resolved.relay_urls = vec!["https://only.example".to_string()];
+        let config = resolved.proxy_config().unwrap();
+        for destination in &config.destinations {
+            assert_eq!(destination.relay.custom_urls().len(), 1);
+        }
+    }
+
     #[test]
     fn proxy_config_errors_name_the_destination() {
         let err = |resolved: ResolvedClient| match resolved.proxy_config() {

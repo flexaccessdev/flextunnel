@@ -162,7 +162,7 @@ enum ClientAction {
         /// own.
         #[arg(long)]
         auth_key_file: Option<PathBuf>,
-        /// Custom relay server URL(s) for failover (repeatable; at least two),
+        /// Custom relay server URL(s) (repeatable; two or more for failover),
         /// for every destination that does not name its own.
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
@@ -565,7 +565,7 @@ async fn run_server(r: config::ResolvedServer, quick: Option<QuickServer>) -> Re
         }
     };
 
-    close_or_exit(running.endpoint().close()).await;
+    close_or_exit(running.close()).await;
     res
 }
 

@@ -1175,6 +1175,29 @@ mod tests {
         stop_handle(handle);
     }
 
+    /// One custom relay starts a session (reduced-redundancy mode).
+    #[test]
+    fn start_accepts_a_single_custom_relay() {
+        let key = flextunnel_core::auth::ClientKey::generate().unwrap();
+        let json = serde_json::json!({
+            "auth_key": key.secret_str(),
+            "relay_urls": ["https://only.example"],
+            "destinations": [{ "name": "m1", "server_node_id": node_id(1) }],
+        })
+        .to_string();
+        let (handle, _) = start_inner(&json).expect("starts");
+        let status: serde_json::Value =
+            serde_json::from_str(&status_json(&handle.client.status(), Instant::now())).unwrap();
+        assert_eq!(
+            status["destinations"][0]["relay_urls"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        stop_handle(handle);
+    }
+
     #[test]
     fn idle_timeout_zero_means_never() {
         let key = flextunnel_core::auth::ClientKey::generate().unwrap();
@@ -1265,12 +1288,12 @@ mod tests {
             err(serde_json::json!({ "auth_key": "nope", "server_node_id": node_id(1) }))
                 .contains("invalid auth key")
         );
-        let one_relay = serde_json::json!({
+        let bad_relay = serde_json::json!({
             "auth_key": key,
             "server_node_id": node_id(1),
-            "relay_urls": ["https://relay.example"],
+            "relay_urls": ["not a url"],
         });
-        assert!(err(one_relay).contains("invalid relay configuration"));
+        assert!(err(bad_relay).contains("invalid relay configuration"));
     }
 
     // Byte the caller-side buffers below start out holding, so a test can tell

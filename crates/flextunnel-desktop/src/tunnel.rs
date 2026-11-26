@@ -1203,8 +1203,12 @@ mod tests {
         let mut bad_server = good.clone();
         bad_server.server_node_id = "nope".into();
         assert!(err(spec(bad_server, &secret)).contains("invalid server node id"));
-        let mut one_relay = good;
-        one_relay.relay_urls = vec!["https://relay.example".into()];
-        assert!(err(spec(one_relay, &secret)).contains("invalid relay configuration"));
+        let mut one_relay = good.clone();
+        one_relay.relay_urls = vec!["https://only.example".into()];
+        let config = destination_config(&spec(one_relay, &secret)).expect("one relay");
+        assert_eq!(config.relay.custom_urls().len(), 1);
+        let mut bad_relay = good;
+        bad_relay.relay_urls = vec!["not a url".into()];
+        assert!(err(spec(bad_relay, &secret)).contains("invalid relay configuration"));
     }
 }

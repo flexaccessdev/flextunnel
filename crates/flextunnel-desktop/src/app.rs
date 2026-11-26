@@ -3337,8 +3337,7 @@ mod tests {
         }
 
         // What the client could not start with is refused too, by name: a
-        // server node id that is not one, relays that do not parse or are
-        // too few.
+        // server node id that is not one, relays that do not parse.
         for bad_id in ["", "!", "node-b"] {
             let mut bad = existing_destination("b");
             bad.server_node_id = bad_id.into();
@@ -3348,22 +3347,14 @@ mod tests {
                 "{bad_id:?}: {err}"
             );
         }
-        for bad_relays in [
-            &["not a url", "https://b.example"][..],
-            &["https://only.example"][..],
-        ] {
-            let mut bad = existing_destination("b");
-            bad.relay_urls = bad_relays.iter().map(|u| u.to_string()).collect();
-            let err = import(vec![existing_destination("a"), bad]).unwrap_err();
-            assert!(
-                err.contains("\"b\"") && err.contains("relay"),
-                "{bad_relays:?}: {err}"
-            );
-        }
+        let mut bad = existing_destination("b");
+        bad.relay_urls = vec!["not a url".into(), "https://b.example".into()];
+        let err = import(vec![existing_destination("a"), bad]).unwrap_err();
+        assert!(err.contains("\"b\"") && err.contains("relay"), "{err}");
         // Replacing a working destination is held to the same: its relays
         // are not swapped for ones that would stop the client starting.
         let mut breaking = current.destinations[0].clone();
-        breaking.relay_urls = vec!["https://only.example".into()];
+        breaking.relay_urls = vec!["not a url".into()];
         assert!(import(vec![breaking]).is_err());
 
         // A server id spelled another way is the same server: it replaces
@@ -3516,11 +3507,11 @@ mod tests {
         form.routed_cidrs = String::new();
         assert!(form.validate(&[], &keys).is_ok());
 
-        // The core's relay rules: custom relays come in pairs at least, and a
-        // token needs them.
+        // The core's relay rules: a single custom relay is accepted, and a
+        // token needs custom relays.
         let mut form = valid_form();
         form.relay_urls = "https://only.example".into();
-        assert!(form.validate(&[], &keys).is_err(), "a single custom relay");
+        assert!(form.validate(&[], &keys).is_ok(), "a single custom relay");
         let mut form = valid_form();
         form.relay_urls = String::new();
         assert!(form.validate(&[], &keys).is_ok(), "the default relays");
@@ -3566,9 +3557,9 @@ mod tests {
         }];
         assert!(missing(form(), &lost).contains("auth key"));
         assert!(missing(form(), &test_keys()).contains("not usable"));
-        let mut one_relay = form();
-        one_relay.relay_urls = "https://only.example".into();
-        assert!(form().routes_query(&keys).is_ok() && one_relay.routes_query(&keys).is_err());
+        let mut bad_relay = form();
+        bad_relay.relay_urls = "not a url".into();
+        assert!(form().routes_query(&keys).is_ok() && bad_relay.routes_query(&keys).is_err());
     }
 
     /// The form shows where its routes — typed, or filled from the server —
@@ -3947,7 +3938,7 @@ mod tests {
             "a relay URL that doesn't parse"
         );
         form.relay_urls = "https://relay.example".into();
-        assert!(form.validate(None).is_err(), "one custom relay");
+        assert!(form.validate(None).is_ok(), "one custom relay");
         form.relay_urls = "https://a.relay.example, https://b.relay.example".into();
         assert!(form.validate(None).is_ok());
     }

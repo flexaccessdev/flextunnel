@@ -138,18 +138,19 @@ pub type EndpointProvider = Arc<
 >;
 
 /// The production [`EndpointProvider`]: an ephemeral-identity client endpoint,
-/// or one bound to the session secret for a quick-mode destination.
-pub(crate) fn default_endpoint_provider() -> EndpointProvider {
-    Arc::new(|cfg: &DestinationConfig| {
+/// or one bound to the session secret for a quick-mode destination. Each
+/// endpoint's startup relay probe, and any close its creation stops waiting
+/// for, is kept in `closes`, which the client drains when it closes (see
+/// [`ProxyClient::close`](crate::proxy::ProxyClient::close)).
+pub(crate) fn default_endpoint_provider(closes: PendingCloses) -> EndpointProvider {
+    Arc::new(move |cfg: &DestinationConfig| {
         let relay = cfg.relay.clone();
+        let closes = closes.clone();
         let secret = match &cfg.auth {
             ClientAuth::Key(_) => None,
             ClientAuth::Quick(secret) => Some(secret.clone()),
         };
         Box::pin(async move {
-            // A client session's runtime outlives its endpoints: a close the
-            // creation stops waiting for finishes on it by itself.
-            let closes = PendingCloses::new();
             match secret {
                 Some(secret) => create_quick_client_endpoint(&relay, *secret, &closes).await,
                 None => create_client_endpoint(&relay, &closes).await,

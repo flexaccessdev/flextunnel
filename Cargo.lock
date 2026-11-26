@@ -1913,8 +1913,8 @@ dependencies = [
 
 [[package]]
 name = "flexaccess-iroh"
-version = "0.0.19"
-source = "git+https://github.com/flexaccessdev/flexaccess-iroh?tag=v0.0.19#67bb55080dd62d32b0a69c836b9fbfa0dbc0d0cb"
+version = "0.0.28"
+source = "git+https://github.com/flexaccessdev/flexaccess-iroh?tag=v0.0.28#a6d1d70aa7d39fa972c86c9e1590ef911def2ea7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

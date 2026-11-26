@@ -44,7 +44,7 @@
 auth_key_file = "~/.config/flextunnel/client.key"
 
 # Optional iroh tuning.
-# Custom relays for failover (at least two), used for every destination that
+# Custom relays (two or more for failover), used for every destination that
 # does not name its own. Configuring custom relays disables n0 internet
 # discovery (pkarr/DNS) — a server is reached via relay hints instead; mDNS
 # local-network discovery stays on. relay_auth_token is an optional shared
@@ -58,7 +58,7 @@ auth_key_file = "~/.config/flextunnel/client.key"
 # connection (it is still only opened on first use). A connection with an open stream — an ssh session, a
 # download — is never idle, however long it lasts. The first use after an idle
 # close pays for a fresh connection; raise this if that delay is noticeable
-# (most likely with custom relays, which are probed before each one).
+# (most likely with custom relays while one of them is down).
 # idle_timeout_secs = 300
 
 # A destination: a name for one server.

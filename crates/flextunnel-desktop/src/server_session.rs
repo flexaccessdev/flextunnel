@@ -261,11 +261,13 @@ async fn run_server(server: ServerConfig, mut rx: mpsc::Receiver<ServerCmd>, slo
     finish(&slot, cmd, result);
 }
 
-/// Close the endpoint gracefully before it is dropped (an ungraceful drop is
-/// fatal under panic=abort), bounded so a slow relay teardown can't wedge the
-/// session.
+/// Close the server gracefully before it is dropped with this session's
+/// runtime (an ungraceful drop is fatal under panic=abort): the endpoint, and
+/// the endpoints of a startup relay probe its close stopped (see
+/// [`server::RunningServer::close`]). Bounded so a slow relay teardown can't
+/// wedge the session.
 async fn close(running: &server::RunningServer) {
-    let _ = tokio::time::timeout(Duration::from_secs(5), running.endpoint().close()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), running.close()).await;
 }
 
 /// The session's final snapshot write, once the endpoint is closed: reset

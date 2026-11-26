@@ -13,6 +13,7 @@ pub use flexaccess_iroh::endpoint::PendingCloses;
 use flexaccess_iroh::endpoint::{
     CreatedEndpoint, EndpointOptions, create_endpoint, endpoint_builder,
 };
+use flexaccess_iroh::relay::online_timeout;
 use futures::future::BoxFuture;
 use iroh::{
     Endpoint, EndpointId, SecretKey,
@@ -113,22 +114,25 @@ pub(crate) fn server_setup(
 /// A single endpoint serves both relay modes. With the default relays internet
 /// discovery is on, so the server publishes its current home relay and clients
 /// resolve it by endpoint ID. With custom relays discovery is off, so clients
-/// reach the server through relay hints. Every custom relay is probed
-/// (startup fails only if none answers), the endpoint is bound without the
-/// relays that failed and must come online. The relays left out come back in
-/// [`CreatedEndpoint::relays_left_out`] for the home-relay failover (run by
-/// the CLI's serve loop) to restore once they are connectable.
+/// reach the server through relay hints. The endpoint binds with every custom
+/// relay and must come online, while each relay is probed beside it and taken
+/// out of the relay map if it fails; startup fails only if none answers. The
+/// startup probe comes back in [`CreatedEndpoint::relays`] for the home-relay
+/// failover (run by [`crate::server::RunningServer::serve`]), which puts the
+/// relays it left out back once they are connectable.
+///
+/// The probe's task and endpoints, and any close the creation stops waiting
+/// for, are kept in `closes`, which the server drains at shutdown
+/// ([`crate::server::RunningServer::close`]): its runtime ends with it.
 pub async fn create_server_endpoint(
     relay_config: &RelayConfig,
+    closes: &PendingCloses,
     setup: impl FnOnce(EndpointBuilder) -> EndpointBuilder,
 ) -> Result<CreatedEndpoint> {
-    // A server's runtime is the process's: a close the creation stops waiting
-    // for finishes on it by itself.
-    let closes = PendingCloses::new();
     create_endpoint(
         relay_config,
         setup(base_builder(relay_config, Side::Server)?),
-        &closes,
+        closes,
     )
     .await
 }
@@ -198,7 +202,8 @@ async fn create_client(
             let relay_config = relay_config.clone();
             let secret = secret.clone();
             Box::pin(async move {
-                rebuild_client_endpoint(client_builder(&relay_config, secret)?).await
+                let builder = client_builder(&relay_config, secret)?;
+                rebuild_client_endpoint(&relay_config, builder).await
             })
         })
     };
@@ -216,19 +221,25 @@ async fn create_client(
 ///   hints and mDNS can still reach the server without a home relay — and the
 ///   reconnect loop that asked for the rebuild escalates again if the relays
 ///   stay unreachable.
-async fn rebuild_client_endpoint(builder: EndpointBuilder) -> Result<Endpoint> {
+///
+/// The wait is the shared crate's [`online_timeout`] for an endpoint waited on
+/// without the startup probe: [`RELAY_CONNECT_TIMEOUT`], plus iroh's QUIC
+/// address discovery probe timeout where the endpoint runs it, since it picks
+/// no home relay until those probes are done.
+async fn rebuild_client_endpoint(
+    relay_config: &RelayConfig,
+    builder: EndpointBuilder,
+) -> Result<Endpoint> {
     let endpoint = builder
         .bind()
         .await
         .context("Failed to create iroh endpoint")?;
-    if tokio::time::timeout(RELAY_CONNECT_TIMEOUT, endpoint.online())
-        .await
-        .is_err()
-    {
+    let wait = online_timeout(relay_config, &endpoint);
+    if tokio::time::timeout(wait, endpoint.online()).await.is_err() {
         log::warn!(
             "Rebuilt endpoint has no connected home relay after {}s; continuing (relay hints \
              and local discovery may still reach the server)",
-            RELAY_CONNECT_TIMEOUT.as_secs()
+            wait.as_secs()
         );
     }
     Ok(endpoint)

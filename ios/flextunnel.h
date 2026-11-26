@@ -101,8 +101,7 @@ int flextunnel_client_public_key(const char *secret_key, char *out_buf, size_t o
  *   port is required (an in-use port fails the start).
  *   relay_auth_token is optional: a shared bearer token sent to every custom
  *   relay's WebSocket upgrade; it is only valid with custom relay_urls
- *   (rejected with the default iroh relays). Custom relays need at least two
- *   URLs.
+ *   (rejected with the default iroh relays).
  *   idle_timeout_secs is optional: how long a destination's connection is kept
  *   with no stream open on it. Omitted means 300; 0 means never close one for
  *   idleness.
