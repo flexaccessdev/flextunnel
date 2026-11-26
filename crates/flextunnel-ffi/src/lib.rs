@@ -122,11 +122,17 @@ use flextunnel_core::transport::paths::ConnPathKind;
 /// [`flextunnel_fetch_server_routes`]).
 const ROUTES_THREAD_NAME: &str = "flextunnel-routes";
 
-/// Bound on [`flextunnel_stop`]'s graceful close of the client's endpoints.
-/// Closing waits out an endpoint still being built (see
-/// `ProxyClient::close`), which in the worst case takes as long as a relay
-/// probe plus the online wait; the app's calling thread must not hang on that.
+/// How long [`flextunnel_stop`] waits for the graceful close of the client's
+/// endpoints. Closing waits out an endpoint still being built (see
+/// `ProxyClient::close`), which in the worst case takes as long as the relay
+/// probes plus the online wait; the app's calling thread must not hang on
+/// that. A close that takes longer is not given up on: it is finished on a
+/// thread of its own, which keeps the runtime until then (see [`stop_handle`]).
 const STOP_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Name of the thread that finishes a close [`flextunnel_stop`] stopped
+/// waiting for.
+const CLOSE_THREAD_NAME: &str = "flextunnel-close";
 
 /// Process-global guard enforcing **at most one** running proxy instance. A
 /// second [`flextunnel_start`] while one is live is rejected rather than racing.
@@ -746,6 +752,11 @@ pub unsafe extern "C" fn flextunnel_set_network_available(
 /// Stop the proxy and free the handle. After this call `handle` is invalid and
 /// must not be used again. Passing null is a safe no-op.
 ///
+/// Blocks for the close of the endpoints in use, for at most
+/// [`STOP_CLOSE_TIMEOUT`]. A close that takes longer is finished on a thread
+/// of its own after this returns; the session is stopped either way, and
+/// [`flextunnel_start`] can be called again at once.
+///
 /// # Safety
 /// `handle` must be a valid pointer returned by [`flextunnel_start`] and not
 /// already freed.
@@ -1085,18 +1096,40 @@ fn stop_handle(handle: FlextunnelHandle) {
     // Skipping this makes iroh tear down its relay tasks ungracefully (a
     // JoinSet abort that panics — fatal under panic=abort). The session task is
     // awaited first so nothing is still using them; `block_on` is safe here,
-    // on the app's own thread. Bounded: the close waits out an endpoint build
-    // in flight, and stopping must not hang the caller on a slow one.
-    runtime.block_on(async {
+    // on the app's own thread. The wait is bounded — the close waits out an
+    // endpoint build in flight, and stopping must not hang the caller on a
+    // slow one — but only the wait: the close is a task of its own, and one
+    // still running when the wait is up is finished on a thread of its own,
+    // which keeps the runtime until then. Shutting the runtime down here would
+    // cut the close short, with the build or a relay probe still on it.
+    let mut closing = runtime.spawn(async move {
         let _ = task.await;
-        if tokio::time::timeout(STOP_CLOSE_TIMEOUT, client.close())
-            .await
-            .is_err()
-        {
-            log::warn!("Closing the client's endpoints is taking too long; stopping anyway");
-        }
+        client.close().await;
     });
-    runtime.shutdown_background();
+    let closed = runtime.block_on(async {
+        tokio::time::timeout(STOP_CLOSE_TIMEOUT, &mut closing)
+            .await
+            .is_ok()
+    });
+    if closed {
+        runtime.shutdown_background();
+        return;
+    }
+    log::warn!(
+        "Closing the client's endpoints is taking long; stopped, and the close goes on in \
+         the background"
+    );
+    // If the thread cannot be spawned its closure is dropped, and the runtime
+    // with it: the close is cut short, as it would be without the thread.
+    let spawned = std::thread::Builder::new()
+        .name(CLOSE_THREAD_NAME.into())
+        .spawn(move || {
+            let _ = runtime.block_on(closing);
+            runtime.shutdown_background();
+        });
+    if let Err(e) = spawned {
+        log::warn!("Could not finish closing the client's endpoints: {e}");
+    }
 }
 
 /// Write `s` (always NUL-terminated) into the caller buffer. Returns `true` if

@@ -337,6 +337,11 @@ int flextunnel_conn_path(const FlextunnelHandle *handle, const char *name,
  * Stop the client, close the endpoints of the destinations in use, and free
  * the handle. After this call the handle is invalid. Passing NULL is a safe
  * no-op.
+ *
+ * Blocks for the close, for at most about 5 seconds. A close that takes
+ * longer (one behind an endpoint still being built, say) is finished on a
+ * thread of its own after this returns; the session is stopped either way,
+ * and flextunnel_start can be called again at once.
  */
 void flextunnel_stop(FlextunnelHandle *handle);
 

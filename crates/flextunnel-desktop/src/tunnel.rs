@@ -49,10 +49,12 @@ pub const CLIENT_THREAD_NAME: &str = "client";
 /// hang if a session stalls.
 const CONN_PATH_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bound on the client's graceful endpoint close at teardown. The close waits
-/// out an endpoint still being built (see `ProxyClient::close`), which a stop
-/// during a slow dial must not hang behind; an ordinary close finishes well
-/// inside it.
+/// How long a stopping client waits for its graceful endpoint close before it
+/// reports itself stopped. The close waits out an endpoint still being built
+/// (see `ProxyClient::close`), which a stop during a slow dial must not hang
+/// behind; an ordinary close finishes well inside it. A close that takes
+/// longer is not given up on: it runs on, and the session's runtime with it,
+/// after the session has said it stopped (see [`run_client`]).
 const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -461,17 +463,30 @@ fn spawn_client(
                 .thread_name(CLIENT_THREAD_NAME)
                 .enable_all()
                 .build();
-            match runtime {
-                Ok(rt) => rt.block_on(run_client(
-                    spec,
-                    forwards,
-                    session_rx,
-                    slot,
-                    session_handled,
-                )),
-                Err(e) => slot.fail(format!("Failed to build the client runtime: {e:#}")),
-            }
+            let runtime = match runtime {
+                Ok(runtime) => runtime,
+                Err(e) => {
+                    slot.fail(format!("Failed to build the client runtime: {e:#}"));
+                    let _ = done_tx.send(());
+                    return;
+                }
+            };
+            let closing = runtime.block_on(run_client(
+                spec,
+                forwards,
+                session_rx,
+                slot,
+                session_handled,
+            ));
+            // The session is over for everyone waiting on it. A close it
+            // stopped waiting for still runs on this runtime, which is kept
+            // until that close is over: dropping it now would cut the close
+            // short, with an endpoint build or a relay probe still on it.
             let _ = done_tx.send(());
+            if let Some(closing) = closing {
+                let _ = runtime.block_on(closing);
+                log::info!("The stopped client's endpoints have finished closing");
+            }
         });
     match spawned {
         Ok(_) => Some(SessionHandle {
@@ -882,13 +897,16 @@ fn destination_config(spec: &DestinationSpec) -> Result<DestinationConfig, Strin
     })
 }
 
+/// Run the client session to its end. Returns the close of its endpoints when
+/// that outlasted [`SESSION_CLOSE_TIMEOUT`] and is still running: the caller
+/// keeps this runtime until it is over.
 async fn run_client(
     spec: ClientSpec,
     mut forwards: Vec<PortForward>,
     mut rx: mpsc::Receiver<SessionCmd>,
     slot: ClientSlot,
     handled: Arc<AtomicU64>,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     let mut spec = Arc::new(spec);
     slot.update(|s| {
         *s = ClientSnapshot {
@@ -902,7 +920,10 @@ async fn run_client(
     // a bad setting fails the session cleanly rather than panicking.
     let destinations = match spec.destinations.iter().map(destination_config).collect() {
         Ok(destinations) => destinations,
-        Err(reason) => return slot.fail(reason),
+        Err(reason) => {
+            slot.fail(reason);
+            return None;
+        }
     };
     // Building the client validates the names and routes together and dials
     // nothing.
@@ -912,7 +933,10 @@ async fn run_client(
         idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
     }) {
         Ok(client) => Arc::new(client),
-        Err(e) => return slot.fail(e.to_string()),
+        Err(e) => {
+            slot.fail(e.to_string());
+            return None;
+        }
     };
 
     // Bind enabled proxy front-ends before any forward listener exists. A
@@ -923,7 +947,10 @@ async fn run_client(
     let mut serves = match serve_proxies(&client, &spec).await {
         Ok(serves) => serves,
         // No endpoint exists yet, so there is nothing to close.
-        Err(reason) => return slot.fail(reason),
+        Err(reason) => {
+            slot.fail(reason);
+            return None;
+        }
     };
 
     // Forwards listen for the whole session, whatever the connections are
@@ -1057,7 +1084,8 @@ async fn run_client(
     // "stopped" immediately, then close the endpoints in use gracefully before
     // they are dropped (see the CLI's close_or_exit for why an ungraceful drop
     // is fatal under panic=abort). The command receiver lives until this
-    // returns, so the supervisor starts nothing new before the close is done.
+    // returns, so the supervisor starts nothing new before the close is done
+    // or given up waiting for.
     slot.update(|s| {
         s.phase = ClientPhase::Stopping;
         s.spec = None;
@@ -1068,12 +1096,20 @@ async fn run_client(
     drop(fwd_mgr);
     drop(serves);
     drop(manage);
-    if tokio::time::timeout(SESSION_CLOSE_TIMEOUT, client.close())
-        .await
-        .is_err()
-    {
-        log::warn!("Closing the client's endpoints is taking too long; giving up");
-    }
+    // The close is a task of its own, so that the bounded wait here stops
+    // only the waiting: a close still running then — one behind an endpoint
+    // build, say — is handed back, for the runtime to be kept until it ends.
+    let mut closing = tokio::spawn(async move { client.close().await });
+    let closing = match tokio::time::timeout(SESSION_CLOSE_TIMEOUT, &mut closing).await {
+        Ok(_) => None,
+        Err(_) => {
+            log::warn!(
+                "Closing the client's endpoints is taking long; the client is stopped, and \
+                 the close goes on in the background"
+            );
+            Some(closing)
+        }
+    };
     slot.update(|s| {
         *s = match failure {
             Some(reason) => ClientSnapshot {
@@ -1084,6 +1120,7 @@ async fn run_client(
             None => ClientSnapshot::default(),
         };
     });
+    closing
 }
 
 #[cfg(test)]

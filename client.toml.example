@@ -56,8 +56,9 @@ auth_key_file = "~/.config/flextunnel/client.key"
 # Whether the custom relays serve QUIC address discovery, all of them or none
 # (default: true). Set false for relays behind a Cloudflare Tunnel or another
 # HTTP-only front: left on, iroh probes them for it and each start can wait
-# out its 3 s probe timeout. Only valid with custom relay_urls; set it the
-# same on the server.
+# out its 3 s probe timeout. Only valid with the relay_urls above, and for the
+# destinations that use them (one that names its own relay_urls has its own
+# setting); set it the same on the server.
 # relay_quic_addr_discovery = false
 
 # How long a destination's connection is kept with nothing using it, in

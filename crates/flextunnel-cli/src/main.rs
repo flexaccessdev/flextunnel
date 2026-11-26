@@ -175,10 +175,12 @@ enum ClientAction {
         /// Shared bearer token sent to every custom relay (custom relays only).
         #[arg(long)]
         relay_auth_token: Option<String>,
-        /// Whether the custom relays serve QUIC address discovery, all of them
-        /// or none (default: true; custom relays only). Pass false for relays
-        /// behind a Cloudflare Tunnel or another HTTP-only front, which
-        /// otherwise delay startup by up to 3 s.
+        /// Whether the --relay-url relays serve QUIC address discovery, all of
+        /// them or none (default: true; needs --relay-url or the config's
+        /// top-level relay_urls). Pass false for relays behind a Cloudflare
+        /// Tunnel or another HTTP-only front, which otherwise delay startup by
+        /// up to 3 s. A destination that names its own relays has its own
+        /// setting in the config.
         #[arg(long, value_name = "BOOL")]
         relay_quic_addr_discovery: Option<bool>,
         /// Seconds a destination's connection is kept with nothing using it

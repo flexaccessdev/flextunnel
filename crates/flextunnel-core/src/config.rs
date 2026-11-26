@@ -221,7 +221,8 @@ pub struct ResolvedClient {
     /// Shared bearer token for the default custom relays.
     pub relay_auth_token: Option<String>,
     /// Whether the default custom relays serve QUIC address discovery; `None`
-    /// keeps the default, on.
+    /// keeps the default, on. Like the token it goes with the default relays
+    /// only: a destination that names its own `relay_urls` has its own.
     pub relay_quic_addr_discovery: Option<bool>,
     /// `None`: never close a connection for idleness.
     pub idle_timeout: Option<Duration>,
@@ -254,10 +255,19 @@ impl ResolvedClient {
         if self.auth_key.is_some() && self.auth_key_file.is_some() {
             anyhow::bail!("Both an inline client key and a client key file are set; use one");
         }
-        // The default credential and relays are loaded once, and only if some
-        // destination actually falls back to them.
+        // The default relays are checked whether or not a destination falls
+        // back to them: a top-level token or QUIC address discovery setting
+        // with no top-level relays to apply to is a mistake either way, and
+        // would pass unnoticed when every destination names its own.
+        let default_relay: RelayConfig = relay_config(
+            &self.relay_urls,
+            self.relay_auth_token.clone(),
+            self.relay_quic_addr_discovery,
+        )
+        .context("Invalid top-level relay settings")?;
+        // The default credential is loaded once, and only if some destination
+        // actually falls back to it.
         let mut default_key: Option<crate::auth::ClientKey> = None;
-        let mut default_relay: Option<RelayConfig> = None;
 
         let mut destinations = Vec::with_capacity(self.destinations.len());
         for entry in &self.destinations {
@@ -304,17 +314,7 @@ impl ResolvedClient {
                             context()
                         );
                     }
-                    match &default_relay {
-                        Some(relay) => relay.clone(),
-                        None => {
-                            let relay = relay_config(
-                                &self.relay_urls,
-                                self.relay_auth_token.clone(),
-                                self.relay_quic_addr_discovery,
-                            )?;
-                            default_relay.insert(relay).clone()
-                        }
-                    }
+                    default_relay.clone()
                 }
             };
 
@@ -779,6 +779,45 @@ mod tests {
             panic!("expected an error");
         };
         assert!(format!("{err:#}").contains("relay_urls"), "{err:#}");
+    }
+
+    /// The top-level relay settings are checked even when no destination
+    /// falls back to them: a setting or a token given without top-level
+    /// relays is refused, not dropped, when every destination names its own.
+    #[test]
+    fn proxy_config_checks_the_top_level_relay_settings_when_unused() {
+        let own = || {
+            let mut own = entry("m1", 1);
+            own.relay_urls = Some(vec!["https://own.example".to_string()]);
+            own
+        };
+        let err = |resolved: ResolvedClient| match resolved.proxy_config() {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => format!("{e:#}"),
+        };
+
+        let mut stray_discovery = resolved_with(vec![own()]);
+        stray_discovery.relay_quic_addr_discovery = Some(false);
+        let message = err(stray_discovery);
+        assert!(
+            message.contains("top-level") && message.contains("relay_urls"),
+            "{message}"
+        );
+
+        let mut stray_token = resolved_with(vec![own()]);
+        stray_token.relay_auth_token = Some("t".to_string());
+        assert!(err(stray_token).contains("top-level"));
+
+        // With top-level relays the setting is valid, and still not the
+        // destination's: its own relays keep their own.
+        let mut unused = resolved_with(vec![own()]);
+        unused.relay_urls = vec!["https://only.example".to_string()];
+        unused.relay_quic_addr_discovery = Some(false);
+        let config = unused.proxy_config().unwrap();
+        assert_eq!(
+            config.destinations[0].relay.quic_addr_discovery(),
+            Some(true)
+        );
     }
 
     #[test]

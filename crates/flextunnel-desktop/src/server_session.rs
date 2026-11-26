@@ -24,6 +24,11 @@ pub const THREAD_NAME: &str = "server";
 /// snapshot.
 const CLIENTS_POLL: Duration = Duration::from_secs(1);
 
+/// How long the server's close may take before the log says it is slow. An
+/// ordinary close, a relay that does not answer included, is over in about a
+/// second.
+const SLOW_CLOSE: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ServerPhase {
     Stopped,
@@ -267,10 +272,20 @@ async fn run_server(server: ServerConfig, mut rx: mpsc::Receiver<ServerCmd>, slo
 /// Close the server gracefully before it is dropped with this session's
 /// runtime (an ungraceful drop is fatal under panic=abort): the endpoint, and
 /// the endpoints of a startup relay probe its close stopped (see
-/// [`server::RunningServer::close`]). Bounded so a slow relay teardown can't
-/// wedge the session.
+/// [`server::RunningServer::close`]).
+///
+/// Waited for to the end, however long it takes. Those closes run as tasks on
+/// this runtime, which a wait given up on would not stop: returning would
+/// report the server stopped, release its identity's lock and drop the runtime
+/// with them unfinished. A close that is slow is logged once and waited for
+/// all the same; the server shows as stopping meanwhile.
 async fn close(running: &server::RunningServer) {
-    let _ = tokio::time::timeout(Duration::from_secs(5), running.close()).await;
+    let close = running.close();
+    tokio::pin!(close);
+    if tokio::time::timeout(SLOW_CLOSE, &mut close).await.is_err() {
+        log::warn!("The server is slow to close; still waiting for it");
+        close.await;
+    }
 }
 
 /// The session's final snapshot write, once the endpoint is closed: reset
