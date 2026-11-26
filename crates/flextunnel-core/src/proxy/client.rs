@@ -870,6 +870,14 @@ impl ProxyClient {
     /// endpoints' creation left running — a relay probe stopped by its
     /// endpoint's close, a close it stopped waiting for — so that none of it
     /// is dropped with the runtime.
+    ///
+    /// Run it to its end: it is not made to be dropped part-way and called
+    /// again. A second call does not wait for an endpoint whose close the
+    /// first one began, since iroh returns at once for an endpoint that is
+    /// already closing. A caller that cannot wait bounds its own wait and
+    /// leaves the close running, as
+    /// [`tear_down_runtime`](crate::transport::endpoint::tear_down_runtime)
+    /// does, or ends the process.
     pub async fn close(&self) {
         // Latched under the reconfigure lock, so the routing taken here is the
         // last one: a reconfigure either committed before (its destinations
