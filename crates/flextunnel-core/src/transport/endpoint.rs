@@ -24,6 +24,7 @@ use iroh::{
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::task::TaskTracker;
 
 pub use flexaccess_iroh::relay::{RELAY_CONNECT_TIMEOUT, RelayConfig};
 
@@ -283,6 +284,11 @@ pub struct ClientEndpoint {
     /// endpoint and have the second discard (and close) the first's good one.
     /// [`Self::close`] takes it too, so it waits a rebuild in flight out.
     rebuilding: Arc<tokio::sync::Mutex<()>>,
+    /// The closes of the endpoints rebuilds replaced, each a task of its own,
+    /// for [`Self::close`] to wait for: one still running when the session's
+    /// runtime goes would be dropped with it. A wait given up on loses none
+    /// of them: the next one finds them all the same.
+    replaced: TaskTracker,
 }
 
 /// The installed endpoint plus how many rebuilds produced it, so a rebuild
@@ -293,11 +299,6 @@ struct Current {
     /// Latched by [`ClientEndpoint::close`]: no rebuild installs an endpoint
     /// after it.
     closed: bool,
-    /// The closes of the endpoints rebuilds replaced, each a task of its own,
-    /// for [`ClientEndpoint::close`] to wait for: one still running when the
-    /// session's runtime goes would be dropped with it. Those already over
-    /// are forgotten at the next rebuild.
-    replaced: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl ClientEndpoint {
@@ -308,10 +309,10 @@ impl ClientEndpoint {
                 generation: 0,
                 endpoint,
                 closed: false,
-                replaced: Vec::new(),
             })),
             factory,
             rebuilding: Arc::new(tokio::sync::Mutex::new(())),
+            replaced: TaskTracker::new(),
         }
     }
 
@@ -362,28 +363,24 @@ impl ClientEndpoint {
             }
             // `close` waits for this lock, so it cannot run before the swap.
             let fresh = (this.factory)().await?;
-            let (closed, over) = tokio::sync::oneshot::channel();
-            let mut current = this.current.write().expect("endpoint lock");
-            current.generation += 1;
-            let old = std::mem::replace(&mut current.endpoint, fresh);
+            let old = {
+                let mut current = this.current.write().expect("endpoint lock");
+                current.generation += 1;
+                std::mem::replace(&mut current.endpoint, fresh)
+            };
             // Graceful close on its own task: bounded wait below, but the task
-            // is never cancelled (see [`REBUILD_CLOSE_TIMEOUT`]). It is kept
-            // for `close`, which waits for this lock and so finds it there.
-            current.replaced.retain(|close| !close.is_finished());
-            current.replaced.push(tokio::spawn(async move {
-                old.close().await;
-                let _ = closed.send(());
-            }));
-            Ok(Some(over))
+            // is never cancelled (see [`REBUILD_CLOSE_TIMEOUT`]). It is
+            // tracked for `close`, which waits for this lock and so finds it.
+            Ok(Some(this.replaced.spawn(async move { old.close().await })))
         });
         let close = match swap.await {
             Ok(swapped) => swapped?,
             Err(e) => anyhow::bail!("the endpoint rebuild task failed: {e}"),
         };
-        let Some(close) = close else {
+        let Some(mut close) = close else {
             return Ok(());
         };
-        if tokio::time::timeout(REBUILD_CLOSE_TIMEOUT, close)
+        if tokio::time::timeout(REBUILD_CLOSE_TIMEOUT, &mut close)
             .await
             .is_err()
         {
@@ -399,15 +396,14 @@ impl ClientEndpoint {
     /// rebuilds replaced are waited for as well, where still running.
     pub async fn close(&self) {
         let _serialized = self.rebuilding.lock().await;
-        let (endpoint, replaced) = {
+        let endpoint = {
             let mut current = self.current.write().expect("endpoint lock");
             current.closed = true;
-            (
-                current.endpoint.clone(),
-                std::mem::take(&mut current.replaced),
-            )
+            current.endpoint.clone()
         };
-        futures::future::join(endpoint.close(), futures::future::join_all(replaced)).await;
+        // Nothing is replaced from here on, so the wait can end.
+        self.replaced.close();
+        futures::future::join(endpoint.close(), self.replaced.wait()).await;
     }
 }
 
@@ -436,15 +432,14 @@ mod tests {
         handle.rebuild().await.unwrap();
         assert_ne!(handle.id(), first_id, "an ephemeral rebuild gets a new id");
         assert!(first.is_closed(), "the replaced endpoint is closed");
-        let kept = handle.current.read().unwrap().replaced.len();
-        assert_eq!(kept, 1, "and its close is kept for the close to wait for");
         handle.close().await;
         assert!(handle.endpoint().is_closed());
     }
 
     /// A close waits for the close of an endpoint a rebuild replaced, which
     /// runs on a task of its own: here one that is held open and let go only
-    /// once the close has had time to return without it.
+    /// once the close has had time to return without it. A close given up on
+    /// before that leaves it for the next one to wait for.
     #[tokio::test]
     async fn a_close_waits_for_the_close_of_a_replaced_endpoint() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -455,7 +450,7 @@ mod tests {
         );
         let (release, released) = tokio::sync::oneshot::channel::<()>();
         let over = Arc::new(AtomicBool::new(false));
-        let replaced = tokio::spawn({
+        handle.replaced.spawn({
             let over = over.clone();
             async move {
                 // Gives up if the close never lets this test get to release.
@@ -463,7 +458,8 @@ mod tests {
                 over.store(true, Ordering::SeqCst);
             }
         });
-        handle.current.write().unwrap().replaced.push(replaced);
+        let given_up = tokio::time::timeout(Duration::from_millis(100), handle.close()).await;
+        assert!(given_up.is_err(), "the close waits while it is held");
 
         // On this test's single thread the held task cannot run between its
         // release and the join returning, unless the close is waiting for it.

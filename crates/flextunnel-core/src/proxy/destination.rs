@@ -62,6 +62,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Semaphore, watch};
 use tokio::time::Instant;
+use tokio_util::task::TaskTracker;
 
 /// Bound wait on an endpoint's graceful close when a destination goes idle.
 /// The close runs as its own task and is never cancelled (dropping a bound
@@ -570,6 +571,10 @@ pub(crate) struct Destination {
     /// The endpoint, present from the first dial until the destination goes
     /// idle. Std lock: never held across an await.
     endpoint: Mutex<Option<ClientEndpoint>>,
+    /// The closes of the endpoints let go as the destination went idle, each
+    /// a task of its own, for [`Self::close`] to wait for: one still running
+    /// when the session's runtime goes would be dropped with it.
+    idle_closes: TaskTracker,
     /// Held by an endpoint build for its whole duration, so [`Self::close`]
     /// can wait a build in flight out instead of leaving it to be cut off.
     building: tokio::sync::Mutex<()>,
@@ -598,6 +603,7 @@ impl Destination {
                 unused_since: Instant::now(),
             }),
             endpoint: Mutex::new(None),
+            idle_closes: TaskTracker::new(),
             building: tokio::sync::Mutex::new(()),
             nonce_tracker: Mutex::new(ServerNonceTracker::default()),
             closed: AtomicBool::new(false),
@@ -825,6 +831,9 @@ impl Destination {
     /// The link goes to its terminal state next: requests held for this
     /// destination end at once, its manager stops, and a dialer that outlives
     /// it is turned away instead of leasing a connection about to be closed.
+    ///
+    /// The closes of the endpoints it let go while idle are waited for too,
+    /// where still running.
     pub(crate) async fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         self.state.send_modify(|s| {
@@ -836,6 +845,10 @@ impl Destination {
         if let Some(endpoint) = endpoint {
             endpoint.close().await;
         }
+        // An idle close starts under the slot lock, so with the slot emptied
+        // above they are all tracked by now.
+        self.idle_closes.close();
+        self.idle_closes.wait().await;
     }
 
     /// The connection manager: runs for the life of the client, never returns.
@@ -1189,14 +1202,19 @@ impl Destination {
     /// Close and forget the endpoint, if there is one (the destination is
     /// going idle).
     async fn release_endpoint(&self) {
-        let endpoint = self.endpoint.lock().expect("endpoint slot lock").take();
-        let Some(endpoint) = endpoint else {
-            return;
+        // Graceful close on its own task: bounded wait here, but the task is
+        // never cancelled (see [`IDLE_CLOSE_TIMEOUT`]). It starts under the
+        // slot lock, so that [`Self::close`], which empties the slot first,
+        // finds it tracked.
+        let mut close = {
+            let mut slot = self.endpoint.lock().expect("endpoint slot lock");
+            let Some(endpoint) = slot.take() else {
+                return;
+            };
+            self.idle_closes
+                .spawn(async move { endpoint.close().await })
         };
         self.status_fields().client_node_id = None;
-        // Graceful close on its own task: bounded wait here, but the task is
-        // never cancelled (see [`IDLE_CLOSE_TIMEOUT`]).
-        let mut close = tokio::spawn(async move { endpoint.close().await });
         if tokio::time::timeout(IDLE_CLOSE_TIMEOUT, &mut close)
             .await
             .is_err()
@@ -1620,6 +1638,29 @@ mod tests {
             shared: &drained,
         };
         assert!(holds.try_acquire().is_some());
+    }
+
+    /// Closing a destination waits for the close of an endpoint it let go
+    /// while idle, which runs on a task of its own: here one that is held
+    /// open. A close given up on leaves it for the next one to wait for.
+    #[tokio::test(start_paused = true)]
+    async fn close_waits_for_an_idle_endpoints_close() {
+        let d = destination(false);
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let over = Arc::new(AtomicBool::new(false));
+        d.idle_closes.spawn({
+            let over = over.clone();
+            async move {
+                let _ = released.await;
+                over.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let given_up = tokio::time::timeout(Duration::from_secs(60), d.close()).await;
+        assert!(given_up.is_err(), "the close waits while it is held");
+        release.send(()).unwrap();
+        d.close().await;
+        assert!(over.load(Ordering::SeqCst), "the close waited for it");
     }
 
     /// Closing a destination ends the requests held for it at once and turns
