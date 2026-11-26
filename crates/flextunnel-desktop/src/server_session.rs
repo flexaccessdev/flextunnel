@@ -12,6 +12,7 @@
 
 use crate::config::ServerConfig;
 use flextunnel_core::server::{self, ServerOptions};
+use flextunnel_core::transport::endpoint::PendingCloses;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -215,19 +216,28 @@ async fn run_server(server: ServerConfig, mut rx: mpsc::Receiver<ServerCmd>, slo
     // waits the bind out instead of giving up on it: returning early would
     // drop this runtime, and the task with it. (On app quit the process exits
     // without waiting for this thread, which drops nothing.)
-    let mut bind = tokio::spawn(prepared.bind());
+    //
+    // A bind that fails leaves work behind as well (a relay probe, a slow
+    // close of the endpoint that never came online), in `closes`: waited for
+    // like the close of a server that ran, before this runtime goes.
+    let closes = PendingCloses::new();
+    let mut bind = tokio::spawn(prepared.bind(closes.clone()));
     let running = tokio::select! {
         bound = &mut bind => match bound.map_err(anyhow::Error::from) {
             Ok(Ok(running)) => running,
-            Ok(Err(e)) | Err(e) => return slot.fail(format!("{e:#}")),
+            Ok(Err(e)) | Err(e) => {
+                closed(closes.finished()).await;
+                return slot.fail(format!("{e:#}"));
+            }
         },
         cmd = rx.recv() => {
             if matches!(cmd, Some(ServerCmd::Stop | ServerCmd::Remove)) {
                 log::info!("Stopping the server");
             }
             slot.update(|s| s.phase = ServerPhase::Stopping);
-            if let Ok(Ok(running)) = bind.await {
-                close(&running).await;
+            match bind.await {
+                Ok(Ok(running)) => closed(running.close()).await,
+                _ => closed(closes.finished()).await,
             }
             return finish(&slot, cmd, Ok(()));
         }
@@ -265,22 +275,22 @@ async fn run_server(server: ServerConfig, mut rx: mpsc::Receiver<ServerCmd>, slo
         s.running_since = None;
         s.connected_clients.clear();
     });
-    close(&running).await;
+    closed(running.close()).await;
     finish(&slot, cmd, result);
 }
 
-/// Close the server gracefully before it is dropped with this session's
-/// runtime (an ungraceful drop is fatal under panic=abort): the endpoint, and
-/// the endpoints of a startup relay probe its close stopped (see
-/// [`server::RunningServer::close`]).
+/// Wait for `close` before this session's runtime is dropped (an ungraceful
+/// drop is fatal under panic=abort): the close of a server that ran, which is
+/// its endpoint and the endpoints of a startup relay probe that close stopped
+/// (see [`server::RunningServer::close`]), or what a bind that failed left
+/// running.
 ///
 /// Waited for to the end, however long it takes. Those closes run as tasks on
 /// this runtime, which a wait given up on would not stop: returning would
 /// report the server stopped, release its identity's lock and drop the runtime
 /// with them unfinished. A close that is slow is logged once and waited for
 /// all the same; the server shows as stopping meanwhile.
-async fn close(running: &server::RunningServer) {
-    let close = running.close();
+async fn closed(close: impl Future<Output = ()>) {
     tokio::pin!(close);
     if tokio::time::timeout(SLOW_CLOSE, &mut close).await.is_err() {
         log::warn!("The server is slow to close; still waiting for it");

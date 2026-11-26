@@ -31,6 +31,7 @@ mod tui;
 use flextunnel_core::app;
 use flextunnel_core::iroh::{EndpointId, SecretKey};
 use flextunnel_core::secret::secret_to_endpoint_id;
+use flextunnel_core::transport::endpoint::PendingCloses;
 use flextunnel_core::{auth, config, secret, server};
 
 #[derive(Parser)]
@@ -540,7 +541,11 @@ async fn run_server(r: config::ResolvedServer, quick: Option<QuickServer>) -> Re
         routed_cidrs: r.routed_cidrs,
         blocklist_file: r.blocklist_file,
     })?;
-    let running = prepared.bind().await?;
+    let closes = PendingCloses::new();
+    let running = match prepared.bind(closes.clone()).await {
+        Ok(running) => running,
+        Err(e) => return Err(closed_or_exit_failed(closes.finished(), e).await),
+    };
 
     match &quick {
         Some(_) => log::info!(
@@ -614,6 +619,26 @@ pub(crate) async fn close_or_exit(close: impl Future<Output = ()>) {
             std::process::exit(0);
         }
     }
+}
+
+/// [`close_or_exit`] for a start that failed with `error`, over what it left
+/// running (a relay probe, the close of an endpoint that never came online):
+/// returns the error once that is over. Past `SHUTDOWN_CLOSE_TIMEOUT` it
+/// reports the error and exits with a failure status itself, as returning it
+/// would have done, but without dropping the runtime under that work.
+async fn closed_or_exit_failed(
+    close: impl Future<Output = ()>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    if tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, close)
+        .await
+        .is_err()
+    {
+        log::warn!("Endpoint close is taking too long — exiting now");
+        eprintln!("Error: {error:?}");
+        std::process::exit(1);
+    }
+    error
 }
 
 #[cfg(test)]

@@ -211,8 +211,13 @@ impl PreparedServer {
     /// Bind the iroh endpoint (with every configured relay; the startup probe
     /// runs beside it and takes out the relays that fail). Can take several
     /// seconds (the relay online-wait).
-    pub async fn bind(self) -> Result<RunningServer> {
-        let closes = PendingCloses::new();
+    ///
+    /// `closes` is the caller's, since a bind that fails leaves work in it
+    /// too: the startup probe's task and endpoints, and the close of an
+    /// endpoint that never came online, if it is slow. A caller whose runtime
+    /// ends with the failed start waits for [`PendingCloses::finished`] first.
+    /// On success the server keeps it, and [`RunningServer::close`] drains it.
+    pub async fn bind(self, closes: PendingCloses) -> Result<RunningServer> {
         let CreatedEndpoint { endpoint, relays } =
             create_server_endpoint(&self.relay_config, &closes, |base| self.endpoint_on(base))
                 .await
