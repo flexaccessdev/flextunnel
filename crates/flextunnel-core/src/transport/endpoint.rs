@@ -394,6 +394,13 @@ impl ClientEndpoint {
     /// flight is waited out first, so the endpoint it installs is the one
     /// closed here; none is installed after. The closes of the endpoints that
     /// rebuilds replaced are waited for as well, where still running.
+    ///
+    /// Run it to its end: it is not made to be dropped part-way and called
+    /// again. A second call still waits for the replaced endpoints, but not
+    /// for the current one once the first call began closing it, since iroh
+    /// returns at once for an endpoint that is already closing. A caller that
+    /// cannot wait keeps the one close running, on a task say, and stops
+    /// waiting for it.
     pub async fn close(&self) {
         let _serialized = self.rebuilding.lock().await;
         let endpoint = {
