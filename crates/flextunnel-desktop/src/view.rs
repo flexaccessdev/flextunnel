@@ -1294,11 +1294,10 @@ fn destination_detail<'a>(app: &'a App, destination: &'a Destination) -> Element
             None => info_row("Auth key", "none picked — edit to pick one".into(), None),
         },
     );
-    let relays = if destination.relay_urls.is_empty() {
-        "default".to_string()
-    } else {
-        destination.relay_urls.join(", ")
-    };
+    let relays = relays_line(
+        &destination.relay_urls,
+        destination.relay_quic_addr_discovery,
+    );
     info = info.push(info_row("Relays", relays, None));
     if let Some(status) = status
         && status.state == DestinationState::Connected
@@ -1632,6 +1631,12 @@ fn destination_form_view<'a>(app: &'a App, form: &'a DestinationForm) -> Element
             .width(240),
         ),
     ]);
+    if crate::app::names_relays(&form.relay_urls) {
+        card = card.push(quic_addr_discovery_row(
+            form.relay_quic_addr_discovery,
+            Message::RelayQuicAddrDiscoveryToggled,
+        ));
+    }
 
     if let Err(message) = &validated {
         card = card.push(text(message.clone()).size(12).color(AMBER));
@@ -1957,11 +1962,7 @@ fn server_detail<'a>(app: &'a App, server: &'a ServerConfig) -> Element<'a, Mess
         "http://flextunnel.internal/servers/<name>/",
         "this server's status page, through a proxy the client has enabled",
     ));
-    let relays = if server.relay_urls.is_empty() {
-        "default".to_string()
-    } else {
-        server.relay_urls.join(", ")
-    };
+    let relays = relays_line(&server.relay_urls, server.relay_quic_addr_discovery);
     tunnel = tunnel.push(space().height(4));
     tunnel = tunnel.push(info_row("Relays", relays, None));
     col = col.push(
@@ -2518,6 +2519,12 @@ fn server_settings_card<'a>(app: &'a App, form: &'a ServerForm) -> Element<'a, M
             .width(240),
         ),
     ]);
+    if crate::app::names_relays(&form.relay_urls) {
+        card = card.push(quic_addr_discovery_row(
+            form.relay_quic_addr_discovery,
+            Message::ServerRelayQuicAddrDiscoveryToggled,
+        ));
+    }
     if let Err(message) = &validated {
         card = card.push(text(message.clone()).size(12).color(AMBER));
     }
@@ -2920,6 +2927,38 @@ fn route_row<'a>(value: String, trailing: Option<Element<'a, Message>>) -> Eleme
     r.into()
 }
 
+/// What a pane says of its relays: the custom URLs, with a word when QUIC
+/// address discovery is off for them, or that they are the default ones.
+fn relays_line(relay_urls: &[String], quic_addr_discovery: bool) -> String {
+    if relay_urls.is_empty() {
+        "default".to_string()
+    } else if quic_addr_discovery {
+        relay_urls.join(", ")
+    } else {
+        format!("{} (no QUIC address discovery)", relay_urls.join(", "))
+    }
+}
+
+/// The relay forms' tick for whether the custom relays serve QUIC address
+/// discovery, shown while the form has relay URLs.
+fn quic_addr_discovery_row<'a>(
+    ticked: bool,
+    on_toggle: fn(bool) -> Message,
+) -> Element<'a, Message> {
+    form_row(
+        "QUIC discovery",
+        checkbox(ticked)
+            .label(
+                "relays serve QUIC address discovery — untick behind a Cloudflare Tunnel \
+                 or another HTTP-only front",
+            )
+            .text_size(13)
+            .width(Fill)
+            .on_toggle(on_toggle)
+            .style(style::check),
+    )
+}
+
 fn form_row<'a>(
     label: &'static str,
     input: impl Into<Element<'a, Message>>,
@@ -3201,6 +3240,7 @@ mod tests {
             auth_key_id: String::new(),
             relay_urls: Vec::new(),
             relay_auth_token: None,
+            relay_quic_addr_discovery: true,
         };
         let mut client = ClientSettings {
             destinations: vec![destination("nas", &["*.corp.example"])],

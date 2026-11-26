@@ -29,7 +29,7 @@ use flextunnel_core::proxy::{
     ClientAuth, ClientConfig, DestinationConfig, DestinationStatus, HeldDestination,
     LocalListeners, ProxyClient, ServerRoutes,
 };
-use flextunnel_core::transport::endpoint::RelayConfig;
+use flextunnel_core::transport::endpoint::{RelayConfig, relay_config};
 use flextunnel_core::transport::paths::ConnectionSnapshot;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -858,9 +858,10 @@ fn held_destination(destination: &Destination) -> HeldDestination {
 fn destination_config(spec: &DestinationSpec) -> Result<DestinationConfig, String> {
     let destination = &spec.destination;
     let name = &destination.name;
-    let relay = RelayConfig::from_urls_with_token(
+    let relay = relay_config(
         &destination.relay_urls,
         destination.relay_auth_token.clone(),
+        crate::config::relay_quic_addr_discovery_setting(destination.relay_quic_addr_discovery),
     )
     .map_err(|e| format!("Destination \"{name}\": invalid relay configuration: {e:#}"))?;
     let client_key = flextunnel_core::auth::ClientKey::from_secret_str(spec.auth_secret.trim())
@@ -1108,6 +1109,7 @@ mod tests {
             auth_key_id: auth_key_id.into(),
             relay_urls: Vec::new(),
             relay_auth_token: None,
+            relay_quic_addr_discovery: true,
         }
     }
 
@@ -1205,8 +1207,17 @@ mod tests {
         assert!(err(spec(bad_server, &secret)).contains("invalid server node id"));
         let mut one_relay = good.clone();
         one_relay.relay_urls = vec!["https://only.example".into()];
-        let config = destination_config(&spec(one_relay, &secret)).expect("one relay");
+        let config = destination_config(&spec(one_relay.clone(), &secret)).expect("one relay");
         assert_eq!(config.relay.custom_urls().len(), 1);
+        assert_eq!(config.relay.quic_addr_discovery(), Some(true));
+        // QUIC address discovery is as stored for custom relays; turned off
+        // with the default ones (a hand-edited file), it cannot be used.
+        let mut discovery_off = one_relay;
+        discovery_off.relay_quic_addr_discovery = false;
+        let config = destination_config(&spec(discovery_off.clone(), &secret)).expect("off");
+        assert_eq!(config.relay.quic_addr_discovery(), Some(false));
+        discovery_off.relay_urls.clear();
+        assert!(err(spec(discovery_off, &secret)).contains("invalid relay configuration"));
         let mut bad_relay = good;
         bad_relay.relay_urls = vec!["not a url".into()];
         assert!(err(spec(bad_relay, &secret)).contains("invalid relay configuration"));

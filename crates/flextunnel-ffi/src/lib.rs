@@ -67,12 +67,19 @@
 //! stream open on it: absent means the default (300), `0` means never close
 //! one for idleness.
 //!
+//! `relay_quic_addr_discovery` says whether the custom relays serve QUIC
+//! address discovery, all of them or none: absent or `null` means they do
+//! (the default); `false` is for relays behind a Cloudflare Tunnel or another
+//! HTTP-only front, which otherwise delay each start by up to 3 s. Only valid
+//! with custom `relay_urls`.
+//!
 //! ```json
 //! {
 //!   "auth_key": "ed25519-sec:...",
 //!   "socks_port": null,
 //!   "relay_urls": ["https://relay-a.example/", "https://relay-b.example/"],
 //!   "relay_auth_token": null,
+//!   "relay_quic_addr_discovery": null,
 //!   "idle_timeout_secs": 300,
 //!   "destinations": [
 //!     { "name": "machine1", "server_node_id": "<iroh endpoint id>",
@@ -108,7 +115,7 @@ use flextunnel_core::proxy::{
     ClientAuth, ClientConfig, DestinationConfig, ForwardManager, ForwardSpec, ForwardState,
     LocalListeners, ProxyClient,
 };
-use flextunnel_core::transport::endpoint::RelayConfig;
+use flextunnel_core::transport::endpoint::relay_config;
 use flextunnel_core::transport::paths::ConnPathKind;
 
 /// The thread a routes request runs on (see
@@ -158,6 +165,10 @@ struct FfiConfig {
     /// valid with custom `relay_urls`; rejected with the default iroh relays.
     #[serde(default)]
     relay_auth_token: Option<String>,
+    /// Whether the custom relays serve QUIC address discovery, all of them or
+    /// none. Absent: they do. Only valid with custom `relay_urls`.
+    #[serde(default)]
+    relay_quic_addr_discovery: Option<bool>,
     /// Seconds a destination's connection is kept with no stream open on it.
     /// Absent: the default; `0`: never closed for idleness.
     #[serde(default)]
@@ -190,6 +201,8 @@ struct FfiRoutesRequest {
     relay_urls: Vec<String>,
     #[serde(default)]
     relay_auth_token: Option<String>,
+    #[serde(default)]
+    relay_quic_addr_discovery: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -405,8 +418,12 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
         None => (None, None),
     };
 
-    let relay = RelayConfig::from_urls_with_token(&cfg.relay_urls, cfg.relay_auth_token)
-        .map_err(|e| format!("invalid relay configuration: {e}"))?;
+    let relay = relay_config(
+        &cfg.relay_urls,
+        cfg.relay_auth_token,
+        cfg.relay_quic_addr_discovery,
+    )
+    .map_err(|e| format!("invalid relay configuration: {e}"))?;
     let client_key = flextunnel_core::auth::ClientKey::from_secret_str(cfg.auth_key.trim())
         .map_err(|e| format!("invalid auth key: {e:#}"))?;
     let idle_timeout = match cfg.idle_timeout_secs {
@@ -478,11 +495,13 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
 ///
 /// ```json
 /// { "auth_key": "ed25519-sec:...", "server_node_id": "<iroh endpoint id>",
-///   "relay_urls": [], "relay_auth_token": null }
+///   "relay_urls": [], "relay_auth_token": null,
+///   "relay_quic_addr_discovery": null }
 /// ```
 ///
-/// `relay_urls` and `relay_auth_token` are optional. The server must already
-/// authorize the key's public half. The server's answer is
+/// `relay_urls`, `relay_auth_token` and `relay_quic_addr_discovery` are
+/// optional, with the rules they have in a session's config. The server must
+/// already authorize the key's public half. The server's answer is
 ///
 /// ```json
 /// { "routed_domains": ["*.corp.example"], "routed_cidrs": ["10.0.0.0/8"] }
@@ -538,8 +557,12 @@ pub unsafe extern "C" fn flextunnel_fetch_server_routes(
 fn fetch_server_routes_inner(json: &str) -> Result<String, String> {
     let request: FfiRoutesRequest =
         serde_json::from_str(json).map_err(|e| format!("invalid request JSON: {e}"))?;
-    let relay = RelayConfig::from_urls_with_token(&request.relay_urls, request.relay_auth_token)
-        .map_err(|e| format!("invalid relay configuration: {e}"))?;
+    let relay = relay_config(
+        &request.relay_urls,
+        request.relay_auth_token,
+        request.relay_quic_addr_discovery,
+    )
+    .map_err(|e| format!("invalid relay configuration: {e}"))?;
     let key = flextunnel_core::auth::ClientKey::from_secret_str(request.auth_key.trim())
         .map_err(|e| format!("invalid auth key: {e:#}"))?;
     let server_id = request
@@ -1175,6 +1198,35 @@ mod tests {
         stop_handle(handle);
     }
 
+    /// `relay_quic_addr_discovery` is taken with custom relays, set or left
+    /// out, and refused with the default relays, which it cannot apply to.
+    #[test]
+    fn start_takes_the_relay_quic_addr_discovery_setting() {
+        let key = flextunnel_core::auth::ClientKey::generate().unwrap();
+        let config = |relay_urls: &[&str], discovery: Option<bool>| {
+            let mut json = serde_json::json!({
+                "auth_key": key.secret_str(),
+                "relay_urls": relay_urls,
+                "destinations": [{ "name": "m1", "server_node_id": node_id(1) }],
+            });
+            if let Some(discovery) = discovery {
+                json["relay_quic_addr_discovery"] = discovery.into();
+            }
+            json.to_string()
+        };
+        for discovery in [None, Some(true), Some(false)] {
+            let (handle, _) =
+                start_inner(&config(&["https://only.example"], discovery)).expect("starts");
+            stop_handle(handle);
+        }
+        for discovery in [true, false] {
+            let Err(message) = start_inner(&config(&[], Some(discovery))) else {
+                panic!("the default relays take no setting");
+            };
+            assert!(message.contains("invalid relay configuration"), "{message}");
+        }
+    }
+
     /// One custom relay starts a session (reduced-redundancy mode).
     #[test]
     fn start_accepts_a_single_custom_relay() {
@@ -1294,6 +1346,14 @@ mod tests {
             "relay_urls": ["not a url"],
         });
         assert!(err(bad_relay).contains("invalid relay configuration"));
+        // The QUIC address discovery setting needs custom relays, as in a
+        // session's config.
+        let stray_discovery = serde_json::json!({
+            "auth_key": key,
+            "server_node_id": node_id(1),
+            "relay_quic_addr_discovery": false,
+        });
+        assert!(err(stray_discovery).contains("invalid relay configuration"));
     }
 
     // Byte the caller-side buffers below start out holding, so a test can tell

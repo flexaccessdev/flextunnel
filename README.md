@@ -535,6 +535,7 @@ Client auth keypairs are generated with the standalone
 | `--authorized-keys-file <FILE>` | File of authorized client public keys, one `ed25519-pub:…` per line (optional trailing comment, ssh `authorized_keys` style). |
 | `--relay-url <URL>` | Custom relay URLs (repeatable; a single URL runs in reduced-redundancy mode, with no home-relay failover). See the [shared relay guide](https://github.com/flexaccessdev/flexaccess-iroh/blob/main/docs/relays-and-address-lookup.md) for discovery and dialing requirements. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
+| `--relay-quic-addr-discovery <BOOL>` | Whether the custom relays serve QUIC address discovery, all of them or none (default `true`). Pass `false` for relays behind a Cloudflare Tunnel or another HTTP-only front, which otherwise delay startup by up to 3 s; see [self-hosting a relay](https://github.com/flexaccessdev/flexaccess-iroh/blob/main/docs/self-hosting.md). Only valid with `--relay-url`. |
 | `--quick` | Ephemeral one-off server: prompt for the client's EndpointId (shown by `client start --quick`) and natively allowlist it as the only allowed client — no auth keypair — then mint an in-memory identity, full-tunnel all traffic, print this server's EndpointId, and exit if the client doesn't connect within 5 minutes. Needs an interactive terminal. Takes no single-instance lock; nothing is persisted. Conflicts with `-c`/`--secret-file`/`--authorized-keys-file`. |
 
 The server takes a single-instance lock keyed by the prefix of its own
@@ -553,6 +554,7 @@ second start of the same identity is refused.
 | `--auth-key <SECRET>` / `--auth-key-file <FILE>` | Client auth keypair for every destination that names no key file of its own: the inline `ed25519-sec:…` secret, or the key file from `flexaccess-keys generate-auth-key`. |
 | `--relay-url <URL>` | Custom relay URLs (repeatable, matching the servers' set), for every destination that names no relays of its own. See the shared relay guide above. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
+| `--relay-quic-addr-discovery <BOOL>` | Whether the custom relays serve QUIC address discovery, all of them or none (default `true`). Pass `false` for relays behind a Cloudflare Tunnel or another HTTP-only front, which otherwise delay startup by up to 3 s; see [self-hosting a relay](https://github.com/flexaccessdev/flexaccess-iroh/blob/main/docs/self-hosting.md). Only valid with `--relay-url`. |
 | `--idle-timeout <SECS>` | How long a destination's connection is kept with nothing using it (default 300; `0` never closes an idle connection). |
 | `--quick` | Self-contained ephemeral session (pairs with `server start --quick`): ignore any saved config, print this client's EndpointId (enter it at the quick server's prompt — that allowlist entry is the credential; no auth keypair), prompt for the server EndpointId, then run the live control panel in this terminal. Needs an interactive terminal. Takes no lock and opens no control socket; quitting the panel disconnects. Nothing is persisted. Conflicts with `-c`/`--auth-key(-file)`/`--idle-timeout`. |
 
@@ -571,10 +573,10 @@ panel disconnects instead of detaching. Nothing is saved.
 Each `[[destinations]]` table (see [`client.toml.example`](client.toml.example))
 has a `name` (one DNS label) and a `server_node_id`, and optionally `routed_domains` /
 `routed_cidrs` (see [Routing](#routing)) and its own `auth_key_file`,
-`relay_urls` and `relay_auth_token`, which override the top-level ones for that
-destination. Names and server ids must each be unique. The config is validated
-at startup; an invalid destination or an ambiguous route stops the client
-before anything is bound.
+`relay_urls`, `relay_auth_token` and `relay_quic_addr_discovery`, which
+override the top-level ones for that destination. Names and server ids must
+each be unique. The config is validated at startup; an invalid destination or
+an ambiguous route stops the client before anything is bound.
 
 Port forwards are declared in the config as `[[forwards]]` tables: each listens
 on `localhost:<local_port>` and opens a stream to `<remote_host>:<remote_port>`

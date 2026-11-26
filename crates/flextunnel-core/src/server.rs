@@ -20,7 +20,7 @@ use crate::lock::InstanceLock;
 use crate::proxy::{ProxyServer, ProxyServerParams, RoutedSet};
 use crate::secret::secret_to_endpoint_id;
 use crate::transport::endpoint::{
-    PendingCloses, RelayConfig, create_server_endpoint, server_setup,
+    self, PendingCloses, RelayConfig, create_server_endpoint, server_setup,
 };
 use anyhow::{Context, Result};
 use iroh::endpoint::Builder as EndpointBuilder;
@@ -45,6 +45,9 @@ pub struct ServerOptions {
     pub relay_urls: Vec<String>,
     /// Shared bearer token for custom relays (custom relays only).
     pub relay_auth_token: Option<String>,
+    /// Whether the custom relays serve QUIC address discovery (custom relays
+    /// only); `None` keeps the default, on.
+    pub relay_quic_addr_discovery: Option<bool>,
     /// Server-side host aliases, keys lowercased.
     pub host_aliases: HashMap<String, String>,
     /// The tunnel set; may be empty (the server's own loopback and status
@@ -115,6 +118,7 @@ pub fn prepare(opts: ServerOptions) -> Result<PreparedServer> {
         first_client,
         relay_urls,
         relay_auth_token,
+        relay_quic_addr_discovery,
         host_aliases,
         routed_domains,
         routed_cidrs,
@@ -160,8 +164,9 @@ pub fn prepare(opts: ServerOptions) -> Result<PreparedServer> {
     let routed_set = RoutedSet::new(&routed_domains, &routed_cidrs)
         .context("Invalid routed-set configuration")?;
 
-    let relay_config = RelayConfig::from_urls_with_token(&relay_urls, relay_auth_token)
-        .context("Invalid relay configuration")?;
+    let relay_config =
+        endpoint::relay_config(&relay_urls, relay_auth_token, relay_quic_addr_discovery)
+            .context("Invalid relay configuration")?;
 
     if !host_aliases.is_empty() {
         log::info!("Loaded {} host alias(es)", host_aliases.len());
@@ -330,6 +335,7 @@ mod tests {
             first_client: None,
             relay_urls: Vec::new(),
             relay_auth_token: None,
+            relay_quic_addr_discovery: None,
             host_aliases: HashMap::new(),
             routed_domains: vec!["*".into()],
             routed_cidrs: Vec::new(),
@@ -382,6 +388,24 @@ mod tests {
         opts.relay_urls = vec!["https://only.example".into()];
         let prepared = prepare(opts).unwrap();
         assert_eq!(prepared.relay_config.custom_urls().len(), 1);
+        assert_eq!(prepared.relay_config.quic_addr_discovery(), Some(true));
+    }
+
+    /// QUIC address discovery follows the option for custom relays, and the
+    /// option is refused with the default relays, which keep iroh's own.
+    #[test]
+    fn prepare_takes_the_relay_quic_addr_discovery_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut off = options(dir.path());
+        off.relay_urls = vec!["https://only.example".into()];
+        off.relay_quic_addr_discovery = Some(false);
+        let prepared = prepare(off).unwrap();
+        assert_eq!(prepared.relay_config.quic_addr_discovery(), Some(false));
+
+        let mut stray = options(dir.path());
+        stray.relay_quic_addr_discovery = Some(false);
+        let err = prepare(stray).err().expect("default relays");
+        assert!(format!("{err:#}").contains("relay_urls"), "{err:#}");
     }
 
     #[test]

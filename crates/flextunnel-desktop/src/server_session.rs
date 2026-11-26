@@ -132,6 +132,9 @@ fn options(server: &ServerConfig) -> anyhow::Result<ServerOptions> {
         first_client: None,
         relay_urls: server.relay_urls.clone(),
         relay_auth_token: server.relay_auth_token.clone(),
+        relay_quic_addr_discovery: crate::config::relay_quic_addr_discovery_setting(
+            server.relay_quic_addr_discovery,
+        ),
         host_aliases: HashMap::new(),
         routed_domains: server.routed_domains.clone(),
         routed_cidrs: server.routed_cidrs.clone(),
@@ -299,6 +302,7 @@ mod tests {
             routed_cidrs: Vec::new(),
             relay_urls: Vec::new(),
             relay_auth_token: None,
+            relay_quic_addr_discovery: true,
             enabled: true,
         }
     }
@@ -318,6 +322,13 @@ mod tests {
         assert_eq!(opts.authorized_keys.comment(&public), Some("laptop"));
         assert_eq!(opts.routed_domains, server.routed_domains);
         assert!(opts.quick_client.is_none());
+        // On is the core's default, so only off is passed on as a setting.
+        assert_eq!(opts.relay_quic_addr_discovery, None);
+        let mut discovery_off = server;
+        discovery_off.relay_urls = vec!["https://relay.example".into()];
+        discovery_off.relay_quic_addr_discovery = false;
+        let opts = options(&discovery_off).unwrap();
+        assert_eq!(opts.relay_quic_addr_discovery, Some(false));
     }
 
     #[test]

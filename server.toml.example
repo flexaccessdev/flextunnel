@@ -26,6 +26,13 @@ authorized_keys_file = "./authorized_keys"
 # relay_urls = ["https://relay.example"]
 # relay_auth_token = "shared-relay-secret"
 
+# Whether the custom relays serve QUIC address discovery, all of them or none
+# (default: true). Set false for relays behind a Cloudflare Tunnel or another
+# HTTP-only front: left on, iroh probes them for it and each start can wait
+# out its 3 s probe timeout. Only valid with custom relay_urls; set it the
+# same on the clients.
+# relay_quic_addr_discovery = false
+
 # Duplicate-id blocklist (JSON). This path is fixed at
 # ~/.config/flextunnel/blocklist.json and is deliberately not configurable. The
 # server records confirmed duplicate client ids here, and its own id if it

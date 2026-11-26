@@ -53,6 +53,13 @@ auth_key_file = "~/.config/flextunnel/client.key"
 # relay_urls = ["https://relay-a.example", "https://relay-b.example"]
 # relay_auth_token = "shared-relay-secret"
 
+# Whether the custom relays serve QUIC address discovery, all of them or none
+# (default: true). Set false for relays behind a Cloudflare Tunnel or another
+# HTTP-only front: left on, iroh probes them for it and each start can wait
+# out its 3 s probe timeout. Only valid with custom relay_urls; set it the
+# same on the server.
+# relay_quic_addr_discovery = false
+
 # How long a destination's connection is kept with nothing using it, in
 # seconds. Default: 300, at most 31536000 (one year). `0` never closes an idle
 # connection (it is still only opened on first use). A connection with an open stream — an ssh session, a
@@ -100,13 +107,15 @@ server_node_id = "<server endpoint id>"
 # routed_cidrs = ["10.0.0.0/8"]
 
 # A destination may override the client key and the relays above. One that
-# names its own relay_urls uses only its own relay_auth_token.
+# names its own relay_urls uses only its own relay_auth_token and
+# relay_quic_addr_discovery.
 # [[destinations]]
 # name = "machine2"
 # server_node_id = "<another server endpoint id>"
 # auth_key_file = "~/.config/flextunnel/machine2.key"
 # relay_urls = ["https://relay-c.example", "https://relay-d.example"]
 # relay_auth_token = "machine2-relay-secret"
+# relay_quic_addr_discovery = false
 
 # Port forwards: each `[[forwards]]` table listens on localhost:<local_port>
 # (127.0.0.1/::1 only) and opens a stream to <remote_host>:<remote_port>

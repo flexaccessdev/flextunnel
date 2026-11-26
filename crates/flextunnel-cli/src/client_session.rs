@@ -28,7 +28,7 @@ use flextunnel_core::proxy::{
     ClientAuth, ClientConfig, ClientStatus, DestinationConfig, DestinationStatus, LocalListeners,
     ProxyClient, TunnelDialer, reserved,
 };
-use flextunnel_core::transport::endpoint::RelayConfig;
+use flextunnel_core::transport::endpoint::relay_config;
 use flextunnel_core::transport::paths::{ConnPath, ConnPathKind};
 use flextunnel_core::{app, config};
 
@@ -105,6 +105,7 @@ pub struct QuickSession {
     pub http_port: Option<u16>,
     pub relay_urls: Vec<String>,
     pub relay_auth_token: Option<String>,
+    pub relay_quic_addr_discovery: Option<bool>,
 }
 
 /// The self-contained `flextunnel client start --quick` session: an ephemeral
@@ -126,8 +127,12 @@ pub struct QuickSession {
 /// that id (not a keypair) is the quick client's credential, so the endpoint must
 /// bind with exactly this secret.
 pub async fn run_quick(quick: QuickSession, client_secret: SecretKey) -> Result<()> {
-    let relay = RelayConfig::from_urls_with_token(&quick.relay_urls, quick.relay_auth_token)
-        .context("Invalid relay configuration")?;
+    let relay = relay_config(
+        &quick.relay_urls,
+        quick.relay_auth_token,
+        quick.relay_quic_addr_discovery,
+    )
+    .context("Invalid relay configuration")?;
     let client = Arc::new(
         ProxyClient::new(ClientConfig {
             destinations: vec![DestinationConfig {
@@ -581,6 +586,7 @@ fn wire_conn_path(p: &ConnPath) -> WireConnPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flextunnel_core::transport::endpoint::RelayConfig;
 
     /// A dialer over two destinations: `m1` routing `*.internal` and
     /// `2001:db8::/32`, `m2` routing `10.0.0.0/8`. Building it
