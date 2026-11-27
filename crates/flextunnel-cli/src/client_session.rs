@@ -284,9 +284,11 @@ async fn drive_session(
     // One shutdown future for the whole loop rather than one per pass. Its
     // listeners see only the signals that arrive while they exist, so a signal
     // that lands as another arm completes would be lost with the future that
-    // pass drops, and the handler stays installed, so the process would not
-    // be killed either.
-    let mut shutdown = std::pin::pin!(app::shutdown_signal());
+    // pass drops (and on Unix the handler stays installed, so the process
+    // would not be killed either). Boxed so it can be dropped when the loop
+    // ends: on Windows a listener that exists counts a Ctrl-C as handled, so
+    // one left unpolled through the teardown would swallow it.
+    let mut shutdown = Box::pin(app::shutdown_signal());
 
     let res = loop {
         tokio::select! {
@@ -348,6 +350,7 @@ async fn drive_session(
             }
         }
     };
+    drop(shutdown);
 
     // Close the channel so a quick panel still waiting on a reply (or issuing
     // its next request) unblocks and exits, tear down forwards and the control
