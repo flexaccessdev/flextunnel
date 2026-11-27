@@ -12,7 +12,7 @@
 //!
 //! The stack underneath is forks of iroh, noq and netwatch carrying the
 //! changes ezvpn's forks do, patched in by the workspace manifest, whose
-//! comments say what each carries. `docs/benchmarks.md` has what they measured here.
+//! comments say what each carries.
 
 pub mod endpoint;
 pub mod paths;

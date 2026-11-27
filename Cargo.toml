@@ -66,7 +66,7 @@ block = { path = "vendor/block" }
 # graph (`flexaccess-iroh`, iroh itself, the mDNS address lookup) resolves to
 # the same package (see flexaccess-iroh's README, "Consumers on a fork of
 # iroh"). Cargo.lock pins each tested branch commit. What they do for the data
-# path, and what each measured, is in docs/benchmarks.md.
+# path is in docs/architecture.md, under "Byte piping".
 #
 # Forked from netwatch v0.20.2 (n0-computer/net-tools). Opens a connected UDP
 # socket per busy peer beside the unconnected main socket, sharing its port

@@ -948,8 +948,7 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
   one unit for all your servers, the control panel and journald logging.
 - [`docs/benchmarks.md`](docs/benchmarks.md) — what a forward or `client nc`
   carries, what limits it, the Linux UDP buffer limit worth raising, and the
-  measurements: one version against the last, and what each change to the
-  data path measured.
+  measurements of the current version against an earlier one.
 - [`docs/roadmap.md`](docs/roadmap.md) — the roadmap: an index of the topic
   roadmaps, and the items under consideration that have no document of their
   own (dynamic configuration, for when uptime matters).
