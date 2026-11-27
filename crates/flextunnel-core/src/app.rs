@@ -153,6 +153,12 @@ pub fn log_version(pkg_name: &str, pkg_version: &str) {
 /// elsewhere. Await this alongside the main task in a `tokio::select!`. Returns
 /// an error if the signal handlers can't be registered, so the caller can log
 /// and exit cleanly instead of the process panicking.
+///
+/// In a `select!` loop, make one future before the loop and poll that one on
+/// every pass. The future sees only the signals that arrive after its first
+/// poll, and the process's handler outlives it, so a signal that arrives
+/// between one future's drop and the next one's first poll is neither
+/// delivered nor fatal.
 #[cfg(unix)]
 pub async fn shutdown_signal() -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
