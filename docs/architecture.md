@@ -201,7 +201,7 @@ picks the transmit queue by CPU, and the sending task moves between runtime
 threads), which the QUIC defaults read as loss.
 
 Three things under the splice set how fast it runs, and
-[benchmarks.md](benchmarks.md) has what each measured. The transport stack is
+[benchmarks.md](benchmarks.md) has what the result measures. The transport stack is
 forks of iroh, noq and netwatch carrying the changes ezvpn's do, patched in by
 the workspace manifest: netwatch sends to a busy peer on a connected UDP
 socket, which on Linux keeps the connection's packets on one transmit queue

@@ -120,7 +120,7 @@ pub fn raise_fd_limit() {}
 /// three, 4.7 and 4.6 on six, and 3.8 and 4.1 on one. Two rather than one, so
 /// a saturated connection cannot hold up the control streams and the
 /// listeners, and a server still has a second core for a second client.
-/// Numbers and method are in `docs/benchmarks.md`.
+/// `docs/benchmarks.md` describes the two VMs.
 pub const RUNTIME_WORKER_THREADS: usize = 2;
 
 /// A builder for the multi-threaded Tokio runtime of a client or server, with
