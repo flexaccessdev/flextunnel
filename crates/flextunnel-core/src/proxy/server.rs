@@ -35,6 +35,11 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 /// duplicate-id conflict (distinct from the auth-failure code `1`).
 const CLOSE_DUPLICATE: u32 = 2;
 
+/// How long a server that has blocked itself gives its answer to the client
+/// that reported the duplicate, the write and its time to leave together,
+/// before it stops without it.
+const SELF_BLOCK_REPLY_DEADLINE: Duration = Duration::from_secs(2);
+
 /// Monotonic per-connection sequence, assigned to each accepted connection so
 /// the registry can key entries by connection instance (not just by node id or
 /// nonce). This lets a benign same-process reconnect overlap keep two distinct
@@ -237,8 +242,10 @@ impl ProxyServer {
         }
     }
 
-    /// Record this server's own id as conflicted (duplicate server detected),
-    /// persist the blocklist, and trip the shutdown so [`run`](Self::run) exits.
+    /// Record this server's own id as conflicted (duplicate server detected)
+    /// and persist the blocklist. The caller trips the shutdown that makes
+    /// [`run`](Self::run) exit, once the client that reported it has its
+    /// answer.
     fn self_block(&self, reason: &str) {
         {
             let mut bl = self.blocklist.lock().expect("blocklist lock");
@@ -257,7 +264,6 @@ impl ProxyServer {
             }
         }
         log::error!("Duplicate server id detected: {reason}");
-        self.shutdown.notify_one();
     }
 
     /// Record a confirmed duplicate client id and persist the blocklist.
@@ -445,11 +451,26 @@ impl ProxyServer {
                 self.server_instance_nonce,
                 "server is stopping: duplicate server id detected",
             );
-            let _ = signaling::write_message(&mut send, &signaling::encode_hello_response(&resp)?)
+            let reply = signaling::encode_hello_response(&resp);
+            if let Ok(reply) = &reply {
+                // Under a deadline: the write waits for flow-control credit
+                // from the client, and a server that has blocked itself must
+                // not go on accepting connections for want of it.
+                let _ = tokio::time::timeout(SELF_BLOCK_REPLY_DEADLINE, async {
+                    let _ = signaling::write_message(&mut send, reply).await;
+                    let _ = send.finish();
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                })
                 .await;
-            let _ = send.finish();
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            }
             connection.close(CLOSE_DUPLICATE.into(), b"duplicate server id");
+            // Stop only now, and whatever became of the reply. `run`
+            // returning has the endpoint closed, and with it this connection:
+            // tripped before the reply was written, that close could overtake
+            // the reply and the client would see a closed connection in place
+            // of the reason.
+            self.shutdown.notify_one();
+            reply?;
             return Ok(());
         }
 

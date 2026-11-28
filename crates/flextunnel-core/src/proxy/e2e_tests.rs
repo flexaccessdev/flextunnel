@@ -32,7 +32,8 @@ use crate::transport::endpoint::{ClientEndpoint, RelayConfig, server_setup};
 use crate::transport::{ALPN, QUICK_ALPN, build_quic_transport_config};
 use iroh::address_lookup::MemoryLookup;
 use iroh::endpoint::{
-    Builder as EndpointBuilder, Connection, RecvStream, SendStream, Side, presets,
+    Builder as EndpointBuilder, Connection, QuicTransportConfig, RecvStream, SendStream, Side,
+    presets,
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use std::collections::{HashMap, HashSet};
@@ -76,9 +77,17 @@ async fn loopback_endpoint(secret: SecretKey, is_server: bool) -> Endpoint {
 /// setup: relay off, no discovery, `127.0.0.1:0`. `lookup` holds out-of-band
 /// addresses for the peers the endpoint dials by id alone.
 fn loopback_base(side: Side, lookup: MemoryLookup) -> EndpointBuilder {
+    loopback_base_with(lookup, build_quic_transport_config(side).unwrap())
+}
+
+/// [`loopback_base`] on a transport config of the test's own.
+fn loopback_base_with(
+    lookup: MemoryLookup,
+    transport_config: QuicTransportConfig,
+) -> EndpointBuilder {
     Endpoint::builder(presets::Empty)
         .relay_mode(RelayMode::Disabled)
-        .transport_config(build_quic_transport_config(side).unwrap())
+        .transport_config(transport_config)
         .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
         .unwrap()
@@ -130,6 +139,20 @@ fn spawn_server_full(
     host_aliases: HashMap<String, String>,
     routed_domains: Vec<String>,
 ) -> iroh::EndpointId {
+    spawn_server_task(endpoint, blocklist_path, host_aliases, routed_domains).0
+}
+
+/// [`spawn_server_full`], with the server's task: it ends when the server
+/// stops, with what [`ProxyServer::run`] returned.
+fn spawn_server_task(
+    endpoint: Endpoint,
+    blocklist_path: std::path::PathBuf,
+    host_aliases: HashMap<String, String>,
+    routed_domains: Vec<String>,
+) -> (
+    iroh::EndpointId,
+    tokio::task::JoinHandle<crate::error::ProxyResult<()>>,
+) {
     let own_id = endpoint.id();
     let no_cidrs: Vec<String> = Vec::new();
     let server = ProxyServer::new(ProxyServerParams {
@@ -142,16 +165,22 @@ fn spawn_server_full(
         blocklist: BlockList::load(blocklist_path).unwrap(),
         first_client: None,
     });
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         // Surface why the server task ended — captured by the test harness and
         // shown on failure, aiding diagnosis. This must NOT panic: a
         // duplicate-server self-block legitimately returns `Err` here (it's the
         // expected outcome of one test), so it's informational, not an assertion.
-        if let Err(e) = server.run(&endpoint).await {
+        let stopped = server.run(&endpoint).await;
+        if let Err(e) = &stopped {
             eprintln!("e2e test server task ended: {e}");
         }
+        // As a real server does once its accept loop ends (`RunningServer`'s
+        // `serve` and then `close`): a close that takes every connection on
+        // the endpoint with it, whatever they had left to send.
+        endpoint.close().await;
+        stopped
     });
-    own_id
+    (own_id, task)
 }
 
 /// Baseline [`ProxyServerParams`]: the [`test_client_key`] authorized and
@@ -1555,7 +1584,7 @@ async fn a_servers_routes_are_fetched_in_one_connection() {
 /// on the peer, and has no bound of its own.
 #[tokio::test]
 async fn a_peer_granting_no_stream_times_the_handshake_out() {
-    let no_streams = iroh::endpoint::QuicTransportConfig::builder()
+    let no_streams = QuicTransportConfig::builder()
         .max_concurrent_bidi_streams(0u32.into())
         .build();
     let server = server_setup(
@@ -1994,25 +2023,93 @@ async fn duplicate_client_is_detected_and_blocklisted() {
 }
 
 /// A client advisory (`duplicate_server_observed`) makes the server self-block:
-/// it records its own id in the blocklist and stops.
-#[tokio::test]
+/// it records its own id in the blocklist and stops, and the client that
+/// reported it is told why before the connection goes.
+///
+/// On several threads, as a real server runs, and against several servers in
+/// turn: the stop has the endpoint closed with every connection on it, and
+/// when the server tripped it before answering, that close reached the client
+/// in place of the answer in about one handshake of four.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_self_blocks_on_duplicate_advisory() {
-    let bl_path = temp_blocklist("selfblock");
+    for round in 0..8 {
+        let bl_path = temp_blocklist(&format!("selfblock-{round}"));
+
+        let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
+        let server_addr =
+            EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
+        let (own_id, server_task) =
+            spawn_server_task(server_ep, bl_path.clone(), HashMap::new(), Vec::new());
+
+        let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
+        let (_conn, _s, _r, resp) = client_handshake(&client_ep, server_addr, 9, true).await;
+        assert!(
+            !resp.accepted,
+            "self-blocking server should reject the connection"
+        );
+        assert!(
+            resp.reject_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("duplicate server id")),
+            "reject reason should mention the duplicate: {:?}",
+            resp.reject_reason
+        );
+
+        // The server recorded its own id as conflicted. Poll rather than assume
+        // a fixed delay is enough (avoids flaking under load).
+        wait_for_blocklist(&bl_path, |bl| bl.is_server_conflicted(&own_id.to_string())).await;
+
+        // And it stopped: its accept loop ended, with the duplicate as the
+        // reason. The record above is written before the stop is tripped, and
+        // the handler closes the reporting connection either way, so neither
+        // shows it.
+        let stopped = with_timeout(server_task).await.unwrap();
+        assert!(
+            matches!(stopped, Err(ProxyError::DuplicateServerId(_))),
+            "the server should stop on its duplicate: {stopped:?}"
+        );
+
+        let _ = std::fs::remove_file(&bl_path);
+    }
+}
+
+/// A server that has blocked itself stops whether or not its answer can be
+/// written: a client that grants the reply's stream a few bytes of credit and
+/// reads none of it leaves the write waiting, and the server stops all the
+/// same once the answer's deadline has passed.
+#[tokio::test]
+async fn server_self_block_does_not_wait_on_the_clients_credit() {
+    let bl_path = temp_blocklist("selfblock-no-credit");
 
     let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
     let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
-    let own_id = spawn_server(server_ep, bl_path.clone());
+    let (_own_id, server_task) =
+        spawn_server_task(server_ep, bl_path.clone(), HashMap::new(), Vec::new());
 
-    let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
-    let (_conn, _s, _r, resp) = client_handshake(&client_ep, server_addr, 9, true).await;
+    let eight_bytes = crate::transport::quic_transport_config(Side::Client, 8, 8).unwrap();
+    let client_ep = loopback_base_with(MemoryLookup::new(), eight_bytes)
+        .secret_key(SecretKey::generate())
+        .bind()
+        .await
+        .unwrap();
+    let conn = with_timeout(client_ep.connect(server_addr, ALPN))
+        .await
+        .unwrap();
+    let (mut send, _recv) = with_timeout(conn.open_bi()).await.unwrap();
+    let mut hello = Hello::new(Some(test_auth_payload(&client_ep)), 9);
+    hello.duplicate_server_observed = true;
+    signaling::write_message(&mut send, &signaling::encode_hello(&hello).unwrap())
+        .await
+        .unwrap();
+    send.flush().await.unwrap();
+
+    // The connection and its unread stream are held open all the while.
+    let stopped = with_timeout(server_task).await.unwrap();
     assert!(
-        !resp.accepted,
-        "self-blocking server should reject the connection"
+        matches!(stopped, Err(ProxyError::DuplicateServerId(_))),
+        "the server should stop on its duplicate: {stopped:?}"
     );
-
-    // The server recorded its own id as conflicted. Poll rather than assume a
-    // fixed delay is enough (avoids flaking under load).
-    wait_for_blocklist(&bl_path, |bl| bl.is_server_conflicted(&own_id.to_string())).await;
+    drop(conn);
 
     let _ = std::fs::remove_file(&bl_path);
 }
@@ -2592,32 +2689,71 @@ async fn a_peer_is_granted_only_the_streams_tunnels_use() {
 /// A stream's flow-control window follows its reader. Unread, a stream holds
 /// what every stream starts with and no more: the peer gets
 /// [`STREAM_RECEIVE_WINDOW`](crate::transport::STREAM_RECEIVE_WINDOW) ahead of
-/// the reader and is held there. Read as fast as loopback delivers, it is
-/// given more, and keeps it when the reader stops: the peer then gets further
-/// ahead than a starting window, though never past
-/// [`STREAM_RECEIVE_WINDOW_MAX`](crate::transport::STREAM_RECEIVE_WINDOW_MAX).
+/// the reader and is held there. Read, it never lets the peer further ahead
+/// than [`STREAM_RECEIVE_WINDOW_MAX`](crate::transport::STREAM_RECEIVE_WINDOW_MAX).
+///
+/// That a window grows is shown on windows a fraction of that size, set
+/// through the same config. A window grows when half of it is read within two
+/// round trips, of 5 ms at least: that is 500 Mbit/s for the real starting
+/// window over loopback, more than an unoptimized build delivers, so there a
+/// reader that takes all it is sent is rightly given no more. A small window
+/// is one the sender is held back by on any machine, which is what growth is
+/// for, and it is kept when the reader stops.
 #[tokio::test]
 async fn a_streams_window_follows_its_reader() {
     use crate::transport::{STREAM_RECEIVE_WINDOW, STREAM_RECEIVE_WINDOW_MAX};
+
+    // Only the iOS build's windows stay as they start.
+    assert_eq!(
+        STREAM_RECEIVE_WINDOW_MAX > STREAM_RECEIVE_WINDOW,
+        !cfg!(target_os = "ios")
+    );
+    // The real windows through the config every endpoint is built with.
+    window_follows_its_reader(
+        |side| build_quic_transport_config(side).unwrap(),
+        STREAM_RECEIVE_WINDOW,
+        STREAM_RECEIVE_WINDOW_MAX,
+        false,
+    )
+    .await;
+    let (start, max) = (64 * 1024, 1024 * 1024);
+    window_follows_its_reader(
+        |side| crate::transport::quic_transport_config(side, start, max).unwrap(),
+        start,
+        max,
+        true,
+    )
+    .await;
+}
+
+/// One stream between two endpoints of `config`, whose streams start with a
+/// window of `start` bytes that grows to `max`: held at `start` unread, never
+/// more than `max` ahead of its reader, and with `grows`, further ahead than
+/// `start` once it has been read at full speed.
+async fn window_follows_its_reader(
+    config: impl Fn(Side) -> QuicTransportConfig,
+    start: u32,
+    max: u32,
+    grows: bool,
+) {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const TEST_ALPN: &[u8] = b"flextunnel-test/stream-window";
-    const START: u64 = STREAM_RECEIVE_WINDOW as u64;
-    const MAX: u64 = STREAM_RECEIVE_WINDOW_MAX as u64;
+    let (start, max) = (u64::from(start), u64::from(max));
     // What the reader takes at a stretch before it stops to see how far ahead
     // the sender gets: several times what a window needs to reach its maximum.
-    const STRETCH: u64 = 4 * MAX;
+    let stretch = 4 * max;
     // Long enough for a sender with credit to use all of it.
     const SETTLE: Duration = Duration::from_millis(500);
 
-    let server = loopback_base(Side::Server, MemoryLookup::new())
+    let server = loopback_base_with(MemoryLookup::new(), config(Side::Server))
         .secret_key(SecretKey::from_bytes(&[71; 32]))
         .alpns(vec![TEST_ALPN.to_vec()])
         .bind()
         .await
         .unwrap();
     let server_addr = EndpointAddr::new(server.id()).with_ip_addr(server.bound_sockets()[0]);
-    let client = loopback_base(Side::Client, MemoryLookup::new())
+    let client = loopback_base_with(MemoryLookup::new(), config(Side::Client))
         .secret_key(SecretKey::from_bytes(&[72; 32]))
         .bind()
         .await
@@ -2644,37 +2780,34 @@ async fn a_streams_window_follows_its_reader() {
         send.write_all(b"go").await.unwrap();
 
         // Unread, the stream takes its starting window and stops there.
-        while sent.load(Ordering::Relaxed) < START {
+        while sent.load(Ordering::Relaxed) < start {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         tokio::time::sleep(SETTLE).await;
-        assert_eq!(sent.load(Ordering::Relaxed), START);
+        assert_eq!(sent.load(Ordering::Relaxed), start);
 
-        // Read at full speed and then stopped, it has more than that. How fast
-        // a stretch has to be read for the window to grow is the transport's
-        // business; a slow machine gets several stretches to manage it.
+        // Read at full speed and then stopped, it is never more than the
+        // maximum ahead, and where the window is to grow, more than it
+        // started with: a sender still getting up to speed gets several
+        // stretches to be held back by the window.
         let mut read = 0u64;
         let mut chunks: [bytes::Bytes; 32] = std::array::from_fn(|_| bytes::Bytes::new());
         let mut ahead = 0;
-        for _ in 0..8 {
-            let until = read + STRETCH;
+        for _ in 0..if grows { 8 } else { 1 } {
+            let until = read + stretch;
             while read < until {
                 let n = recv.read_many_chunks(&mut chunks).await.unwrap().unwrap();
                 read += chunks[..n].iter().map(|c| c.len() as u64).sum::<u64>();
             }
             tokio::time::sleep(SETTLE).await;
             ahead = sent.load(Ordering::Relaxed) - read;
-            assert!(ahead <= MAX, "{ahead} bytes ahead of the reader");
-            if ahead > START {
+            assert!(ahead <= max, "{ahead} bytes ahead of the reader");
+            if ahead > start {
                 break;
             }
         }
-        // Only the iOS build's windows stay as they start. Any other build
-        // has to show growth, whatever its maximum has been set to.
-        if cfg!(target_os = "ios") {
-            assert_eq!(MAX, START);
-        } else {
-            assert!(ahead > START, "the window never grew: {ahead} bytes ahead");
+        if grows {
+            assert!(ahead > start, "the window never grew: {ahead} bytes ahead");
         }
         recv.stop(0u32.into()).unwrap();
     };
