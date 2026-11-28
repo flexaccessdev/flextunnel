@@ -237,14 +237,25 @@ pub const QUICK_ALPN: &[u8] = b"flextunnel-quick/1";
 /// The window growth settings exist only in the noq fork the workspace builds
 /// against, and reach here through the iroh fork's builder.
 pub fn build_quic_transport_config(side: Side) -> Result<QuicTransportConfig> {
+    quic_transport_config(side, STREAM_RECEIVE_WINDOW, STREAM_RECEIVE_WINDOW_MAX)
+}
+
+/// [`build_quic_transport_config`] with the window a stream starts with and
+/// the most it grows to given, for a test of the growth that cannot count on
+/// its machine to fill the real ones in time.
+pub(crate) fn quic_transport_config(
+    side: Side,
+    stream_receive_window: u32,
+    max_stream_receive_window: u32,
+) -> Result<QuicTransportConfig> {
     let mut transport_config = QuicTransportConfig::builder();
     let idle_timeout = QUIC_IDLE_TIMEOUT
         .try_into()
         .context("converting QUIC_IDLE_TIMEOUT to IdleTimeout")?;
     transport_config = transport_config.max_idle_timeout(Some(idle_timeout));
     transport_config = transport_config.initial_mtu(QUIC_INITIAL_MTU);
-    transport_config = transport_config.stream_receive_window(STREAM_RECEIVE_WINDOW.into());
-    transport_config = transport_config.max_stream_receive_window(STREAM_RECEIVE_WINDOW_MAX.into());
+    transport_config = transport_config.stream_receive_window(stream_receive_window.into());
+    transport_config = transport_config.max_stream_receive_window(max_stream_receive_window.into());
     transport_config = transport_config.stream_receive_window_budget(STREAM_WINDOW_BUDGET);
     transport_config = transport_config.send_window(SEND_WINDOW);
     transport_config = transport_config.max_concurrent_uni_streams(0u32.into());
