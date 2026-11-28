@@ -382,6 +382,11 @@ scheduled work.
 
 ## Reproducing
 
+The scripts in [`bench/`](../bench) take this page's measurements: `stage.py`
+sets a session up on the machines, which keep nothing between sessions,
+`run.py` takes the rows and `summ.py` sums them up. Each one's usage is at its
+top. What follows is how to take a run by hand.
+
 Start a server on one machine with `iperf3 -s -B 127.0.0.1` beside it, and on
 the other a client whose config forwards a local port to it. The client needs
 a key the server authorizes: generate one with
