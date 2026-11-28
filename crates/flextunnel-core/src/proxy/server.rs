@@ -35,6 +35,11 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 /// duplicate-id conflict (distinct from the auth-failure code `1`).
 const CLOSE_DUPLICATE: u32 = 2;
 
+/// How long a server that has blocked itself gives its answer to the client
+/// that reported the duplicate, the write and its time to leave together,
+/// before it stops without it.
+const SELF_BLOCK_REPLY_DEADLINE: Duration = Duration::from_secs(2);
+
 /// Monotonic per-connection sequence, assigned to each accepted connection so
 /// the registry can key entries by connection instance (not just by node id or
 /// nonce). This lets a benign same-process reconnect overlap keep two distinct
@@ -448,9 +453,15 @@ impl ProxyServer {
             );
             let reply = signaling::encode_hello_response(&resp);
             if let Ok(reply) = &reply {
-                let _ = signaling::write_message(&mut send, reply).await;
-                let _ = send.finish();
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                // Under a deadline: the write waits for flow-control credit
+                // from the client, and a server that has blocked itself must
+                // not go on accepting connections for want of it.
+                let _ = tokio::time::timeout(SELF_BLOCK_REPLY_DEADLINE, async {
+                    let _ = signaling::write_message(&mut send, reply).await;
+                    let _ = send.finish();
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                })
+                .await;
             }
             connection.close(CLOSE_DUPLICATE.into(), b"duplicate server id");
             // Stop only now, and whatever became of the reply. `run`

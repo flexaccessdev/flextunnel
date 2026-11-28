@@ -139,6 +139,20 @@ fn spawn_server_full(
     host_aliases: HashMap<String, String>,
     routed_domains: Vec<String>,
 ) -> iroh::EndpointId {
+    spawn_server_task(endpoint, blocklist_path, host_aliases, routed_domains).0
+}
+
+/// [`spawn_server_full`], with the server's task: it ends when the server
+/// stops, with what [`ProxyServer::run`] returned.
+fn spawn_server_task(
+    endpoint: Endpoint,
+    blocklist_path: std::path::PathBuf,
+    host_aliases: HashMap<String, String>,
+    routed_domains: Vec<String>,
+) -> (
+    iroh::EndpointId,
+    tokio::task::JoinHandle<crate::error::ProxyResult<()>>,
+) {
     let own_id = endpoint.id();
     let no_cidrs: Vec<String> = Vec::new();
     let server = ProxyServer::new(ProxyServerParams {
@@ -151,20 +165,22 @@ fn spawn_server_full(
         blocklist: BlockList::load(blocklist_path).unwrap(),
         first_client: None,
     });
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         // Surface why the server task ended — captured by the test harness and
         // shown on failure, aiding diagnosis. This must NOT panic: a
         // duplicate-server self-block legitimately returns `Err` here (it's the
         // expected outcome of one test), so it's informational, not an assertion.
-        if let Err(e) = server.run(&endpoint).await {
+        let stopped = server.run(&endpoint).await;
+        if let Err(e) = &stopped {
             eprintln!("e2e test server task ended: {e}");
         }
         // As a real server does once its accept loop ends (`RunningServer`'s
         // `serve` and then `close`): a close that takes every connection on
         // the endpoint with it, whatever they had left to send.
         endpoint.close().await;
+        stopped
     });
-    own_id
+    (own_id, task)
 }
 
 /// Baseline [`ProxyServerParams`]: the [`test_client_key`] authorized and
@@ -2022,7 +2038,8 @@ async fn server_self_blocks_on_duplicate_advisory() {
         let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
         let server_addr =
             EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
-        let own_id = spawn_server(server_ep, bl_path.clone());
+        let (own_id, server_task) =
+            spawn_server_task(server_ep, bl_path.clone(), HashMap::new(), Vec::new());
 
         let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
         let (_conn, _s, _r, resp) = client_handshake(&client_ep, server_addr, 9, true).await;
@@ -2042,8 +2059,59 @@ async fn server_self_blocks_on_duplicate_advisory() {
         // a fixed delay is enough (avoids flaking under load).
         wait_for_blocklist(&bl_path, |bl| bl.is_server_conflicted(&own_id.to_string())).await;
 
+        // And it stopped: its accept loop ended, with the duplicate as the
+        // reason. The record above is written before the stop is tripped, and
+        // the handler closes the reporting connection either way, so neither
+        // shows it.
+        let stopped = with_timeout(server_task).await.unwrap();
+        assert!(
+            matches!(stopped, Err(ProxyError::DuplicateServerId(_))),
+            "the server should stop on its duplicate: {stopped:?}"
+        );
+
         let _ = std::fs::remove_file(&bl_path);
     }
+}
+
+/// A server that has blocked itself stops whether or not its answer can be
+/// written: a client that grants the reply's stream a few bytes of credit and
+/// reads none of it leaves the write waiting, and the server stops all the
+/// same once the answer's deadline has passed.
+#[tokio::test]
+async fn server_self_block_does_not_wait_on_the_clients_credit() {
+    let bl_path = temp_blocklist("selfblock-no-credit");
+
+    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
+    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
+    let (_own_id, server_task) =
+        spawn_server_task(server_ep, bl_path.clone(), HashMap::new(), Vec::new());
+
+    let eight_bytes = crate::transport::quic_transport_config(Side::Client, 8, 8).unwrap();
+    let client_ep = loopback_base_with(MemoryLookup::new(), eight_bytes)
+        .secret_key(SecretKey::generate())
+        .bind()
+        .await
+        .unwrap();
+    let conn = with_timeout(client_ep.connect(server_addr, ALPN))
+        .await
+        .unwrap();
+    let (mut send, _recv) = with_timeout(conn.open_bi()).await.unwrap();
+    let mut hello = Hello::new(Some(test_auth_payload(&client_ep)), 9);
+    hello.duplicate_server_observed = true;
+    signaling::write_message(&mut send, &signaling::encode_hello(&hello).unwrap())
+        .await
+        .unwrap();
+    send.flush().await.unwrap();
+
+    // The connection and its unread stream are held open all the while.
+    let stopped = with_timeout(server_task).await.unwrap();
+    assert!(
+        matches!(stopped, Err(ProxyError::DuplicateServerId(_))),
+        "the server should stop on its duplicate: {stopped:?}"
+    );
+    drop(conn);
+
+    let _ = std::fs::remove_file(&bl_path);
 }
 
 /// The routed-set whitelist is enforced on the *requested* hostname before any
