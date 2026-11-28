@@ -237,8 +237,10 @@ impl ProxyServer {
         }
     }
 
-    /// Record this server's own id as conflicted (duplicate server detected),
-    /// persist the blocklist, and trip the shutdown so [`run`](Self::run) exits.
+    /// Record this server's own id as conflicted (duplicate server detected)
+    /// and persist the blocklist. The caller trips the shutdown that makes
+    /// [`run`](Self::run) exit, once the client that reported it has its
+    /// answer.
     fn self_block(&self, reason: &str) {
         {
             let mut bl = self.blocklist.lock().expect("blocklist lock");
@@ -257,7 +259,6 @@ impl ProxyServer {
             }
         }
         log::error!("Duplicate server id detected: {reason}");
-        self.shutdown.notify_one();
     }
 
     /// Record a confirmed duplicate client id and persist the blocklist.
@@ -445,11 +446,20 @@ impl ProxyServer {
                 self.server_instance_nonce,
                 "server is stopping: duplicate server id detected",
             );
-            let _ = signaling::write_message(&mut send, &signaling::encode_hello_response(&resp)?)
-                .await;
-            let _ = send.finish();
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            let reply = signaling::encode_hello_response(&resp);
+            if let Ok(reply) = &reply {
+                let _ = signaling::write_message(&mut send, reply).await;
+                let _ = send.finish();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
             connection.close(CLOSE_DUPLICATE.into(), b"duplicate server id");
+            // Stop only now, and whatever became of the reply. `run`
+            // returning has the endpoint closed, and with it this connection:
+            // tripped before the reply was written, that close could overtake
+            // the reply and the client would see a closed connection in place
+            // of the reason.
+            self.shutdown.notify_one();
+            reply?;
             return Ok(());
         }
 

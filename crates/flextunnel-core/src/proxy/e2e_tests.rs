@@ -150,6 +150,10 @@ fn spawn_server_full(
         if let Err(e) = server.run(&endpoint).await {
             eprintln!("e2e test server task ended: {e}");
         }
+        // As a real server does once its accept loop ends (`RunningServer`'s
+        // `serve` and then `close`): a close that takes every connection on
+        // the endpoint with it, whatever they had left to send.
+        endpoint.close().await;
     });
     own_id
 }
@@ -1994,27 +1998,43 @@ async fn duplicate_client_is_detected_and_blocklisted() {
 }
 
 /// A client advisory (`duplicate_server_observed`) makes the server self-block:
-/// it records its own id in the blocklist and stops.
-#[tokio::test]
+/// it records its own id in the blocklist and stops, and the client that
+/// reported it is told why before the connection goes.
+///
+/// On several threads, as a real server runs, and against several servers in
+/// turn: the stop has the endpoint closed with every connection on it, and
+/// when the server tripped it before answering, that close reached the client
+/// in place of the answer in about one handshake of four.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_self_blocks_on_duplicate_advisory() {
-    let bl_path = temp_blocklist("selfblock");
+    for round in 0..8 {
+        let bl_path = temp_blocklist(&format!("selfblock-{round}"));
 
-    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
-    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
-    let own_id = spawn_server(server_ep, bl_path.clone());
+        let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
+        let server_addr =
+            EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
+        let own_id = spawn_server(server_ep, bl_path.clone());
 
-    let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
-    let (_conn, _s, _r, resp) = client_handshake(&client_ep, server_addr, 9, true).await;
-    assert!(
-        !resp.accepted,
-        "self-blocking server should reject the connection"
-    );
+        let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
+        let (_conn, _s, _r, resp) = client_handshake(&client_ep, server_addr, 9, true).await;
+        assert!(
+            !resp.accepted,
+            "self-blocking server should reject the connection"
+        );
+        assert!(
+            resp.reject_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("duplicate server id")),
+            "reject reason should mention the duplicate: {:?}",
+            resp.reject_reason
+        );
 
-    // The server recorded its own id as conflicted. Poll rather than assume a
-    // fixed delay is enough (avoids flaking under load).
-    wait_for_blocklist(&bl_path, |bl| bl.is_server_conflicted(&own_id.to_string())).await;
+        // The server recorded its own id as conflicted. Poll rather than assume
+        // a fixed delay is enough (avoids flaking under load).
+        wait_for_blocklist(&bl_path, |bl| bl.is_server_conflicted(&own_id.to_string())).await;
 
-    let _ = std::fs::remove_file(&bl_path);
+        let _ = std::fs::remove_file(&bl_path);
+    }
 }
 
 /// The routed-set whitelist is enforced on the *requested* hostname before any
